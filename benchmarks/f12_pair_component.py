@@ -2,7 +2,6 @@
 
 import argparse
 import json
-import shutil
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -13,7 +12,6 @@ from generativeqc_compiler.mp2.f12_pairs import (
     restricted_f12_pair_response,
     restricted_f12_pairs,
 )
-from generativeqc_compiler.tensor.program import Program
 
 CASES = ("he", "h2", "h2_df", "water_df")
 FIXTURE = (
@@ -123,37 +121,14 @@ def verify(row: Mapping[str, Any]) -> None:
 
 
 def main() -> None:
-    from generativeqc_compiler.common.cuda_adapter import CudaCompilerAdapter
-    from generativeqc_compiler.common.cuda_target import cuda_target_info
-    from generativeqc_compiler.tensor.cuda_execute import PreparedCuda, compile_cuda
-    from generativeqc_compiler.tensor.cuda_plan import plan_cuda
-
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--arch", required=True)
     parser.add_argument("--cache", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    nvcc = shutil.which("nvcc")
-    if nvcc is None:
-        raise RuntimeError("CUDA qualification requires nvcc")
-    compiler = CudaCompilerAdapter(Path(nvcc), cuda_target_info(args.arch))
-    compiled = {}
-    metrics = []
+    from benchmarks._f12_cuda import cuda_runner
 
-    def run(program: Program, inputs: Mapping[str, np.ndarray]) -> Any:
-        key = program.logical_hash
-        if key not in compiled:
-            plan = plan_cuda(program, compiler.target, max_bytes=512 << 20)
-            compiled[key] = (plan, compile_cuda(plan, compiler, args.cache))
-        plan, artifact = compiled[key]
-        with PreparedCuda(plan, artifact, device=0) as prepared:
-            result = prepared.execute(inputs)
-        if result.backend != "cuda-fp64-ordinary-stream":
-            raise RuntimeError(f"unqualified F12 pair backend {result.backend}")
-        metrics.append(
-            {"program": key, "backend": result.backend, "metrics": result.metrics}
-        )
-        return result
+    run, metrics = cuda_runner(args.arch, args.cache)
 
     rows = []
     with np.load(FIXTURE, allow_pickle=False) as data:
