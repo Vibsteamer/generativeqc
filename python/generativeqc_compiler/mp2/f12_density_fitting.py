@@ -1,8 +1,64 @@
 """Coulomb-metric robust fitting of a tile of F12 two-electron integrals."""
 
-from ..tensor.ir import Node, add, einsum, input_tensor, transpose
+from ..tensor.ir import Node, add, einsum, input_tensor, slice_tensor, transpose
 from ..tensor.program import Program
 from ..tensor.types import Index, IndexSpace, TensorSpec
+
+
+def molecular_orbital_sources(
+    atomic: int, orbitals: int, occupied: int, auxiliaries: int
+) -> Program:
+    """Transform AO sources to one shared occupied/OBS/CABS orbital frame.
+
+    The frame coefficients include the ordinary MOs and complementary virtuals
+    in that order. Their AO rows use the same combined basis as each integral.
+    Coulomb transforms retain the full frame for the extended Fock. The other
+    four operators need an occupied index on the left. All inputs are live in
+    the reverse program, including both appearances of the shared coefficients.
+    A separate metric solve supplies the fitted Coulomb coefficients.
+    """
+    if (
+        any(
+            type(n) is not int or n <= 0
+            for n in (atomic, orbitals, occupied, auxiliaries)
+        )
+        or occupied >= orbitals
+        or orbitals > atomic
+    ):
+        raise ValueError(
+            "Expected positive AO/auxiliary sizes and 0 < occupied < orbitals <= AO"
+        )
+    ao = IndexSpace("combined_atomic", "ao", atomic)
+    mo = IndexSpace("extended_orbital", "orbital", orbitals)
+    u, v = Index("u", ao), Index("v", ao)
+    p = Index("p", mo)
+    a = Index("a", IndexSpace("fitting_basis", "auxiliary", auxiliaries))
+
+    def source(name: str, axes: tuple[Index, ...]) -> Node:
+        return input_tensor(name, TensorSpec(axes, role="input", differentiable=True))
+
+    coefficients = source("coefficients", (u, p))
+    occupied_coefficients = slice_tensor(coefficients, ((0, atomic), (0, occupied)))
+    hcore = source("hcore_ao", (u, v))
+    h_right = einsum("uv,vq->uq", hcore, coefficients)
+    result = {"hcore": einsum("up,uq->pq", coefficients, h_right)}
+    for operator in (
+        "coulomb",
+        "f12",
+        "f12_squared",
+        "f12_over_coulomb",
+        "double_commutator",
+    ):
+        raw = source("ao_" + operator, (a, u, v))
+        right = einsum("auv,vq->auq", raw, coefficients)
+        left = coefficients if operator == "coulomb" else occupied_coefficients
+        result["raw_" + operator] = einsum("up,auq->apq", left, right)
+    return Program(
+        result,
+        provenance={
+            "operation": "AO to shared OBS/CABS frame with full source and frame adjoints"
+        },
+    )
 
 
 def robust_fitted_operator(

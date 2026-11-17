@@ -5,8 +5,10 @@ import pytest
 from generativeqc_compiler.mp2.f12_density_fitting import (
     coulomb_fit_response,
     fitted_integral_block,
+    molecular_orbital_sources,
 )
 from generativeqc_compiler.tensor import execute
+from generativeqc_compiler.tensor.ad_program import transpose_program
 
 from benchmarks.f12_df_component import molecular_case, response_case
 
@@ -59,3 +61,65 @@ def test_metric_solve_response_across_independent_pair_tiles() -> None:
 def test_positive_block_sizes(dimensions: tuple[int, ...]) -> None:
     with pytest.raises(ValueError, match="positive dimensions"):
         fitted_integral_block(*dimensions)
+
+
+@pytest.mark.parametrize("occupied", [1, 3])
+def test_shared_orbital_frame_source_response(occupied: int) -> None:
+    """Both AO indices use the same coefficient matrix, including the CABS columns."""
+    rng = np.random.default_rng(5191)
+    atomic, orbitals, auxiliaries = 7, 5, 4
+    coefficients = rng.normal(size=(atomic, orbitals))
+    sources = {
+        "coefficients": coefficients,
+        "hcore_ao": rng.normal(size=(atomic, atomic)),
+        **{
+            "ao_" + op: rng.normal(size=(auxiliaries, atomic, atomic))
+            for op in (
+                "coulomb",
+                "f12",
+                "f12_squared",
+                "f12_over_coulomb",
+                "double_commutator",
+            )
+        },
+    }
+    graph = molecular_orbital_sources(atomic, orbitals, occupied, auxiliaries)
+    actual = execute(graph, sources).outputs
+    reference = {"hcore": coefficients.T @ sources["hcore_ao"] @ coefficients}
+    for name, value in sources.items():
+        if name.startswith("ao_"):
+            left = coefficients if name == "ao_coulomb" else coefficients[:, :occupied]
+            reference["raw_" + name[3:]] = np.stack(
+                [left.T @ matrix @ coefficients for matrix in value]
+            )
+    for name, value in reference.items():
+        np.testing.assert_allclose(actual[name], value, atol=2e-12, rtol=2e-14)
+    seeds = {name: rng.normal(size=value.shape) for name, value in reference.items()}
+    reverse = transpose_program(graph, tuple(graph.outputs)).program
+    bars = execute(
+        reverse, {**sources, **{"bar_" + name: value for name, value in seeds.items()}}
+    ).outputs
+    assert set(bars) == {"bar_" + name for name in sources}
+    for selected in ("coefficients", "hcore_ao", "ao_coulomb", "ao_double_commutator"):
+        direction = rng.normal(size=sources[selected].shape)
+        slope = np.vdot(bars["bar_" + selected], direction)
+        for h in (2e-5, 1e-5):
+            displaced = []
+            for step in (h, -h):
+                result = execute(
+                    graph, {**sources, selected: sources[selected] + step * direction}
+                ).outputs
+                displaced.append(
+                    sum(np.vdot(seeds[name], value) for name, value in result.items())
+                )
+            assert slope == pytest.approx(
+                (displaced[0] - displaced[1]) / (2 * h), abs=2e-7
+            )
+
+
+@pytest.mark.parametrize(
+    "dimensions", [(3, 4, 1, 2), (4, 4, 4, 2), (4, 4, 0, 2), (4, 4, 1, True)]
+)
+def test_orbital_source_dimensions(dimensions: tuple[int, ...]) -> None:
+    with pytest.raises(ValueError, match="positive AO"):
+        molecular_orbital_sources(*dimensions)

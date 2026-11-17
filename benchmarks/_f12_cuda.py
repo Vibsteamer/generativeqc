@@ -9,7 +9,9 @@ import numpy as np
 from generativeqc_compiler.tensor.program import Program
 
 
-def cuda_runner(arch: str, cache: Path) -> tuple[Callable, list[dict[str, Any]]]:
+def cuda_runner(
+    arch: str, cache: Path, *, max_bytes: int = 512 << 20
+) -> tuple[Callable, list[dict[str, Any]]]:
     """Return a source-cached graph runner and the list of actual backend measurements."""
     from generativeqc_compiler.common.cuda_adapter import CudaCompilerAdapter
     from generativeqc_compiler.common.cuda_target import cuda_target_info
@@ -26,7 +28,7 @@ def cuda_runner(arch: str, cache: Path) -> tuple[Callable, list[dict[str, Any]]]
     def run(program: Program, inputs: Mapping[str, np.ndarray]) -> Any:
         key = program.logical_hash
         if key not in compiled:
-            plan = plan_cuda(program, compiler.target, max_bytes=512 << 20)
+            plan = plan_cuda(program, compiler.target, max_bytes=max_bytes)
             compiled[key] = (plan, compile_cuda(plan, compiler, cache))
         plan, artifact = compiled[key]
         with PreparedCuda(plan, artifact, device=0) as prepared:
