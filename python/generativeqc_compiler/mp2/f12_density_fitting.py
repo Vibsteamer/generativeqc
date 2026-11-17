@@ -1,6 +1,6 @@
 """Coulomb-metric robust fitting of a tile of F12 two-electron integrals."""
 
-from ..tensor.ir import Node, add, einsum, input_tensor
+from ..tensor.ir import Node, add, einsum, input_tensor, transpose
 from ..tensor.program import Program
 from ..tensor.types import Index, IndexSpace, TensorSpec
 
@@ -54,4 +54,37 @@ def fitted_integral_block(
             "columns": "ordered orbital pairs on each side",
             "coefficients": "full Coulomb-metric solve",
         },
+    )
+
+
+def coulomb_fit_response(auxiliaries: int, pairs: int) -> Program:
+    """Propagate one pair tile through the full-rank metric solve J D = G.
+
+    The caller supplies a full-rank whitening factor W with W.T W = J^{-1}
+    for the same metric and three-center integrals. An adjoint seed on D yields an
+    adjoint on those integrals and the symmetric full-Frobenius weight on J.
+    Sum the latter over all tiles sharing J. Rank truncation requires its own
+    spectral derivative and must be handled before selecting this graph.
+    """
+    if any(type(n) is not int or n < 1 for n in (auxiliaries, pairs)):
+        raise ValueError("Coulomb fit response requires positive dimensions")
+    aux = IndexSpace("fitting_basis", "auxiliary", auxiliaries)
+    a, b = Index("a", aux), Index("b", aux)
+    p = Index("p", IndexSpace("orbital_pairs", "pair", pairs))
+    whitener = input_tensor("metric_whitener", TensorSpec((a, b), role="input"))
+    raw = input_tensor("three_center", TensorSpec((b, p), role="input"))
+    seed = input_tensor("fit_bar", TensorSpec((a, p), role="input"))
+
+    def solve(rhs: Node) -> Node:
+        whitened = einsum("ab,bp->ap", whitener, rhs)
+        return einsum("ab,ap->bp", whitener, whitened)
+
+    fit = solve(raw)
+    raw_bar = solve(seed)
+    # dD = J^{-1}(dG - dJ D). Both triangles describe the same metric.
+    weight = einsum("ap,bp->ab", fit, raw_bar)
+    metric_bar = add(weight, transpose(weight, (1, 0)), coefficients=("-1/2", "-1/2"))
+    return Program(
+        {"fit": fit, "three_center_bar": raw_bar, "metric_bar": metric_bar},
+        provenance={"operation": "full-rank Coulomb-fit implicit response"},
     )

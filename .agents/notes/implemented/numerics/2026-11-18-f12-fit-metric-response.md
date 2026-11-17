@@ -1,0 +1,7 @@
+# Full-rank Coulomb fit response for F12 integral tiles
+
+The robust four-index operator uses fitted pair densities that share a Coulomb metric. The integral fit needs the geometry derivative of each density and the accumulated metric response. For `J D = G`, contraction with the seed `U` gives `Y = solve(J,U)`, `bar(G) = Y` and `bar(J) = -(Y D.T + D Y.T)/2`. Sum metric weights over all pair tiles sharing `J`. There is no derivative of the choice of whitening gauge in this expression.
+
+The tensor program applies each solve as `W.T (W rhs)`, with `W.T W = inverse(J)`. This accepts inverse-Cholesky and symmetric whitening factors. On the water molecular control, an explicitly materialized inverse multiplied by the right-hand side disagreed with the independent triangular solve by up to 1.1e-9 in the tested coefficients. Two whitening operations reduced this difference below 4e-11. A moving retained subspace needs a separate spectral derivative when discarding eigenvalues.
+
+`tools/generate_f12_fit_response_reference.py` reconverges the linear system with independent libcint molecular inputs at two nuclear displacement sizes. The hydrogen and non-collinear water controls use cc-pVDZ-F12 and aug-cc-pVTZ-RI, with same-centre and inter-centre pairs. `benchmarks/f12_fit_response_component.py` checks both nuclear response terms together. These are derivatives of a linear probe of the fitting coefficients. A molecular F12 force also needs all integral operator, orbital, pair and reference responses.
