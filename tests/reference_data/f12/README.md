@@ -32,6 +32,15 @@ checks shared-atom motion: both orbital factors of one s–s product belong to t
 same H nucleus. Four operators and β = 0.9, 1.4, 2.2 are retained. This is a scalar
 source panel, not a complete molecular F12 force or whole-shell performance result.
 
+`libint_contracted_full_shells.json` preserves those 48 rows and adds 24 signed,
+externally weighted full Cartesian shell contractions: all 15 g–s metric
+components and all 18 s–p–d three-center components. The independent Libint2
+engine evaluates each shell value and raised/lowered derivative before the
+external contraction. This panel qualifies radial reuse with the same physical
+radial coefficients and four operators. `--timing-repeats 64` additionally measures
+repeated rows with allocation, transfers and synchronization; these source timings
+are not complete molecular F12 endpoint timings.
+
 ```sh
 PYTHONPATH=python:. python -m pytest -q tests/python/test_f12_contracted_integrals.py
 GENERATIVEQC_TEST_CUDA=1 PYTHONPATH=python:. python benchmarks/f12_contracted_integrals.py --fixture tests/reference_data/f12/libint_contracted.json --arch sm_89 --cache /tmp/gqc-f12-contracted --output /tmp/gqc-f12-contracted.json

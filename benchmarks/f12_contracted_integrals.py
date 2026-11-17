@@ -88,7 +88,11 @@ def adapter_source(groups: list[dict], primitives: int, projection: int) -> str:
     )
 
 
-def check(fixture: dict[str, Any], build: Path, arch: str | None) -> dict[str, Any]:
+def check(
+    fixture: dict[str, Any], build: Path, arch: str | None, *, timing_repeats: int = 1
+) -> dict[str, Any]:
+    if timing_repeats < 1:
+        raise ValueError("timing_repeats must be positive")
     compiler = shutil.which("nvcc" if arch else "c++")
     if compiler is None:
         raise RuntimeError("A compiler for the requested backend is required")
@@ -169,6 +173,18 @@ def check(fixture: dict[str, Any], build: Path, arch: str | None) -> dict[str, A
     start = time.perf_counter()
     np.testing.assert_array_equal(execute(inputs), observed)
     warm = time.perf_counter() - start
+    # Include allocation, transfers and synchronization, not just kernel time.
+    # Repeated rows expose amplification over Cartesian projection terms while
+    # preserving exactly the independently checked molecular basis coefficients.
+    repeated = np.tile(inputs, (timing_repeats, 1))
+    durations = []
+    for _ in range(5):
+        start = time.perf_counter()
+        repeated_output = execute(repeated)
+        durations.append(time.perf_counter() - start)
+        np.testing.assert_array_equal(
+            repeated_output, np.tile(observed, (timing_repeats, 1))
+        )
     expected = np.asarray([row["value_and_gradient"] for row in rows])
     scale = np.maximum(1.0, np.max(np.abs(expected), axis=1))
     error = (observed - expected) / scale[:, None]
@@ -217,10 +233,23 @@ def check(fixture: dict[str, Any], build: Path, arch: str | None) -> dict[str, A
         delta = (slopes - nuclear_slopes) / nuclear_scale
         np.testing.assert_allclose(delta, 0.0, atol=4e-7, rtol=0)
         nuclear_errors[str(step)] = float(np.max(np.abs(delta)))
-    for column, value in ((3, 0), (4, 0), (16, -1.0), (7, float("nan"))):
+    for column, value in (
+        (3, 0),
+        (4, 0),
+        (16, -1.0),
+        (7, float("nan")),
+        (16 + maximum_primitives, float("inf")),
+        (16 + 2 * maximum_primitives, float("nan")),
+    ):
         invalid = inputs.copy()
         invalid[:, column] = value
         np.testing.assert_array_equal(execute(invalid, False), 123.5)
+    insufficient = inputs.copy()
+    insufficient[:, 3] -= 1
+    np.testing.assert_array_equal(execute(insufficient, False), 123.5)
+    zero_weights = inputs.copy()
+    zero_weights[:, 16 + 2 * maximum_primitives :] = 0
+    np.testing.assert_array_equal(execute(zero_weights), 0.0)
     after = subprocess.check_output([str(launcher.path), "--show-stats"], text=True)
     return {
         "backend": "cuda-fp64" if arch else "host-fp64",
@@ -236,6 +265,22 @@ def check(fixture: dict[str, Any], build: Path, arch: str | None) -> dict[str, A
         "compile_seconds": compile_seconds,
         "cold_batch_seconds": cold,
         "warm_batch_seconds": warm,
+        "repeated_projection_endpoint": {
+            "scope": "contracted source rows including allocations/transfers; not molecular E/F",
+            "rows": len(repeated),
+            "repeats_of_fixture": timing_repeats,
+            "primitive_combinations": timing_repeats
+            * sum(math.prod(row["counts"]) for row in rows),
+            "nonzero_primitive_cartesian_terms": timing_repeats
+            * int(
+                sum(
+                    math.prod(row["counts"]) * np.count_nonzero(row["projection"])
+                    for row in rows
+                )
+            ),
+            "seconds": durations,
+            "median_seconds": float(np.median(durations)),
+        },
         "source_bytes": source.stat().st_size,
         "cache": {
             "path": str(launcher.path),
@@ -264,12 +309,18 @@ def main() -> None:
     parser.add_argument("--cache", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--arch")
+    parser.add_argument("--timing-repeats", type=int, default=1)
     args = parser.parse_args()
     if os.environ.get("GENERATIVEQC_TEST_CUDA") == "1" and not args.arch:
         raise ValueError(
             "Allocated GPU qualification requires an explicit CUDA architecture"
         )
-    result = check(json.loads(args.fixture.read_text()), args.cache, args.arch)
+    result = check(
+        json.loads(args.fixture.read_text()),
+        args.cache,
+        args.arch,
+        timing_repeats=args.timing_repeats,
+    )
     args.output.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
 
 

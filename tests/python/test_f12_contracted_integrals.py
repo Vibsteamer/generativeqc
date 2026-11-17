@@ -19,11 +19,14 @@ def test_contracted_values_and_nuclear_response(tmp_path: Path) -> None:
     ):
         pytest.skip("host compiler and compiler cache required")
     data = json.loads(
-        (ROOT / "tests/reference_data/f12/libint_contracted.json").read_text()
+        (
+            ROOT / "tests/reference_data/f12/libint_contracted_full_shells.json"
+        ).read_text()
     )
-    # The allocated L20 qualification additionally includes the g metric and
-    # the longer oxygen core contraction. CI retains both Cartesian and pure d.
-    selected = (0, 1)
+    # Retain normalized contraction, pure d and dense external weights on whole
+    # Cartesian shells, not only single-component source microbenchmarks.
+    # The L20 qualification additionally includes the pure g and oxygen core.
+    selected = (0, 1, 4, 5)
     fixture = copy.deepcopy(data)
     fixture["groups"] = [data["groups"][i] for i in selected]
     fixture["rows"] = [row for row in fixture["rows"] if row["group"] in selected]

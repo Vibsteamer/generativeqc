@@ -27,6 +27,32 @@ def emit_f12_df_component(components: tuple[str, ...], name: str) -> str:
     """
     if not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name):
         raise ValueError("expected a C++ function identifier")
+    body, boys_count = _emit_f12_df_angular(components, name + "_angular")
+    return "\n".join(
+        [
+            body,
+            f"GQC_F12_COMPONENT_HD inline bool {name}(",
+            "    const double* exponents, const double* centers,",
+            "    generativeqc::integrals::GeminalProduct op,",
+            "    const generativeqc::integrals::FittedSlater& left,",
+            "    const generativeqc::integrals::FittedSlater& right, double* output) {",
+            *_emit_f12_df_geometry(len(components), boys_count),
+            f"  return {name}_angular(exponents, centers, geometry.boys, output);",
+            "}",
+            "",
+        ]
+    )
+
+
+def _emit_f12_df_angular(components: tuple[str, ...], name: str) -> tuple[str, int]:
+    """Lower the existing derivative DAG against caller-owned radial moments.
+
+    Consumers sharing one primitive geometry may reuse the radial provider.
+    This is the same mathematical DAG as the standalone primitive; it does not
+    approximate, renormalize or differentiate a second recurrence.
+    """
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name):
+        raise ValueError("expected a C++ function identifier")
     if len(components) not in (2, 3):
         raise ValueError("F12 DF primitives need two or three physical centers")
     family = "coulomb_metric" if len(components) == 2 else "three_center_eri"
@@ -41,15 +67,30 @@ def emit_f12_df_component(components: tuple[str, ...], name: str) -> str:
             for j, axis in enumerate("xyz")
         }
     )
-    variables.update(
-        {f"boys_{n}": f"geometry.boys[{n}]" for n in range(kernel.boys_count)}
-    )
+    variables.update({f"boys_{n}": f"moments[{n}]" for n in range(kernel.boys_count)})
     roots = (kernel.value, *(root for axes in kernel.gradients for root in axes))
     emitter = ScalarCEmitter(kernel.graph, variables)
     emitter.emit(roots)
+    lines = [
+        f"GQC_F12_COMPONENT_HD inline bool {name}(",
+        "    const double* exponents, const double* centers,",
+        "    const double* moments, double* output) {",
+        *emitter.lines,
+        *(
+            f"  output[{i}] = {emitter.names[root.identifier]};"
+            for i, root in enumerate(roots)
+        ),
+        "  return true;",
+        "}",
+    ]
+    return "\n".join(lines) + "\n", kernel.boys_count
+
+
+def _emit_f12_df_geometry(centers_count: int, boys_count: int) -> list[str]:
+    """Prepare one radial context for a two/three-center shell signature."""
     # Missing products are explicit unit Gaussian slots in the existing radial
     # provider. The angular DAG contains only the physical basis factors.
-    slots = (0, None, 1, None) if len(components) == 2 else (0, 1, 2, None)
+    slots = (0, None, 1, None) if centers_count == 2 else (0, 1, 2, None)
     expanded_exponents = [
         "0.0" if slot is None else f"exponents[{slot}]" for slot in slots
     ]
@@ -59,17 +100,12 @@ def emit_f12_df_component(components: tuple[str, ...], name: str) -> str:
         for axis in range(3)
     ]
     unit_mask = sum(1 << i for i, slot in enumerate(slots) if slot is None)
-    order = kernel.boys_count - 1
-    lines = [
-        f"GQC_F12_COMPONENT_HD inline bool {name}(",
-        "    const double* exponents, const double* centers,",
-        "    generativeqc::integrals::GeminalProduct op,",
-        "    const generativeqc::integrals::FittedSlater& left,",
-        "    const generativeqc::integrals::FittedSlater& right, double* output) {",
+    order = boys_count - 1
+    return [
         "  struct Geometry {",
         "    double inverse_two_p, inverse_two_q, rho, difference[3], shifts[4][3];",
         "    double decay[4][3], product_scales[4], prefactor;",
-        f"    double boys[{kernel.boys_count}];",
+        f"    double boys[{boys_count}];",
         "  } geometry;",
         "  const double expanded_exponents[4] = {"
         + ", ".join(expanded_exponents)
@@ -78,12 +114,4 @@ def emit_f12_df_component(components: tuple[str, ...], name: str) -> str:
         "  if (!generativeqc::integrals::make_fitted_geminal_geometry<",
         f"          Geometry, {order}, {unit_mask}>(expanded_exponents, expanded_centers,",
         f"          {order}, op, left, right, geometry)) return false;",
-        *emitter.lines,
-        *(
-            f"  output[{i}] = {emitter.names[root.identifier]};"
-            for i, root in enumerate(roots)
-        ),
-        "  return true;",
-        "}",
     ]
-    return "\n".join(lines) + "\n"
