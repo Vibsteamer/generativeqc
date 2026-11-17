@@ -5,6 +5,19 @@ from ..tensor.program import Program
 from ..tensor.types import Index, IndexSpace, TensorSpec
 
 
+def robust_fitted_operator(
+    fit_left: Node, raw_left: Node, fit_right: Node, raw_right: Node, metric: Node
+) -> Node:
+    """Robust non-Coulomb integral for two Coulomb-fitted density tiles."""
+    residual = add(
+        raw_right, einsum("ab,br->ar", metric, fit_right), coefficients=(1, -1)
+    )
+    return add(
+        einsum("al,ar->lr", fit_left, residual),
+        einsum("bl,br->lr", raw_left, fit_right),
+    )
+
+
 def fitted_integral_block(
     auxiliaries: int, left_pairs: int, right_pairs: int, *, coulomb: bool = False
 ) -> Program:
@@ -45,8 +58,7 @@ def fitted_integral_block(
         dr = factor("fit_right", (aux_right, right_axis))
         left = factor("raw_left", (aux_right, left_axis))
         metric = factor("operator_metric", (aux_left, aux_right))
-        residual = add(right, einsum("ab,br->ar", metric, dr), coefficients=(1, -1))
-        block = add(einsum("al,ar->lr", dl, residual), einsum("bl,br->lr", left, dr))
+        block = robust_fitted_operator(dl, left, dr, right, metric)
     return Program(
         {"block": block},
         provenance={

@@ -18,3 +18,5 @@ PYTHONPATH=python:. python benchmarks/f12_cabs_component.py --output /tmp/f12-ca
 PYTHONPATH=python:. python benchmarks/f12_pair_component.py --arch sm_89 --cache /tmp/gqc-f12-cache --output /tmp/f12-pairs.json
 PYTHONPATH=python:. python benchmarks/f12_df_component.py --arch sm_89 --cache /tmp/gqc-f12-cache --output /tmp/f12-df.json
 ```
+
+The H₂ molecular-pair fixture contains all fitted density and operator factors for the occupied pair, including their CABS columns, the four operator metrics, extended Fock and exchange matrices. It also contains V, X, B, C and Coulomb values from the in-memory Psi4 contraction and its independent 3C(FIX) pair energy. Its embedded source digest identifies the same DF-H₂ archive used above. The extended Fock is reconstructed separately from one-electron and Coulomb-fit sources in the GPU qualification. The larger qualification additionally exercises all 15 H₂O pairs and checks their fitted-source adjoints.

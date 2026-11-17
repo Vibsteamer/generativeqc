@@ -1,11 +1,56 @@
 """Restricted 3C(FIX) Hylleraas correction for an unordered occupied-pair tile."""
 
+from collections.abc import Mapping
 from fractions import Fraction
 
 from ..tensor.ad_program import transpose_program
 from ..tensor.ir import Node, add, input_tensor, multiply, reduce_sum
 from ..tensor.program import Program
 from ..tensor.types import Index, IndexSpace, TensorSpec
+
+
+def restricted_pair_functional(terms: Mapping[str, Node], *, diagonal: bool) -> Node:
+    """Spin-adapted 3C(FIX) energy for a pair or pair batch with two trailing virtual axes."""
+    c = terms["c_direct"]
+    virtual_axes = (len(c.spec.indices) - 2, len(c.spec.indices) - 1)
+    d = terms["inverse_gap"]
+    gd = multiply(terms["g"], d)
+    cd = multiply(c, d)
+    f = terms["occupied_fock_sum"]
+
+    def dressed(suffix: str, coupling: Node) -> tuple[Node, Node]:
+        linear = add(
+            terms["v_" + suffix],
+            reduce_sum(multiply(coupling, gd), virtual_axes),
+            coefficients=(1, -1),
+        )
+        quadratic = add(
+            terms["b_" + suffix],
+            multiply(f, terms["x_" + suffix]),
+            reduce_sum(multiply(coupling, cd), virtual_axes),
+            coefficients=(1, -1, -1),
+        )
+        return linear, quadratic
+
+    vd, bd = dressed("direct", c)
+    if diagonal:
+        energy = add(vd, bd, coefficients=(1, Fraction(1, 4)))
+    else:
+        vx, bx = dressed("exchange", terms["c_exchange"])
+        # Spin singlet plus three triplet components for a spatial i < j pair.
+        energy = add(
+            vd,
+            vx,
+            bd,
+            bx,
+            coefficients=(
+                Fraction(5, 2),
+                Fraction(-1, 2),
+                Fraction(7, 16),
+                Fraction(1, 16),
+            ),
+        )
+    return energy
 
 
 def restricted_f12_pairs(pairs: int, virtuals: int, *, diagonal: bool) -> Program:
@@ -38,44 +83,16 @@ def restricted_f12_pairs(pairs: int, virtuals: int, *, diagonal: bool) -> Progra
             ),
         )
 
-    c = feed("c_direct", pab)
-    d = feed("inverse_gap", pab)
-    gd = multiply(feed("g", pab), d)
-    cd = multiply(c, d)
-    f = feed("occupied_fock_sum", (p,))
-
-    def dressed(suffix: str, coupling: Node) -> tuple[Node, Node]:
-        linear = add(
-            feed("v_" + suffix, (p,)),
-            reduce_sum(multiply(coupling, gd), (1, 2)),
-            coefficients=(1, -1),
-        )
-        quadratic = add(
-            feed("b_" + suffix, (p,)),
-            multiply(f, feed("x_" + suffix, (p,))),
-            reduce_sum(multiply(coupling, cd), (1, 2)),
-            coefficients=(1, -1, -1),
-        )
-        return linear, quadratic
-
-    vd, bd = dressed("direct", c)
-    if diagonal:
-        energy = add(vd, bd, coefficients=(1, Fraction(1, 4)))
-    else:
-        vx, bx = dressed("exchange", feed("c_exchange", pab))
-        # Spin singlet plus three triplet components for a spatial i < j pair.
-        energy = add(
-            vd,
-            vx,
-            bd,
-            bx,
-            coefficients=(
-                Fraction(5, 2),
-                Fraction(-1, 2),
-                Fraction(7, 16),
-                Fraction(1, 16),
-            ),
-        )
+    terms = {name: feed(name, pab) for name in ("c_direct", "inverse_gap", "g")}
+    terms["occupied_fock_sum"] = feed("occupied_fock_sum", (p,))
+    suffixes = ("direct",) if diagonal else ("direct", "exchange")
+    for suffix in suffixes:
+        for key in ("v", "x", "b"):
+            name = f"{key}_{suffix}"
+            terms[name] = feed(name, (p,))
+    if not diagonal:
+        terms["c_exchange"] = feed("c_exchange", pab)
+    energy = restricted_pair_functional(terms, diagonal=diagonal)
     return Program(
         {"pair_energy": energy},
         provenance={
