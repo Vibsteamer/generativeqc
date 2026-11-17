@@ -22,3 +22,17 @@ PYTHONPATH=python:. python benchmarks/f12_df_component.py --arch sm_89 --cache /
 The H₂ molecular-pair fixture contains all fitted density and operator factors for the occupied pair, including their CABS columns, the four operator metrics, extended Fock and exchange matrices. It also contains V, X, B, C and Coulomb values from the in-memory Psi4 contraction and its independent 3C(FIX) pair energy. Its embedded source digest identifies the same DF-H₂ archive used above. The extended Fock is reconstructed separately from one-electron and Coulomb-fit sources in the GPU qualification. The larger qualification additionally exercises all 15 H₂O pairs and checks their fitted-source adjoints.
 
 `libint_df_primitives.json` records independent unnormalized Cartesian two- and three-center geminal integrals. Nine component signatures cover orbital g and auxiliary h, including ggh. The operators are f, f/r₁₂, f² and ∇₁f·∇₁f, using each of the three archived Slater ranges. Nuclear derivatives use the Gaussian raising/lowering identity with independently evaluated Libint2 values. The fixture preserves the reference adapter and parameter-file digests. The native benchmark additionally checks both nuclear finite-difference steps and translation invariance. This panel evaluates primitive source integrals.
+
+`libint_contracted.json` adds 48 contracted source cases using normalized radial
+coefficients from cc-pVDZ-F12 and aug-cc-pVTZ-RI. The independent Libint2 shell
+engine performs contraction and pure d/g transformations itself; a separate
+Cartesian projection checks their normalization and phase conventions. Derivatives
+use independently evaluated raising/lowering contractions. The native test also
+checks shared-atom motion: both orbital factors of one s–s product belong to the
+same H nucleus. Four operators and β = 0.9, 1.4, 2.2 are retained. This is a scalar
+source panel, not a complete molecular F12 force or whole-shell performance result.
+
+```sh
+PYTHONPATH=python:. python -m pytest -q tests/python/test_f12_contracted_integrals.py
+GENERATIVEQC_TEST_CUDA=1 PYTHONPATH=python:. python benchmarks/f12_contracted_integrals.py --fixture tests/reference_data/f12/libint_contracted.json --arch sm_89 --cache /tmp/gqc-f12-contracted --output /tmp/gqc-f12-contracted.json
+```
