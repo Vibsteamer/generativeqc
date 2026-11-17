@@ -5,31 +5,18 @@
 #include <string>
 #include <vector>
 
+#include "posthf/cabs_cuda_support.cuh"
 #include "posthf/cabs_singles_cuda.hpp"
-#include "runtime/cuda_resources.cuh"
-#include "solver/cuda/symmetric_eigen_handles.hpp"
-#include "tensor/cuda_runtime.cuh"
 
 namespace {
 namespace gpu = generativeqc::runtime;
 namespace eig = generativeqc::solver::cuda;
 using generativeqc_tensor::blas_check;
 
-struct Blas {
-  cublasHandle_t handle{};
-  Blas() { blas_check(cublasCreate(&handle)); }
-  ~Blas() { (void)cublasDestroy(handle); }
-  Blas(const Blas&) = delete;
-  Blas& operator=(const Blas&) = delete;
-};
-
-void solver_check(std::uint32_t status) {
-  if (status) throw std::runtime_error("CABS cuSOLVER status " + std::to_string(status));
-}
-
-unsigned blocks(std::size_t count) {
-  return static_cast<unsigned>(std::min<std::size_t>(65535, (count - 1) / 256 + 1));
-}
+using generativeqc::posthf::cabs::Blas;
+using generativeqc::posthf::cabs::blocks;
+using generativeqc::posthf::cabs::check_flags;
+using generativeqc::posthf::cabs::solver_check;
 
 // Pack column-major provider blocks from the two triangles of a symmetric
 // row-major Fock. Tiny last-bit AO-transform asymmetries use their mean.
@@ -79,17 +66,6 @@ __global__ void write_pullback(double* f, std::size_t n, std::size_t o, const do
     f[k] = value;
     if (!isfinite(value)) atomicExch(bad, 1);
   }
-}
-
-void check_flags(const gpu::OwnedCudaStream& stream, const int* flags, int count,
-                 const char* message) {
-  int host[3]{};
-  gpu::cuda_resource_check(cudaGetLastError());
-  gpu::cuda_resource_check(
-      cudaMemcpyAsync(host, flags, count * sizeof(int), cudaMemcpyDeviceToHost, stream.get()));
-  stream.synchronize();
-  if (std::any_of(host, host + count, [](int x) { return x != 0; }))
-    throw std::runtime_error(message);
 }
 
 void cabs_singles(int device, int n, int o, int weight, double min_gap, const double* fock,

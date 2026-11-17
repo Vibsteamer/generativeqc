@@ -1,0 +1,11 @@
+# CABS overlap response on a locally fixed rank
+
+Status: implemented component
+
+Date: 2026-11-17
+
+The molecular F12 integrals depend on the complementary orbital space as nuclei move. Use its contravariant AO kernel K = C Cᵀ, which is invariant to orthogonal column rotations of C. Order the union basis as all orbital functions followed by all auxiliary functions. For symmetric overlap blocks A, D, B, let J be the vertical stack of −A⁻¹D and the identity, T = B − DᵀA⁻¹D, and H the inverse of T on its retained spectrum. Then K = J H Jᵀ; K S K = K and the first orbital rows of S K vanish. Preserve the whole well-conditioned orbital space. Rank selection applies to projected, normalized auxiliary AO functions. At full rank this also equals the union inverse minus the embedded orbital inverse. Cutoff policies in other programs can select different subspaces near linear dependence.
+
+The differential dT = Jᵀ dS J includes motion of the orbital and auxiliary functions. With U the symmetric part of the incoming kernel cotangent and O the embedded A⁻¹, the overlap adjoint is J G Jᵀ − O U K − K U O, where G is the adjoint of H applied to Jᵀ U J. Reuse the compiler-owned symmetric pseudoinverse rule, including retained/discarded spectral rotations. Repeated eigenvalues within either group are admissible. Check the guard interval around the cutoff and expose the retained rank for comparisons across displaced geometries. No individual eigenvector derivatives are needed. A near-singular orbital block, unresolved auxiliary space or branch crossing requires diagnosis.
+
+The FP64 CUDA component uses the existing cuSOLVER eigensystem and cuBLAS products. Molecular overlap matrices can be prepared independently with `tools/generate_f12_projector_reference.py`. The reference uses libcint derivatives and complete QR of a Cholesky AO embedding. For a moving probe b, its squared projected norm has derivative ⟨bar_S, dS⟩ + 2 dbᵀ K b with seed U = b bᵀ. The benchmark checks H₂ stretching and H₂O stretching/bending with two displacement sizes. The separate synthetic rotation and degeneracy tests exercise partial rank, including cases that the full-rank molecular fixtures do not reach. Timings cover the projector or projector plus its adjoint. Fock relaxation, differentiated molecular integrals and a stationary molecular F12 energy are subsequent consumers.
