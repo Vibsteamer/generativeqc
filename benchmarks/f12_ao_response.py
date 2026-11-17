@@ -98,25 +98,25 @@ def evaluate(data: dict, run: Callable, *, pullback: bool) -> tuple[float, dict,
         if k.startswith("ao_") or k in ("coefficients", "hcore_ao")
     }
     mapped = run(plan, source).outputs
-    raw = np.ascontiguousarray(mapped["raw_coulomb"].reshape(aux, -1))
+    raw = np.ascontiguousarray(mapped["raw_coulomb"][:, :occ].reshape(aux, -1))
     fitter = fit_plan(*raw.shape)
     fit_inputs = {
         "metric_whitener": data["metric_whitener"],
         "three_center": raw,
         "fit_bar": np.zeros_like(raw),
     }
-    fitted = run(fitter, fit_inputs).outputs["fit"].reshape(aux, ri, ri)
+    fitted = run(fitter, fit_inputs).outputs["fit"].reshape(aux, occ, ri)
     mol = {
         **mapped,
         "space": data["space"],
-        "fit": np.ascontiguousarray(fitted[:, :occ]),
-        "fit_all": fitted,
+        "fit": fitted,
+        "raw_coulomb_all": mapped["raw_coulomb"],
         "raw_occupied": np.ascontiguousarray(mapped["raw_coulomb"][:, :occ]),
         **{"metric_" + op: data["metric_" + op] for op in OPERATORS},
     }
     mol["raw_coulomb"] = mol["raw_occupied"]
     fock = fock_plan(occ, ri, aux)
-    fock_inputs = {k: mol[k] for k in ("hcore", "fit_all", "raw_occupied")}
+    fock_inputs = {k: mol[k] for k in ("hcore", "fit", "raw_coulomb_all")}
     fock_out = run(fock, fock_inputs).outputs
     fock_bars = {"bar_" + k: np.zeros_like(v) for k, v in fock_out.items()}
     pair_bars = {
@@ -149,21 +149,22 @@ def evaluate(data: dict, run: Callable, *, pullback: bool) -> tuple[float, dict,
             else:
                 column = i if name.endswith("_i") else j
                 pair_bars[name[:-2]][:, column] += value
-    intermediates = {**mapped, "fit_all": fitted, **fock_out}
+    intermediates = {**mapped, "fit": fitted, **fock_out}
     if not pullback:
         return total, {}, intermediates
     fock_back = run(
         transpose_program(fock, ("fock", "exchange")).program,
         {**fock_inputs, **fock_bars},
     ).outputs
-    fit_bar = fock_back["bar_fit_all"].copy()
-    fit_bar[:, :occ] += pair_bars["fit"]
+    fit_bar = fock_back["bar_fit"] + pair_bars["fit"]
     fit_back = run(
         fitter,
         {**fit_inputs, "fit_bar": np.ascontiguousarray(fit_bar.reshape(aux, -1))},
     ).outputs
-    raw_bar = fit_back["three_center_bar"].reshape(aux, ri, ri).copy()
-    raw_bar[:, :occ] += fock_back["bar_raw_occupied"] + pair_bars["raw_coulomb"]
+    raw_bar = fock_back["bar_raw_coulomb_all"].copy()
+    raw_bar[:, :occ] += (
+        fit_back["three_center_bar"].reshape(aux, occ, ri) + pair_bars["raw_coulomb"]
+    )
     seeds = {
         "bar_hcore": fock_back["bar_hcore"],
         "bar_raw_coulomb": raw_bar,
@@ -190,7 +191,7 @@ def check(data: dict, name: str, run: Callable) -> dict:
     maxima = {}
     for key in (
         "hcore",
-        "fit_all",
+        "fit",
         "fock",
         "exchange",
         "raw_coulomb",

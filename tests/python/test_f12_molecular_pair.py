@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from generativeqc_compiler.mp2.f12_density_fitting import coulomb_fit_response
 from generativeqc_compiler.mp2.f12_molecular_pair import (
     extended_df_fock,
     projected_f12_pair,
@@ -61,14 +62,14 @@ def test_extended_df_fock_and_reverse_on_all_sources() -> None:
     occ, ri, aux = 2, 6, 7
     p = extended_df_fock(occ, ri, aux)
     fields = {
-        "fit_all": rng.normal(size=(aux, ri, ri)),
-        "raw_occupied": rng.normal(size=(aux, occ, ri)),
+        "fit": rng.normal(size=(aux, occ, ri)),
+        "raw_coulomb_all": rng.normal(size=(aux, ri, ri)),
         "hcore": rng.normal(size=(ri, ri)),
     }
-    fit, raw, h = (fields[k] for k in ("fit_all", "raw_occupied", "hcore"))
-    positive_k = sum(fit[a, :, :occ] @ raw[a] for a in range(aux))
+    fit, raw, h = (fields[k] for k in ("fit", "raw_coulomb_all", "hcore"))
+    positive_k = sum(fit[a].T @ raw[a, :occ] for a in range(aux))
     direct = (
-        h + 2 * sum(fit[a] * np.trace(raw[a, :, :occ]) for a in range(aux)) - positive_k
+        h + 2 * sum(raw[a] * np.trace(fit[a, :, :occ]) for a in range(aux)) - positive_k
     )
     answer = execute(p, fields).outputs
     np.testing.assert_allclose(answer["fock"], direct, atol=1e-13)
@@ -88,6 +89,72 @@ def test_extended_df_fock_and_reverse_on_all_sources() -> None:
     assert predicted == pytest.approx(
         (objective(1e-4) - objective(-1e-4)) / 2e-4, abs=1e-8
     )
+
+
+def test_occupied_fit_metric_response_against_dense_four_index_oracle() -> None:
+    rng = np.random.default_rng(17863)
+    occ, norb, naux = 2, 5, 7
+    a = rng.normal(size=(naux, naux))
+    metric = a @ a.T + 3 * np.eye(naux)
+    raw = rng.normal(size=(naux, norb, norb))
+    raw = (raw + raw.swapaxes(1, 2)) / 2
+    hcore = rng.normal(size=(norb, norb))
+    hcore = (hcore + hcore.T) / 2
+    w = np.linalg.inv(np.linalg.cholesky(metric))
+    fit_graph = coulomb_fit_response(naux, occ * norb)
+    source = {
+        "metric_whitener": w,
+        "three_center": raw[:, :occ].reshape(naux, -1),
+        "fit_bar": np.zeros((naux, occ * norb)),
+    }
+    fit = execute(fit_graph, source).outputs["fit"].reshape(naux, occ, norb)
+    fock_graph = extended_df_fock(occ, norb, naux)
+    fields = {"hcore": hcore, "raw_coulomb_all": raw, "fit": fit}
+    answer = execute(fock_graph, fields).outputs
+
+    def independent(j: np.ndarray, g: np.ndarray, h: np.ndarray) -> dict:
+        # Deliberately materialize the full four-index oracle, not the new
+        # occupied-fit schedule; the production graph must not do this.
+        eri = g.reshape(naux, -1).T @ np.linalg.solve(j, g.reshape(naux, -1))
+        eri = eri.reshape((norb,) * 4)
+        coulomb = sum(eri[:, :, i, i] for i in range(occ))
+        exchange = sum(eri[:, i, i, :] for i in range(occ))
+        return {"fock": h + 2 * coulomb - exchange, "exchange": exchange}
+
+    reference = independent(metric, raw, hcore)
+    for key in reference:
+        np.testing.assert_allclose(answer[key], reference[key], atol=3e-13, rtol=0)
+    seeds = {"bar_" + k: rng.normal(size=v.shape) for k, v in answer.items()}
+    reverse = execute(
+        transpose_program(fock_graph, tuple(answer)).program, {**fields, **seeds}
+    ).outputs
+    fit_back = execute(
+        fit_graph, {**source, "fit_bar": reverse["bar_fit"].reshape(naux, -1)}
+    ).outputs
+    bar_raw = reverse["bar_raw_coulomb_all"].copy()
+    bar_raw[:, :occ] += fit_back["three_center_bar"].reshape(naux, occ, norb)
+    dj = rng.normal(size=metric.shape)
+    dj = (dj + dj.T) / (2 * np.linalg.norm(dj))
+    dg = rng.normal(size=raw.shape)
+    dg = (dg + dg.swapaxes(1, 2)) / (2 * np.linalg.norm(dg))
+    dh = rng.normal(size=hcore.shape)
+    dh = (dh + dh.T) / (2 * np.linalg.norm(dh))
+    slope = sum(
+        np.vdot(b, d)
+        for b, d in (
+            (bar_raw, dg),
+            (fit_back["metric_bar"], dj),
+            (reverse["bar_hcore"], dh),
+        )
+    )
+    for step in (2e-4, 1e-4):
+        values = []
+        for t in (step, -step):
+            shifted = independent(metric + t * dj, raw + t * dg, hcore + t * dh)
+            values.append(
+                sum(np.vdot(seeds["bar_" + k], v) for k, v in shifted.items())
+            )
+        assert slope == pytest.approx((values[0] - values[1]) / (2 * step), abs=2e-8)
 
 
 @pytest.mark.parametrize("dimensions", [(0, 3, 5), (2, 0, 5), (2, 3, False)])

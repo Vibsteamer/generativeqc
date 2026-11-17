@@ -24,7 +24,7 @@ pair_plan = lru_cache(maxsize=16)(projected_f12_pair)
 def molecular_fock(data: dict, run: Callable) -> tuple:
     occ, _, ri = map(int, data["space"])
     plan = fock_plan(occ, ri, len(data["fit"]))
-    source = {k: data[k] for k in ("fit_all", "raw_occupied", "hcore")}
+    source = {k: data[k] for k in ("fit", "raw_coulomb_all", "hcore")}
     return plan, source, run(plan, source).outputs
 
 
@@ -55,14 +55,12 @@ def matrix_directions(data: dict) -> dict:
     rng = np.random.default_rng(923647)
     result = {}
     for key, value in sorted(data.items()):
-        if key not in {"fit", "fit_all", "hcore"} and not key.startswith(
-            ("raw_", "metric_")
-        ):
+        if key not in {"fit", "hcore"} and not key.startswith(("raw_", "metric_")):
             continue
         tangent = rng.normal(size=value.shape)
         if key == "hcore" or key.startswith("metric_"):
             tangent = (tangent + tangent.T) / 2
-        elif key == "fit_all":
+        elif key == "raw_coulomb_all":
             tangent = (tangent + tangent.swapaxes(1, 2)) / 2
         result[key] = tangent / max(1.0, np.linalg.norm(tangent))
     return result

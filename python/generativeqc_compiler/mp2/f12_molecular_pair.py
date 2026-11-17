@@ -69,7 +69,14 @@ def _fitted_blocks(
 
 
 def extended_df_fock(occupied: int, orbitals: int, auxiliaries: int) -> Program:
-    """Build F and positive exchange once in the full orthonormal OBS/CABS frame."""
+    """Build F and positive exchange from occupied-only Coulomb fits.
+
+    D[A,i,p] solves J D = G for occupied i and all extended-frame p. Contract
+    the occupied trace of D before forming Coulomb; exchange also needs only
+    this occupied slice. No virtual/virtual or CABS/CABS fitted densities are
+    formed. Raw G[A,p,q] and D are independent differentiable inputs here;
+    the metric owner supplies the implicit response of D to J and G.
+    """
     if (
         any(type(x) is not int or x < 1 for x in (occupied, orbitals, auxiliaries))
         or occupied >= orbitals
@@ -87,18 +94,21 @@ def extended_df_fock(occupied: int, orbitals: int, auxiliaries: int) -> Program:
 
     h, fit, raw = (
         source("hcore", (p, q)),
-        source("fit_all", (a, p, q)),
-        source("raw_occupied", (a, o, q)),
+        source("fit", (a, o, q)),
+        source("raw_coulomb_all", (a, p, q)),
     )
     tr = einsum(
-        "aii->a", slice_tensor(raw, ((0, auxiliaries), (0, occupied), (0, occupied)))
+        "aii->a", slice_tensor(fit, ((0, auxiliaries), (0, occupied), (0, occupied)))
     )
-    coul = einsum("apq,a->pq", fit, tr, coefficient=2)
-    occ_fit = slice_tensor(fit, ((0, auxiliaries), (0, orbitals), (0, occupied)))
-    exchange = einsum("api,aiq->pq", occ_fit, raw)
+    coul = einsum("apq,a->pq", raw, tr, coefficient=2)
+    occ_raw = slice_tensor(raw, ((0, auxiliaries), (0, occupied), (0, orbitals)))
+    exchange = einsum("aip,aiq->pq", fit, occ_raw)
     return Program(
         {"fock": add(h, coul, exchange, coefficients=(1, 1, -1)), "exchange": exchange},
-        provenance={"method": "restricted extended-frame Coulomb-fitted Fock"},
+        provenance={
+            "method": "restricted extended-frame Coulomb-fitted Fock",
+            "fitted_density_domain": "occupied by full OBS/CABS frame",
+        },
     )
 
 
