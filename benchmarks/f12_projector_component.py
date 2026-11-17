@@ -46,6 +46,15 @@ def evaluate(fixture: Path, library: ctypes.CDLL) -> dict[str, Any]:
                 "rank": central.rank,
                 "cutoff_margin": central.cutoff_margin,
                 "kernel_relative_frobenius": float(np.linalg.norm(k - ref) / norm),
+                "frame_kernel_relative": float(
+                    np.linalg.norm(central.frame @ central.frame.T - k) / norm
+                ),
+                "frame_metric_orthonormality": float(
+                    np.max(np.abs(central.frame.T @ s @ central.frame - np.eye(rank)))
+                ),
+                "frame_obs_orthogonality": float(
+                    np.max(np.abs((s @ central.frame)[:obs]))
+                ),
                 "metric_idempotence_relative": float(
                     np.linalg.norm(k @ s @ k - k) / norm
                 ),
@@ -85,6 +94,9 @@ def evaluate(fixture: Path, library: ctypes.CDLL) -> dict[str, Any]:
                 )
             measurements["passed"] = bool(
                 measurements["kernel_relative_frobenius"] < 1e-8
+                and measurements["frame_kernel_relative"] < 1e-8
+                and measurements["frame_metric_orthonormality"] < 2e-8
+                and measurements["frame_obs_orthogonality"] < 2e-8
                 and measurements["metric_idempotence_relative"] < 1e-8
                 and measurements["max_obs_overlap"] < 2e-8
                 and abs(slope - field("slope")) < 3e-8

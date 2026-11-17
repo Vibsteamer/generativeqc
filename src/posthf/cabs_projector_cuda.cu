@@ -48,6 +48,23 @@ __global__ void identity_tail(double* lift, std::size_t n, std::size_t o) {
     lift[o + k % x + n * (k / x)] = k % x == k / x;
 }
 
+__global__ void normalize_retained_columns(const double* vectors, const double* values,
+                                           std::size_t rows, std::size_t rank, double* scaled) {
+  for (std::size_t k = blockIdx.x * blockDim.x + threadIdx.x; k < rows * rank;
+       k += std::size_t(blockDim.x) * gridDim.x)
+    scaled[k] = vectors[k] / sqrt(values[k / rows]);
+}
+
+__global__ void pack_frame(const double* column_major, std::size_t rows, std::size_t cols,
+                           double* row_major, int* bad) {
+  for (std::size_t k = blockIdx.x * blockDim.x + threadIdx.x; k < rows * cols;
+       k += std::size_t(blockDim.x) * gridDim.x) {
+    const double value = column_major[k / cols + rows * (k % cols)];
+    if (!isfinite(value)) atomicExch(bad, 1);
+    row_major[k] = value;
+  }
+}
+
 __global__ void assemble_response(const double* from_metric, const double* from_lift, std::size_t n,
                                   std::size_t o, double* out) {
   for (std::size_t k = blockIdx.x * blockDim.x + threadIdx.x; k < n * n;
@@ -59,15 +76,16 @@ __global__ void assemble_response(const double* from_metric, const double* from_
 }
 
 void evaluate(int device, int n, int o, double cutoff, double guard, int expected,
-              const double* overlap, const double* seed, double* kernel, double* bar, int* rank,
-              double* margin) {
+              const double* overlap, const double* seed, double* kernel, double* frame,
+              std::size_t frame_capacity, double* bar, int* rank, double* margin) {
   if (device < 0 || n <= 1 || o <= 0 || o >= n || !(0. < guard && guard < cutoff && cutoff < 1.) ||
-      expected < -1 || expected > n - o || !overlap || !kernel || !rank || !margin ||
+      expected < -1 || expected > n - o || !overlap || !kernel || !frame || !rank || !margin ||
       (seed == nullptr) != (bar == nullptr))
     throw std::invalid_argument("invalid CABS projector dimensions, cutoff, rank or buffers");
   const int x = n - o;
   const auto nn = gpu::size_mul(n, n, "CABS overlap size overflow");
   const auto oo = std::size_t(o) * o, xx = std::size_t(x) * x, nx = std::size_t(n) * x;
+  if (frame_capacity < nx) throw std::invalid_argument("insufficient CABS frame capacity");
   if (seed && xx > 256ull * std::numeric_limits<int>::max())
     throw std::invalid_argument("CABS spectral-response CUDA grid is too large");
   gpu::CudaDeviceScope device_scope(device);
@@ -193,27 +211,40 @@ void evaluate(int device, int n, int o, double cutoff, double guard, int expecte
     symmetrize<<<blocks(nn), 256, 0, stream.get()>>>(tmp, n, false, info.get());
   }
   check_flags(stream, info.get(), 1, "nonfinite CABS projector or overlap response");
-  std::vector<double> staged(nn), staged_bar(seed ? nn : 0);
+  const auto nr = gpu::size_mul(n, kept, "CABS frame size overflow");
+  std::vector<double> staged(nn), staged_bar(seed ? nn : 0), staged_frame(nr);
   cuda_resource_check(
       cudaMemcpyAsync(staged.data(), k, bytes, cudaMemcpyDeviceToHost, stream.get()));
   if (seed)
     cuda_resource_check(
         cudaMemcpyAsync(staged_bar.data(), tmp, bytes, cudaMemcpyDeviceToHost, stream.get()));
+  // cuSOLVER orders eigenvalues increasingly: the retained columns form a suffix.
+  // Reuse contraction tiles only after the optional response copy on this stream.
+  normalize_retained_columns<<<blocks(std::size_t(x) * kept), 256, 0, stream.get()>>>(
+      t + std::size_t(x) * (x - kept), et + x - kept, x, kept, inv_t);
+  gemm(false, false, n, kept, x, j, n, inv_t, x, tmp2, n);
+  pack_frame<<<blocks(nr), 256, 0, stream.get()>>>(tmp2, n, kept, tmp, info.get());
+  check_flags(stream, info.get(), 1, "nonfinite CABS frame");
+  cuda_resource_check(cudaMemcpyAsync(staged_frame.data(), tmp, nr * sizeof(double),
+                                      cudaMemcpyDeviceToHost, stream.get()));
   stream.synchronize();
   std::copy(staged.begin(), staged.end(), kernel);
   if (seed) std::copy(staged_bar.begin(), staged_bar.end(), bar);
+  std::copy(staged_frame.begin(), staged_frame.end(), frame);
   *rank = kept;
   *margin = distance / largest;
 }
 }  // namespace
 
-extern "C" int generativeqc_f12_cabs_projector_cuda_v1(int device, int n, int o, double cutoff,
+extern "C" int generativeqc_f12_cabs_projector_cuda_v2(int device, int n, int o, double cutoff,
                                                        double guard, int expected, const double* s,
-                                                       const double* seed, double* k, double* bar,
+                                                       const double* seed, double* k, double* frame,
+                                                       std::size_t frame_capacity, double* bar,
                                                        int* rank, double* margin, char* error,
                                                        std::size_t error_size) {
   try {
-    evaluate(device, n, o, cutoff, guard, expected, s, seed, k, bar, rank, margin);
+    evaluate(device, n, o, cutoff, guard, expected, s, seed, k, frame, frame_capacity, bar, rank,
+             margin);
     return 0;
   } catch (const std::exception& ex) {
     generativeqc_tensor::error_text(error, error_size, ex.what());

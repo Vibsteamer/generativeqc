@@ -102,9 +102,14 @@ def synthetic_case(partial_rank: bool) -> tuple[np.ndarray, int, float, np.ndarr
 def composition_case(partial_rank: bool, run: Callable, projector: Callable) -> dict:
     start = time.monotonic()
     s, obs, cutoff, hamiltonian = synthetic_case(partial_rank)
-    frame = reference_frame(s, obs, cutoff)
+    primal = projector(s, obs, relative_cutoff=cutoff)
+    frame = primal.frame
+    independent = reference_frame(s, obs, cutoff)
     rank = frame.shape[1]
     k = frame @ frame.T
+    np.testing.assert_allclose(k, independent @ independent.T, atol=2e-12, rtol=2e-12)
+    np.testing.assert_allclose(frame.T @ s @ frame, np.eye(rank), atol=2e-12)
+    np.testing.assert_allclose((s @ frame)[:obs], 0.0, atol=2e-12)
 
     def observable(kernel: np.ndarray) -> float:
         return float(np.vdot(hamiltonian, kernel) + 0.2 * np.vdot(kernel, kernel))
@@ -131,7 +136,7 @@ def composition_case(partial_rank: bool, run: Callable, projector: Callable) -> 
                 raise ValueError("Reference CABS rank changed")
             reference_values.append(observable(c @ c.T))
             moved = projector(moved_s, obs, **arguments)
-            native_values.append(observable(moved.kernel))
+            native_values.append(observable(moved.frame @ moved.frame.T))
         fd = (native_values[0] - native_values[1]) / (2 * step)
         reference_fd = (reference_values[0] - reference_values[1]) / (2 * step)
         row = {
@@ -151,7 +156,7 @@ def composition_case(partial_rank: bool, run: Callable, projector: Callable) -> 
         errors.append(row)
     return {
         "case": "partial_rank" if partial_rank else "full_rank",
-        "scope": "GPU frame-to-kernel cotangent composed with GPU CABS overlap response",
+        "scope": "GPU forward frame, frame-to-kernel cotangent and CABS overlap response",
         "rank": rank,
         "retained_degeneracy": True,
         "invariants": residuals,
