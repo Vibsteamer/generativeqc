@@ -88,14 +88,30 @@ def check_sources(data: dict, name: str, run: Callable) -> dict:
     }
 
 
-def evaluate(data: dict, run: Callable, *, pullback: bool) -> tuple[float, dict, dict]:
+def evaluate(
+    data: dict,
+    run: Callable,
+    *,
+    pullback: bool,
+    singles: Callable | None = None,
+) -> tuple[float, dict, dict]:
+    """Evaluate the F12 increment, optionally composing a native singles action.
+
+    The explicit callback receives the shared extended Fock/occupied count and
+    pullback flag. Its Fock cotangent is summed with the F12 pair sources before
+    the shared Fock/fit/AO reverse pass. No additional HF or conventional MP2
+    energy is included here, and no implicit reference-program fallback exists.
+    """
     occ, obs, ri = map(int, data["space"])
     aux = len(data["metric"])
     plan = source_plan(len(data["coefficients"]), ri, occ, aux)
     source = {
         k: data[k]
-        for k in data
-        if k.startswith("ao_") or k in ("coefficients", "hcore_ao")
+        for k in (
+            "coefficients",
+            "hcore_ao",
+            *("ao_" + op for op in ("coulomb", *OPERATORS)),
+        )
     }
     mapped = run(plan, source).outputs
     raw = np.ascontiguousarray(mapped["raw_coulomb"][:, :occ].reshape(aux, -1))
@@ -129,6 +145,13 @@ def evaluate(data: dict, run: Callable, *, pullback: bool) -> tuple[float, dict,
         )
     }
     total = 0.0
+    if singles is not None:
+        singles_energy, singles_bar = singles(fock_out["fock"], occ, pullback=pullback)
+        total += float(singles_energy)
+        if pullback:
+            if singles_bar is None or singles_bar.shape != fock_out["fock"].shape:
+                raise ValueError("CABS singles must supply the complete Fock cotangent")
+            fock_bars["bar_fock"] += singles_bar
     for first, second in zip(*np.triu_indices(occ), strict=True):
         i, j = int(first), int(second)
         pair = pair_plan(occ, obs - occ, ri - obs, diagonal=i == j, auxiliaries=aux)
