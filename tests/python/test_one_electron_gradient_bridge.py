@@ -1,0 +1,143 @@
+"""Check fixed-weight native contraction ownership and bounded input admission."""
+
+import ctypes as ct
+from types import SimpleNamespace
+from typing import Any
+
+import numpy as np
+import pytest
+from generativeqc import _native
+from generativeqc._api_types import Primitive, Shell
+from generativeqc._one_electron_gradient import cuda_one_electron_gradient
+
+
+class Function:
+    def __init__(self, implementation: Any) -> None:
+        self.implementation = implementation
+
+    def __call__(self, *args: Any) -> Any:
+        return self.implementation(*args)
+
+
+def calculator(*, failure: Any = False, creation_failure: Any = False) -> Any:
+    live = set()
+
+    def create(descriptor: Any, output: Any) -> int:
+        ct.cast(output, ct.POINTER(ct.c_void_p))[0] = ct.c_void_p(51)
+        live.add(51)
+        return 0
+
+    def destroy(handle: Any) -> None:
+        live.remove(handle.value)
+
+    def system(context: Any, atoms: Any, charge: Any, multiplicity: Any) -> Any:
+        assert context.value in live
+        if creation_failure:
+            raise RuntimeError("injected system creation failure")
+        live.add(61)
+        return ct.c_void_p(61)
+
+    def gradient(
+        context: Any,
+        system: Any,
+        overlap: Any,
+        kinetic: Any,
+        attraction: Any,
+        size: Any,
+        schedule: Any,
+        budget: Any,
+        output: Any,
+        count: Any,
+        resources: Any,
+    ) -> Any:
+        assert context.value in live and system.value in live
+        assert size == 4 and count == 3
+        if failure:
+            return _native.STATUS_OUT_OF_MEMORY
+        assert not attraction
+        np.testing.assert_array_equal(
+            np.ctypeslib.as_array(overlap, (4,)), [0, 1, 2, 3]
+        )
+        np.testing.assert_array_equal(
+            np.ctypeslib.as_array(kinetic, (4,)), [0, 2, 1, 3]
+        )
+        np.ctypeslib.as_array(output, (count,))[:] = [1, 2, 3]
+        return 0
+
+    lib = SimpleNamespace(
+        generativeqc_context_create=Function(create),
+        generativeqc_context_destroy=Function(destroy),
+        generativeqc_system_destroy=Function(destroy),
+        generativeqc_system_one_electron_gradient_cuda=Function(gradient),
+        generativeqc_status_message=Function(lambda status: b"native capacity limit"),
+        generativeqc_context_get_last_detail=Function(
+            lambda context: b"native capacity limit"
+        ),
+    )
+    shells = (Shell(0, 0, (Primitive(1.0, 1.0),)),) * 2
+    calc = SimpleNamespace(
+        _library=lib,
+        _backend=_native.BACKEND_CUDA,
+        _basis_representation=_native.BASIS_SPHERICAL,
+        _shells_for_atoms=lambda *args, **kwargs: shells,
+        _create_native_system=system,
+        _context_descriptor=lambda: _native.ContextDescriptor(
+            ct.sizeof(_native.ContextDescriptor),
+            _native.ABI_VERSION,
+            0,
+            _native.BACKEND_CUDA,
+        ),
+    )
+    return (calc, live)
+
+
+@pytest.mark.parametrize(
+    "failure,creation_failure", [(False, False), (True, False), (False, True)]
+)
+def test_transaction_success_and_native_failure_cleanup(
+    failure: Any, creation_failure: Any
+) -> None:
+    (calc, live) = calculator(failure=failure, creation_failure=creation_failure)
+    w = np.arange(4.0).reshape(2, 2)
+    before = w.copy()
+    args = {"overlap": w, "kinetic": w.T, "maximum_bytes": 1024}
+    if failure or creation_failure:
+        with pytest.raises(RuntimeError):
+            cuda_one_electron_gradient(calc, [("H", (0, 0, 0))], **args)
+    else:
+        result = cuda_one_electron_gradient(calc, [("H", (0, 0, 0))], **args)
+        np.testing.assert_array_equal(result.gradient, [[1, 2, 3]])
+    assert not live
+    np.testing.assert_array_equal(w, before)
+
+
+@pytest.mark.parametrize(
+    "matrix", [np.eye(2, dtype=np.float32), np.eye(3), np.full((2, 2), np.nan)]
+)
+def test_reject_invalid_weights_before_native_ownership(matrix: Any) -> None:
+    (calc, live) = calculator()
+    with pytest.raises(ValueError):
+        cuda_one_electron_gradient(calc, [("H", (0, 0, 0))], overlap=matrix)
+    assert not live
+
+
+def test_requires_cuda_and_bounded_staging() -> None:
+    (calc, live) = calculator()
+    with pytest.raises(MemoryError):
+        cuda_one_electron_gradient(
+            calc, [("H", (0, 0, 0))], overlap=np.eye(2), maximum_bytes=16
+        )
+    calc._backend = _native.BACKEND_CPU_REFERENCE
+    with pytest.raises(ValueError, match="CUDA"):
+        cuda_one_electron_gradient(calc, [("H", (0, 0, 0))], overlap=np.eye(2))
+    assert not live
+
+
+def test_size_t_budget_is_not_restricted_to_int32() -> None:
+    calc, live = calculator()
+    w = np.arange(4.0).reshape(2, 2)
+    result = cuda_one_electron_gradient(
+        calc, [("H", (0, 0, 0))], overlap=w, kinetic=w.T, maximum_bytes=43 << 30
+    )
+    np.testing.assert_array_equal(result.gradient, [[1, 2, 3]])
+    assert not live
