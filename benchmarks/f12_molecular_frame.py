@@ -93,6 +93,12 @@ def chain(
     # The OBS cotangent remains for SCF response; the CABS cotangent has now
     # been consumed by the projector. Do not pass it to the SCF owner again.
     bars["coefficients"] = bars["coefficients"][:, :obs]
+    checks["cabs_response"] = {
+        "requested_full_rank": full_rank_constraint,
+        "applied": "full_rank_constraint" if use_constraint else "projector",
+        "retained_rank": frame.rank,
+        "complement_dimension": len(overlap) - obs,
+    }
     return energy, bars, checks
 
 

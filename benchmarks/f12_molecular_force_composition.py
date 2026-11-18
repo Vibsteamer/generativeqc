@@ -97,6 +97,11 @@ def endpoint_arguments() -> Namespace:
     ):
         parser.add_argument("--" + option, required=True, type=Path)
     parser.add_argument("--cabs-h-one-electron-library", type=Path)
+    parser.add_argument(
+        "--full-rank-cabs-response",
+        action="store_true",
+        help="Use the constraint derivative for a complete CABS and the projector derivative for a truncated CABS.",
+    )
     parser.add_argument("--arch", required=True)
     add_molecular_graph_budget(parser)
     return parser.parse_args()
@@ -394,7 +399,9 @@ def common_checks(result: dict, target: dict) -> dict:
 def main() -> None:
     args = endpoint_arguments()
     target = json.loads(args.panel.read_bytes())
-    report = calculate_panel(args, target)
+    report = calculate_panel(
+        args, target, full_rank_constraint=args.full_rank_cabs_response
+    )
     forces = np.asarray(report["total_force_Eh_per_bohr"])
     oracle = target["stock"]
     de = abs(report["total_energy_Eh"] - oracle["energy_Eh"])

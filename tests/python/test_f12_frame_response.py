@@ -148,8 +148,14 @@ def test_truncated_space_preserves_projector_response(
         "space": [1, o, o + r],
     }
     _, original, _ = molecular.chain(data, execute, projector, None, pullback=True)
-    _, optional, _ = molecular.chain(
+    _, optional, response = molecular.chain(
         data, execute, projector, None, pullback=True, full_rank_constraint=True
     )
     np.testing.assert_array_equal(original["overlap"], grad)
     np.testing.assert_array_equal(original["overlap"], optional["overlap"])
+    assert response["cabs_response"] == {
+        "requested_full_rank": True,
+        "applied": "projector",
+        "retained_rank": r,
+        "complement_dimension": n - o,
+    }

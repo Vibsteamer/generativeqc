@@ -1,12 +1,13 @@
 """Exercise the sign and single-reference ownership of the full molecular force."""
 
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
-from benchmarks.f12_molecular_force_composition import full_result
+from benchmarks.f12_molecular_force_composition import endpoint_arguments, full_result
 
 
 def test_only_correlation_is_added_to_the_owned_reference() -> None:
@@ -58,3 +59,26 @@ def test_numpy_scalar_checkpoint_survives_later_invalid_report(tmp_path: Path) -
         with pytest.raises(exception):
             write_measurement(path, {"value": bad})
         assert path.read_bytes() == raw
+
+
+@pytest.mark.parametrize("selected", [False, True])
+def test_full_rank_cabs_response_is_opt_in(
+    monkeypatch: pytest.MonkeyPatch, selected: bool
+) -> None:
+    paths = [
+        "scf-inputs",
+        "component-library",
+        "session-library",
+        "cache",
+        "output",
+        "layout",
+        "sink-library",
+        "panel",
+    ]
+    argv = ["molecular-ef", "--arch", "sm_89", "--budget-mib", "16384"]
+    for name in paths:
+        argv.extend(["--" + name, name])
+    if selected:
+        argv.append("--full-rank-cabs-response")
+    monkeypatch.setattr(sys, "argv", argv)
+    assert endpoint_arguments().full_rank_cabs_response is selected

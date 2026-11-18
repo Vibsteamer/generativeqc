@@ -114,7 +114,10 @@ def main() -> None:
     args = endpoint_arguments()
     target = json.loads(args.panel.read_bytes())
     check_graph_budget(target, args.panel, args.layout, args.budget_mib)
-    report = assess(calculate_panel(args, target), target)
+    result = calculate_panel(
+        args, target, full_rank_constraint=args.full_rank_cabs_response
+    )
+    report = assess(result, target)
     write_measurement(args.output, report)
     if not report["passed"]:
         raise SystemExit(
