@@ -6,7 +6,7 @@ from typing import Any
 
 import numpy as np
 import pytest
-from generativeqc import _native
+from generativeqc import Atom, Calculator, _native
 from generativeqc._api_types import Primitive, Shell
 from generativeqc._one_electron_gradient import cuda_one_electron_gradient
 
@@ -30,7 +30,9 @@ def calculator(*, failure: Any = False, creation_failure: Any = False) -> Any:
     def destroy(handle: Any) -> None:
         live.remove(handle.value)
 
-    def system(context: Any, atoms: Any, charge: Any, multiplicity: Any) -> Any:
+    def system(
+        context: Any, atoms: Any, charge: Any, multiplicity: Any, **domain: Any
+    ) -> Any:
         assert context.value in live
         if creation_failure:
             raise RuntimeError("injected system creation failure")
@@ -89,6 +91,58 @@ def calculator(*, failure: Any = False, creation_failure: Any = False) -> Any:
         ),
     )
     return (calc, live)
+
+
+@pytest.mark.parametrize("representation,nao", [("spherical", 9), ("cartesian", 15)])
+def test_standalone_g_shell_reaches_the_contraction(
+    representation: str, nao: int
+) -> None:
+    # Exercise the real Python preflight, shell expansion and descriptor path.
+    # Only the CUDA ABI boundary is replaced on this host-only test.
+    stub, live = calculator()
+    calc = Calculator.__new__(Calculator)
+    calc._method = _native.METHOD_RHF
+    calc._device_name = "cuda"
+    calc._device_id = 0
+    calc._backend = _native.BACKEND_CUDA
+    calc._density_fitting_mode = _native.DENSITY_FITTING_NONE
+    calc._auxiliary_basis = None
+    calc._dispersion_method_ir = None
+    calc._representation_name = representation
+    calc._basis_representation = (
+        _native.BASIS_SPHERICAL
+        if representation == "spherical"
+        else _native.BASIS_CARTESIAN
+    )
+    calc._basis = (Shell(0, 4, (Primitive(0.9, 1.0),)),)
+    calc._library = stub._library
+    atoms = (Atom.from_value(("He", (0.0, 0.0, 0.0))),)
+
+    def create(context: Any, descriptor: Any, out: Any) -> int:
+        d = ct.cast(descriptor, ct.POINTER(_native.SystemDescriptor)).contents
+        assert d.shell_count == 1 and d.shells[0].angular_momentum == 4
+        assert d.basis_representation == calc._basis_representation
+        ct.cast(out, ct.POINTER(ct.c_void_p))[0] = ct.c_void_p(61)
+        live.add(61)
+        return 0
+
+    def contract(*args: Any) -> int:
+        assert args[1].value in live and args[5] == nao * nao
+        np.testing.assert_array_equal(
+            np.ctypeslib.as_array(args[2], (nao * nao,)), np.eye(nao).ravel()
+        )
+        np.ctypeslib.as_array(args[8], (3,))[:] = 0.0
+        return 0
+
+    calc._library.generativeqc_system_create = Function(create)
+    calc._library.generativeqc_system_one_electron_gradient_cuda = Function(contract)
+    np.testing.assert_array_equal(
+        cuda_one_electron_gradient(calc, atoms, overlap=np.eye(nao)).gradient,
+        np.zeros((1, 3)),
+    )
+    with pytest.raises(NotImplementedError, match="cuda/eri"):
+        calc._create_native_system(ct.c_void_p(), atoms, 0, 1)
+    assert not live
 
 
 @pytest.mark.parametrize(

@@ -134,6 +134,13 @@ matrices; a null channel means zero. `matrix_count` must equal `NAO*NAO`, and
 builds return `NOT_IMPLEMENTED`; generated runtime failures are returned to the
 caller instead of silently selecting a CPU implementation.
 
+The Python fixed-weight contraction uses the `one_electron_gradient`
+orbital capability at derivative order one for both AO weight layout and
+native system creation. The all-electron CUDA bridge accepts Cartesian and
+real-spherical shells through g. A system with a scalar ECP accepts orbital
+shells through f under the native ECP descriptor contract. Direct ERI
+preparation and auxiliary fitting bases have their own admission rules.
+
 The bridge stages compact basis metadata and weights on the device and returns
 only `3*Natom` gradient scalars. A finite `maximum_bytes` bounds its numeric host
 staging and device arena separately. It checks a conservative capacity bound

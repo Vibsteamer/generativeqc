@@ -77,7 +77,7 @@ def cuda_one_electron_gradient(
     if not geometry:
         raise ValueError("one-electron gradient requires atoms")
     shells = calculator._shells_for_atoms(
-        geometry, operator="overlap", derivative_order=1
+        geometry, operator="one_electron_gradient", derivative_order=1
     )
     spherical = calculator._basis_representation == _native.BASIS_SPHERICAL
     n = sum(
@@ -142,7 +142,12 @@ def cuda_one_electron_gradient(
         with owner.lock:
             context = owner.get(calculator._context_descriptor())
             system = calculator._create_native_system(
-                context, geometry, charge, multiplicity
+                context,
+                geometry,
+                charge,
+                multiplicity,
+                operator="one_electron_gradient",
+                derivative_order=1,
             )
             status = routine(
                 context,
