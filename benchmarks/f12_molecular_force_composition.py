@@ -103,7 +103,11 @@ def endpoint_arguments() -> Namespace:
 
 
 def calculate_panel(
-    args: Namespace, target: dict, *, central_component: Callable | None = None
+    args: Namespace,
+    target: dict,
+    *,
+    central_component: Callable | None = None,
+    full_rank_constraint: bool = False,
 ) -> dict:
     """Compute and checkpoint central Cartesian E/F and requested native energy displacements."""
     name = target["molecule"]
@@ -139,6 +143,7 @@ def calculate_panel(
         run=run,
         projector=partial(cabs_projector, library=lib),
         singles=partial(cabs_singles, library=lib, spin_weight=2),
+        full_rank_constraint=full_rank_constraint,
     )
     begin = time.monotonic()
     case = target["combined_basis"]
