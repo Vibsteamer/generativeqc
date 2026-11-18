@@ -8,7 +8,7 @@ from generativeqc._f12_unrestricted import (
     UnrestrictedCabsSingles,
     unrestricted_cabs_energy,
 )
-from generativeqc_compiler.tensor import execute
+from generativeqc_compiler.tensor import Execution, Program, execute
 from scipy.linalg import solve_sylvester
 
 
@@ -150,3 +150,22 @@ def test_joint_spin_pair_and_reference_vjp(frozen: tuple[int, int]) -> None:
     for step in (1e-4, 3e-5):
         expected = (forward(step) - forward(-step)) / (2 * step)
         np.testing.assert_allclose(actual, expected, atol=1e-8, rtol=0)
+
+
+@pytest.mark.parametrize("limit", [1, 4, 100])
+def test_chunked_force_preserves_strides_and_reference(limit: int) -> None:
+    from generativeqc._f12_spin_force import spin_source_force
+
+    seed = np.random.default_rng(5189)
+    w = {"B": seed.normal(size=(5, 3)).T, "C": seed.normal(size=4)}
+    d = {"C": seed.normal(size=4), "B": seed.normal(size=(3, 5))[:, ::-1]}
+    expected = -(1.329 + sum(np.sum(w[k] * d[k]) for k in w))
+    sizes = []
+
+    def checked(graph: Program, feeds: dict[str, np.ndarray]) -> Execution:
+        sizes.append(feeds["weights"].size)
+        return execute(graph, feeds)
+
+    actual = spin_source_force(w, d, 1.329, checked, block_elements=limit)
+    assert max(sizes) <= limit and sum(sizes) == 19
+    assert abs(actual - expected) < 1e-14

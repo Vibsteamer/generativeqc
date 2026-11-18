@@ -4,16 +4,14 @@ import argparse
 import ctypes
 import json
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 
 import numpy as np
 from generativeqc._f12_cabs import cabs_singles
+from generativeqc._f12_spin_force import spin_source_force
 from generativeqc._f12_unrestricted import unrestricted_mp2_f12_source_pullback
-from generativeqc_compiler.mp2.f12_unrestricted_force import (
-    unrestricted_f12_nuclear_source_action,
-)
 
 from benchmarks._f12_cuda import add_molecular_graph_budget, cuda_runner
 
@@ -30,22 +28,7 @@ def evaluate(
             "The distorted NH2 doublet requires distinct alpha/beta occupied spaces"
         )
     bars = unrestricted_mp2_f12_source_pullback(spec, data, run, singles=singles)
-    names = sorted(bars)
     size = sum(v.size for v in bars.values())
-
-    def pack(tensors: Mapping[str, np.ndarray]) -> np.ndarray:
-        flat = np.empty(size)
-        offset = 0
-        for key in names:
-            array = tensors[key]
-            if array.shape != bars[key].shape:
-                raise ValueError(f"Wrong UHF nuclear source shape for {key}")
-            flat[offset : offset + array.size] = array.ravel()
-            offset += array.size
-        return flat
-
-    flat = pack(bars)
-    graph = unrestricted_f12_nuclear_source_action(size)
     ref = json.loads((directory / "reference.json").read_bytes())
     coords = np.asarray(ref["geometry_bohr"])
     expected = np.asarray(ref["force_Eh_per_bohr"])
@@ -56,12 +39,9 @@ def evaluate(
         with np.load(
             directory / ("tangent_" + tag + ".npz"), allow_pickle=False
         ) as tan:
-            tangent = pack(tan)
-            dref = tan["reference_gradient"]
-        g = run(
-            graph, {"weights": flat, "tangents": tangent, "reference_gradient": dref}
-        ).outputs
-        force = float(g["force"])
+            force = spin_source_force(
+                bars, tan, float(tan["reference_gradient"]), run, block_elements=1 << 20
+            )
         errors = {
             h: abs(force + value) for h, value in ref["finite_gradients"][tag].items()
         }
