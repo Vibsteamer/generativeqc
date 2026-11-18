@@ -16,6 +16,36 @@ from generativeqc._f12_unrestricted import unrestricted_mp2_f12_source_pullback
 from benchmarks._f12_cuda import add_molecular_graph_budget, cuda_runner
 
 
+def _displacement_errors(force: float, points: list[dict]) -> list[float]:
+    """Check a finite, reoptimized, two-step energy stencil against the physical force."""
+    if len(points) != 2 or len({row["step_bohr"] for row in points}) != 2:
+        raise ValueError(
+            "Expected independently reoptimized energies at two distinct steps"
+        )
+    errors = []
+    for row in points:
+        h = row["step_bohr"]
+        if h <= 0 or not np.isfinite(h):
+            raise ValueError("Displacement step must be finite and positive")
+        fd = -(row["plus_Eh"] - row["minus_Eh"]) / (2 * h)
+        errors.append(abs(force - fd))
+    if not np.isfinite(errors).all() or max(errors) > 3e-7:
+        raise ValueError(
+            f"Nuclear force {force} failed its independent displacement checks {errors}"
+        )
+    return errors
+
+
+def check_displacements(force: float, ref: dict) -> tuple[list[float], dict]:
+    """Every supplied independent reference must pass both force checks."""
+    errors = _displacement_errors(force, ref["displacements"])
+    additional_errors = {
+        name: _displacement_errors(force, points)
+        for name, points in ref.get("independent_displacements", {}).items()
+    }
+    return errors, additional_errors
+
+
 def evaluate(directory: Path, run: Callable, singles: Callable) -> dict:
     """Use common orbital/metric and Gaussian tangents from the same reoptimized UHF root."""
     ref = json.loads((directory / "reference.json").read_text())
@@ -39,22 +69,7 @@ def evaluate(directory: Path, run: Callable, singles: Callable) -> dict:
             run,
             block_elements=1 << 20,
         )
-    points = ref["displacements"]
-    if len(points) != 2 or len({row["step_bohr"] for row in points}) != 2:
-        raise ValueError(
-            "Expected independently reoptimized energies at two distinct steps"
-        )
-    errors = []
-    for row in points:
-        h = row["step_bohr"]
-        if h <= 0 or not np.isfinite(h):
-            raise ValueError("Displacement step must be finite and positive")
-        fd = -(row["plus_Eh"] - row["minus_Eh"]) / (2 * h)
-        errors.append(abs(force - fd))
-    if not np.isfinite(errors).all() or max(errors) > 3e-7:
-        raise ValueError(
-            f"Nuclear force {force} failed its independent displacement checks {errors}"
-        )
+    errors, additional_errors = check_displacements(force, ref)
     return {
         "case": ref["case"],
         "atom": ref["atom"],
@@ -62,6 +77,7 @@ def evaluate(directory: Path, run: Callable, singles: Callable) -> dict:
         "full_spin_pairs": 36,
         "force_Eh_per_bohr": force,
         "two_step_errors_Eh_per_bohr": errors,
+        "additional_two_step_errors_Eh_per_bohr": additional_errors,
         "adjoint_seconds": elapsed,
         "elapsed_seconds": time.monotonic() - t0,
         "active_source_elements": sum(v.size for v in bars.values()),

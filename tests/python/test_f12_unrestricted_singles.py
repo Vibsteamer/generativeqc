@@ -169,3 +169,22 @@ def test_chunked_force_preserves_strides_and_reference(limit: int) -> None:
     actual = spin_source_force(w, d, 1.329, checked, block_elements=limit)
     assert max(sizes) <= limit and sum(sizes) == 19
     assert abs(actual - expected) < 1e-14
+
+
+def test_independent_force_stencils_each_keep_both_steps() -> None:
+    from benchmarks.f12_uhf_direction import check_displacements
+
+    force = 0.023
+    steps = [0.0002, 0.0001]
+    good = [
+        {"step_bohr": h, "plus_Eh": -55.0 - h * force, "minus_Eh": -55.0 + h * force}
+        for h in steps
+    ]
+    ref = {"displacements": good, "independent_displacements": {"other": good}}
+    original, independent = check_displacements(force, ref)
+    assert max(original) < 1e-10
+    assert independent == {"other": original}
+    bad = [dict(good[0]), dict(good[1], plus_Eh=good[1]["plus_Eh"] + 1e-9)]
+    ref["independent_displacements"] = {"other": bad}
+    with pytest.raises(ValueError, match="failed its independent displacement checks"):
+        check_displacements(force, ref)
