@@ -16,8 +16,10 @@ from generativeqc_compiler.cc.f12_residual import (
     fixed_pair_cc_residual,
     fixed_pair_geminal_energy,
 )
+from generativeqc_compiler.tensor.ad_program import transpose_program
 
 from benchmarks._f12_cuda import cuda_runner
+from benchmarks.f12_restricted_df_action import RestrictedDFAction
 
 
 def conventional_inputs(src: dict, o: int) -> dict:
@@ -145,14 +147,66 @@ def fixed_source_cc_equations(
     return e, r1, r2
 
 
-def solve_all_pair_cc(src: dict, run: Callable) -> dict:
+class DenseRestrictedAction:
+    """Four-index diagnostic for cross-checking the factorized Hamiltonian actions."""
+
+    def __init__(self, src: dict, o: int, run: Callable) -> None:
+        self.run = run
+        self.f = src["f"]
+        self.eri = src["eri"]
+        self.o = o
+        self.ham = conventional_inputs(src, o)
+        self.cc = _graphs(o, len(self.f) - o)[0]
+        self.derivatives = {}
+
+    def evaluate(self, t1: np.ndarray, t2: np.ndarray) -> dict:
+        return self.run(self.cc, {**self.ham, "t1": t1, "t2": t2}).outputs
+
+    def adjoint(
+        self,
+        t1: np.ndarray,
+        t2: np.ndarray,
+        l1: np.ndarray,
+        l2: np.ndarray,
+        *,
+        amplitudes: bool,
+    ) -> dict:
+        if amplitudes not in self.derivatives:
+            keys = ("t1", "t2") if amplitudes else tuple(self.ham)
+            self.derivatives[amplitudes] = transpose_program(
+                self.cc, tuple(self.cc.outputs), inputs=keys
+            ).program
+        out = self.run(
+            self.derivatives[amplitudes],
+            {
+                **self.ham,
+                "t1": t1,
+                "t2": t2,
+                "bar_correlation_energy": np.array(1.0),
+                "bar_singles_residual": l1,
+                "bar_doubles_residual": l2,
+            },
+        ).outputs
+        if amplitudes:
+            return {name: out["bar_" + name] for name in ("t1", "t2")}
+        ans = {"f": np.zeros_like(self.f), "eri": np.zeros_like(self.eri)}
+        rs = {"o": slice(0, self.o), "v": slice(self.o, None)}
+        for k in self.ham:
+            target = "f" if k.startswith("f") else "eri"
+            axes = k[1:] if target == "f" else k
+            ans[target][tuple(rs[a] for a in axes)] += out["bar_" + k]
+        return ans
+
+
+def solve_all_pair_cc(
+    src: dict, run: Callable, *, ordinary: RestrictedDFAction | None = None
+) -> dict:
     """Converge ordinary and fixed-cusp residuals jointly from zero, then evaluate ordered energies."""
     o, _, v, _ = src["c"].shape
-    if not (1 <= o <= 8 and v >= 1 and o + v <= 48):
+    if min(o, v) < 1 or (ordinary is None and (o > 8 or o + v > 48)):
         raise ValueError("bounded molecular qualification dimensions required")
-    cc, *_ = _graphs(o, v)
+    ordinary = DenseRestrictedAction(src, o, run) if ordinary is None else ordinary
     correction = all_pair_cc_residual(o, v)
-    h = conventional_inputs(src, o)
     z = fixed_residual_inputs(src, o)
     gaps = np.diag(src["f"])[:o, None] - np.diag(src["f"])[None, o:]
     if np.any(gaps >= 0):
@@ -162,7 +216,7 @@ def solve_all_pair_cc(src: dict, run: Callable) -> dict:
     t2 = np.zeros((o, o, v, v))
     errors = []
     for _ in range(100):
-        r = run(cc, {**h, "t1": t1, "t2": t2}).outputs
+        r = ordinary.evaluate(t1, t2)
         w = run(correction, {**z, "t1": t1}).outputs
         one = r["singles_residual"] + w["singles"]
         two = r["doubles_residual"] + w["doubles"]

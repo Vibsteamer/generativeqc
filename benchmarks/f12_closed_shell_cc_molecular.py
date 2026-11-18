@@ -4,6 +4,7 @@ from collections.abc import Callable
 from functools import lru_cache
 
 import numpy as np
+from generativeqc_compiler.cc.f12_factor_response import coulomb_gram_factor_response
 from generativeqc_compiler.cc.f12_residual import df_standard_v
 from generativeqc_compiler.mp2.f12_density_fitting import coulomb_fit_response
 from generativeqc_compiler.mp2.f12_occupied_pair_overlap import all_occupied_vx
@@ -12,6 +13,7 @@ from generativeqc_compiler.tensor.ad_program import transpose_program
 
 from benchmarks.f12_h2_cc_molecular_correlation import _small_df_coulomb
 from benchmarks.f12_molecular_pairs import factor_inputs, pair_plan
+from benchmarks.f12_restricted_df_action import RestrictedDFAction
 from benchmarks.f12_restricted_multipair_cc import solve_all_pair_cc
 from benchmarks.f12_restricted_multipair_lambda import (
     prepare_lagrangian_gradient,
@@ -49,7 +51,13 @@ def _add_pair_weights(target: dict, weights: dict, m: int, n: int) -> None:
 
 
 def molecular_cc_correlation(
-    mol: dict, fock: dict, whitener: np.ndarray, run: Callable, *, pullback: bool
+    mol: dict,
+    fock: dict,
+    whitener: np.ndarray,
+    run: Callable,
+    *,
+    pullback: bool,
+    auxiliary_batch_size: int | None = None,
 ) -> tuple:
     """Return all relaxed electronic weights to the same HF/CABS molecular response chain.
 
@@ -60,7 +68,7 @@ def molecular_cc_correlation(
     o, n, r = map(int, mol["space"])
     a = len(whitener)
     v = n - o
-    if not 1 <= o <= 8 or not 1 <= v or n > 48:
+    if min(o, v) < 1 or (auxiliary_batch_size is None and (o > 8 or n > 48)):
         raise ValueError(
             "bounded all-pair molecular diagnostic requires 1–8 occupied and at most 48 orbitals"
         )
@@ -72,15 +80,29 @@ def molecular_cc_correlation(
         "fit_bar": np.zeros((a, n * n)),
     }
     fit = run(fitg, fit_inputs).outputs["fit"].reshape(raw.shape)
-    gg = _small_df_coulomb(n, a)
-    gfeed = {"fit": fit, "raw": raw}
-    eri = run(gg, gfeed).outputs["eri"]
+    ordinary = None
+    if auxiliary_batch_size is None:
+        gg = _small_df_coulomb(n, a)
+        gfeed = {"fit": fit, "raw": raw}
+        conv = {"eri": run(gg, gfeed).outputs["eri"]}
+    else:
+        gram = coulomb_gram_factor_response(a, n * n)
+        white = Program({"whitened": gram.outputs["whitened"]})
+        bmo = (
+            run(white, {"whitener": whitener, "raw": raw.reshape(a, -1)})
+            .outputs["whitened"]
+            .reshape(raw.shape)
+        )
+        ordinary = RestrictedDFAction(
+            fock["fock"][:n, :n], bmo, o, run, batch_size=auxiliary_batch_size
+        )
+        conv = {}
     table = all_occupied_vx(o, v, r - n, a)
     vf = _live_inputs(table, mol)
     rows = run(table, vf).outputs
     cc = {
         "f": fock["fock"][:n, :n],
-        "eri": eri,
+        **conv,
         "v": rows["v"],
         "x": rows["x"],
         "b": np.zeros((o, o, o, o)),
@@ -120,7 +142,7 @@ def molecular_cc_correlation(
             allowed_b[k, m, k, m] = allowed_b[k, m, m, k] = allowed_b[m, k, k, m] = True
         if pullback:
             records.append((m, k, ext, extfeed, bc, bcfeed))
-    solved = solve_all_pair_cc(cc, run)
+    solved = solve_all_pair_cc(cc, run, ordinary=ordinary)
     energies = solved["component_energies_Eh"]
     details = {
         "ordinary_cc_correlation_Eh": energies[0],
@@ -132,13 +154,15 @@ def molecular_cc_correlation(
     if not pullback:
         return float(sum(energies)), {}, details
     t1, t2 = solved["t1"], solved["t2"]
-    gradient = prepare_lagrangian_gradient(cc, t1, t2, run)
+    gradient = prepare_lagrangian_gradient(cc, t1, t2, run, ordinary=ordinary)
     dual = solve_lambda(gradient, cc["f"], o)
     details.update(
         lambda_iterations=len(dual["residual_history"]),
         lambda_residual=dual["residual_history"][-1],
     )
-    relaxed = relaxed_source_weights(cc, t1, t2, dual["lambda1"], dual["lambda2"], run)
+    relaxed = relaxed_source_weights(
+        cc, t1, t2, dual["lambda1"], dual["lambda2"], run, ordinary=ordinary
+    )
     if np.any(relaxed["b"][~allowed_b] != 0):
         raise ValueError(
             "fixed-geminal equations requested an uncomputed interpair B element"
@@ -160,11 +184,27 @@ def molecular_cc_correlation(
     ans["fock"] = np.zeros_like(fock["fock"])
     ans["exchange"] = np.zeros_like(fock["exchange"])
     ans["fock"][:n, :n] = relaxed["f"]
-    gr = run(
-        transpose_program(gg, ("eri",)).program, {**gfeed, "bar_eri": relaxed["eri"]}
-    ).outputs
-    fitbar = gr["bar_fit"].copy()
-    rawbar = gr["bar_raw"].copy()
+    if auxiliary_batch_size is None:
+        gr = run(
+            transpose_program(gg, ("eri",)).program,
+            {**gfeed, "bar_eri": relaxed["eri"]},
+        ).outputs
+        fitbar = gr["bar_fit"].copy()
+        rawbar = gr["bar_raw"].copy()
+        metricbar = np.zeros((a, a))
+    else:
+        sources = Program({k: gram.outputs[k] for k in ("raw_bar", "metric_bar")})
+        gr = run(
+            sources,
+            {
+                "whitener": whitener,
+                "whitened_bar": relaxed["bmo"].reshape(a, -1),
+                "fitted": fit.reshape(a, -1),
+            },
+        ).outputs
+        fitbar = np.zeros_like(fit)
+        rawbar = gr["raw_bar"].reshape(raw.shape).copy()
+        metricbar = gr["metric_bar"]
     vr = run(
         transpose_program(table, ("v", "x")).program,
         {**vf, "bar_v": relaxed["v"], "bar_x": relaxed["x"]},
@@ -202,5 +242,5 @@ def molecular_cc_correlation(
     ans["raw_coulomb_all"][:, :n, :n] += rawbar + fitpull["three_center_bar"].reshape(
         raw.shape
     )
-    ans["metric"] = fitpull["metric_bar"]
+    ans["metric"] = fitpull["metric_bar"] + metricbar
     return float(sum(energies)), ans, details
