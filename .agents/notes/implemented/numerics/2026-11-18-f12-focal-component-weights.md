@@ -13,3 +13,10 @@ space for its two methods. This assembly accepts that already-differenced
 increment. A measured GPU or numerical accuracy claim still requires its
 individual energy and analytic force to be qualified. Coordinate-dependent
 weights would require additional derivative terms and a different contract.
+
+The complementary i shells in the Br/I PP-F12 auxiliary basis exceed the
+orbital range of the production ECP quadrature adapter. Generate Cartesian
+Gaussian jets through i for independent operator development. The angular
+switch uses a radix exceeding the largest individual Cartesian power. Runtime
+spherical term staging and the nuclear/integral channels still require their
+own qualification before extending an ECP molecular endpoint.
