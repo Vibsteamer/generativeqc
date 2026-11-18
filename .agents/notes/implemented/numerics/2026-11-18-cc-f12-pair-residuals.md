@@ -1,5 +1,17 @@
 # Restricted explicitly correlated CC residual components
 
+The bounded all-active molecular driver also returns the stationary weights
+of the Fock matrix, ordinary two-electron integrals and five geminal
+intermediates. Its Lambda uses the Frobenius inner product on the full
+symmetric doubles tensor. The projected derivative is half the sum of an
+entry and its electron-swapped partner. Validate this convention against
+the independent scalar Lagrangian for a nonzero dual and against fully
+reconverged energies under simultaneous perturbations of the inputs.
+Small-molecule Cartesian qualification uses each atom and component at two
+displacement steps. In this diagnostic both fixed-geminal CC amplitudes and
+the orbital reference relax. A root check at fixed integrals and a
+Cartesian nuclear-force check cover different stages.
+
 For multi-occupied restricted molecules the canonical Fock is diagonal, but
 its orbital derivative can be off diagonal. Retain the occupied-pair
 overlap between different bra and ket geminals for the corresponding Fock

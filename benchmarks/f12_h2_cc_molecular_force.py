@@ -22,8 +22,13 @@ def validate(report: dict, target: dict) -> dict:
     errors = []
     for step in steps:
         ref = np.array(oracle["forces_Eh_per_bohr"][step])
-        if forces.shape != (2, 3) or ref.shape != forces.shape:
-            raise ValueError("H2 requires six Cartesian derivatives per step")
+        if (
+            forces.shape != (len(target["geometry"]["elements"]), 3)
+            or ref.shape != forces.shape
+        ):
+            raise ValueError(
+                "all molecular Cartesian derivatives are required at each step"
+            )
         errors.append(float(np.max(abs(forces - ref))))
     arms = report["native_directional_checks"]
     directions = {(a["direction"], a["step_bohr"]) for a in arms}

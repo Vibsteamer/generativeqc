@@ -74,3 +74,58 @@ def test_cc_two_electron_driver_enforces_occupied_and_diagnostic_limits(
 ) -> None:
     with pytest.raises(ValueError, match="one occupied pair"):
         h2_cc_correlation({"space": spaces}, {}, np.eye(3), execute, pullback=True)
+
+
+def test_multipair_source_lagrangian_agrees_with_symmetric_variations() -> None:
+    from benchmarks.f12_restricted_multipair_cc import fixed_source_cc_equations
+    from benchmarks.f12_restricted_multipair_lambda import (
+        prepare_lagrangian_gradient,
+        relaxed_source_weights,
+    )
+
+    rng = np.random.default_rng(675913)
+    o, v = 2, 3
+    n = o + v
+
+    def symmetric_pairs(a: np.ndarray) -> np.ndarray:
+        return (a + a.transpose(1, 0, 3, 2)) * 0.5
+
+    eri = rng.normal(scale=0.03, size=(n, n, n, n))
+    eri = (eri + eri.swapaxes(0, 1)) * 0.5
+    eri = (eri + eri.swapaxes(2, 3)) * 0.5
+    eri = (eri + eri.transpose(2, 3, 0, 1)) * 0.5
+    f = rng.normal(scale=0.03, size=(n, n))
+    f = (f + f.T) * 0.5
+    source = {
+        "f": f,
+        "eri": eri,
+        "external": symmetric_pairs(rng.normal(size=(o, o, n, n))),
+        "c": symmetric_pairs(rng.normal(size=(o, o, v, v))),
+    }
+    for k in ("v", "b", "x"):
+        source[k] = symmetric_pairs(rng.normal(size=(o, o, o, o)))
+    t = rng.normal(scale=0.1, size=(o, v))
+    tt = symmetric_pairs(rng.normal(scale=0.1, size=(o, o, v, v)))
+    l = rng.normal(scale=0.1, size=t.shape)
+    ll = symmetric_pairs(rng.normal(scale=0.1, size=tt.shape))
+    gradient = prepare_lagrangian_gradient(source, t, tt, execute)
+    g1, g2 = gradient(l, ll)
+    weights = relaxed_source_weights(source, t, tt, l, ll, execute)
+    d = rng.normal(size=t.shape)
+    dd = symmetric_pairs(rng.normal(size=tt.shape))
+    exact = (
+        np.vdot(g1, d)
+        + np.vdot(g2, dd)
+        + sum(np.vdot(weights[k], x) for k, x in source.items())
+    )
+    obs = []
+    h = 1e-5
+    for sign in (-1.0, 1.0):
+        out, one, two = fixed_source_cc_equations(
+            {k: x * (1 + sign * h) for k, x in source.items()},
+            t + sign * h * d,
+            tt + sign * h * dd,
+            execute,
+        )
+        obs.append(out.sum() + np.vdot(one, l) + np.vdot(two, ll))
+    np.testing.assert_allclose((obs[1] - obs[0]) / (2 * h), exact, atol=2e-8, rtol=0)

@@ -1,7 +1,10 @@
 """Off-diagonal rows of the strong-orthogonality projector on a finite orbital frame."""
 
 import numpy as np
-from generativeqc_compiler.mp2.f12_occupied_pair_overlap import occupied_pair_vx
+from generativeqc_compiler.mp2.f12_occupied_pair_overlap import (
+    all_occupied_vx,
+    occupied_pair_vx,
+)
 from generativeqc_compiler.tensor import execute
 
 
@@ -56,6 +59,15 @@ def test_distinct_bra_and_ket_use_the_full_strong_orthogonality_projector() -> N
     mask[obs:, :o] = True
     right = fitted("f12", k, l)
     out = execute(graph, feed).outputs
+    whole = all_occupied_vx(o, obs - o, ri - obs, aux)
+    tables = execute(
+        whole,
+        {
+            q.attrs["name"]: sources[q.attrs["name"]]
+            for q in whole.live_nodes
+            if q.op == "input"
+        },
+    ).outputs
     for name, left, direct in (
         ("v", "coulomb", "f12_over_coulomb"),
         ("x", "f12", "f12_squared"),
@@ -64,3 +76,4 @@ def test_distinct_bra_and_ket_use_the_full_strong_orthogonality_projector() -> N
             fitted(left, m, n)[mask], right[mask]
         )
         np.testing.assert_allclose(out[name], expected, rtol=1e-12)
+        np.testing.assert_allclose(tables[name][m, n, k, l], expected, rtol=1e-12)
