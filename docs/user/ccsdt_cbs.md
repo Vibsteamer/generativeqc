@@ -694,3 +694,21 @@ srun --partition=main --gres=gpu:5090:1 --nodes=1 --ntasks=1 \
   --device cuda --case h2-dz-tz --oracle --work --repeats 1 \
   --output .artifacts/ccsdt-cbs-h2.json
 ```
+
+### Explicitly correlated component assembly
+
+`generativeqc.experimental.f12_focal.combine` accepts independently evaluated
+energy and Cartesian force contributions from a single geometry. Pass a
+`FocalSeries` for HF plus CABS singles, a second series for ordinary MP2
+correlation plus the explicit F12 pair correction, and one `post_mp2`
+difference evaluated in a matched high-level basis. A single upper term selects
+a finite endpoint. Supplying a lower term and a positive power selects the
+two-point inverse-power limit. Each series can have its own family, for example
+a parent HF series and a heavy-augmented correlation series. Use the same
+surface identity for all terms, including ordered coordinates, electronic root,
+ECP and frozen-core convention, and distinct basis identities for different
+cardinals. Returned weights apply to both energy (Eh) and force (Eh/bohr).
+
+This function assembles components after their native calculations. Availability
+of electronic methods, elements and their molecular responses is established by
+the corresponding solver and independent endpoint tests.

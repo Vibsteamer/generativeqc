@@ -12,7 +12,7 @@ import typing
 
 API_VERSION = 1
 
-_PUBLIC_MODULES = frozenset({"array_api"})
+_PUBLIC_MODULES = frozenset({"array_api", "f12_focal"})
 
 
 def __getattr__(name: str) -> typing.Any:
@@ -29,4 +29,4 @@ def __dir__() -> list[str]:
     return sorted(set(globals()) | _PUBLIC_MODULES)
 
 
-__all__ = ["API_VERSION", "array_api"]
+__all__ = ["API_VERSION", "array_api", "f12_focal"]
