@@ -294,3 +294,27 @@ def opposite_spin_cusp_source(orbitals: int) -> Program:
         },
         provenance={"method": "opposite-spin SP geminal source in distinct UHF frames"},
     )
+
+
+def unrestricted_cross_frame_overlap(atomic: int, orbitals: int) -> Program:
+    """Map a common AO overlap to the cross-spin metric in distinct UHF frames."""
+    if (
+        type(atomic) is not int
+        or type(orbitals) is not int
+        or not 0 < orbitals <= atomic
+    ):
+        raise ValueError(
+            "Need positive extended orbital count at most the AO dimension"
+        )
+    ao = IndexSpace("combined_atomic", "ao", atomic)
+    u, v = Index("u", ao), Index("v", ao)
+    p = Index("p", IndexSpace("extended_alpha", "orbital", orbitals, spin="alpha"))
+    q = Index("q", IndexSpace("extended_beta", "orbital", orbitals, spin="beta"))
+    left = _field("coefficients_alpha", u, p)
+    right = _field("coefficients_beta", v, q)
+    overlap = _field("overlap_ao", u, v)
+    projected = einsum("uv,vq->uq", overlap, right)
+    return Program(
+        {"cross_overlap": einsum("up,uq->pq", left, projected)},
+        provenance={"method": "cross-spin overlap in the extended UHF frames"},
+    )

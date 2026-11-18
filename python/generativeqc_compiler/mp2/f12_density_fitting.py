@@ -18,15 +18,13 @@ def molecular_orbital_sources(
     A separate metric solve supplies the fitted Coulomb coefficients.
     """
     if (
-        any(
-            type(n) is not int or n <= 0
-            for n in (atomic, orbitals, occupied, auxiliaries)
-        )
-        or occupied >= orbitals
+        any(type(n) is not int or n <= 0 for n in (atomic, orbitals, auxiliaries))
+        or type(occupied) is not int
+        or not 0 <= occupied < orbitals
         or orbitals > atomic
     ):
         raise ValueError(
-            "Expected positive AO/auxiliary sizes and 0 < occupied < orbitals <= AO"
+            "Expected positive AO/auxiliary sizes and 0 <= occupied < orbitals <= AO"
         )
     ao = IndexSpace("combined_atomic", "ao", atomic)
     mo = IndexSpace("extended_orbital", "orbital", orbitals)
@@ -38,7 +36,9 @@ def molecular_orbital_sources(
         return input_tensor(name, TensorSpec(axes, role="input", differentiable=True))
 
     coefficients = source("coefficients", (u, p))
-    occupied_coefficients = slice_tensor(coefficients, ((0, atomic), (0, occupied)))
+    occupied_coefficients = (
+        slice_tensor(coefficients, ((0, atomic), (0, occupied))) if occupied else None
+    )
     hcore = source("hcore_ao", (u, v))
     h_right = einsum("uv,vq->uq", hcore, coefficients)
     result = {"hcore": einsum("up,uq->pq", coefficients, h_right)}
@@ -49,9 +49,12 @@ def molecular_orbital_sources(
         "f12_over_coulomb",
         "double_commutator",
     ):
+        if not occupied and operator != "coulomb":
+            continue
         raw = source("ao_" + operator, (a, u, v))
         right = einsum("auv,vq->auq", raw, coefficients)
         left = coefficients if operator == "coulomb" else occupied_coefficients
+        assert left is not None
         result["raw_" + operator] = einsum("up,auq->apq", left, right)
     return Program(
         result,

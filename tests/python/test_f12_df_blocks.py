@@ -118,7 +118,7 @@ def test_shared_orbital_frame_source_response(occupied: int) -> None:
 
 
 @pytest.mark.parametrize(
-    "dimensions", [(3, 4, 1, 2), (4, 4, 4, 2), (4, 4, 0, 2), (4, 4, 1, True)]
+    "dimensions", [(3, 4, 1, 2), (4, 4, 4, 2), (4, 4, -1, 2), (4, 4, 1, True)]
 )
 def test_orbital_source_dimensions(dimensions: tuple[int, ...]) -> None:
     with pytest.raises(ValueError, match="positive AO"):
