@@ -46,23 +46,26 @@ def chain(
     singles: Callable,
     *,
     pullback: bool,
-    record_energy: Callable[[float], None] | None = None,
+    record_energy: Callable[[float, dict[str, float]], None] | None = None,
+    singles_only: bool = False,
     physical_fock: Callable | None = None,
     metric_gram: Callable | None = None,
     full_rank_constraint: bool = False,
     frame_observer: Callable | None = None,
 ) -> tuple[float, dict, dict]:
     inputs, frame = with_frame(data, projector)
-    energy, bars, _ = evaluate(
+    energy, bars, intermediates = evaluate(
         inputs,
         run,
         pullback=pullback,
         singles=singles,
+        singles_only=singles_only,
         record_energy=record_energy,
         physical_fock=physical_fock,
     )
     if not pullback:
-        return energy, {}, {}
+        return energy, {}, intermediates["energy_components"]
+    del intermediates
     permutation = data["ao_permutation"]
     obs = int(data["space"][1])
     overlap = data["overlap"][np.ix_(permutation, permutation)]
