@@ -50,3 +50,28 @@ def test_cabs_h_angular_polynomial_against_gauss_hermite(
 def test_cabs_h_angular_scope(powers: tuple[int, ...], options: dict) -> None:
     with pytest.raises(ValueError):
         build_df_axis_moment(*powers, **options)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"maximum_orbital": 5, "auxiliary_h": True},
+        {"cabs_h": True, "auxiliary_h": True, "maximum_orbital": 4},
+        {"cabs_h": True, "maximum_orbital": 5},
+        {
+            "cabs_h": True,
+            "maximum_orbital": 5,
+            "auxiliary_h": True,
+            "scalar_type": "float",
+        },
+    ],
+)
+def test_molecular_h_source_requires_the_explicit_bounded_variant(
+    options: dict,
+) -> None:
+    from generativeqc_compiler.integral.df_derivatives_cuda import (
+        emit_df_derivatives_cuda,
+    )
+
+    with pytest.raises(ValueError):
+        emit_df_derivatives_cuda(**options)

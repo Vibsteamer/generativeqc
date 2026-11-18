@@ -227,6 +227,7 @@ def emit_df_derivatives_cuda(
     scalar_type: str = "double",
     maximum_orbital: int = 3,
     fitted_geminal: bool = False,
+    cabs_h: bool = False,
 ) -> str:
     """Share base axis moments and Boys values across all independent centers.
 
@@ -241,6 +242,10 @@ def emit_df_derivatives_cuda(
     the same moment DAG and analytic single-center Gaussian derivative rule.
     Selecting ``maximum_orbital=4`` with the h variant owns fifteen slots/F14,
     including either raised orbital center without admitting public orbital h.
+
+    The separate molecular CABS h selection admits two combined-basis h slots
+    and a fitting shell through h. It uses F16 for the highest single raise.
+    The conventional DF source inventory keeps its original orbital domain.
 
     Positive omega selects the same radial kernel in the metric and the
     three-center response. Zero preserves Coulomb. Long-range production uses
@@ -261,7 +266,12 @@ def emit_df_derivatives_cuda(
         raise ValueError("fitted-geminal nuclear response requires FP64")
     if scalar_type not in ("double", "float"):
         raise ValueError("scalar type must be double or float")
-    if maximum_orbital not in (3, 4) or (maximum_orbital == 4 and not auxiliary_h):
+    if cabs_h:
+        if maximum_orbital != 5 or not auxiliary_h or scalar_type != "double":
+            raise ValueError(
+                "CABS h sources require FP64 and the h/h/h response domain"
+            )
+    elif maximum_orbital not in (3, 4) or (maximum_orbital == 4 and not auxiliary_h):
         raise ValueError("orbital g requires the auxiliary-through-h response domain")
     prefix = r"""// Generated DF metric/three-center first derivatives.
 #ifndef GENERATIVEQC_GENERATED_DF_DERIVATIVES_CUH
@@ -389,7 +399,7 @@ __device__ __forceinline__ Response three_center(double alpha,Vec3 A,Angular a,
         radial_header = '#include "integrals/f12_geminal.hpp"\n'
         parameters = "integrals::GeminalProduct op,const integrals::FittedSlater& fit"
         radial_parameters, radial_arguments = parameters, "op,fit"
-        # The largest total is g,g,h with a single nuclear raise (F14).
+        # Reserve a radial moment for the single internal center raise.
         max_order = auxiliary_maximum + 2 * maximum_orbital + 1
         geometry_source = (
             emit_df_geometry_cuda(
@@ -492,6 +502,7 @@ def emit_df_derivatives_cpu(
     scalar_type: str = "double",
     maximum_orbital: int = 3,
     fitted_geminal: bool = False,
+    cabs_h: bool = False,
 ) -> str:
     """Lower the same generated DF derivative algebra to ordinary host C++.
 
@@ -506,6 +517,7 @@ def emit_df_derivatives_cpu(
         scalar_type=scalar_type,
         maximum_orbital=maximum_orbital,
         fitted_geminal=fitted_geminal,
+        cabs_h=cabs_h,
     )
     if auxiliary_h:
         source = source.replace(

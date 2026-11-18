@@ -18,3 +18,16 @@ force assembly.
 The regression integrates the two correlated Gaussian variables with a
 tensor-product Gauss–Hermite rule. It checks the angular polynomial over
 multiple radial nodes and verifies illegal raises and undeclared domains.
+
+## Molecular source variant
+
+The molecular shell builder's explicit `--cabs-h` option emits the FP64 angular
+and radial bounds jointly for the raw Cartesian forward and its weighted
+nuclear derivative. The same contraction, CCA ordering, rejection checks and
+allocation ledger are used for Coulomb, the geminal, geminal/r, geminal-squared
+and the double-commutator operator. The new library and build-cache directory
+have distinct names. A single shared object can be selected by full path for
+either backend and coexists with the conventional lower-angular library.
+The conventional through-g kernel and the physical orbital DF method domain
+keep their original bounds. A QZ-F12 one-electron forward and nuclear pullback
+still require separate h-shell support.
