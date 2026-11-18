@@ -4,10 +4,10 @@ from collections.abc import Callable, Mapping
 from typing import NamedTuple
 
 import numpy as np
-from generativeqc_compiler.mp2.f12_unrestricted import unrestricted_extended_df_fock
 from generativeqc_compiler.tensor import transpose_program
 
 from ._f12_cabs import cabs_singles
+from ._f12_spin_fock import spin_fock, spin_fock_pullback
 from ._f12_spin_pairs import occupied_pair_blocks, pair_operands
 
 
@@ -24,6 +24,7 @@ def unrestricted_cabs_energy(
     *,
     pullback: bool = True,
     singles: Callable = cabs_singles,
+    auxiliary_batch_size: int | None = None,
 ) -> UnrestrictedCabsSingles:
     """Compute both singles contributions and their joint fixed-frame DF source VJP.
 
@@ -33,8 +34,7 @@ def unrestricted_cabs_energy(
     couples their responses to both occupied densities through the Fock graph.
     Nuclear differentiation also needs frame, fitting and SCF response.
     """
-    graph = unrestricted_extended_df_fock(*dimensions)
-    forward = run(graph, sources).outputs
+    forward = spin_fock(dimensions, sources, run, auxiliary_batch_size)
     seeds = {}
     energies = []
     for spin, occupied in zip(("alpha", "beta"), dimensions[:2], strict=True):
@@ -49,14 +49,12 @@ def unrestricted_cabs_energy(
         if pullback:
             if bar is None:
                 raise ValueError("missing singles Fock cotangent")
-            seeds["bar_" + key] = (bar + bar.T) / 2
+            seeds[key] = (bar + bar.T) / 2
     weights = None
     if pullback:
-        reverse = transpose_program(graph, ("fock_alpha", "fock_beta")).program
-        weights = {
-            k.removeprefix("bar_"): v
-            for k, v in run(reverse, {**sources, **seeds}).outputs.items()
-        }
+        weights = spin_fock_pullback(
+            dimensions, sources, seeds, run, auxiliary_batch_size
+        )
     return UnrestrictedCabsSingles(sum(energies), (energies[0], energies[1]), weights)
 
 
@@ -67,6 +65,7 @@ def unrestricted_mp2_f12_source_pullback(
     *,
     frozen_occupied: tuple[int, int] = (0, 0),
     singles: Callable = cabs_singles,
+    auxiliary_batch_size: int | None = None,
 ) -> dict[str, np.ndarray]:
     """Pull the molecular UMP2, geminal and CABS energies back to their shared sources.
 
@@ -81,8 +80,8 @@ def unrestricted_mp2_f12_source_pullback(
         for key, v in data.items()
         if key.startswith("source/")
     }
-    fock_graph = unrestricted_extended_df_fock(oa, ob, ext, aux)
-    fock = run(fock_graph, sources).outputs
+    fock_space = (oa, ob, ext, aux)
+    fock = spin_fock(fock_space, sources, run, auxiliary_batch_size)
     source_bars = {k: np.zeros_like(v) for k, v in sources.items()}
     raw_bars = {
         k: np.zeros_like(v)
@@ -116,11 +115,13 @@ def unrestricted_mp2_f12_source_pullback(
             )
             for key, value in result.items():
                 buffers[key.removeprefix("bar_")] += value
-    rev = transpose_program(fock_graph, tuple(fock)).program
-    fock_weights = run(
-        rev, {**sources, **{"bar_" + k: v for k, v in fock_bars.items()}}
-    ).outputs
-    for key, value in fock_weights.items():
-        source_bars[key.removeprefix("bar_")] += value
+    spin_fock_pullback(
+        fock_space,
+        sources,
+        fock_bars,
+        run,
+        auxiliary_batch_size,
+        accumulate=source_bars,
+    )
     raw_bars.update({"source/" + k: v for k, v in source_bars.items()})
     return raw_bars

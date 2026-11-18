@@ -10,8 +10,8 @@ from pathlib import Path
 
 import numpy as np
 from generativeqc._f12_cabs import cabs_singles
+from generativeqc._f12_spin_fock import spin_fock
 from generativeqc._f12_spin_pairs import molecular_pair_energies
-from generativeqc_compiler.mp2.f12_unrestricted import unrestricted_extended_df_fock
 
 from benchmarks._f12_cuda import add_molecular_graph_budget, cuda_runner
 
@@ -21,18 +21,26 @@ def evaluate(
     run: Callable,
     singles: Callable,
     checkpoint: Callable | None = None,
+    *,
+    auxiliary_batch_size: int | None = None,
+    reference_filename: str = "NH2_parent_DF_MP2_F12.json",
+    fixture_filename: str = "nh2_parent_D_f12.npz",
 ) -> list[dict]:
     start = time.monotonic()
-    reference = json.loads((directory / "NH2_parent_DF_MP2_F12.json").read_text())
-    with np.load(directory / "nh2_parent_D_f12.npz", allow_pickle=False) as stored:
+    reference = json.loads((directory / reference_filename).read_text())
+    with np.load(directory / fixture_filename, allow_pickle=False) as stored:
         data = dict(stored)
     oa, ob, obs, n, aux = map(int, data["space"])
+    cardinal = reference["obs_basis"].removeprefix("cc-pv").removesuffix("z-f12")
+    if cardinal not in ("d", "t", "q", "5"):
+        raise ValueError(f"Unrecognized NH2 orbital family: {reference['obs_basis']}")
+    case = f"NH2_{cardinal.upper()}_f12"
     names = ("alpha", "beta")
     occs = (oa, ob)
     src = {
         k.removeprefix("source/"): v for k, v in data.items() if k.startswith("source/")
     }
-    fock = run(unrestricted_extended_df_fock(oa, ob, n, aux), src).outputs
+    fock = spin_fock((oa, ob, n, aux), src, run, auxiliary_batch_size)
     errors = {k: float(np.max(abs(a - data["expected_" + k]))) for k, a in fock.items()}
     if any(not np.isfinite(v) or v > 2e-8 for v in errors.values()):
         raise ValueError(f"UHF Fock component {errors}")
@@ -44,7 +52,7 @@ def evaluate(
         raise ValueError("CABS singles")
     checkpoints = [
         {
-            "case": "NH2_D_f12",
+            "case": case,
             "scope": "spin-dependent extended DF Fock and CABS",
             "errors_Eh": errors,
             "alpha_beta_CABS_Eh": single,
@@ -67,7 +75,7 @@ def evaluate(
         doubles.append(u)
         checkpoints.append(
             {
-                "case": "NH2_D_f12",
+                "case": case,
                 "scope": "density fitted pair",
                 "spin": sl + "_" + sr,
                 "ij": [i, j],
@@ -94,7 +102,7 @@ def evaluate(
         )
     checkpoints.append(
         {
-            "case": "NH2_D_f12",
+            "case": case,
             "scope": "all-pair DF UHF F12 molecular energy on supplied three-center and orbital UHF sources",
             "pairs": len(corrections),
             "total_Eh": total,
@@ -114,6 +122,9 @@ def main() -> None:
     parser.add_argument("--arch", required=True)
     parser.add_argument("--cache", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--auxiliary-batch-size", type=int)
+    parser.add_argument("--reference-filename", default="NH2_parent_DF_MP2_F12.json")
+    parser.add_argument("--fixture-filename", default="nh2_parent_D_f12.npz")
     add_molecular_graph_budget(parser)
     args = parser.parse_args()
     run, metrics = cuda_runner(args.arch, args.cache, max_bytes=args.budget_mib << 20)
@@ -131,6 +142,9 @@ def main() -> None:
         run,
         partial(cabs_singles, library=ctypes.CDLL(args.component_library)),
         checkpoint,
+        auxiliary_batch_size=args.auxiliary_batch_size,
+        reference_filename=args.reference_filename,
+        fixture_filename=args.fixture_filename,
     )
 
 

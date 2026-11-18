@@ -36,7 +36,10 @@ def _singles(
 
 
 @pytest.mark.parametrize("occs", [(2, 1), (1, 0)])
-def test_joint_ao_source_pullback_and_empty_spin(occs: tuple[int, int]) -> None:
+@pytest.mark.parametrize("tile", [None, 2])
+def test_joint_ao_source_pullback_and_empty_spin(
+    occs: tuple[int, int], tile: int | None
+) -> None:
     rng = np.random.default_rng(58487)
     size, aux = 4, 5
     data = {}
@@ -58,6 +61,7 @@ def test_joint_ao_source_pullback_and_empty_spin(occs: tuple[int, int]) -> None:
             execute,
             singles=_singles,
             pullback=pullback,
+            auxiliary_batch_size=tile,
         )
 
     center = calc(0, True)
@@ -135,7 +139,12 @@ def test_joint_spin_pair_and_reference_vjp(frozen: tuple[int, int]) -> None:
         return en
 
     bars = unrestricted_mp2_f12_source_pullback(
-        space, values, execute, singles=_singles, frozen_occupied=frozen
+        space,
+        values,
+        execute,
+        singles=_singles,
+        frozen_occupied=frozen,
+        auxiliary_batch_size=2,
     )
     actual = sum(np.vdot(bar, delta[k]) for k, bar in bars.items())
     for step in (1e-4, 3e-5):
