@@ -17,3 +17,15 @@ The public basis admission and low-angular one-electron kernels retain their ori
 The qualification panel takes four complete h-containing blocks from methane cc-pVQZ-F12 OptRI,
 including separated and repeated centers. Psi4/Libint supplies the independent real-spherical
 values and all 15 analytic derivatives, with independent five-point checks at two displacements.
+
+## Combined-basis assembly
+
+All h-containing shell pairs share one Cartesian evaluation launch and one spherical projection.
+The primal reads compact S and Hcore. The central geometry retains the high-shell Jacobian in
+source AO order on the host, then transfers it and all ordered weights together for a single CUDA
+contraction. Displaced scalar geometries compile out nuclear responses. Low/low pairs retain the
+qualified native value and gradient providers. Distinct shell pairs accumulate both W_ab and
+the transpose of W_ba. A repeated shell consumes its full ordered block exactly once.
+Source-row, angular, nuclear-center, primitive exponent and normalized radial identities are
+checked before either cohort runs. The per-call byte gate accounts for the Cartesian scratch,
+projected spherical output and staged inputs. The compiler separately reports per-thread storage.

@@ -54,7 +54,7 @@ struct Matrices {
   }
 };
 struct Pair {
-  int la, lb, first, second, nfirst, nsecond, natom;
+  int la, lb, first, second, nfirst, nsecond, natom, first_primitive, second_primitive;
   const double *alpha, *radial, *coords;
   const int* charges;
   GENERATIVEQC_ERI_DEVICE Vec3<double> xyz(int atom) const {
@@ -65,6 +65,7 @@ struct Pair {
 GENERATIVEQC_ERI_DEVICE double at_axis(const Vec3<double>& v, int axis) {
   return axis == 0 ? v.x : axis == 1 ? v.y : v.z;
 }
+template <bool Response>
 GENERATIVEQC_ERI_DEVICE void primitive(const Pair& pair, const Powers& u, const Powers& v, int ii,
                                        int jj, Matrices dst) {
   const double a = pair.alpha[ii], b = pair.alpha[jj], p = a + b;
@@ -84,18 +85,20 @@ GENERATIVEQC_ERI_DEVICE void primitive(const Pair& pair, const Powers& u, const 
     Dual factors[3];
     for (int k = 0; k < 3; ++k) factors[k] = (k == term ? axes[k].kinetic : axes[k].e[0]);
     dst.entry(op, 0) += overlap_scale * factors[0].value * factors[1].value * factors[2].value;
-    for (int k = 0; k < 3; ++k) {
-      const double derivative = overlap_scale * factors[k].derivative * factors[(k + 1) % 3].value *
-                                factors[(k + 2) % 3].value;
-      dst.center(op, pair.first, k, derivative);
-      dst.center(op, pair.second, k, -derivative);
-    }
+    if constexpr (Response)
+      for (int k = 0; k < 3; ++k) {
+        const double derivative = overlap_scale * factors[k].derivative *
+                                  factors[(k + 1) % 3].value * factors[(k + 2) % 3].value;
+        dst.center(op, pair.first, k, derivative);
+        dst.center(op, pair.second, k, -derivative);
+      }
   }
   for (int atom = 0; atom < pair.natom; ++atom) {
-    CoulombAuxiliary<double, MaxPair + 1> R;
-    fill_coulomb<MaxPair + 1>(
+    constexpr int order = MaxPair + int(Response);
+    CoulombAuxiliary<double, order> R;
+    fill_coulomb<order>(
         p, P, pair.xyz(atom), R,
-        {unsigned(limits[0]), unsigned(limits[1]), unsigned(limits[2]), true, true});
+        {unsigned(limits[0]), unsigned(limits[1]), unsigned(limits[2]), true, Response});
     const double prefactor = -pair.charges[atom] * w * 2 * kPi / p;
     double value = 0, derivative_ab[3]{}, derivative_pc[3]{};
     for (int x = 0; x <= limits[0]; ++x)
@@ -104,34 +107,39 @@ GENERATIVEQC_ERI_DEVICE void primitive(const Pair& pair, const Powers& u, const 
           const Dual X = axes[0].e[x], Y = axes[1].e[y], Z = axes[2].e[z];
           const double r = R.at(0, x, y, z), prod = X.value * Y.value * Z.value;
           value += prod * r;
-          derivative_ab[0] += X.derivative * Y.value * Z.value * r;
-          derivative_ab[1] += X.value * Y.derivative * Z.value * r;
-          derivative_ab[2] += X.value * Y.value * Z.derivative * r;
-          derivative_pc[0] += prod * R.at(0, x + 1, y, z);
-          derivative_pc[1] += prod * R.at(0, x, y + 1, z);
-          derivative_pc[2] += prod * R.at(0, x, y, z + 1);
+          if constexpr (Response) {
+            derivative_ab[0] += X.derivative * Y.value * Z.value * r;
+            derivative_ab[1] += X.value * Y.derivative * Z.value * r;
+            derivative_ab[2] += X.value * Y.value * Z.derivative * r;
+            derivative_pc[0] += prod * R.at(0, x + 1, y, z);
+            derivative_pc[1] += prod * R.at(0, x, y + 1, z);
+            derivative_pc[2] += prod * R.at(0, x, y, z + 1);
+          }
         }
     dst.entry(2, 0) += prefactor * value;
     // R depends on P-C. All nuclei move with their own point charges.
-    for (int k = 0; k < 3; ++k) {
-      dst.center(2, pair.first, k, prefactor * (derivative_ab[k] + a / p * derivative_pc[k]));
-      dst.center(2, pair.second, k, prefactor * (-derivative_ab[k] + b / p * derivative_pc[k]));
-      dst.center(2, atom, k, -prefactor * derivative_pc[k]);
-    }
+    if constexpr (Response)
+      for (int k = 0; k < 3; ++k) {
+        dst.center(2, pair.first, k, prefactor * (derivative_ab[k] + a / p * derivative_pc[k]));
+        dst.center(2, pair.second, k, prefactor * (-derivative_ab[k] + b / p * derivative_pc[k]));
+        dst.center(2, atom, k, -prefactor * derivative_pc[k]);
+      }
   }
 }
 
+template <bool Response>
 GENERATIVEQC_ERI_DEVICE void element(const Pair& pair, int index, int stride, double* out) {
   const int nb = (pair.lb + 1) * (pair.lb + 2) / 2;
   const auto u = component(pair.la, index / nb), v = component(pair.lb, index % nb);
-  Matrices dst{out + index, Size(stride), 1 + 3 * Size(pair.natom)};
+  Matrices dst{out + index, Size(stride), 1 + (Response ? 3 * Size(pair.natom) : 0)};
   for (int i = 0; i < pair.nfirst; ++i)
-    for (int j = pair.nfirst; j < pair.nfirst + pair.nsecond; ++j) primitive(pair, u, v, i, j, dst);
+    for (int j = 0; j < pair.nsecond; ++j)
+      primitive<Response>(pair, u, v, i + pair.first_primitive, j + pair.second_primitive, dst);
 }
 #ifdef __CUDACC__
 __global__ void kernel(Pair pair, int stride, double* out) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index < stride) element(pair, index, stride, out);
+  if (index < stride) element<true>(pair, index, stride, out);
 }
 #define EXPORT gqc_f12_cabs_h_one_electron
 #else
@@ -162,7 +170,7 @@ extern "C" int EXPORT(int la, int lb, int first, int second, int na, int nb, int
     if (charges[i] <= 0 || !std::isfinite(coords[3 * i]) || !std::isfinite(coords[3 * i + 1]) ||
         !std::isfinite(coords[3 * i + 2]))
       return 1;
-  Pair pair{la, lb, first, second, na, nb, natom, exps, radial, coords, charges};
+  Pair pair{la, lb, first, second, na, nb, natom, 0, na, exps, radial, coords, charges};
 #ifdef __CUDACC__
   double* buf{};
   if (cudaMalloc(&buf, *bytes) != cudaSuccess) return 3;
@@ -189,7 +197,9 @@ extern "C" int EXPORT(int la, int lb, int first, int second, int na, int nb, int
   return ok && freed ? 0 : 3;
 #else
   std::fill_n(out, count, 0.0);
-  for (int index = 0; index < stride; ++index) element(pair, index, stride, out);
+  for (int index = 0; index < stride; ++index) element<true>(pair, index, stride, out);
   return 0;
 #endif
 }
+
+#include "f12_cabs_h_one_electron_batch.cuh"
