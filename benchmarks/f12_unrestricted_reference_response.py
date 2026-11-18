@@ -1,4 +1,4 @@
-"""Solve the coupled DF-UHF orbital response of the bent NH2 molecule on physical fit sources."""
+"""Verify a coupled DF-UHF orbital response against a molecular reference."""
 
 import argparse
 import json
@@ -15,8 +15,15 @@ from generativeqc_compiler.mp2.f12_unrestricted_reference import (
 from benchmarks._f12_cuda import add_molecular_graph_budget, cuda_runner
 
 
-def evaluate(directory: Path, run: Callable) -> dict:
-    with np.load(directory / "nh2_D_uhf_cphf.npz", allow_pickle=False) as z:
+def evaluate(
+    directory: Path,
+    run: Callable,
+    *,
+    fixture_name: str = "nh2_D_uhf_cphf.npz",
+    case_name: str = "NH2_D_f12",
+    coordinate: str = "H1 z",
+) -> dict:
+    with np.load(directory / fixture_name, allow_pickle=False) as z:
         oa, ob, n, aux = map(int, z["space"])
         rhs, solution = z["rhs"], z["solution"]
         fixed = {k: z[k] for k in z if k not in {"space", "rhs", "solution"}}
@@ -54,15 +61,15 @@ def evaluate(directory: Path, run: Callable) -> dict:
     error = float(np.max(abs(result.solution - solution)))
     if not np.isfinite([error, residual]).all() or residual > 2e-10 or error > 2e-9:
         raise ValueError(
-            f"Coupled UHF orbital response differs from fully assembled Hessian: residual={residual}, error={error}"
+            f"Coupled UHF orbital response differs from the reference: residual={residual}, error={error}"
         )
     return {
-        "case": "NH2_D_f12",
+        "case": case_name,
         "iterations": result.iterations,
         "alpha_occupied": oa,
         "beta_occupied": ob,
         "rotations": len(rhs),
-        "nuclear_coordinate": "H1 z",
+        "nuclear_coordinate": coordinate,
         "residual": residual,
         "maximum_amplitude_error": error,
     }
@@ -74,10 +81,19 @@ def main() -> None:
     parser.add_argument("--arch", required=True)
     parser.add_argument("--cache", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--fixture-name", default="nh2_D_uhf_cphf.npz")
+    parser.add_argument("--case-name", default="NH2_D_f12")
+    parser.add_argument("--coordinate", default="H1 z")
     add_molecular_graph_budget(parser)
     a = parser.parse_args()
     run, metrics = cuda_runner(a.arch, a.cache, max_bytes=a.budget_mib << 20)
-    row = evaluate(a.fixtures, run)
+    row = evaluate(
+        a.fixtures,
+        run,
+        fixture_name=a.fixture_name,
+        case_name=a.case_name,
+        coordinate=a.coordinate,
+    )
     a.output.write_text(
         json.dumps({"rows": [row], "programs": metrics}, indent=2, allow_nan=False)
         + "\n"
