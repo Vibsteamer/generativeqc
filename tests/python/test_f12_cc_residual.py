@@ -314,3 +314,59 @@ def test_cc_common_geminal_energy_recovers_independent_stationary_mp2_pairs(
                 assert ans == pytest.approx(psi_value, abs=1e-12)
                 total += ans
         assert total == pytest.approx(float(f[case + "/energy"]), abs=2e-12)
+
+
+@pytest.mark.parametrize("m,n", [(1, 1), (0, 1)])
+def test_robust_df_external_geminal_source_and_metric_response(m: int, n: int) -> None:
+    from generativeqc_compiler.cc.f12_residual import df_standard_v
+
+    rng = np.random.default_rng(104)
+    obs = 4
+    aux = 6
+    graph = df_standard_v(obs, aux, diagonal=m == n)
+    fields = {
+        q.attrs["name"]: rng.normal(size=q.spec.shape)
+        for q in graph.live_nodes
+        if q.op == "input"
+    }
+    fields["select_m"] = np.eye(obs)[m]
+    if m != n:
+        fields["select_n"] = np.eye(obs)[n]
+
+    def reference(s: dict) -> np.ndarray:
+        fit = s["fit_all"]
+        direct = {}
+        for name in ("f12", "f12_over_coulomb"):
+            a = s["raw_" + name + "_m"]
+            b = s["raw_" + name + ("_m" if m == n else "_n")]
+            x, y = fit[:, :, m], fit[:, :, n]
+            direct[name] = x.T @ b + a.T @ y - x.T @ s["metric_" + name] @ y
+        coulomb = np.einsum("pur,pvs->urvs", fit, s["raw_coulomb_all"])
+        return direct["f12_over_coulomb"] - np.einsum(
+            "urvs,rs->uv", coulomb, direct["f12"]
+        )
+
+    np.testing.assert_allclose(
+        execute(graph, fields).outputs["v"], reference(fields), rtol=1e-12, atol=1e-12
+    )
+    seed = rng.normal(size=(obs, obs))
+    bars = execute(
+        transpose_program(graph, ("v",)).program, {**fields, "bar_v": seed}
+    ).outputs
+    for key, value in fields.items():
+        if key.startswith("select_"):
+            continue
+        delta = rng.normal(size=value.shape) / np.sqrt(value.size)
+        for h in (4e-4, 2e-4):
+            slopes = [
+                np.vdot(seed, reference({**fields, key: value + sign * h * delta}))
+                for sign in [-1, 1]
+            ]
+            # The fitted density also occurs in the OBS subtraction. Its finite difference has an O(h^2) term.
+            assert (
+                abs(
+                    np.vdot(bars["bar_" + key], delta)
+                    - (slopes[1] - slopes[0]) / (2 * h)
+                )
+                < 2e-6
+            )

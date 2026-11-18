@@ -4,6 +4,7 @@ from fractions import Fraction
 
 from ..tensor.ir import Node, add, einsum, input_tensor, transpose
 from ..tensor.program import Program
+from ..tensor.robust_density_fit import robust_fitted_operator
 from ..tensor.types import Index, IndexSpace, TensorSpec
 
 
@@ -29,8 +30,7 @@ def standard_v_tile(obs: int, auxiliary: int, left: int, right: int) -> Program:
     f = _source("geminal_obs", r, s)
     fit = _source("fit_left", p, u, r)
     raw = _source("raw_coulomb_right", p, v, s)
-    right_action = einsum("rs,pvs->prv", f, raw)
-    value = add(direct, einsum("pur,prv->uv", fit, right_action), coefficients=(1, -1))
+    value = _projected_v(direct, f, fit, raw)
     return Program(
         {"v": value},
         provenance={
@@ -217,5 +217,60 @@ def fixed_pair_geminal_energy(occupied: int, virtual: int) -> Program:
             "operation": "restricted ordered CC-F12 geminal energy terms",
             "reference": "Knizia Eqs. (4.125)-(4.127)",
             "pair_enumeration": "ordered; diagonal visited once",
+        },
+    )
+
+
+def _projected_v(direct: Node, geminal: Node, fit: Node, raw: Node) -> Node:
+    right_action = einsum("rs,pvs->prv", geminal, raw)
+    return add(direct, einsum("pur,prv->uv", fit, right_action), coefficients=(1, -1))
+
+
+def df_standard_v(obs: int, auxiliary: int, *, diagonal: bool) -> Program:
+    """Build the standard-approximation external CC-F12 V matrix from fitted sources.
+
+    Sources are in real spatial OBS coordinates. For each geminal orbital m,
+    raw_f12_m[P,r] = (P|f|mr), likewise for the product g*f. The metric for
+    each non-Coulomb operator is its own (P|O|Q). Fit coefficients multiply
+    the full OBS Coulomb integrals with the inverse Coulomb metric. The
+    caller must propagate their cotangents through that same metric solve.
+    Only the contracted OBS matrix is emitted. Its occupied–occupied entries
+    use the external projector convention and must not replace the full-Q12
+    occupied matrix in the common Hylleraas energy.
+    """
+    if type(diagonal) is not bool or any(
+        type(d) is not int or d < 1 for d in (obs, auxiliary)
+    ):
+        raise ValueError(
+            "positive OBS and auxiliary spaces and a boolean diagonal flag required"
+        )
+    orb = IndexSpace("observable_orbitals", "orbital", obs)
+    aux = IndexSpace("fitting_basis", "auxiliary", auxiliary)
+    r, s = Index("r", orb), Index("s", orb)
+    p, q = Index("p", aux), Index("q", aux)
+    fit = _source("fit_all", p, r, s)
+    raw = _source("raw_coulomb_all", p, r, s)
+    control = TensorSpec(
+        (r,), role="input", differentiable=False, representation="restricted_spatial"
+    )
+    m = input_tensor("select_m", control)
+    n = m if diagonal else input_tensor("select_n", control)
+    dm = einsum("prs,s->pr", fit, m)
+    dn = dm if diagonal else einsum("prs,s->pr", fit, n)
+
+    def fitted_operator(name: str) -> Node:
+        rm = _source("raw_" + name + "_m", p, r)
+        rn = rm if diagonal else _source("raw_" + name + "_n", p, r)
+        return robust_fitted_operator(dm, rm, dn, rn, _source("metric_" + name, p, q))
+
+    v = _projected_v(
+        fitted_operator("f12_over_coulomb"), fitted_operator("f12"), fit, raw
+    )
+    return Program(
+        {"v": v},
+        provenance={
+            "operation": "robust density-fitted standard projected CC-F12 V in the orbital space",
+            "projection": "1-P_OBS(1)P_OBS(2)",
+            "metric": "independent full-rank Coulomb solve upstream",
         },
     )

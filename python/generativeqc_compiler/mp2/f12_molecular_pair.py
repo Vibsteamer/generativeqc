@@ -11,8 +11,8 @@ from ..tensor.ir import (
     transpose,
 )
 from ..tensor.program import Program
+from ..tensor.robust_density_fit import robust_fitted_operator
 from ..tensor.types import Index, IndexSpace, TensorSpec
-from .f12_density_fitting import robust_fitted_operator
 from .f12_pairs import restricted_pair_functional
 
 
