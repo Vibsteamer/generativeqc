@@ -359,3 +359,42 @@ def test_spin_resolved_robust_factors_propagate_both_spin_sources() -> None:
         np.testing.assert_allclose(
             (perturb(h) - perturb(-h)) / (2 * h), predicted, atol=2e-8, rtol=0
         )
+
+
+@pytest.mark.parametrize("occs", [(2, 1), (2, 0), (0, 1)])
+def test_unrestricted_df_orbital_action_against_spin_density(
+    occs: tuple[int, int],
+) -> None:
+    from generativeqc_compiler.mp2.f12_unrestricted_reference import (
+        unrestricted_df_orbital_action,
+    )
+
+    rng = np.random.default_rng(734)
+    n, aux = 7, 11
+    sources = rng.normal(size=(aux, n, n))
+    sources = (sources + sources.swapaxes(1, 2)) / 2
+    coeff = [np.linalg.qr(rng.normal(size=(n, n)))[0] for _ in occs]
+    dms = []
+    inputs = {}
+    for spin, o, c in zip(("alpha", "beta"), occs, coeff, strict=True):
+        ov = c[:, o:].T @ sources @ c[:, :o]
+        x = rng.normal(size=(n - o, o))
+        rot = c[:, o:] @ x @ c[:, :o].T
+        dms.append(rot + rot.T)
+        if o:
+            inputs["vo_" + spin] = ov
+            inputs["oo_" + spin] = c[:, :o].T @ sources @ c[:, :o]
+            inputs["vv_" + spin] = c[:, o:].T @ sources @ c[:, o:]
+            inputs["trial_" + spin] = x
+            inputs["gap_" + spin] = rng.uniform(0.3, 5, x.shape)
+    out = execute(unrestricted_df_orbital_action(*occs, n, aux), inputs).outputs
+    eri = np.einsum("Apq,Ars->pqrs", sources, sources)
+    j = np.einsum("pqrs,rs->pq", eri, sum(dms))
+    for spin, o, c, dm in zip(("alpha", "beta"), occs, coeff, dms, strict=True):
+        if o:
+            k = np.einsum("prsq,rs->pq", eri, dm)
+            expected = (
+                c[:, o:].T @ (j - k) @ c[:, :o]
+                + inputs["gap_" + spin] * inputs["trial_" + spin]
+            )
+            np.testing.assert_allclose(out[spin], expected, atol=2e-13, rtol=0)
