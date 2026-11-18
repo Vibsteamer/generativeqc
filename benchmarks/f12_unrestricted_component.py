@@ -44,7 +44,7 @@ def check(
 
     def unit(value: np.ndarray) -> np.ndarray:
         a = np.asarray(rng.normal(size=value.shape), dtype=np.float64)
-        return a / max(1.0, float(np.linalg.norm(a)))
+        return np.asarray(a / max(1.0, float(np.linalg.norm(a))), dtype=np.float64)
 
     seeds = {k: unit(v) for k, v in reference.items()}
     directions = {k: unit(v) for k, v in inputs.items()}
@@ -57,7 +57,11 @@ def check(
 
     def displaced(t: float) -> float:
         values = run(
-            graph, {k: v + t * directions[k] for k, v in inputs.items()}
+            graph,
+            {
+                k: np.asarray(v + t * directions[k], dtype=np.float64)
+                for k, v in inputs.items()
+            },
         ).outputs
         return sum(float(np.vdot(seeds[k], v)) for k, v in values.items())
 
@@ -75,13 +79,26 @@ def check(
     }
 
 
-def run_cases(directory: Path, run: Callable) -> list[dict[str, Any]]:
+def run_cases(
+    directory: Path,
+    run: Callable,
+    *,
+    pairs_only: bool = False,
+    checkpoint: Callable | None = None,
+) -> list[dict[str, Any]]:
     rows = []
-    for name in ("H_doublet", "NH2_bent_distorted_doublet"):
+
+    def record(row: dict) -> None:
+        rows.append(row)
+        if checkpoint is not None:
+            checkpoint(rows)
+
+    molecules = () if pairs_only else ("H_doublet", "NH2_bent_distorted_doublet")
+    for name in molecules:
         with np.load(directory / (name + ".npz"), allow_pickle=False) as data:
             fields = dict(data)
         graph = unrestricted_extended_df_fock(*map(int, fields["space"]))
-        rows.append(
+        record(
             {
                 "case": name,
                 "component": "extended Fock and exchange",
@@ -101,7 +118,7 @@ def run_cases(directory: Path, run: Callable) -> list[dict[str, Any]]:
             spins = ("alpha", "beta")
             channel = spins[sa] + "_" + spins[sb]
             graph = unrestricted_pair_vx((a, b, c), (d, e, f), channel=channel)
-            rows.append(
+            record(
                 {
                     "case": "NH2_bent_distorted_doublet",
                     "component": "V/X",
@@ -119,14 +136,24 @@ def main() -> None:
     parser.add_argument("--arch", required=True)
     parser.add_argument("--cache", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--pairs-only",
+        action="store_true",
+        help="Run only the five physical NH2 V/X checks.",
+    )
     add_molecular_graph_budget(parser)
     args = parser.parse_args()
     run, metrics = cuda_runner(args.arch, args.cache, max_bytes=args.budget_mib << 20)
-    rows = run_cases(args.fixtures, run)
-    args.output.write_text(
-        json.dumps({"rows": rows, "programs": metrics}, indent=2, allow_nan=False)
-        + "\n"
-    )
+
+    def checkpoint(rows: list[dict]) -> None:
+        temporary = args.output.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps({"rows": rows, "programs": metrics}, indent=2, allow_nan=False)
+            + "\n"
+        )
+        temporary.replace(args.output)
+
+    run_cases(args.fixtures, run, pairs_only=args.pairs_only, checkpoint=checkpoint)
 
 
 if __name__ == "__main__":
