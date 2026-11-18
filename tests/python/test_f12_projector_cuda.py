@@ -158,6 +158,30 @@ class CABSProjectorDevice(unittest.TestCase):
             self.run_kernel(5 * s, 1).kernel, r.kernel / 5, atol=2e-14
         )
 
+    def test_resolved_observable_complement_with_conditioned_obs(self) -> None:
+        # Distorted methane with an F12-D basis has a small projected overlap
+        # eigenvalue despite full retained rank. The inverse-times-block path
+        # amplified its forward error when constructing the normalized columns.
+        rng = np.random.default_rng(441)
+        obs, aux = 20, 32
+        q = np.linalg.qr(rng.normal(size=(obs, obs)))[0]
+        u = np.linalg.qr(rng.normal(size=(aux, aux)))[0]
+        lift = 0.5 * rng.normal(size=(obs, aux))
+        a = (q * np.geomspace(3e-5, 2, obs)) @ q.T
+        a = (a + a.T) / 2
+        t = (u * np.geomspace(1e-5, 1, aux)) @ u.T
+        cross = a @ lift
+        s = np.block([[a, cross], [cross.T, t + cross.T @ lift]])
+        result = self.run_kernel(s, obs, expected_rank=aux, cotangent=s)
+        frame = result.frame
+        np.testing.assert_allclose(
+            frame.T @ (s @ frame), np.eye(aux), atol=2e-9, rtol=0
+        )
+        np.testing.assert_allclose(s[:obs] @ frame, 0, atol=2e-9)
+        assert result.overlap_bar is not None
+        # The seed is fixed to the central S: K((1+h)S)=K(S)/(1+h).
+        self.assertAlmostEqual(float(np.vdot(result.overlap_bar, s)), -aux, delta=2e-6)
+
     def test_rank_and_input_guards(self) -> None:
         s = np.diag([1.0, 0.1, 1.0])
         with self.assertRaisesRegex(RuntimeError, "cutoff guard"):

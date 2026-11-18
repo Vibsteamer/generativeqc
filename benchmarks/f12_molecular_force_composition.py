@@ -29,6 +29,18 @@ from benchmarks.f12_molecular_one_electron_forward import combined_matrices
 from benchmarks.f12_molecular_sink_live import contract_live_weights
 
 
+def full_energy(reference: float, increment: float, ordinary: dict) -> float:
+    """Combine a live HF energy and F12 increment with the matched native MP2 correlation."""
+    if ordinary["backend"] != "cuda" or ordinary["passed"] is not True:
+        raise ValueError("an accepted native DF-MP2 result is required")
+    if abs(reference - ordinary["reference_energy_Eh"]) > 5e-11:
+        raise ValueError("the separately evaluated DF-MP2 has a different RHF energy")
+    energy = reference + increment + ordinary["correlation_energy_Eh"]
+    if not np.isfinite(energy):
+        raise ValueError("nonfinite molecular energy")
+    return float(energy)
+
+
 def full_result(
     reference: F12ReferenceResponse,
     explicit_one: ArrayLike,
@@ -36,8 +48,6 @@ def full_result(
     ordinary: dict,
 ) -> tuple[float, np.ndarray]:
     """Reuse conventional MP2 correlation only. The reference force includes nuclei."""
-    if ordinary["backend"] != "cuda" or ordinary["passed"] is not True:
-        raise ValueError("an accepted native DF-MP2 result is required")
     nref = np.asarray(reference.reference_forces)
     correlation = np.asarray(ordinary["correlation_forces_Eh_per_bohr"])
     terms = (correlation, np.asarray(explicit_one), np.asarray(explicit_two_three))
@@ -47,15 +57,11 @@ def full_result(
         or any(v.shape != nref.shape or not np.isfinite(v).all() for v in terms)
     ):
         raise ValueError("incompatible molecular Cartesian forces")
-    if abs(reference.reference_energy - ordinary["reference_energy_Eh"]) > 5e-11:
-        raise ValueError("the separately evaluated DF-MP2 has a different RHF energy")
-    energy = (
-        reference.reference_energy
-        + reference.increment_energy
-        + ordinary["correlation_energy_Eh"]
+    energy = full_energy(
+        reference.reference_energy, reference.increment_energy, ordinary
     )
     forces = nref + correlation - terms[1] - terms[2]
-    if not np.isfinite(energy) or not np.isfinite(forces).all():
+    if not np.isfinite(forces).all():
         raise ValueError("nonfinite molecular endpoint")
     return float(energy), forces
 
@@ -164,11 +170,39 @@ def calculate_panel(args: Namespace, target: dict) -> dict:
         )
 
     data, topology, forward_cost = geometry_sources(base_xyz)
+    scalar_checkpoint_seconds = None
     with DFReferenceSession(
         args.session_library, args.scf_inputs / (name + "_central.in")
     ) as session:
+
+        def record_energy(increment: float) -> None:
+            nonlocal scalar_checkpoint_seconds
+            reference = float(session.snapshot()["energy"])
+            scalar_checkpoint_seconds = time.monotonic() - begin
+            write_measurement(
+                args.output,
+                {
+                    "case": name,
+                    "passed": False,
+                    "phase": "central_energy_complete",
+                    "total_energy_Eh": full_energy(reference, increment, ordinary),
+                    "reference_energy_Eh": reference,
+                    "increment_Eh": increment,
+                    "ordinary_corr_Eh": ordinary["correlation_energy_Eh"],
+                    "forward_resources": forward_cost,
+                    "graph_gpu_programs": programs,
+                    "conventional_input": target["ordinary_receipt"],
+                    "scalar_checkpoint_seconds": scalar_checkpoint_seconds,
+                },
+            )
+
         obs = molecular_reference_response(
-            session, data, indices, reverse, run, canonical=canonical
+            session,
+            data,
+            indices,
+            partial(reverse, record_energy=record_energy),
+            run,
+            canonical=canonical,
         )
     del data
     explicit = native_contraction(
@@ -190,6 +224,7 @@ def calculate_panel(args: Namespace, target: dict) -> dict:
         "ordinary_corr_Eh": ordinary["correlation_energy_Eh"],
         "total_force_Eh_per_bohr": forces.tolist(),
         "central_seconds": central_seconds,
+        "scalar_checkpoint_seconds": scalar_checkpoint_seconds,
         "forward_resources": forward_cost,
         "displacements": df_checks,
         "forward_input": "native GPU from supplied geometry and explicit contracted shells",

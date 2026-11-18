@@ -39,10 +39,18 @@ def with_frame(data: dict, projector: Callable) -> tuple[dict, Any]:
 
 
 def chain(
-    data: dict, run: Callable, projector: Callable, singles: Callable, *, pullback: bool
+    data: dict,
+    run: Callable,
+    projector: Callable,
+    singles: Callable,
+    *,
+    pullback: bool,
+    record_energy: Callable[[float], None] | None = None,
 ) -> tuple[float, dict, dict]:
     inputs, frame = with_frame(data, projector)
-    energy, bars, _ = evaluate(inputs, run, pullback=pullback, singles=singles)
+    energy, bars, _ = evaluate(
+        inputs, run, pullback=pullback, singles=singles, record_energy=record_energy
+    )
     if not pullback:
         return energy, {}, {}
     permutation = data["ao_permutation"]

@@ -7,6 +7,7 @@
 #include "generated_symmetric_matrix_function.cuh"
 #include "posthf/cabs_cuda_support.cuh"
 #include "posthf/cabs_projector_cuda.hpp"
+#include "solver/cuda/cholesky_provider.hpp"
 
 namespace {
 namespace gpu = generativeqc::runtime;
@@ -99,7 +100,7 @@ void evaluate(int device, int n, int o, double cutoff, double guard, int expecte
   auto resources = solver.view();
   // S (later seed), K, two contraction tiles, eigensystems and the lift.
   std::size_t count = gpu::size_mul(4, nn, "CABS projector arena overflow");
-  for (auto size : {oo, oo, xx, xx, nx, std::size_t(n)})
+  for (auto size : {oo, xx, xx, nx, std::size_t(n)})
     count = gpu::size_add(count, size, "CABS projector arena overflow");
   gpu::OwnedCudaBuffer<double> arena(device, count, stream.get());
   gpu::OwnedCudaBuffer<int> info(device, 2, stream.get());
@@ -108,8 +109,7 @@ void evaluate(int device, int n, int o, double cutoff, double guard, int expecte
   double* tmp = k + nn;
   double* tmp2 = tmp + nn;
   double* a = tmp2 + nn;
-  double* inv_a = a + oo;
-  double* t = inv_a + oo;
+  double* t = a + oo;
   double* inv_t = t + xx;
   double* j = inv_t + xx;
   double* ea = j + nx;
@@ -133,7 +133,12 @@ void evaluate(int device, int n, int o, double cutoff, double guard, int expecte
   eig::SymmetricEigenWorkspace wa{}, wt{};
   solver_check(eig::query_symmetric_eigen(resources, family, {o, 1}, a, ea, wa));
   solver_check(eig::query_symmetric_eigen(resources, family, {x, 1}, t, et, wt));
-  const auto work_bytes = std::max(wa.device_bytes, wt.device_bytes);
+  int cholesky_elements = 0;
+  solver_check(eig::query_lower_cholesky(resources.solver, o, a, cholesky_elements));
+  if (cholesky_elements < 0) throw std::runtime_error("invalid OBS Cholesky workspace");
+  const auto work_bytes = std::max({wa.device_bytes, wt.device_bytes,
+                                    gpu::size_mul(std::size_t(cholesky_elements), sizeof(double),
+                                                  "CABS Cholesky workspace overflow")});
   gpu::OwnedCudaBuffer<unsigned char> workspace;
   if (work_bytes) workspace.allocate(device, work_bytes, stream.get());
   std::vector<unsigned char> host_workspace(std::max(wa.host_bytes, wt.host_bytes));
@@ -166,10 +171,26 @@ void evaluate(int device, int n, int o, double cutoff, double guard, int expecte
   auto obs_spectrum = eigen(o, a, ea);
   if (obs_spectrum.back() <= 0. || obs_spectrum.front() <= guard * obs_spectrum.back())
     throw std::runtime_error("unresolved OBS overlap rank");
-  invert(o, a, ea, 0., inv_a);
-  // J=[-A^-1 D; I], T=B-D^T A^-1 D. OBS directions are preserved exactly.
+  // Solve against A directly. Multiplying a spectral inverse by D can lose
+  // significant digits before the Schur subtraction and frame normalization.
+  block_copy(a, s, o);
+  solver_check(eig::launch_lower_cholesky(resources.solver, o, a,
+                                          reinterpret_cast<double*>(workspace.get()),
+                                          cholesky_elements, info.get() + 1));
+  check_flags(stream, info.get() + 1, 1, "CABS OBS Cholesky factorization failed");
+  auto solve_obs = [&](double* rhs, int cols, int ld_rhs, double scale) {
+    const double one = 1.;
+    blas_check(cublasDtrsm(blas.handle, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N,
+                           CUBLAS_DIAG_NON_UNIT, o, cols, &scale, a, o, rhs, ld_rhs));
+    blas_check(cublasDtrsm(blas.handle, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_T,
+                           CUBLAS_DIAG_NON_UNIT, o, cols, &one, a, o, rhs, ld_rhs));
+  };
+  // J=[-A^-1 D; I], T=B+D^T J_obs. OBS directions are preserved exactly.
   const double* cross = s + std::size_t(o) * n;
-  gemm(false, false, o, x, o, inv_a, o, cross, n, j, n, -1.);
+  cuda_resource_check(cudaMemcpy2DAsync(
+      j, std::size_t(n) * sizeof(double), cross, std::size_t(n) * sizeof(double),
+      std::size_t(o) * sizeof(double), x, cudaMemcpyDeviceToDevice, stream.get()));
+  solve_obs(j, x, n, -1.);
   identity_tail<<<blocks(xx), 256, 0, stream.get()>>>(j, n, o);
   gemm(true, false, x, x, o, cross, n, j, n, t, x, 1., 1.);
   symmetrize<<<blocks(xx), 256, 0, stream.get()>>>(t, x, false, info.get());
@@ -206,9 +227,9 @@ void evaluate(int device, int n, int o, double cutoff, double guard, int expecte
     gemm(false, true, n, n, x, tmp, n, j, n, tmp2, n);
     // bar_S = J G J^T - O U K - K U O, O contains A^-1 in the OBS block.
     gemm(false, false, o, n, n, s, n, k, n, tmp, o);
-    gemm(false, false, o, n, o, inv_a, o, tmp, o, s, o);
-    assemble_response<<<blocks(nn), 256, 0, stream.get()>>>(tmp2, s, n, o, tmp);
-    symmetrize<<<blocks(nn), 256, 0, stream.get()>>>(tmp, n, false, info.get());
+    solve_obs(tmp, n, o, 1.);
+    assemble_response<<<blocks(nn), 256, 0, stream.get()>>>(tmp2, tmp, n, o, s);
+    symmetrize<<<blocks(nn), 256, 0, stream.get()>>>(s, n, false, info.get());
   }
   check_flags(stream, info.get(), 1, "nonfinite CABS projector or overlap response");
   const auto nr = gpu::size_mul(n, kept, "CABS frame size overflow");
@@ -217,7 +238,7 @@ void evaluate(int device, int n, int o, double cutoff, double guard, int expecte
       cudaMemcpyAsync(staged.data(), k, bytes, cudaMemcpyDeviceToHost, stream.get()));
   if (seed)
     cuda_resource_check(
-        cudaMemcpyAsync(staged_bar.data(), tmp, bytes, cudaMemcpyDeviceToHost, stream.get()));
+        cudaMemcpyAsync(staged_bar.data(), s, bytes, cudaMemcpyDeviceToHost, stream.get()));
   // cuSOLVER orders eigenvalues increasingly: the retained columns form a suffix.
   // Reuse contraction tiles only after the optional response copy on this stream.
   normalize_retained_columns<<<blocks(std::size_t(x) * kept), 256, 0, stream.get()>>>(

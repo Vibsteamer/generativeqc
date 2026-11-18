@@ -94,6 +94,7 @@ def evaluate(
     *,
     pullback: bool,
     singles: Callable | None = None,
+    record_energy: Callable[[float], None] | None = None,
 ) -> tuple[float, dict, dict]:
     """Evaluate the F12 increment, optionally composing a native singles action.
 
@@ -172,6 +173,8 @@ def evaluate(
             else:
                 column = i if name.endswith("_i") else j
                 pair_bars[name[:-2]][:, column] += value
+    if record_energy is not None:
+        record_energy(total)
     intermediates = {**mapped, "fit": fitted, **fock_out}
     if not pullback:
         return total, {}, intermediates
