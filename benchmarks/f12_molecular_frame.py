@@ -52,6 +52,7 @@ def chain(
     metric_gram: Callable | None = None,
     full_rank_constraint: bool = False,
     frame_observer: Callable | None = None,
+    molecular_correlation: Callable | None = None,
 ) -> tuple[float, dict, dict]:
     inputs, frame = with_frame(data, projector)
     energy, bars, intermediates = evaluate(
@@ -62,6 +63,7 @@ def chain(
         singles_only=singles_only,
         record_energy=record_energy,
         physical_fock=physical_fock,
+        molecular_correlation=molecular_correlation,
     )
     if not pullback:
         return energy, {}, intermediates["energy_components"]

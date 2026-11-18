@@ -19,9 +19,15 @@ from benchmarks._f12_cuda import cuda_runner
 
 
 def solve_fixed_sources(
-    source: dict, run: Callable, *, source_pullback: bool = False
+    source: dict,
+    run: Callable,
+    *,
+    source_pullback: bool = False,
+    solve_adjoint: bool = True,
 ) -> dict:
     """Use one occupied spatial orbital. The dense conventional tensors are diagnostic-sized."""
+    if source_pullback and not solve_adjoint:
+        raise ValueError("relaxed source cotangents require a converged Lambda")
     obs = source["f"].shape[0]
     if (
         not 2 <= obs <= 24
@@ -176,7 +182,7 @@ def solve_fixed_sources(
     lam = np.zeros_like(packed)
     dual_gaps = np.r_[d1.ravel(), d2[0, 0][upper]]
     dual_history = []
-    for _ in range(90):
+    for _ in range(90 if solve_adjoint else 0):
         derivative, _ = adjoint(lam)
         error = float(np.max(abs(derivative)))
         if not np.isfinite(error):
@@ -186,11 +192,12 @@ def solve_fixed_sources(
             break
         lam += derivative / dual_gaps
     else:
-        raise ValueError(f"CC Lambda solve failed to converge: {dual_history[-1]}")
+        if solve_adjoint:
+            raise ValueError(f"CC Lambda solve failed to converge: {dual_history[-1]}")
     bars = adjoint(lam, all_sources=True)[1] if source_pullback else {}
     return {
         "amplitudes": packed,
-        "lambda": lam,
+        "lambda": lam if solve_adjoint else None,
         "source_cotangents": bars,
         "lambda_residual_history": dual_history,
         "ordered_component_energies_Eh": components.tolist(),

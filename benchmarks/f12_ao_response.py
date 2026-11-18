@@ -98,6 +98,7 @@ def evaluate(
     singles_only: bool = False,
     record_energy: Callable[[float, dict[str, float]], None] | None = None,
     physical_fock: Callable | None = None,
+    molecular_correlation: Callable | None = None,
 ) -> tuple[float, dict, dict]:
     """Evaluate the F12 increment, optionally composing a native singles action.
 
@@ -177,7 +178,25 @@ def evaluate(
             if singles_bar is None or singles_bar.shape != fock_out["fock"].shape:
                 raise ValueError("CABS singles must supply the complete Fock cotangent")
             fock_bars["bar_fock"] += singles_bar
-    pairs = () if singles_only else zip(*np.triu_indices(occ), strict=True)
+    extra_weights = {}
+    correlation_info = {}
+    if molecular_correlation is not None and not singles_only:
+        pair_sum, extra_weights, correlation_info = molecular_correlation(
+            mol, fock_out, data["metric_whitener"], run, pullback=pullback
+        )
+        total += pair_sum
+        if pullback:
+            for key in fock_bars:
+                fock_bars[key] += extra_weights.pop(key.removeprefix("bar_"))
+            for key in pair_bars:
+                pair_bars[key] += extra_weights.pop(key)
+            if set(extra_weights) != {"raw_coulomb_all", "metric"}:
+                raise ValueError("Unexpected molecular correlation source weights")
+    pairs = (
+        ()
+        if singles_only or molecular_correlation is not None
+        else zip(*np.triu_indices(occ), strict=True)
+    )
     for first, second in pairs:
         i, j = int(first), int(second)
         pair = pair_plan(occ, obs - occ, ri - obs, diagonal=i == j, auxiliaries=aux)
@@ -201,7 +220,11 @@ def evaluate(
                 column = i if name.endswith("_i") else j
                 pair_bars[name[:-2]][:, column] += value
     components = {
-        "f12_pair_energy_Eh": pair_sum,
+        **(
+            {"f12_pair_energy_Eh": pair_sum}
+            if not correlation_info
+            else correlation_info
+        ),
         "cabs_singles_energy_Eh": float(singles_energy),
     }
     if record_energy is not None:
@@ -227,6 +250,8 @@ def evaluate(
     raw_bar[:, :occ] += (
         fit_back["three_center_bar"].reshape(aux, occ, ri) + pair_bars["raw_coulomb"]
     )
+    if extra_weights:
+        raw_bar += extra_weights["raw_coulomb_all"]
     seeds = {
         "bar_hcore": fock_back["bar_hcore"],
         "bar_raw_coulomb": raw_bar,
@@ -236,7 +261,7 @@ def evaluate(
         transpose_program(plan, tuple(plan.outputs)).program, {**source, **seeds}
     ).outputs
     result = {key.removeprefix("bar_"): value for key, value in source_back.items()}
-    result["metric"] = fit_back["metric_bar"]
+    result["metric"] = fit_back["metric_bar"] + extra_weights.get("metric", 0.0)
     result.update({"metric_" + op: pair_bars["metric_" + op] for op in operators})
     return total, result, intermediates
 

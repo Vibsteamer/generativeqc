@@ -156,10 +156,25 @@ def calculate_panel(
     *,
     central_component: Callable | None = None,
     full_rank_constraint: bool = False,
+    molecular_correlation: Callable | None = None,
 ) -> dict:
     """Compute and checkpoint central Cartesian E/F and requested native energy displacements."""
     name = target["molecule"]
-    ordinary = target["ordinary"]
+    ordinary = target["ordinary"] if molecular_correlation is None else None
+    if ordinary is None and getattr(args, "component_forces", False):
+        raise ValueError(
+            "MP2 component-force resolution requires the ordinary MP2 route"
+        )
+    conventional = (
+        {
+            "ordinary_corr_Eh": ordinary["correlation_energy_Eh"],
+            "conventional_input": target["ordinary_receipt"],
+        }
+        if ordinary is not None
+        else {
+            "correlation_input": "self-consistent native molecular CC and fixed geminal sources"
+        }
+    )
     spec = target["geometry"]
     lib = ctypes.CDLL(str(args.component_library.resolve()))
     canonical = partial(canonical_frame_seed, library=lib)
@@ -192,6 +207,7 @@ def calculate_panel(
         projector=partial(cabs_projector, library=lib),
         singles=partial(cabs_singles, library=lib, spin_weight=2),
         full_rank_constraint=full_rank_constraint,
+        molecular_correlation=molecular_correlation,
     )
     begin = time.monotonic()
     case = target["combined_basis"]
@@ -316,15 +332,16 @@ def calculate_panel(
                     "case": name,
                     "passed": False,
                     "phase": "central_energy_complete",
-                    "total_energy_Eh": full_energy(reference, increment, ordinary),
+                    "total_energy_Eh": full_energy(reference, increment, ordinary)
+                    if ordinary is not None
+                    else reference + increment,
                     "reference_energy_Eh": reference,
                     "increment_Eh": increment,
                     **components,
-                    "ordinary_corr_Eh": ordinary["correlation_energy_Eh"],
+                    **conventional,
                     "forward_resources": forward_cost,
                     "graph_gpu_programs": programs,
                     "physical_fock_projections": fock_projections,
-                    "conventional_input": target["ordinary_receipt"],
                     "scalar_checkpoint_seconds": scalar_checkpoint_seconds,
                 },
             )
@@ -339,9 +356,19 @@ def calculate_panel(
         )
         explicit, sinks = contract_explicit(obs, singles_only=False)
         obs = obs._replace(explicit_weights={})
-        energy, forces = full_result(
-            obs, explicit.gradient, sinks["gradient_Eh_per_bohr"], ordinary
-        )
+        if ordinary is None:
+            energy = obs.reference_energy + obs.increment_energy
+            one = np.asarray(explicit.gradient)
+            two = np.asarray(sinks["gradient_Eh_per_bohr"])
+            if one.shape != obs.reference_forces.shape or two.shape != one.shape:
+                raise ValueError("incompatible relaxed Cartesian force contributions")
+            forces = obs.reference_forces - one - two
+            if not np.isfinite(energy) or not np.isfinite(forces).all():
+                raise ValueError("nonfinite molecular CC endpoint")
+        else:
+            energy, forces = full_result(
+                obs, explicit.gradient, sinks["gradient_Eh_per_bohr"], ordinary
+            )
         if getattr(args, "component_forces", False):
             tick = time.monotonic()
             single = molecular_reference_response(
@@ -389,17 +416,20 @@ def calculate_panel(
         "increment_Eh": obs.increment_energy,
         **central_components,
         **split_report,
-        "ordinary_corr_Eh": ordinary["correlation_energy_Eh"],
+        **conventional,
         "total_force_Eh_per_bohr": forces.tolist(),
         "central_seconds": central_seconds,
         "scalar_checkpoint_seconds": scalar_checkpoint_seconds,
         "forward_resources": forward_cost,
         "displacements": df_checks,
         "forward_input": "native GPU from supplied geometry and explicit contracted shells",
-        "conventional_input": target["ordinary_receipt"],
         "force_terms": {
             "reference_plus_orbital": obs.reference_forces.tolist(),
-            "ordinary_correlation": ordinary["correlation_forces_Eh_per_bohr"],
+            **(
+                {"ordinary_correlation": ordinary["correlation_forces_Eh_per_bohr"]}
+                if ordinary is not None
+                else {}
+            ),
             "explicit_one_electron_gradient": explicit.gradient.tolist(),
             "explicit_two_three_gradient": sinks["gradient_Eh_per_bohr"],
         },
@@ -408,7 +438,11 @@ def calculate_panel(
         "one_electron_resources": explicit.resources,
         "physical_fock_projections": fock_projections,
         "graph_gpu_programs": programs,
-        "reused_ordinary_central_seconds": ordinary["central_seconds"],
+        **(
+            {"reused_ordinary_central_seconds": ordinary["central_seconds"]}
+            if ordinary is not None
+            else {}
+        ),
     }
     write_measurement(args.output, checkpoint)
     for arm in target["native_displacements"]:
@@ -417,8 +451,13 @@ def calculate_panel(
         h = arm["step"]
         endpoints = []
         signed_components = []
+        arm_energies = (
+            arm["mp2_and_hf_Eh"]
+            if ordinary is not None
+            else [(None, hf) for hf in arm["hf_energies_Eh"]]
+        )
         for sign, filename, (emp2, ehf) in zip(
-            (1, -1), arm["files"], arm["mp2_and_hf_Eh"], strict=True
+            (1, -1), arm["files"], arm_energies, strict=True
         ):
             xyz = base_xyz + sign * h * vector
             atoms = (
@@ -449,16 +488,24 @@ def calculate_panel(
             del moved
             # Archived MP2 totals already include the HF energy at this displaced geometry.
             base_energy = (
-                emp2
-                if arm.get("ordinary_total_only")
-                else snap["energy"] + (emp2 - ehf)
+                snap["energy"]
+                if ordinary is None
+                else (
+                    emp2
+                    if arm.get("ordinary_total_only")
+                    else snap["energy"] + (emp2 - ehf)
+                )
             )
             endpoints.append(float(base_energy + increment))
             signed_components.append(
                 {
                     "sign": sign,
                     "reference_energy_Eh": float(snap["energy"]),
-                    "ordinary_corr_Eh": float(base_energy - snap["energy"]),
+                    **(
+                        {"ordinary_corr_Eh": float(base_energy - snap["energy"])}
+                        if ordinary is not None
+                        else {}
+                    ),
                     "increment_Eh": increment,
                     **components,
                 }
