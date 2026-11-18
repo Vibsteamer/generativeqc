@@ -260,3 +260,37 @@ def projected_same_spin_f12_pair(
             "active_pair": "one unordered pair i<j; either alpha/alpha or beta/beta",
         },
     )
+
+
+def opposite_spin_cusp_source(orbitals: int) -> Program:
+    """Spatial geminal source of an alpha-i/beta-j determinant before applying Qf.
+
+    In the alpha(1), beta(2) sector, the spin-projector ansatz is 1/2 of
+    the symmetric spatial part plus 1/4 of the antisymmetric part. Exchange
+    the spatial orbitals at fixed electron spin. S_ab = C_a.T S_AO C_b
+    converts the exchanged product back into the original spin frames. Its
+    orbital dependence must survive differentiation. The fixed selections are
+    whole-OBS unit vectors, with only occupied external orbitals scheduled.
+    """
+    if type(orbitals) is not int or orbitals < 1:
+        raise ValueError("Positive orbital basis size required")
+    p = Index("p", IndexSpace("obs_alpha", "orbital", orbitals, spin="alpha"))
+    q = Index("q", IndexSpace("obs_beta", "orbital", orbitals, spin="beta"))
+    i = input_tensor(
+        "select_alpha", TensorSpec((p,), role="input", differentiable=False)
+    )
+    j = input_tensor(
+        "select_beta", TensorSpec((q,), role="input", differentiable=False)
+    )
+    sab = _field("cross_overlap", p, q)
+    direct = einsum("p,q->pq", i, j)
+    flipped = einsum("p,q->pq", einsum("pq,q->p", sab, j), einsum("pq,p->q", sab, i))
+    return Program(
+        {
+            "reference": direct,
+            "cusp_source": add(
+                direct, flipped, coefficients=(Fraction(3, 8), Fraction(1, 8))
+            ),
+        },
+        provenance={"method": "opposite-spin SP geminal source in distinct UHF frames"},
+    )

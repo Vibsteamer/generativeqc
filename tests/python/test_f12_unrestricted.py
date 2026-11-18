@@ -216,3 +216,86 @@ def test_molecular_high_spin_pair() -> None:
 
     for h in (3e-4, 1e-4):
         np.testing.assert_allclose(slope, (at(h) - at(-h)) / (2 * h), atol=2e-8, rtol=0)
+
+
+def test_opposite_spin_source_and_orbital_overlap_pullback() -> None:
+    # Form the physical ket in a common spatial basis, using the explicit
+    # singlet/triplet spatial projectors before transforming the two legs.
+    from generativeqc_compiler.mp2.f12_unrestricted import opposite_spin_cusp_source
+
+    rng = np.random.default_rng(53412)
+    n = 6
+    left, right = (np.linalg.qr(rng.normal(size=(n, n)))[0] for _ in range(2))
+    i, j = 1, 3
+    pair = np.outer(left[:, i], right[:, j])
+    sym, antisym = (pair + pair.T) / 2, (pair - pair.T) / 2
+    answers = left.T @ (0.5 * sym + 0.25 * antisym) @ right
+    graph = opposite_spin_cusp_source(n)
+    inputs = {
+        "cross_overlap": left.T @ right,
+        "select_alpha": np.eye(n)[i],
+        "select_beta": np.eye(n)[j],
+    }
+    actual = execute(graph, inputs).outputs
+    np.testing.assert_allclose(actual["cusp_source"], answers, atol=1e-14)
+    seed = rng.normal(size=(n, n))
+    reverse = transpose_program(graph, ("cusp_source",)).program
+    bar = execute(reverse, {**inputs, "bar_cusp_source": seed}).outputs[
+        "bar_cross_overlap"
+    ]
+    direction = rng.normal(size=(n, n))
+
+    def at(t: float) -> float:
+        result = execute(
+            graph, {**inputs, "cross_overlap": inputs["cross_overlap"] + t * direction}
+        ).outputs
+        return float(np.vdot(result["cusp_source"], seed))
+
+    for dt in (3e-4, 1e-4):
+        np.testing.assert_allclose(
+            (at(dt) - at(-dt)) / (2 * dt), np.vdot(bar, direction), atol=2e-10
+        )
+
+
+def test_physical_mixed_pair_against_dense_determinant_space() -> None:
+    from generativeqc_compiler.mp2.f12_opposite_spin import opposite_spin_projected_pair
+
+    path = Path(__file__).parents[1] / "reference_data/f12/psi4_nh2_uhf_mixed_pair.npz"
+    with np.load(path, allow_pickle=False) as data:
+        graph = opposite_spin_projected_pair(*map(int, data["space"]))
+        fields = {
+            k: data[k]
+            for k in data
+            if k not in {"space", "expected_pair", "expected_ump2"}
+        }
+        result = execute(graph, fields).outputs
+        np.testing.assert_allclose(
+            result["ordinary_pair_energy"], data["expected_ump2"], atol=2e-11, rtol=0
+        )
+        np.testing.assert_allclose(
+            result["pair_energy"], data["expected_pair"], atol=3e-10, rtol=0
+        )
+    reverse = transpose_program(graph, ("pair_energy",)).program
+    bar = execute(reverse, {**fields, "bar_pair_energy": np.array(1.0)}).outputs
+    rng = np.random.default_rng(23)
+    dirs = {}
+    for k, v in fields.items():
+        if k.startswith("select"):
+            continue
+        d = rng.normal(size=v.shape)
+        if k.startswith(("fock", "exchange")):
+            d = (d + d.T) / 2
+        dirs[k] = d / max(1.0, np.linalg.norm(d))
+    pred = sum(float(np.vdot(bar["bar_" + k], y)) for k, y in dirs.items())
+
+    def value(t: float) -> float:
+        return float(
+            execute(
+                graph, {**fields, **{k: fields[k] + t * v for k, v in dirs.items()}}
+            ).outputs["pair_energy"]
+        )
+
+    for h in (1e-4, 3e-5):
+        np.testing.assert_allclose(
+            pred, (value(h) - value(-h)) / (2 * h), atol=2e-8, rtol=0
+        )
