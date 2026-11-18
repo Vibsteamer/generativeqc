@@ -13,7 +13,7 @@ from .ecp_grid import emit_ecp_grid_cpp
 from .ecp_policy import emit_ecp_policy_cpp
 from .ecp_schedule import emit_ecp_schedule_cpp
 from .expr import Graph
-from .ir import ECP_MAX_PROJECTOR_ANGULAR, EcpRadialTerm
+from .ir import ECP_MAX_ORBITAL_ANGULAR, ECP_MAX_PROJECTOR_ANGULAR, EcpRadialTerm
 from .scalar_c import ScalarCEmitter
 
 
@@ -142,9 +142,13 @@ def _emit_weighted_consumer() -> typing.Any:
     return lines
 
 
-def emit_ecp_quadrature_cpp() -> typing.Any:
+def emit_ecp_quadrature_cpp(
+    max_orbital_angular: int = ECP_MAX_ORBITAL_ANGULAR,
+) -> str:
     """Emit the validated s/p/d/f projector and powers 0..4 domain.
 
+    The optional AO bound also covers complementary basis functions; the
+    number of physical potential channels is fixed by the operator.
     Type parameters expose only scalar term/node/jet records. They do not
     select a mathematical backend. The same emitted arithmetic is compiled
     as ordinary C++ for independent native tests and as CUDA for production.
@@ -160,7 +164,7 @@ def emit_ecp_quadrature_cpp() -> typing.Any:
         "#else",
         "#define GENERATIVEQC_ECP_INLINE inline",
         "#endif",
-        emit_ecp_ao_cuda()
+        emit_ecp_ao_cuda(max_orbital_angular)
         .replace("#pragma once\n", "")
         .replace("__device__ inline", "GENERATIVEQC_ECP_INLINE"),
         "namespace generativeqc::generated {",
@@ -168,7 +172,7 @@ def emit_ecp_quadrature_cpp() -> typing.Any:
         *emit_ecp_policy_cpp(),
         f"inline constexpr int ecp_max_projector_angular = {ECP_MAX_PROJECTOR_ANGULAR};",
         f"inline constexpr int ecp_projector_count = {(ECP_MAX_PROJECTOR_ANGULAR + 1) ** 2};",
-        *emit_ecp_grid_cpp(),
+        *emit_ecp_grid_cpp(max_orbital_angular),
         *_emit_ao_consumer(),
         *_emit_weighted_consumer(),
         "// Scalar ECP operator contract: local=-1, projectors=0..3, powers=0..4.",
