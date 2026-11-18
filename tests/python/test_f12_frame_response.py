@@ -1,5 +1,7 @@
 """Check invariant frame-to-projector cotangents without choosing an eigenvector gauge."""
 
+from collections.abc import Callable
+
 import numpy as np
 import pytest
 from generativeqc_compiler.mp2.f12_frame_response import frame_kernel_cotangent
@@ -69,3 +71,85 @@ def test_expose_gauge_dependence_and_bad_metric_dual() -> None:
 def test_reject_invalid_frame_dimensions(dimensions: tuple[int, ...]) -> None:
     with pytest.raises(ValueError, match="frame rank"):
         frame_kernel_cotangent(*dimensions)
+
+
+@pytest.mark.parametrize("weak_overlap", [1.0, 2e-8])
+def test_complete_cabs_physical_direction(weak_overlap: float) -> None:
+    from benchmarks.f12_molecular_frame import constraint_weight
+
+    rng = np.random.default_rng(18932)
+    n, o = 13, 6
+    q, _ = np.linalg.qr(rng.normal(size=(n, n)))
+    s = (q * np.geomspace(weak_overlap, 1, n)) @ q.T
+    root = np.linalg.solve(np.linalg.cholesky(s).T, np.eye(n))
+    orbitals, frame = root[:, :o], root[:, o:]
+    u = s @ root[:, -2:]
+    bar = 2 * u @ (u.T @ frame)
+    d = rng.normal(size=(n, n))
+    d = np.linalg.cholesky(s) @ (d + d.T) @ np.linalg.cholesky(s).T
+    weight, _ = constraint_weight(
+        s,
+        orbitals,
+        frame,
+        bar,
+        execute,
+        metric_gram=lambda s, c: np.asarray(
+            c.T.astype(np.longdouble) @ s.astype(np.longdouble) @ c, float
+        ),
+    )
+    analytic = np.vdot(weight, d)
+    solved = np.linalg.solve(s, u)
+    ao = np.linalg.solve(s[:o, :o], u[:o])
+    expected = -np.vdot(solved, d @ solved) + np.vdot(ao, d[:o, :o] @ ao)
+    assert analytic == pytest.approx(expected, rel=2e-8, abs=2e-8)
+    for h in (1e-4, 5e-5):
+
+        def observable(metric: np.ndarray) -> float:
+            return np.vdot(u, np.linalg.solve(metric, u)) - np.vdot(
+                u[:o], np.linalg.solve(metric[:o, :o], u[:o])
+            )
+
+        slope = (observable(s + h * d) - observable(s - h * d)) / (2 * h)
+        assert analytic == pytest.approx(slope, rel=2e-5, abs=2e-5)
+
+
+def test_truncated_space_preserves_projector_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from benchmarks import f12_molecular_frame as molecular
+
+    n, o, r = 6, 2, 3
+    s = np.eye(n)
+    frame = np.eye(n)[:, o : o + r]
+    coeff = np.zeros((n, o + r))
+    coeff[:o, :o] = np.eye(o)
+    grad = np.ones_like(s) / 100
+
+    def projector(
+        overlap: np.ndarray,
+        obs: int,
+        *,
+        expected_rank: int,
+        cotangent: np.ndarray | None = None,
+    ) -> SimpleNamespace:
+        assert expected_rank == r
+        return SimpleNamespace(frame=frame, rank=r, overlap_bar=grad)
+
+    def evaluate(data: dict, run: Callable, **kwargs: object) -> tuple:
+        return 0.5, {"coefficients": data["coefficients"].copy()}, {}
+
+    monkeypatch.setattr(molecular, "evaluate", evaluate)
+    data = {
+        "overlap": s,
+        "coefficients": coeff,
+        "ao_permutation": np.arange(n),
+        "space": [1, o, o + r],
+    }
+    _, original, _ = molecular.chain(data, execute, projector, None, pullback=True)
+    _, optional, _ = molecular.chain(
+        data, execute, projector, None, pullback=True, full_rank_constraint=True
+    )
+    np.testing.assert_array_equal(original["overlap"], grad)
+    np.testing.assert_array_equal(original["overlap"], optional["overlap"])

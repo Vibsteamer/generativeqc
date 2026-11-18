@@ -5,6 +5,7 @@ import ctypes
 import json
 import time
 from argparse import Namespace
+from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 
@@ -22,9 +23,9 @@ from numpy.typing import ArrayLike
 from benchmarks._f12_cuda import add_molecular_graph_budget, cuda_runner
 from benchmarks.df_reference_response import DFReferenceSession
 from benchmarks.f12_cabs_h_batch import CabsHShells
+from benchmarks.f12_molecular_fock import compensated_fock
 from benchmarks.f12_molecular_frame import chain
 from benchmarks.f12_molecular_integral_forward import forward_integrals
-from benchmarks.f12_molecular_fock import compensated_fock
 from benchmarks.f12_molecular_metric import metric_whitener
 from benchmarks.f12_molecular_one_electron import native_contraction
 from benchmarks.f12_molecular_one_electron_forward import combined_matrices
@@ -101,7 +102,9 @@ def endpoint_arguments() -> Namespace:
     return parser.parse_args()
 
 
-def calculate_panel(args: Namespace, target: dict) -> dict:
+def calculate_panel(
+    args: Namespace, target: dict, *, central_component: Callable | None = None
+) -> dict:
     """Compute and checkpoint central Cartesian E/F and requested native energy displacements."""
     name = target["molecule"]
     ordinary = target["ordinary"]
@@ -111,14 +114,14 @@ def calculate_panel(args: Namespace, target: dict) -> dict:
     run, programs = cuda_runner(args.arch, args.cache, max_bytes=args.budget_mib << 20)
     fock_projections = []
 
-    def physical_fock(*sources):
+    def physical_fock(*sources: np.ndarray) -> np.ndarray:
         value, receipt = compensated_fock(
             *sources, library=args.component_library, budget_bytes=args.budget_mib << 20
         )
         fock_projections.append(receipt)
         return value
 
-    def metric_gram(overlap, frame):
+    def metric_gram(overlap: np.ndarray, frame: np.ndarray) -> np.ndarray:
         # The same compensated C.T A C with zero Coulomb and exchange terms.
         columns = frame.shape[1]
         return physical_fock(
@@ -221,6 +224,12 @@ def calculate_panel(args: Namespace, target: dict) -> dict:
     with DFReferenceSession(
         args.session_library, args.scf_inputs / (name + "_central.in")
     ) as session:
+        if central_component is not None:
+            state = session.snapshot()
+            data["coefficients"] = with_reference_orbitals(
+                data["coefficients"], rows, state["coefficients"]
+            )
+            return central_component(data, reverse, programs, forward_cost)
 
         def record_energy(increment: float) -> None:
             nonlocal scalar_checkpoint_seconds

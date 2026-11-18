@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 from generativeqc._f12_cabs import cabs_projector, cabs_singles
+from generativeqc_compiler.mp2.f12_frame_response import full_rank_cabs_cotangent
 
 from benchmarks._f12_cuda import add_molecular_graph_budget, cuda_runner
 from benchmarks.f12_ao_response import evaluate
@@ -48,6 +49,8 @@ def chain(
     record_energy: Callable[[float], None] | None = None,
     physical_fock: Callable | None = None,
     metric_gram: Callable | None = None,
+    full_rank_constraint: bool = False,
+    frame_observer: Callable | None = None,
 ) -> tuple[float, dict, dict]:
     inputs, frame = with_frame(data, projector)
     energy, bars, _ = evaluate(
@@ -63,25 +66,88 @@ def chain(
     permutation = data["ao_permutation"]
     obs = int(data["space"][1])
     overlap = data["overlap"][np.ix_(permutation, permutation)]
-    transferred, checks = bridge(
-        {
-            "overlap": overlap,
-            "frame": frame.frame,
-            "frame_bar": bars["coefficients"][permutation, obs:],
-        },
-        run,
-        metric_gram=metric_gram,
-    )
-    reverse = projector(
-        overlap, obs, expected_rank=frame.rank, cotangent=transferred["kernel_bar"]
-    )
+    orbitals = inputs["coefficients"][permutation, :obs]
+    frame_bar = bars["coefficients"][permutation, obs:]
+    prior = None
+    use_constraint = full_rank_constraint and frame.rank == len(overlap) - obs
+    if not use_constraint or frame_observer is not None:
+        transferred, checks = bridge(
+            {"overlap": overlap, "frame": frame.frame, "frame_bar": frame_bar},
+            run,
+            metric_gram=metric_gram,
+        )
+        prior = projector(
+            overlap, obs, expected_rank=frame.rank, cotangent=transferred["kernel_bar"]
+        ).overlap_bar
+    if use_constraint:
+        result, checks = constraint_weight(
+            overlap, orbitals, frame.frame, frame_bar, run, metric_gram=metric_gram
+        )
+    else:
+        result = prior
+    if frame_observer is not None:
+        frame_observer(overlap, orbitals, frame.frame, frame_bar, prior, result, checks)
     overlap_bar = np.zeros_like(overlap)
-    overlap_bar[np.ix_(permutation, permutation)] = reverse.overlap_bar
+    overlap_bar[np.ix_(permutation, permutation)] = result
     bars["overlap"] = overlap_bar
     # The OBS cotangent remains for SCF response; the CABS cotangent has now
     # been consumed by the projector. Do not pass it to the SCF owner again.
     bars["coefficients"] = bars["coefficients"][:, :obs]
     return energy, bars, checks
+
+
+def constraint_weight(
+    overlap: np.ndarray,
+    orbitals: np.ndarray,
+    frame: np.ndarray,
+    frame_bar: np.ndarray,
+    run: Callable,
+    *,
+    metric_gram: Callable | None,
+) -> tuple[np.ndarray, dict]:
+    """Evaluate the full-rank diagnostic with a physical orthogonality check."""
+    n, obs = orbitals.shape
+    if (
+        frame.shape != (n, n - obs)
+        or frame_bar.shape != frame.shape
+        or np.any(orbitals[obs:] != 0)
+    ):
+        raise ValueError(
+            "Direct constraint requires a complete complement and an embedded orbital basis"
+        )
+    if metric_gram is None:
+        raise ValueError(
+            "Direct constraint requires a checked physical metric projection"
+        )
+    combined = np.column_stack((orbitals, frame))
+    gram = metric_gram(overlap, combined)
+    dual_residual = float(np.max(np.abs(gram - np.eye(n))))
+    if not np.isfinite(dual_residual) or dual_residual >= 2e-9:
+        raise ValueError(f"Invalid full metric frame: {dual_residual}")
+    result = run(
+        full_rank_cabs_cotangent(n, obs),
+        {"orbital_frame": orbitals, "frame": frame, "frame_bar": frame_bar},
+    ).outputs
+    skew = float(
+        np.linalg.norm(result["gauge_skew"])
+        / max(1.0, np.linalg.norm(frame.T @ frame_bar))
+    )
+    weight = result["overlap_bar"]
+    symmetric = float(
+        np.linalg.norm(weight - weight.T) / max(1.0, np.linalg.norm(weight))
+    )
+    if (
+        not np.isfinite(weight).all()
+        or not np.isfinite(skew)
+        or skew >= 2e-9
+        or symmetric >= 2e-9
+    ):
+        raise ValueError("Invalid invariant full-rank CABS cotangent")
+    return weight, {
+        "metric_dual": dual_residual,
+        "gauge_relative": skew,
+        "relative_weight_asymmetry": symmetric,
+    }
 
 
 def check(
