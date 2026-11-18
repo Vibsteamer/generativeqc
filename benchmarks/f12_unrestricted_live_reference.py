@@ -2,6 +2,7 @@
 
 import argparse
 import ctypes
+import hashlib
 import json
 import subprocess
 import tempfile
@@ -20,25 +21,35 @@ from benchmarks.f12_molecular_metric import metric_whitener
 
 
 def evaluate(
-    directory: Path, snap: dict, run: Callable, singles: Callable, whiten: Callable
+    directory: Path,
+    snap: dict,
+    run: Callable,
+    singles: Callable,
+    whiten: Callable,
+    *,
+    geometry_sources: Callable | None = None,
 ) -> list[dict]:
     ref = json.loads((directory / "reference.json").read_bytes())
     space = tuple(ref["space"])
     na, nb, obs, ext, aux = space
     if tuple(snap["occupations"]) != (na, nb) or snap["nbf"] != obs:
         raise ValueError("The live UHF spin occupations or orbital space changed")
-    with np.load(directory / "operator_input.npz", allow_pickle=False) as stored:
-        ao = dict(stored)
+    provider = None
+    if geometry_sources is None:
+        with np.load(directory / "operator_input.npz", allow_pickle=False) as stored:
+            ao = dict(stored)
+        with np.load(directory / "orbital_frame.npz", allow_pickle=False) as f:
+            embedding = f["embedding"]
+            complement = f["cabs"]
+            order = f["native_to_psi"]
+            so = f["overlap_obs"][np.ix_(order, order)]
+            hcore = f["hcore_obs"][np.ix_(order, order)]
+    else:
+        ao, embedding, complement, order, so, hcore, provider = geometry_sources(space)
     if any(k.startswith("coefficients_") or k == "metric_whitener" for k in ao):
         raise ValueError(
             "Unexpected precomputed spin orbitals or metric inverse in the live qualification"
         )
-    with np.load(directory / "orbital_frame.npz", allow_pickle=False) as f:
-        embedding = f["embedding"]
-        complement = f["cabs"]
-        order = f["native_to_psi"]
-        so = f["overlap_obs"][np.ix_(order, order)]
-        hcore = f["hcore_obs"][np.ix_(order, order)]
     if not np.array_equal(np.sort(order), np.arange(obs)):
         raise ValueError("Invalid AO ordering map")
     overlap = np.asarray(snap["overlap"]).reshape(obs, obs)
@@ -129,10 +140,17 @@ def evaluate(
         raise ValueError(
             f"Live reference or molecular energy qualification failed {diffs}, force={err}"
         )
+    scope = (
+        "Native live DF-UHF and 36-pair UMP2-F12 energy from geometry and contracted "
+        "Gaussian shells; native geometric CABS and UHF analytical forces."
+        if provider is not None
+        else "native live DF-UHF reference and 36-pair UMP2-F12 energy from supplied combined AO integrals, integral-only CABS subspace and metric. UHF reference analytical forces, correlation forces not taken in this test."
+    )
     return [
         {
             "case": "NH2_D_f12",
-            "scope": "native live DF-UHF reference and 36-pair UMP2-F12 energy from supplied combined AO integrals, integral-only CABS subspace and metric. UHF reference analytical forces, correlation forces not taken in this test.",
+            "scope": scope,
+            **({"gaussian_provider": provider} if provider is not None else {}),
             "reference_backend": snap["backend"],
             "reference_iterations": snap["iterations"],
             "spin_square": ss,
@@ -161,8 +179,51 @@ def main() -> None:
     parser.add_argument("--arch", required=True)
     parser.add_argument("--cache", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--save-reference", type=Path, help="Save the qualified live CUDA UHF snapshot"
+    )
+    parser.add_argument(
+        "--save-gaussian-frame",
+        type=Path,
+        help="Save the qualified native geometric CABS, combined overlap and OBS mapping as NPZ",
+    )
+    parser.add_argument(
+        "--gaussian-layout", type=Path, help="Contracted-shell integral layout NPZ"
+    )
+    parser.add_argument(
+        "--gaussian-science", type=Path, help="Nuclear geometry and shell mapping JSON"
+    )
+    parser.add_argument(
+        "--sink-library",
+        type=Path,
+        help="Native CUDA two-/three-center integral library",
+    )
+    parser.add_argument(
+        "--one-electron-library", type=Path, help="Native combined-basis S/Hcore bridge"
+    )
     add_molecular_graph_budget(parser)
     a = parser.parse_args()
+    gaussian = (
+        a.gaussian_layout,
+        a.gaussian_science,
+        a.sink_library,
+        a.one_electron_library,
+    )
+    if any(gaussian) and not all(gaussian):
+        parser.error(
+            "Gaussian mode requires --gaussian-layout, --gaussian-science, --sink-library and --one-electron-library"
+        )
+    if a.save_gaussian_frame and not all(gaussian):
+        parser.error("--save-gaussian-frame requires Gaussian mode")
+    destinations = [
+        path.resolve()
+        for path in (a.output, a.save_reference, a.save_gaussian_frame)
+        if path is not None
+    ]
+    if len(set(destinations)) != len(destinations):
+        parser.error(
+            "Measurement, reference and Gaussian frame output paths must be distinct"
+        )
     with tempfile.TemporaryDirectory() as tmp:
         snap = Path(tmp) / "physical.json"
         subprocess.run(
@@ -174,17 +235,45 @@ def main() -> None:
             ],
             check=True,
         )
-        obs = json.loads(snap.read_bytes())
+        snapshot_bytes = snap.read_bytes()
+        obs = json.loads(snapshot_bytes)
     if obs["backend"] != "cuda":
         raise RuntimeError("Reference was not on the CUDA DF-JK route")
     run, metrics = cuda_runner(a.arch, a.cache, max_bytes=a.budget_mib << 20)
+    component = ctypes.CDLL(a.component_library)
+    geometry_sources = None
+    frame_output = {} if a.save_gaussian_frame else None
+    if all(gaussian):
+        from benchmarks.f12_unrestricted_gaussian import gaussian_sources
+
+        geometry_sources = partial(
+            gaussian_sources,
+            science_path=a.gaussian_science,
+            layout_path=a.gaussian_layout,
+            snapshot_input=a.fixtures / "nh2.in",
+            sink_library=a.sink_library,
+            one_electron_library=a.one_electron_library,
+            component_library=component,
+            budget_mib=a.budget_mib,
+            frame_output=frame_output,
+        )
     rows = evaluate(
         a.fixtures,
         obs,
         run,
-        partial(cabs_singles, library=ctypes.CDLL(a.component_library)),
+        partial(cabs_singles, library=component),
         partial(metric_whitener, library=a.component_library),
+        geometry_sources=geometry_sources,
     )
+    if a.save_reference:
+        a.save_reference.write_bytes(snapshot_bytes)
+    if frame_output is not None:
+        with a.save_gaussian_frame.open("wb") as output:
+            np.savez_compressed(
+                output,
+                snapshot_sha256=np.asarray(hashlib.sha256(snapshot_bytes).hexdigest()),
+                **frame_output,
+            )
     a.output.write_text(
         json.dumps({"rows": rows, "programs": metrics}, indent=2, allow_nan=False)
         + "\n"
