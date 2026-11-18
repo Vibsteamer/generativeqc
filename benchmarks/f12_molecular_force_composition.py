@@ -157,10 +157,23 @@ def calculate_panel(
     central_component: Callable | None = None,
     full_rank_constraint: bool = False,
     molecular_correlation: Callable | None = None,
+    reference_singles_only: bool = False,
 ) -> dict:
     """Compute and checkpoint central Cartesian E/F and requested native energy displacements."""
     name = target["molecule"]
-    ordinary = target["ordinary"] if molecular_correlation is None else None
+    if reference_singles_only and (
+        molecular_correlation
+        or central_component
+        or getattr(args, "component_forces", False)
+    ):
+        raise ValueError(
+            "standalone HF+CABS response requires its own molecular calculation"
+        )
+    ordinary = (
+        target["ordinary"]
+        if molecular_correlation is None and not reference_singles_only
+        else None
+    )
     if ordinary is None and getattr(args, "component_forces", False):
         raise ValueError(
             "MP2 component-force resolution requires the ordinary MP2 route"
@@ -173,6 +186,8 @@ def calculate_panel(
         if ordinary is not None
         else {
             "correlation_input": "self-consistent native molecular CC and fixed geminal sources"
+            if not reference_singles_only
+            else "native reference and CABS singles only"
         }
     )
     spec = target["geometry"]
@@ -208,6 +223,7 @@ def calculate_panel(
         singles=partial(cabs_singles, library=lib, spin_weight=2),
         full_rank_constraint=full_rank_constraint,
         molecular_correlation=molecular_correlation,
+        singles_only=reference_singles_only,
     )
     begin = time.monotonic()
     case = target["combined_basis"]
@@ -247,9 +263,14 @@ def calculate_panel(
             "manifest": np.asarray(json.dumps({**meta, "geometry_bohr": geometry})),
         }
         tensors, costs = forward_integrals(
-            topology, args.sink_library, budget_mib=args.budget_mib
+            topology,
+            args.sink_library,
+            budget_mib=args.budget_mib,
+            coulomb_only=reference_singles_only,
         )
-        if len(costs) != 10 or any(rec["device_bytes"] <= 0 for rec in costs.values()):
+        if len(costs) != (2 if reference_singles_only else 10) or any(
+            rec["device_bytes"] <= 0 for rec in costs.values()
+        ):
             raise ValueError("missing GPU integral source")
         factor, whitening = metric_whitener(tensors["metric"], args.component_library)
         frame_case = {**case, "coordinates_bohr": geometry}
@@ -354,7 +375,7 @@ def calculate_panel(
             run,
             canonical=canonical,
         )
-        explicit, sinks = contract_explicit(obs, singles_only=False)
+        explicit, sinks = contract_explicit(obs, singles_only=reference_singles_only)
         obs = obs._replace(explicit_weights={})
         if ordinary is None:
             energy = obs.reference_energy + obs.increment_energy
