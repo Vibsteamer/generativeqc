@@ -4,6 +4,7 @@ import argparse
 import ctypes
 import json
 import time
+from argparse import Namespace
 from functools import partial
 from pathlib import Path
 
@@ -59,7 +60,21 @@ def full_result(
     return float(energy), forces
 
 
-def main() -> None:
+def _numpy_scalar(value: object) -> object:
+    if isinstance(value, (np.bool_, np.integer, np.floating)):
+        return value.item()
+    raise TypeError(f"unsupported molecular result field: {type(value).__name__}")
+
+
+def write_measurement(path: Path, result: dict) -> None:
+    """Serialize before replacing the previous numerical checkpoint."""
+    payload = json.dumps(result, default=_numpy_scalar, indent=2, allow_nan=False)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(payload + "\n")
+    tmp.replace(path)
+
+
+def endpoint_arguments() -> Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     for option in (
         "scf-inputs",
@@ -74,8 +89,11 @@ def main() -> None:
         parser.add_argument("--" + option, required=True, type=Path)
     parser.add_argument("--arch", required=True)
     add_molecular_graph_budget(parser)
-    args = parser.parse_args()
-    target = json.loads(args.panel.read_bytes())
+    return parser.parse_args()
+
+
+def calculate_panel(args: Namespace, target: dict) -> dict:
+    """Compute and checkpoint central Cartesian E/F and requested native energy displacements."""
     name = target["molecule"]
     ordinary = target["ordinary"]
     spec = target["geometry"]
@@ -161,21 +179,36 @@ def main() -> None:
         obs, explicit.gradient, sinks["gradient_Eh_per_bohr"], ordinary
     )
     central_seconds = time.monotonic() - begin
-    orbital_energy = obs.increment_energy
     df_checks = []
     checkpoint = {
         "case": name,
         "passed": False,
         "phase": "central_complete",
         "total_energy_Eh": energy,
-        "increment_Eh": orbital_energy,
+        "reference_energy_Eh": obs.reference_energy,
+        "increment_Eh": obs.increment_energy,
+        "ordinary_corr_Eh": ordinary["correlation_energy_Eh"],
         "total_force_Eh_per_bohr": forces.tolist(),
         "central_seconds": central_seconds,
         "forward_resources": forward_cost,
         "displacements": df_checks,
+        "forward_input": "native GPU from supplied geometry and explicit contracted shells",
+        "conventional_input": target["ordinary_receipt"],
+        "force_terms": {
+            "reference_plus_orbital": obs.reference_forces.tolist(),
+            "ordinary_correlation": ordinary["correlation_forces_Eh_per_bohr"],
+            "explicit_one_electron_gradient": explicit.gradient.tolist(),
+            "explicit_two_three_gradient": sinks["gradient_Eh_per_bohr"],
+        },
+        "integral_gradients": sinks,
+        "orbital_response": obs.diagnostics,
+        "one_electron_resources": explicit.resources,
+        "graph_gpu_programs": programs,
+        "reused_ordinary_central_seconds": ordinary["central_seconds"],
     }
-    args.output.write_text(json.dumps(checkpoint, indent=2, allow_nan=False) + "\n")
+    write_measurement(args.output, checkpoint)
     for arm in target["native_displacements"]:
+        tick = time.monotonic()
         vector = np.array(arm["direction"])
         h = arm["step"]
         endpoints = []
@@ -209,20 +242,61 @@ def main() -> None:
                 )
                 increment = reverse(moved, pullback=False)[0]
             del moved
-            endpoints.append(float(snap["energy"] + (emp2 - ehf) + increment))
+            # Archived MP2 totals already include the HF energy at this displaced geometry.
+            base_energy = (
+                emp2
+                if arm.get("ordinary_total_only")
+                else snap["energy"] + (emp2 - ehf)
+            )
+            endpoints.append(float(base_energy + increment))
         error = abs(-(endpoints[0] - endpoints[1]) / (2 * h) - np.vdot(forces, vector))
         df_checks.append(
             {
                 "direction": arm["name"],
                 "step_bohr": h,
                 "energies_Eh": endpoints,
+                "seconds": time.monotonic() - tick,
                 "max_error_Eh_per_bohr": error,
             }
         )
-        args.output.write_text(json.dumps(checkpoint, indent=2, allow_nan=False) + "\n")
+        write_measurement(args.output, checkpoint)
+    checkpoint["native_directional_checks"] = checkpoint.pop("displacements")
+    checkpoint["composition_seconds"] = time.monotonic() - begin
+    return checkpoint
+
+
+def common_checks(result: dict, target: dict) -> dict:
+    programs = result["graph_gpu_programs"]
+    sinks = result["integral_gradients"]
+    forces = np.asarray(result["total_force_Eh_per_bohr"])
+    translation = float(np.max(np.abs(forces.sum(axis=0))))
+    torque = float(
+        np.max(
+            np.abs(np.cross(target["geometry"]["geometry_bohr"], forces).sum(axis=0))
+        )
+    )
+    result.update(net_force_max_Eh_per_bohr=translation, torque_max_Eh=torque)
+    return {
+        "physical_cuda": bool(programs)
+        and all(p["backend"] == "cuda-fp64-ordinary-stream" for p in programs)
+        and sinks["backend"] == "cuda_fp64"
+        and sinks["max_device_bytes"] > 0
+        and result["one_electron_resources"]["device_bytes"] > 0
+        and result["orbital_response"]["canonical_bytes"] > 0,
+        "orbital_response": result["orbital_response"]["orbital_residual"] <= 1e-8,
+        "translation": translation <= 2e-7,
+        "torque": torque <= 2e-6,
+    }
+
+
+def main() -> None:
+    args = endpoint_arguments()
+    target = json.loads(args.panel.read_bytes())
+    report = calculate_panel(args, target)
+    forces = np.asarray(report["total_force_Eh_per_bohr"])
     oracle = target["stock"]
-    de = abs(energy - oracle["energy_Eh"])
-    inc_error = abs(obs.increment_energy - oracle["increment_energy_Eh"])
+    de = abs(report["total_energy_Eh"] - oracle["energy_Eh"])
+    inc_error = abs(report["increment_Eh"] - oracle["increment_energy_Eh"])
     legacy = [
         float(np.max(np.abs(forces - values)))
         for values in oracle["cartesian_forces_Eh_per_bohr"]
@@ -234,63 +308,30 @@ def main() -> None:
     component_error = float(
         np.max(np.abs(forces - np.asarray(target["analytic_reference_force"])))
     )
-    translation = float(np.max(np.abs(forces.sum(axis=0))))
-    torque = float(np.max(np.abs(np.cross(spec["geometry_bohr"], forces).sum(axis=0))))
-    compute = time.monotonic() - begin
+    df_checks = report["native_directional_checks"]
+    sinks = report["integral_gradients"]
     checks = {
+        **common_checks(report, target),
         "native_two_step_derivatives": len(df_checks) == 4
         and max(r["max_error_Eh_per_bohr"] for r in df_checks) <= 2e-6,
-        "physical_cuda": bool(programs)
-        and all(p["backend"] == "cuda-fp64-ordinary-stream" for p in programs)
-        and sinks["backend"] == "cuda_fp64"
-        and sinks["max_device_bytes"] > 0
-        and explicit.resources["device_bytes"] > 0
-        and obs.diagnostics["canonical_bytes"] > 0,
-        "orbital_response": obs.diagnostics["orbital_residual"] <= 1e-8,
         "physical_increment_energy": inc_error <= 5e-11,
         "total_energy": de <= 5e-11,
         "original_stock_cartesian_forces": len(legacy) == 2 and max(legacy) <= 2e-6,
         "analytic_components": component_error <= 2e-6,
-        "translation": translation <= 2e-7,
-        "torque": torque <= 2e-6,
         "integral_channels": len(sinks["rows"]) == 10
         and sinks["passes_central_channel_references"],
     }
-    report = {
-        "case": name,
-        "passed": all(checks.values()),
-        "checks": checks,
-        "forward_input": "native GPU from supplied geometry and explicit contracted shells",
-        "forward_resources": forward_cost,
-        "central_seconds": central_seconds,
-        "native_directional_checks": df_checks,
-        "conventional_input": target["ordinary_receipt"],
-        "total_energy_Eh": energy,
-        "total_force_Eh_per_bohr": forces.tolist(),
-        "reference_energy_Eh": obs.reference_energy,
-        "increment_Eh": obs.increment_energy,
-        "ordinary_corr_Eh": ordinary["correlation_energy_Eh"],
-        "force_terms": {
-            "reference_plus_orbital": obs.reference_forces.tolist(),
-            "ordinary_correlation": ordinary["correlation_forces_Eh_per_bohr"],
-            "explicit_one_electron_gradient": explicit.gradient.tolist(),
-            "explicit_two_three_gradient": sinks["gradient_Eh_per_bohr"],
-        },
-        "total_energy_error_Eh": de,
-        "increment_error_Eh": inc_error,
-        "stock_cartesian_max_errors_Eh_per_bohr": legacy,
-        "additional_stencil_errors_Eh_per_bohr": supplementary,
-        "independent_analytic_force_max_error_Eh_per_bohr": component_error,
-        "net_force_max_Eh_per_bohr": translation,
-        "torque_max_Eh": torque,
-        "integral_gradients": sinks,
-        "orbital_response": obs.diagnostics,
-        "one_electron_resources": explicit.resources,
-        "graph_gpu_programs": programs,
-        "composition_seconds": compute,
-        "reused_ordinary_central_seconds": ordinary["central_seconds"],
-    }
-    args.output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+    report.update(
+        phase="complete",
+        passed=all(checks.values()),
+        checks=checks,
+        total_energy_error_Eh=de,
+        increment_error_Eh=inc_error,
+        stock_cartesian_max_errors_Eh_per_bohr=legacy,
+        additional_stencil_errors_Eh_per_bohr=supplementary,
+        independent_analytic_force_max_error_Eh_per_bohr=component_error,
+    )
+    write_measurement(args.output, report)
     if not report["passed"]:
         raise SystemExit("molecular closure requires review, full results retained")
 

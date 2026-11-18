@@ -8,7 +8,14 @@ from pathlib import Path
 
 import numpy as np
 
-from benchmarks.f12_molecular_sink_test import _OPCODES, bind, contract
+from benchmarks.f12_molecular_sink_test import (
+    _OPCODES,
+    _TRANSLATION_TOLERANCE,
+    bind,
+    channel_name,
+    compare_reference,
+    contract_geometry,
+)
 
 
 class ShellProjection:
@@ -48,6 +55,30 @@ class ShellProjection:
                 raise ValueError(
                     "spherical row map must be bijective within each basis"
                 )
+        # Prove coverage even for a production geometry without a fixed reference.
+        # Triangular keys identify either orientation of the same symmetric shell pair.
+        naux_shells = len(angular) - orbital_shells
+        pair_basis = naux_shells if ncenters == 2 else orbital_shells
+        triangular = pair_basis * (pair_basis + 1) // 2
+        expected = triangular if ncenters == 2 else naux_shells * triangular
+        if len(self.blocks) != expected:
+            raise ValueError("incomplete shell enumeration")
+        pairs = self.blocks[:, :2].astype(np.int64)
+        if ncenters == 2:
+            pairs -= orbital_shells
+        if np.any(pairs < 0) or np.any(pairs >= pair_basis):
+            raise ValueError("shell pair is outside its basis")
+        upper = pairs.max(axis=1)
+        keys = upper * (upper + 1) // 2 + pairs.min(axis=1)
+        if ncenters == 3:
+            auxiliary = self.blocks[:, 2].astype(np.int64) - orbital_shells
+            if np.any(auxiliary < 0):
+                raise ValueError(
+                    "three-center shell block is missing its auxiliary shell"
+                )
+            keys += triangular * auxiliary
+        if len(np.unique(keys)) != expected:
+            raise ValueError("duplicate shell blocks")
         self.transforms = {l: layout[f"transform_{l}"] for l in np.unique(angular)}
         angulars = angular[self.blocks]
         cart_sizes = np.prod((angulars + 1) * (angulars + 2) // 2, axis=1)
@@ -152,17 +183,26 @@ def contract_live_weights(
 ) -> dict:
     """Run each channel on the supplied AO adjoints and sum its nuclear gradient.
 
-    The layout has geometry, shells, and independently checked channel references
-    for these central molecules. It contains no stored molecular adjoints. The
-    frozen-reference errors are diagnostics when callers deliberately change the
-    adjoints. Only CPU shape transforms and per-atom shell reductions surround
-    the compiled integral kernels.
+    Geometry-only and reference-bearing layouts use the same native contraction.
+    Independent errors are available when the manifest contains all ten central
+    channel references. CPU shape transforms and per-atom shell reductions
+    surround the compiled integral kernels.
     """
     if not 0 < budget_mib <= (2**64 - 1) >> 20:
         raise ValueError("invalid molecular sink budget")
     start = time.monotonic()
     metadata = json.loads(str(layout["manifest"]))
-    channels = set(metadata["channels"])
+    channels = {
+        channel_name(group, op) for group in ("metric", "ao") for op in _OPCODES
+    }
+    references = metadata.get("channels")
+    if references is not None and (
+        not isinstance(references, dict) or set(references) != channels
+    ):
+        raise ValueError("partial or unexpected central channel reference set")
+    labels = metadata.get("integral_channels")
+    if labels is not None and (len(labels) != len(channels) or set(labels) != channels):
+        raise ValueError("partial or unexpected declared integral channels")
     if set(explicit_weights) - {"overlap", "hcore_ao"} != channels:
         raise ValueError(
             "the explicit adjoint set must contain all ten integral channels"
@@ -177,15 +217,11 @@ def contract_live_weights(
     for group in ("metric", "ao"):
         projection = ShellProjection(topology, group)
         for operator in _OPCODES:
-            label = (
-                group
-                if group == "metric" and operator == "coulomb"
-                else group + "_" + operator
-            )
+            label = channel_name(group, operator)
             pack_start = time.monotonic()
             weights = projection.pack(explicit_weights[label])
             pack_seconds = time.monotonic() - pack_start
-            _, row = contract(
+            _, row = contract_geometry(
                 {**topology, "weights_" + label: weights},
                 metadata,
                 functions,
@@ -194,8 +230,15 @@ def contract_live_weights(
                 budget_mib << 20,
                 host_reference,
             )
+            if references is not None:
+                row = compare_reference(label, row, references[label])
+            else:
+                row = {**row, "reference_status": "unavailable", "passed": None}
             total += row["gradient_Eh_per_bohr"]
             rows[label] = {**row, "host_packing_seconds": pack_seconds}
+    if not np.isfinite(total).all():
+        raise ValueError("non-finite total explicit integral gradient")
+    residual = float(abs(total.sum(axis=0)).max())
     return {
         "case": metadata["case"],
         "backend": "host_reference_fp64" if host_reference else "cuda_fp64",
@@ -203,9 +246,15 @@ def contract_live_weights(
         "gradient_Eh_per_bohr": total.tolist(),
         "max_device_bytes": max(row["device_bytes"] for row in rows.values()),
         "seconds": time.monotonic() - start,
-        "passes_central_channel_references": all(
-            row["passed"] for row in rows.values()
+        "max_translation_residual_Eh_per_bohr": residual,
+        "passes_contraction_checks": bool(
+            all(row["contraction_checks_passed"] for row in rows.values())
+            and residual <= _TRANSLATION_TOLERANCE
         ),
+        "reference_channel_count": len(references) if references is not None else 0,
+        "passes_central_channel_references": all(row["passed"] for row in rows.values())
+        if references is not None
+        else None,
     }
 
 
@@ -228,7 +277,11 @@ def main() -> None:
             coulomb_library=args.coulomb_library,
         )
     args.output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
-    if not report["passes_central_channel_references"]:
+    if not report["passes_contraction_checks"]:
+        raise SystemExit(
+            "molecular channel contraction exceeded its numerical or resource gate"
+        )
+    if report["passes_central_channel_references"] is False:
         raise SystemExit(
             "central molecular weights disagree with independent reference"
         )

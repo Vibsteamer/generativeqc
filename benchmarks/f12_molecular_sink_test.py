@@ -62,7 +62,17 @@ def bind(library: Path, kernel: str, host_reference: bool) -> Callable:
     return function
 
 
-def contract(
+def channel_name(group: str, operator: str) -> str:
+    if operator not in _OPCODES or group not in ("metric", "ao"):
+        raise ValueError(f"unknown integral channel {group}/{operator}")
+    return (
+        "metric"
+        if group == "metric" and operator == "coulomb"
+        else group + "_" + operator
+    )
+
+
+def contract_geometry(
     fixture: Mapping[str, np.ndarray],
     manifest: dict,
     functions: Mapping[str, Callable],
@@ -71,10 +81,8 @@ def contract(
     budget: int,
     host_reference: bool,
 ) -> tuple[str, dict]:
-    label = (
-        group if group == "metric" and operator == "coulomb" else group + "_" + operator
-    )
-    reference = manifest["channels"][label]
+    """Execute one physical AO channel from shells, centers and Cartesian adjoints."""
+    label = channel_name(group, operator)
     t0 = time.monotonic()
     blocks = fixture[group + "_blocks"]
     offsets = fixture[group + "_offsets"]
@@ -86,13 +94,22 @@ def contract(
     natoms = len(manifest["elements"])
     nblocks, ncenter = blocks.shape
     if (
-        nblocks != reference["shell_blocks"]
-        or len(weights) != reference["cartesian_weights"]
+        offsets.shape != (nblocks + 1,)
+        or offsets[0] != 0
+        or offsets[-1] != len(weights)
     ):
-        raise ValueError(f"incomplete shell blocks for {label}")
+        raise ValueError(f"incomplete Cartesian shell offsets for {label}")
     if ncenter != (2 if group == "metric" else 3):
         raise ValueError(f"invalid number of shell centers for {label}")
-    if not np.array_equal(np.asarray(manifest["geometry_bohr"])[atom], centers):
+    geometry = np.asarray(manifest["geometry_bohr"])
+    if (
+        geometry.shape != (natoms, 3)
+        or not np.isfinite(geometry).all()
+        or atom.shape != (len(angular),)
+        or np.any(atom < 0)
+        or np.any(atom >= natoms)
+        or not np.array_equal(geometry[atom], centers)
+    ):
         raise ValueError("inconsistent shell and atom geometry")
     output = np.full((nblocks, 10), np.nan)
     size = ct.c_uint64()
@@ -131,25 +148,17 @@ def contract(
     for j, start in enumerate(xyz_offsets):
         np.add.at(gradient, atom[blocks[:, j]], output[:, start : start + 3])
     value = float(output[:, 0].sum())
-    value_error = abs(value - reference["weighted_value_Eh"])
-    target = np.asarray(reference["gradient_Eh_per_bohr"])
-    if target.shape != gradient.shape or not np.isfinite(target).all():
-        raise ValueError(f"invalid independent reference for {label}")
-    gradient_error = float(np.max(np.abs(gradient - target)))
+    if not np.isfinite(value) or not np.isfinite(gradient).all():
+        raise ValueError(f"non-finite molecular value or gradient for {label}")
     translation = float(np.max(np.abs(gradient.sum(axis=0))))
-    passed = (
-        value_error <= _VALUE_TOLERANCE
-        and gradient_error <= _GRADIENT_TOLERANCE
-        and translation <= _TRANSLATION_TOLERANCE
-        and size.value <= budget
-        and (host_reference or size.value > 0)
-    )
     return label, {
-        "passed": passed,
+        "contraction_checks_passed": bool(
+            translation <= _TRANSLATION_TOLERANCE
+            and size.value <= budget
+            and (host_reference or size.value > 0)
+        ),
         "weighted_value_Eh": value,
-        "weighted_value_error_Eh": value_error,
         "gradient_Eh_per_bohr": gradient.tolist(),
-        "max_gradient_error_Eh_per_bohr": gradient_error,
         "max_translation_residual_Eh_per_bohr": translation,
         "shell_blocks": nblocks,
         "cartesian_weights": len(weights),
@@ -157,6 +166,51 @@ def contract(
         "kernel_and_transfer_seconds": kernel_seconds,
         "device_bytes": size.value,
     }
+
+
+def compare_reference(label: str, row: dict, reference: dict) -> dict:
+    """Validate one computed result against independent signed value and gradient."""
+    if (
+        row["shell_blocks"] != reference["shell_blocks"]
+        or row["cartesian_weights"] != reference["cartesian_weights"]
+    ):
+        raise ValueError(f"incomplete shell blocks for {label}")
+    energy = float(reference["weighted_value_Eh"])
+    target = np.asarray(reference["gradient_Eh_per_bohr"], dtype=np.float64)
+    gradient = np.asarray(row["gradient_Eh_per_bohr"])
+    if (
+        not np.isfinite(energy)
+        or target.shape != gradient.shape
+        or not np.isfinite(target).all()
+    ):
+        raise ValueError(f"invalid independent reference for {label}")
+    de = abs(row["weighted_value_Eh"] - energy)
+    dg = float(np.max(np.abs(gradient - target)))
+    return {
+        **row,
+        "reference_status": "compared",
+        "weighted_value_error_Eh": de,
+        "max_gradient_error_Eh_per_bohr": dg,
+        "passed": row["contraction_checks_passed"]
+        and de <= _VALUE_TOLERANCE
+        and dg <= _GRADIENT_TOLERANCE,
+    }
+
+
+def contract(
+    fixture: Mapping[str, np.ndarray],
+    manifest: dict,
+    functions: Mapping[str, Callable],
+    group: str,
+    operator: str,
+    budget: int,
+    host_reference: bool,
+) -> tuple[str, dict]:
+    """Original fixed-fixture gate requires a reference for every channel."""
+    label, row = contract_geometry(
+        fixture, manifest, functions, group, operator, budget, host_reference
+    )
+    return label, compare_reference(label, row, manifest["channels"][label])
 
 
 def main() -> None:

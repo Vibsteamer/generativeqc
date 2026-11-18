@@ -1,5 +1,6 @@
 """Exercise the sign and single-reference ownership of the full molecular force."""
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -33,3 +34,27 @@ def test_only_correlation_is_added_to_the_owned_reference() -> None:
         )
     with pytest.raises(ValueError, match="Cartesian"):
         full_result(reference, np.zeros(3), forces, ordinary)
+
+
+def test_numpy_scalar_checkpoint_survives_later_invalid_report(tmp_path: Path) -> None:
+    import json
+
+    from benchmarks.f12_molecular_force_composition import write_measurement
+
+    path = tmp_path / "receipt.json"
+    partial = {
+        "passed": np.bool_(True),
+        "residual": np.float64(1e-12),
+        "rows": np.int64(10),
+    }
+    write_measurement(path, partial)
+    assert json.loads(path.read_text()) == {
+        "passed": True,
+        "residual": 1e-12,
+        "rows": 10,
+    }
+    raw = path.read_bytes()
+    for bad, exception in ((np.nan, ValueError), (np.array([1.0]), TypeError)):
+        with pytest.raises(exception):
+            write_measurement(path, {"value": bad})
+        assert path.read_bytes() == raw
