@@ -141,3 +141,55 @@ def test_size_t_budget_is_not_restricted_to_int32() -> None:
     )
     np.testing.assert_array_equal(result.gradient, [[1, 2, 3]])
     assert not live
+
+
+@pytest.mark.parametrize("indices", [None, np.array([1, 0])])
+def test_hcore_uses_one_contiguous_matrix_for_two_native_channels(indices: Any) -> None:
+    calc, live = calculator()
+    # A transpose requires a host copy. Both native channels must see that same copy.
+    hcore = np.arange(4.0).reshape(2, 2).T
+
+    def inspect(*args: Any) -> int:
+        _, _, overlap, kinetic, attraction, *_ = args
+        assert not overlap
+        assert ct.addressof(kinetic.contents) == ct.addressof(attraction.contents)
+        expected = hcore if indices is None else hcore[np.ix_(indices, indices)]
+        np.testing.assert_array_equal(
+            np.ctypeslib.as_array(kinetic, (4,)), expected.ravel()
+        )
+        np.ctypeslib.as_array(args[8], (3,))[:] = [0, 1, 2]
+        return 0
+
+    calc._library.generativeqc_system_one_electron_gradient_cuda = Function(inspect)
+    result = cuda_one_electron_gradient(
+        calc,
+        [("H", (0, 0, 0))],
+        hcore=hcore,
+        native_to_source=indices,
+        maximum_bytes=hcore.nbytes,
+    )
+    np.testing.assert_array_equal(result.gradient, [[0, 1, 2]])
+    assert not live
+
+
+@pytest.mark.parametrize("indices", [[0, 0], [-1, 1], [1, 2], [0], [0.0, 1.0]])
+def test_reject_invalid_source_map_before_native_ownership(indices: list) -> None:
+    calc, live = calculator()
+    with pytest.raises(ValueError, match="bijective"):
+        cuda_one_electron_gradient(
+            calc,
+            [("H", (0, 0, 0))],
+            hcore=np.eye(2),
+            native_to_source=np.asarray(indices),
+        )
+    assert not live
+
+
+@pytest.mark.parametrize("separate", ["kinetic", "attraction"])
+def test_hcore_rejects_duplicate_operator_weights(separate: str) -> None:
+    calc, live = calculator()
+    with pytest.raises(ValueError, match="hcore"):
+        cuda_one_electron_gradient(
+            calc, [("H", (0, 0, 0))], hcore=np.eye(2), **{separate: np.eye(2)}
+        )
+    assert not live
