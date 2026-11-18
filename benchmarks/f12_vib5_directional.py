@@ -1,6 +1,8 @@
 """Validate a VIB5 molecular energy and the available directional derivatives."""
 
+import hashlib
 import json
+from pathlib import Path
 
 import numpy as np
 
@@ -70,13 +72,48 @@ def assess(report: dict, target: dict) -> dict:
     return report
 
 
+def check_graph_budget(
+    target: dict, panel: Path, layout: Path, budget_mib: int
+) -> None:
+    """Bind the graph limit to the shape and estimates used for this geometry."""
+    declaration = target.get("native_graph_plan")
+    if declaration is None:
+        if budget_mib == 4096 and target["layout"]["space"] == [5, 66, 220]:
+            return  # The archived D panel predates the per-cardinal plan file.
+        raise ValueError(
+            "missing VIB5 graph preflight for the requested space or budget"
+        )
+    plan_bytes = (panel.parent / "graph_plan.json").read_bytes()
+    if hashlib.sha256(plan_bytes).hexdigest() != declaration["graph_plan_sha256"]:
+        raise ValueError("VIB5 graph preflight hash differs")
+    plan = json.loads(plan_bytes)
+    with np.load(layout, allow_pickle=False) as arrays:
+        sizes = arrays["ao_sizes"].tolist()
+    space = target["layout"]["space"]
+    if (
+        plan["space"] != declaration["space"]
+        or plan["space"] != space
+        or sizes != [space[-1], plan["fitting_aos"]]
+        or plan["fitting_aos"] != declaration["fitting_aos"]
+    ):
+        raise ValueError(
+            "VIB5 graph preflight dimensions differ from the molecular inputs"
+        )
+    largest = max(row["combined_bytes"] for row in plan["per_graph"].values())
+    if (
+        not 0 < largest <= (budget_mib << 20)
+        or declaration["largest_combined_bytes"] != largest
+        or declaration["budget_mib"] != budget_mib
+    ):
+        raise ValueError(
+            "the requested graph budget differs or cannot hold the largest graph"
+        )
+
+
 def main() -> None:
     args = endpoint_arguments()
-    if args.budget_mib != 4096:
-        raise ValueError(
-            "VIB5 molecular graph budget must match the 4096 MiB preflight"
-        )
     target = json.loads(args.panel.read_bytes())
+    check_graph_budget(target, args.panel, args.layout, args.budget_mib)
     report = assess(calculate_panel(args, target), target)
     write_measurement(args.output, report)
     if not report["passed"]:
