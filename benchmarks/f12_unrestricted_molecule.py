@@ -19,6 +19,70 @@ from generativeqc_compiler.mp2.f12_unrestricted import (
 from benchmarks._f12_cuda import add_molecular_graph_budget, cuda_runner
 
 
+def pair_operands(
+    data: dict,
+    src: dict,
+    fock: dict,
+    sl: str,
+    sr: str,
+    nl: int,
+    nr: int,
+    n: int,
+    i: int,
+    j: int,
+) -> dict[str, np.ndarray]:
+    """Select the orbital and fit tensors for one occupied spin pair."""
+    dl, dr = src["fit_" + sl][:, i], src["fit_" + sr][:, j]
+    raw_c = src["raw_coulomb_" + sr][:, j]
+    if sl == sr:
+        vals = {
+            "select_i": np.eye(nl)[i],
+            "select_j": np.eye(nr)[j],
+            "fock": fock["fock_" + sl],
+            "exchange": fock["exchange_" + sl],
+            "fit_i": dl,
+            "fit_j": dr,
+            "raw_coulomb_j": raw_c,
+        }
+    else:
+        vals = {
+            "select_i": np.eye(n)[i],
+            "select_j": np.eye(n)[j],
+            "cross_overlap": data["cross_overlap"],
+            "fit_i_alpha": dl,
+            "fit_j_beta": dr,
+            "raw_coulomb_j_beta": raw_c,
+            **fock,
+        }
+    for op, rel in (
+        ("geminal", "f12"),
+        ("squared_geminal", "f12_squared"),
+        ("geminal_coulomb", "f12_over_coulomb"),
+        ("double_commutator", "double_commutator"),
+    ):
+        la, rb = (
+            data["raw/" + op + "/" + sl][:, i],
+            data["raw/" + op + "/" + sr][:, j],
+        )
+        if sl == sr:
+            vals.update(
+                {
+                    "raw_" + rel + "_i": la,
+                    "raw_" + rel + "_j": rb,
+                    "metric_" + rel: data["metric/" + op],
+                }
+            )
+        else:
+            vals.update(
+                {
+                    "raw_" + op + "_i_alpha": la,
+                    "raw_" + op + "_j_beta": rb,
+                    "metric_" + op: data["metric/" + op],
+                }
+            )
+    return vals
+
+
 def evaluate(
     directory: Path,
     run: Callable,
@@ -69,54 +133,7 @@ def evaluate(
         )
         for i in range(nl):
             for j in range(i + 1 if same else 0, nr):
-                dl, dr = src["fit_" + sl][:, i], src["fit_" + sr][:, j]
-                raw_c = src["raw_coulomb_" + sr][:, j]
-                if same:
-                    vals = {
-                        "select_i": np.eye(nl)[i],
-                        "select_j": np.eye(nr)[j],
-                        "fock": fock["fock_" + sl],
-                        "exchange": fock["exchange_" + sl],
-                        "fit_i": dl,
-                        "fit_j": dr,
-                        "raw_coulomb_j": raw_c,
-                    }
-                else:
-                    vals = {
-                        "select_i": np.eye(n)[i],
-                        "select_j": np.eye(n)[j],
-                        "cross_overlap": data["cross_overlap"],
-                        "fit_i_alpha": dl,
-                        "fit_j_beta": dr,
-                        "raw_coulomb_j_beta": raw_c,
-                        **fock,
-                    }
-                for op, rel in (
-                    ("geminal", "f12"),
-                    ("squared_geminal", "f12_squared"),
-                    ("geminal_coulomb", "f12_over_coulomb"),
-                    ("double_commutator", "double_commutator"),
-                ):
-                    la, rb = (
-                        data["raw/" + op + "/" + sl][:, i],
-                        data["raw/" + op + "/" + sr][:, j],
-                    )
-                    if same:
-                        vals.update(
-                            {
-                                "raw_" + rel + "_i": la,
-                                "raw_" + rel + "_j": rb,
-                                "metric_" + rel: data["metric/" + op],
-                            }
-                        )
-                    else:
-                        vals.update(
-                            {
-                                "raw_" + op + "_i_alpha": la,
-                                "raw_" + op + "_j_beta": rb,
-                                "metric_" + op: data["metric/" + op],
-                            }
-                        )
+                vals = pair_operands(data, src, fock, sl, sr, nl, nr, n, i, j)
                 # Prepared CUDA requires contiguous row-major source buffers.
                 result = run(
                     graph, {k: np.ascontiguousarray(a) for k, a in vals.items()}
