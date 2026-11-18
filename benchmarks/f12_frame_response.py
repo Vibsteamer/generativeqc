@@ -16,14 +16,18 @@ from generativeqc_compiler.mp2.f12_frame_response import frame_kernel_cotangent
 from benchmarks._f12_cuda import cuda_runner
 
 
-def bridge(data: dict, run: Callable) -> tuple[dict, dict]:
+def bridge(
+    data: dict, run: Callable, *, metric_gram: Callable | None = None
+) -> tuple[dict, dict]:
     frame, bar = data["frame"], data["frame_bar"]
     result = run(frame_kernel_cotangent(*frame.shape), data).outputs
+    gram = result["dual_gram"]
+    if metric_gram is not None and frame.shape[1] > 1:
+        # Test the physical invariant at the precision used to normalize this frame.
+        gram = metric_gram(data["overlap"], frame)
     moment = frame.T @ bar
     residuals = {
-        "metric_dual": float(
-            np.max(np.abs(result["dual_gram"] - np.eye(frame.shape[1])))
-        ),
+        "metric_dual": float(np.max(np.abs(gram - np.eye(frame.shape[1])))),
         "gauge_relative": float(
             np.linalg.norm(result["gauge_skew"]) / max(1.0, np.linalg.norm(moment))
         ),

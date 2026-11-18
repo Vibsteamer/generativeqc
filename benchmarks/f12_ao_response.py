@@ -95,6 +95,7 @@ def evaluate(
     pullback: bool,
     singles: Callable | None = None,
     record_energy: Callable[[float], None] | None = None,
+    physical_fock: Callable | None = None,
 ) -> tuple[float, dict, dict]:
     """Evaluate the F12 increment, optionally composing a native singles action.
 
@@ -135,6 +136,17 @@ def evaluate(
     fock = fock_plan(occ, ri, aux)
     fock_inputs = {k: mol[k] for k in ("hcore", "fit", "raw_coulomb_all")}
     fock_out = run(fock, fock_inputs).outputs
+    if physical_fock is not None:
+        # Reassociate C.T (h + 2 J) C - K in the AO basis before both frame
+        # transforms. The TensorIR pullback below differentiates the same
+        # contraction on physical Hermitian AO displacements.
+        fock_out["fock"] = physical_fock(
+            data["hcore_ao"],
+            data["ao_coulomb"],
+            data["coefficients"],
+            fitted,
+            fock_out["exchange"],
+        )
     fock_bars = {"bar_" + k: np.zeros_like(v) for k, v in fock_out.items()}
     pair_bars = {
         k: np.zeros_like(mol[k])

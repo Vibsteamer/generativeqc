@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "generated_symmetric_matrix_function.cuh"
+#include "posthf/cabs_compensated.cuh"
 #include "posthf/cabs_cuda_support.cuh"
 #include "posthf/cabs_projector_cuda.hpp"
 #include "solver/cuda/cholesky_provider.hpp"
@@ -54,6 +55,30 @@ __global__ void normalize_retained_columns(const double* vectors, const double* 
   for (std::size_t k = blockIdx.x * blockDim.x + threadIdx.x; k < rows * rank;
        k += std::size_t(blockDim.x) * gridDim.x)
     scaled[k] = vectors[k] / sqrt(values[k / rows]);
+}
+
+// C contains retained, provisionally normalized columns. A compensated
+// physical Gram keeps the final orthonormalization stable for large lift coefficients.
+using generativeqc::posthf::cabs::Extended;
+__global__ void metric_times_frame(const double* s, const double* c, size_t n, size_t x,
+                                   Extended* work) {
+  for (size_t k = blockIdx.x * blockDim.x + threadIdx.x; k < n * x;
+       k += size_t(blockDim.x) * gridDim.x) {
+    const size_t i = k % n, j = k / n;
+    Extended sum{};
+    for (size_t a = 0; a < n; ++a) sum.add_product(s[i + a * n], c[a + j * n]);
+    work[k] = sum;
+  }
+}
+__global__ void newton_normalizer(const double* c, const Extended* sc, size_t n, size_t x,
+                                  double* m) {
+  for (size_t k = blockIdx.x * blockDim.x + threadIdx.x; k < x * x;
+       k += size_t(blockDim.x) * gridDim.x) {
+    const size_t i = k % x, j = k / x;
+    Extended sum{};
+    for (size_t a = 0; a < n; ++a) sum.add_product(sc[a + j * n], c[a + i * n]);
+    m[k] = (i == j ? 1.5 : 0.) - 0.5 * (sum.hi + sum.lo);
+  }
 }
 
 __global__ void pack_frame(const double* column_major, std::size_t rows, std::size_t cols,
@@ -212,19 +237,44 @@ void evaluate(int device, int n, int o, double cutoff, double guard, int expecte
   if (distance <= guard * std::max(largest, aux_scale))
     throw std::runtime_error("CABS eigenvalue inside the cutoff guard");
   if (expected >= 0 && kept != expected) throw std::runtime_error("CABS retained rank changed");
-  invert(x, t, et, threshold, inv_t);
-  gemm(false, false, n, x, x, j, n, inv_t, x, tmp, n);
-  gemm(false, true, n, n, x, tmp, n, j, n, k, n);
+  const bool full_rank = kept == x;
+  if (full_rank) {
+    // Full rank fixes the subspace independently of its frame gauge.
+    // Correct the realized frame's physical Gram and form K from these same columns.
+    // clang-format off
+    normalize_retained_columns<<<blocks(xx),256,0,stream.get()>>>(t, et, x, x, inv_t);
+    // clang-format on
+    gemm(false, false, n, x, x, j, n, inv_t, x, tmp2, n);
+    gpu::OwnedCudaBuffer<Extended> metric_frame(device, nx, stream.get());
+    // clang-format off
+    metric_times_frame<<<blocks(nx),256,0,stream.get()>>>(s,tmp2,n,x,metric_frame.get());
+    newton_normalizer<<<blocks(xx),256,0,stream.get()>>>(tmp2,metric_frame.get(),n,x,inv_t);
+    // clang-format on
+    cuda_resource_check(cudaGetLastError());
+    gemm(false, false, n, x, x, tmp2, n, inv_t, x, j, n);
+    gemm(false, true, n, n, x, j, n, j, n, k, n);
+  } else {
+    invert(x, t, et, threshold, inv_t);
+    gemm(false, false, n, x, x, j, n, inv_t, x, tmp, n);
+    gemm(false, true, n, n, x, tmp, n, j, n, k, n);
+  }
   symmetrize<<<blocks(nn), 256, 0, stream.get()>>>(k, n, false, info.get());
   if (seed) {
     load(seed, false);
-    // G=frechet(T^+)[J^T U J]. The generated rule includes retained/discarded rotations.
-    gemm(false, false, n, x, n, s, n, j, n, tmp, n);
-    gemm(true, false, x, x, n, j, n, tmp, n, inv_t, x);
-    generativeqc::tensor::launch_symmetric_pseudoinverse_vjp(x, t, et, cutoff, inv_t, tmp, tmp2,
-                                                             inv_t, stream.get());
-    gemm(false, false, n, x, x, j, n, inv_t, x, tmp, n);
-    gemm(false, true, n, n, x, tmp, n, j, n, tmp2, n);
+    if (full_rank) {
+      // K = S^-1 - O, O=embed(A^-1). Its full-rank derivative uses the same
+      // realized K as the forward evaluation. The two cross terms follow below.
+      gemm(false, false, n, n, n, k, n, s, n, tmp, n);
+      gemm(false, false, n, n, n, tmp, n, k, n, tmp2, n, -1.);
+    } else {
+      // G=frechet(T^+)[J^T U J]. Include retained/discarded rotations.
+      gemm(false, false, n, x, n, s, n, j, n, tmp, n);
+      gemm(true, false, x, x, n, j, n, tmp, n, inv_t, x);
+      generativeqc::tensor::launch_symmetric_pseudoinverse_vjp(x, t, et, cutoff, inv_t, tmp, tmp2,
+                                                               inv_t, stream.get());
+      gemm(false, false, n, x, x, j, n, inv_t, x, tmp, n);
+      gemm(false, true, n, n, x, tmp, n, j, n, tmp2, n);
+    }
     // bar_S = J G J^T - O U K - K U O, O contains A^-1 in the OBS block.
     gemm(false, false, o, n, n, s, n, k, n, tmp, o);
     solve_obs(tmp, n, o, 1.);
@@ -241,10 +291,14 @@ void evaluate(int device, int n, int o, double cutoff, double guard, int expecte
         cudaMemcpyAsync(staged_bar.data(), s, bytes, cudaMemcpyDeviceToHost, stream.get()));
   // cuSOLVER orders eigenvalues increasingly: the retained columns form a suffix.
   // Reuse contraction tiles only after the optional response copy on this stream.
-  normalize_retained_columns<<<blocks(std::size_t(x) * kept), 256, 0, stream.get()>>>(
-      t + std::size_t(x) * (x - kept), et + x - kept, x, kept, inv_t);
-  gemm(false, false, n, kept, x, j, n, inv_t, x, tmp2, n);
-  pack_frame<<<blocks(nr), 256, 0, stream.get()>>>(tmp2, n, kept, tmp, info.get());
+  const double* retained = j;
+  if (!full_rank) {
+    normalize_retained_columns<<<blocks(std::size_t(x) * kept), 256, 0, stream.get()>>>(
+        t + std::size_t(x) * (x - kept), et + x - kept, x, kept, inv_t);
+    gemm(false, false, n, kept, x, j, n, inv_t, x, tmp2, n);
+    retained = tmp2;
+  }
+  pack_frame<<<blocks(nr), 256, 0, stream.get()>>>(retained, n, kept, tmp, info.get());
   check_flags(stream, info.get(), 1, "nonfinite CABS frame");
   cuda_resource_check(cudaMemcpyAsync(staged_frame.data(), tmp, nr * sizeof(double),
                                       cudaMemcpyDeviceToHost, stream.get()));

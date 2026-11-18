@@ -46,10 +46,17 @@ def chain(
     *,
     pullback: bool,
     record_energy: Callable[[float], None] | None = None,
+    physical_fock: Callable | None = None,
+    metric_gram: Callable | None = None,
 ) -> tuple[float, dict, dict]:
     inputs, frame = with_frame(data, projector)
     energy, bars, _ = evaluate(
-        inputs, run, pullback=pullback, singles=singles, record_energy=record_energy
+        inputs,
+        run,
+        pullback=pullback,
+        singles=singles,
+        record_energy=record_energy,
+        physical_fock=physical_fock,
     )
     if not pullback:
         return energy, {}, {}
@@ -63,6 +70,7 @@ def chain(
             "frame_bar": bars["coefficients"][permutation, obs:],
         },
         run,
+        metric_gram=metric_gram,
     )
     reverse = projector(
         overlap, obs, expected_rank=frame.rank, cotangent=transferred["kernel_bar"]

@@ -23,6 +23,7 @@ from benchmarks._f12_cuda import add_molecular_graph_budget, cuda_runner
 from benchmarks.df_reference_response import DFReferenceSession
 from benchmarks.f12_molecular_frame import chain
 from benchmarks.f12_molecular_integral_forward import forward_integrals
+from benchmarks.f12_molecular_fock import compensated_fock
 from benchmarks.f12_molecular_metric import metric_whitener
 from benchmarks.f12_molecular_one_electron import native_contraction
 from benchmarks.f12_molecular_one_electron_forward import combined_matrices
@@ -106,8 +107,30 @@ def calculate_panel(args: Namespace, target: dict) -> dict:
     lib = ctypes.CDLL(str(args.component_library.resolve()))
     canonical = partial(canonical_frame_seed, library=lib)
     run, programs = cuda_runner(args.arch, args.cache, max_bytes=args.budget_mib << 20)
+    fock_projections = []
+
+    def physical_fock(*sources):
+        value, receipt = compensated_fock(
+            *sources, library=args.component_library, budget_bytes=args.budget_mib << 20
+        )
+        fock_projections.append(receipt)
+        return value
+
+    def metric_gram(overlap, frame):
+        # The same compensated C.T A C with zero Coulomb and exchange terms.
+        columns = frame.shape[1]
+        return physical_fock(
+            overlap,
+            np.zeros((1, *overlap.shape)),
+            frame,
+            np.zeros((1, 1, columns)),
+            np.zeros((columns, columns)),
+        )
+
     reverse = partial(
         chain,
+        metric_gram=metric_gram,
+        physical_fock=physical_fock,
         run=run,
         projector=partial(cabs_projector, library=lib),
         singles=partial(cabs_singles, library=lib, spin_weight=2),
@@ -191,6 +214,7 @@ def calculate_panel(args: Namespace, target: dict) -> dict:
                     "ordinary_corr_Eh": ordinary["correlation_energy_Eh"],
                     "forward_resources": forward_cost,
                     "graph_gpu_programs": programs,
+                    "physical_fock_projections": fock_projections,
                     "conventional_input": target["ordinary_receipt"],
                     "scalar_checkpoint_seconds": scalar_checkpoint_seconds,
                 },
@@ -238,6 +262,7 @@ def calculate_panel(args: Namespace, target: dict) -> dict:
         "integral_gradients": sinks,
         "orbital_response": obs.diagnostics,
         "one_electron_resources": explicit.resources,
+        "physical_fock_projections": fock_projections,
         "graph_gpu_programs": programs,
         "reused_ordinary_central_seconds": ordinary["central_seconds"],
     }

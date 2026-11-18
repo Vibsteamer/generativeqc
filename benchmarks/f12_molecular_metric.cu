@@ -1,3 +1,4 @@
+#include "f12_molecular_fock.cuh"
 // Symmetric M^(-1/2) for the molecular closed-shell F12 qualification.
 // Full-rank branch only. Input and returned whitener are row-major FP64.
 #include <algorithm>
