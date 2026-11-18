@@ -99,6 +99,19 @@ def endpoint_arguments() -> Namespace:
     return parser.parse_args()
 
 
+def combined_basis_for_geometry(target: dict) -> dict:
+    """Require one electronic state and physical geometry for both integral paths."""
+    case, spec = target["combined_basis"], target["geometry"]
+    if (
+        case["elements"] != spec["elements"]
+        or not np.array_equal(case["coordinates_bohr"], spec["geometry_bohr"])
+        or case.get("charge", 0) != spec.get("charge", 0)
+        or case.get("multiplicity", 1) != spec.get("multiplicity", 1)
+    ):
+        raise ValueError("combined basis and ordinary MP2 geometry or state disagree")
+    return case
+
+
 def calculate_panel(args: Namespace, target: dict) -> dict:
     """Compute and checkpoint central Cartesian E/F and requested native energy displacements."""
     name = target["molecule"]
@@ -136,16 +149,12 @@ def calculate_panel(args: Namespace, target: dict) -> dict:
         singles=partial(cabs_singles, library=lib, spin_weight=2),
     )
     begin = time.monotonic()
-    case = target["combined_basis"]
+    case = combined_basis_for_geometry(target)
     indices = np.array(target["layout"]["native_to_source"])
     permutation = np.array(target["layout"]["ao_permutation"])
     space = np.array(target["layout"]["space"])
     rows = orbital_source_rows(indices, permutation, int(space[1]))
     base_xyz = np.array(spec["geometry_bohr"])
-    if case["elements"] != spec["elements"] or not np.array_equal(
-        case["coordinates_bohr"], base_xyz
-    ):
-        raise ValueError("combined basis and ordinary MP2 geometry disagree")
     with np.load(args.layout, allow_pickle=False) as file:
         template = {k: file[k] for k in file}
     meta = json.loads(str(template["manifest"]))

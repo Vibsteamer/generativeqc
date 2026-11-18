@@ -146,7 +146,13 @@ def native_contraction(
     )
     atoms = list(zip(case["elements"], case["coordinates_bohr"], strict=True))
     return cuda_one_electron_gradient(
-        calc, atoms, overlap=ws, hcore=wh, native_to_source=native_to_source
+        calc,
+        atoms,
+        overlap=ws,
+        hcore=wh,
+        native_to_source=native_to_source,
+        charge=case.get("charge", 0),
+        multiplicity=case.get("multiplicity", 1),
     )
 
 
