@@ -51,3 +51,26 @@ def polarized_pair_forces(
             "method": "analytic four-center source-tangent contraction for a polarized F12 pair",
         },
     )
+
+
+def unrestricted_f12_nuclear_source_action(elements: int) -> Program:
+    """One Cartesian force from the total correlation adjoint and physical sources.
+
+    The nuclear tangent uses the identical flattened source layout as the
+    UMP2/F12/CABS adjoint. Drop the axis after each dot to bound device memory
+    independently of molecule coordinate count. The molecular reference
+    gradient includes nuclear repulsion in Hartree/bohr.
+    """
+    if type(elements) is not int or elements < 1:
+        raise ValueError("An F12 nuclear source vector must contain positive length")
+    k = Index("p", IndexSpace("spin_pair_source", "component", elements))
+    bar = input_tensor("weights", TensorSpec((k,), role="input"))
+    tangent = input_tensor("tangents", TensorSpec((k,), role="input"))
+    dref = input_tensor("reference_gradient", TensorSpec((), role="input"))
+    return Program(
+        {"force": add(dref, einsum("p,p->", bar, tangent), coefficients=(-1, -1))},
+        provenance={
+            "method": "DF UMP2-F12 source-adjoint contraction",
+            "units": "Eh/bohr",
+        },
+    )

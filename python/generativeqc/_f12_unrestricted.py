@@ -8,6 +8,7 @@ from generativeqc_compiler.mp2.f12_unrestricted import unrestricted_extended_df_
 from generativeqc_compiler.tensor import transpose_program
 
 from ._f12_cabs import cabs_singles
+from ._f12_spin_pairs import occupied_pair_blocks, pair_operands
 
 
 class UnrestrictedCabsSingles(NamedTuple):
@@ -57,3 +58,69 @@ def unrestricted_cabs_energy(
             for k, v in run(reverse, {**sources, **seeds}).outputs.items()
         }
     return UnrestrictedCabsSingles(sum(energies), (energies[0], energies[1]), weights)
+
+
+def unrestricted_mp2_f12_source_pullback(
+    space: tuple[int, int, int, int, int],
+    data: dict[str, np.ndarray],
+    run: Callable,
+    *,
+    frozen_occupied: tuple[int, int] = (0, 0),
+    singles: Callable = cabs_singles,
+) -> dict[str, np.ndarray]:
+    """Pull the molecular UMP2, geminal and CABS energies back to their shared sources.
+
+    One reverse per occupied pair provides weights reused for all nuclei. These
+    are derivatives in the two moving OBS/CABS frames. Contract them with total
+    physical source tangents including integral, metric, UHF and orbital motion,
+    and add the reference gradient. The caller owns that geometry response.
+    """
+    oa, ob, _, ext, aux = space
+    sources = {
+        key.removeprefix("source/"): v
+        for key, v in data.items()
+        if key.startswith("source/")
+    }
+    fock_graph = unrestricted_extended_df_fock(oa, ob, ext, aux)
+    fock = run(fock_graph, sources).outputs
+    source_bars = {k: np.zeros_like(v) for k, v in sources.items()}
+    raw_bars = {
+        k: np.zeros_like(v)
+        for k, v in data.items()
+        if k == "cross_overlap" or k.startswith(("raw/", "metric/"))
+    }
+    fock_bars = {k: np.zeros_like(v) for k, v in fock.items()}
+    for spin, occupied in (("alpha", oa), ("beta", ob)):
+        key = "fock_" + spin
+        matrix = fock[key]
+        _, bar = singles(
+            (matrix + matrix.T) / 2, occupied, spin_weight=1, pullback=True
+        )
+        if bar is None:
+            raise ValueError("Missing UHF CABS singles Fock cotangent")
+        fock_bars[key] += (bar + bar.T) / 2
+    for sl, sr, nl, nr, graph, pairs in occupied_pair_blocks(
+        space, frozen_occupied=frozen_occupied
+    ):
+        rev = transpose_program(graph, ("pair_energy", "ordinary_pair_energy")).program
+        for i, j in pairs:
+            primal = pair_operands(data, sources, fock, sl, sr, nl, nr, ext, i, j)
+            feeds = {k: np.ascontiguousarray(v) for k, v in primal.items()}
+            feeds["bar_pair_energy"] = np.array(1.0)
+            feeds["bar_ordinary_pair_energy"] = np.array(1.0)
+            result = run(rev, feeds).outputs
+            # Pair operands are views into the molecular arrays. Shared metric,
+            # Fock, and repeated occupied-leg entries accumulate independently.
+            buffers = pair_operands(
+                raw_bars, source_bars, fock_bars, sl, sr, nl, nr, ext, i, j
+            )
+            for key, value in result.items():
+                buffers[key.removeprefix("bar_")] += value
+    rev = transpose_program(fock_graph, tuple(fock)).program
+    fock_weights = run(
+        rev, {**sources, **{"bar_" + k: v for k, v in fock_bars.items()}}
+    ).outputs
+    for key, value in fock_weights.items():
+        source_bars[key.removeprefix("bar_")] += value
+    raw_bars.update({"source/" + k: v for k, v in source_bars.items()})
+    return raw_bars

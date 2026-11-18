@@ -90,3 +90,54 @@ def _direct_fock(
         if n:
             matrix -= np.einsum("Qip,Qiq->pq", data["fit_" + s], raw[:, :n])
         yield (matrix + matrix.T) / 2
+
+
+@pytest.mark.parametrize("frozen", [(0, 0), (1, 0), (2, 1)])
+def test_joint_spin_pair_and_reference_vjp(frozen: tuple[int, int]) -> None:
+    from generativeqc._f12_spin_pairs import molecular_pair_energies
+    from generativeqc._f12_unrestricted import unrestricted_mp2_f12_source_pullback
+    from generativeqc_compiler.mp2.f12_unrestricted import unrestricted_extended_df_fock
+
+    rng = np.random.default_rng(71137)
+    space = (2, 1, 4, 6, 4)
+    na, nb, _, ext, aux = space
+    values = {"cross_overlap": np.eye(ext)}
+    operators = ("geminal", "squared_geminal", "geminal_coulomb", "double_commutator")
+    for op in operators:
+        matrix = 0.1 * rng.normal(size=(aux, aux))
+        values["metric/" + op] = (matrix + matrix.T) / 2
+    for spin, occ in (("alpha", na), ("beta", nb)):
+        values["source/hcore_" + spin] = np.diag(np.linspace(-1.8, 1, ext))
+        raw = 0.07 * rng.normal(size=(aux, ext, ext))
+        raw += raw.swapaxes(1, 2).copy()
+        values["source/raw_coulomb_" + spin] = raw
+        values["source/fit_" + spin] = raw[:, :occ, :].copy()
+        for op in operators:
+            values["raw/" + op + "/" + spin] = 0.1 * rng.normal(size=(aux, occ, ext))
+    # Independent fitted and raw operands perturb the unconstrained Fock
+    # off its symmetric manifold; the singles energy uses its symmetric part.
+    delta = {k: 0.1 * rng.normal(size=v.shape) for k, v in values.items()}
+
+    def forward(t: float) -> float:
+        data = {k: v + t * delta[k] for k, v in values.items()}
+        src = {k[7:]: v for k, v in data.items() if k.startswith("source/")}
+        fg = unrestricted_extended_df_fock(na, nb, ext, aux)
+        fock = execute(fg, src).outputs
+        en = sum(
+            p.mp2 + p.f12
+            for p in molecular_pair_energies(
+                space, data, src, fock, execute, frozen_occupied=frozen
+            )
+        )
+        for spin, occ in (("alpha", na), ("beta", nb)):
+            ff = fock["fock_" + spin]
+            en += _singles((ff + ff.T) / 2, occ, spin_weight=1, pullback=False)[0]
+        return en
+
+    bars = unrestricted_mp2_f12_source_pullback(
+        space, values, execute, singles=_singles, frozen_occupied=frozen
+    )
+    actual = sum(np.vdot(bar, delta[k]) for k, bar in bars.items())
+    for step in (1e-4, 3e-5):
+        expected = (forward(step) - forward(-step)) / (2 * step)
+        np.testing.assert_allclose(actual, expected, atol=1e-8, rtol=0)
