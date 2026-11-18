@@ -1,12 +1,31 @@
 """Compile and run F12 qualification graphs in FP64 on the allocated CUDA device."""
 
 import shutil
+from argparse import ArgumentParser, ArgumentTypeError
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from generativeqc_compiler.tensor.program import Program
+
+
+def add_molecular_graph_budget(parser: ArgumentParser) -> None:
+    """Set the per-graph numeric-buffer budget for molecular AO response tests."""
+
+    def positive_mib(text: str) -> int:
+        value = int(text)
+        if value <= 0:
+            raise ArgumentTypeError("budget must be positive")
+        return value
+
+    parser.add_argument(
+        "--budget-mib",
+        type=positive_mib,
+        default=1536,
+        help="Combined device and host staging budget per TensorIR graph in MiB "
+        "(default: 1536, including the contracted water AO reverse graph).",
+    )
 
 
 def cuda_runner(

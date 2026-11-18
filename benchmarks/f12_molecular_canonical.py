@@ -20,7 +20,7 @@ from generativeqc_compiler.method.canonical_frame_response import (
     orbital_rotation_cotangent,
 )
 
-from benchmarks._f12_cuda import cuda_runner
+from benchmarks._f12_cuda import add_molecular_graph_budget, cuda_runner
 from benchmarks.f12_molecular_frame import chain
 
 
@@ -128,9 +128,10 @@ def main() -> None:
     parser.add_argument("--arch", required=True)
     parser.add_argument("--cache", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    add_molecular_graph_budget(parser)
     args = parser.parse_args()
     lib = ctypes.CDLL(str(args.component_library))
-    run, programs = cuda_runner(args.arch, args.cache)
+    run, programs = cuda_runner(args.arch, args.cache, max_bytes=args.budget_mib << 20)
     rows = []
     with (
         np.load(args.fixture, allow_pickle=False) as source,

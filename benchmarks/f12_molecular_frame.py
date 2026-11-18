@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 from generativeqc._f12_cabs import cabs_projector, cabs_singles
 
-from benchmarks._f12_cuda import cuda_runner
+from benchmarks._f12_cuda import add_molecular_graph_budget, cuda_runner
 from benchmarks.f12_ao_response import evaluate
 from benchmarks.f12_frame_response import bridge
 
@@ -140,11 +140,12 @@ def main() -> None:
     parser.add_argument("--arch", required=True)
     parser.add_argument("--cache", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    add_molecular_graph_budget(parser)
     args = parser.parse_args()
     lib = ctypes.CDLL(str(args.component_library))
     projector = partial(cabs_projector, library=lib)
     singles = partial(cabs_singles, library=lib, spin_weight=2)
-    run, programs = cuda_runner(args.arch, args.cache)
+    run, programs = cuda_runner(args.arch, args.cache, max_bytes=args.budget_mib << 20)
     rows = []
     with (
         np.load(args.fixture, allow_pickle=False) as source,

@@ -17,7 +17,7 @@ from generativeqc._one_electron_gradient import (
     cuda_one_electron_gradient,
 )
 
-from benchmarks._f12_cuda import cuda_runner
+from benchmarks._f12_cuda import add_molecular_graph_budget, cuda_runner
 from benchmarks.f12_molecular_frame import chain
 
 
@@ -179,11 +179,12 @@ def main() -> None:
     ):
         parser.add_argument("--" + flag, type=Path, required=True)
     parser.add_argument("--arch", required=True)
+    add_molecular_graph_budget(parser)
     args = parser.parse_args()
     lib = ctypes.CDLL(str(args.component_library))
     projector = partial(cabs_projector, library=lib)
     singles = partial(cabs_singles, library=lib, spin_weight=2)
-    run, programs = cuda_runner(args.arch, args.cache)
+    run, programs = cuda_runner(args.arch, args.cache, max_bytes=args.budget_mib << 20)
     with (
         np.load(args.source, allow_pickle=False) as source,
         np.load(args.frame, allow_pickle=False) as frames,

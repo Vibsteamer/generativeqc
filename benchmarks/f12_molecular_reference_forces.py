@@ -12,7 +12,7 @@ from generativeqc._canonical_frame import canonical_frame_seed
 from generativeqc._f12_cabs import cabs_projector, cabs_singles
 from generativeqc._f12_molecular_response import molecular_reference_response
 
-from benchmarks._f12_cuda import cuda_runner
+from benchmarks._f12_cuda import add_molecular_graph_budget, cuda_runner
 from benchmarks.df_reference_response import DFReferenceSession
 from benchmarks.f12_molecular_frame import chain
 from benchmarks.f12_molecular_one_electron import cases, native_contraction
@@ -34,12 +34,13 @@ def main() -> None:
     ):
         parser.add_argument("--" + flag, type=Path, required=True)
     parser.add_argument("--arch", required=True)
+    add_molecular_graph_budget(parser)
     args = parser.parse_args()
     lib = ctypes.CDLL(str(args.component_library.resolve()))
     canonical = partial(
         canonical_frame_seed, library=ctypes.CDLL(str(args.canonical_library.resolve()))
     )
-    run, programs = cuda_runner(args.arch, args.cache)
+    run, programs = cuda_runner(args.arch, args.cache, max_bytes=args.budget_mib << 20)
     reverse = partial(
         chain,
         run=run,
