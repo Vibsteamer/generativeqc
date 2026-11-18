@@ -186,7 +186,15 @@ def test_molecular_high_spin_pair() -> None:
             for k in ds
             if k not in {"reference_pair_energy", "space", "psi4_ump2_total", "beta"}
         }
-    value = float(execute(graph, feeds).outputs["pair_energy"])
+    terms = execute(graph, feeds).outputs
+    value = float(terms["pair_energy"])
+    # One virtual determinant in this (2 occupied, 2 orbital virtual) triplet.
+    v = feeds["coulomb_obs"][2:, 2:]
+    energies = np.diag(feeds["fock"])
+    gap = energies[2:4].sum() - energies[:2].sum()
+    np.testing.assert_allclose(
+        terms["ordinary_pair_energy"], -((v[0, 1] - v[1, 0]) ** 2) / gap, atol=1e-14
+    )
     assert abs(ref) > 1e-4
     np.testing.assert_allclose(value, ref, atol=2e-11, rtol=0)
     reverse = transpose_program(graph, ("pair_energy",)).program

@@ -245,7 +245,15 @@ def projected_same_spin_f12_pair(
     )
     energy = add(linear, quadratic, coefficients=(Fraction(1, 2), Fraction(1, 16)))
     return Program(
-        {"pair_energy": energy},
+        {
+            "pair_energy": energy,
+            "ordinary_pair_energy": einsum(
+                "ab,ab->",
+                antisym_g,
+                multiply(antisym_g, terms["inverse_gap"]),
+                coefficient=Fraction(-1, 2),
+            ),
+        },
         provenance={
             "method": "same-spin semicanonical MP2-F12/3C(FIX) increment",
             "units": "Hartree",
