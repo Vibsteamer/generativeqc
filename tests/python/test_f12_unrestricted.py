@@ -299,3 +299,63 @@ def test_physical_mixed_pair_against_dense_determinant_space() -> None:
         np.testing.assert_allclose(
             pred, (value(h) - value(-h)) / (2 * h), atol=2e-8, rtol=0
         )
+
+
+def test_spin_resolved_robust_factors_propagate_both_spin_sources() -> None:
+    from generativeqc_compiler.mp2.f12_opposite_spin import opposite_spin_projected_pair
+
+    rng = np.random.default_rng(668013)
+    na, nb, obs, n, aux = 2, 1, 4, 5, 6
+    overlap = np.linalg.qr(rng.normal(size=(n, n)))[0]
+    base = {
+        "cross_overlap": overlap,
+        "select_i": np.eye(n)[1],
+        "select_j": np.eye(n)[0],
+    }
+    for spin in ("alpha", "beta"):
+        d = rng.normal(size=(n, n)) * 0.025
+        base["fock_" + spin] = np.diag(np.linspace(-1.6, 1.3, n)) + (d + d.T) / 2
+        k = rng.normal(size=(n, n)) * 0.02
+        base["exchange_" + spin] = (k + k.T) / 2
+    dl, dr = rng.normal(size=(2, aux, n)) * 0.1
+    fit = {**base, "fit_i_alpha": dl, "fit_j_beta": dr}
+    dense = dict(base)
+    fit["raw_coulomb_j_beta"] = rng.normal(size=(aux, n)) * 0.1
+    dense["coulomb"] = dl.T @ fit["raw_coulomb_j_beta"]
+    for name in ("geminal", "geminal_coulomb", "squared_geminal", "double_commutator"):
+        a, b = rng.normal(size=(2, aux, n)) * 0.1
+        m = rng.normal(size=(aux, aux)) * 0.1
+        m = (m + m.T) / 2
+        fit["raw_" + name + "_i_alpha"] = a
+        fit["raw_" + name + "_j_beta"] = b
+        fit["metric_" + name] = m
+        dense[name] = dl.T @ b + a.T @ dr - dl.T @ m @ dr
+    graph = opposite_spin_projected_pair(na, nb, obs, n, auxiliaries=aux)
+    ref = execute(opposite_spin_projected_pair(na, nb, obs, n), dense).outputs
+    answer = execute(graph, fit).outputs
+    for k, v in ref.items():
+        np.testing.assert_allclose(answer[k], v, rtol=0, atol=2e-13)
+    bar = execute(
+        transpose_program(graph, ("pair_energy",)).program,
+        {**fit, "bar_pair_energy": np.array(1.0)},
+    ).outputs
+    dirs = {
+        k: rng.normal(size=v.shape)
+        for k, v in fit.items()
+        if k.startswith(("fit_", "metric_", "raw_"))
+    }
+    for k, d in dirs.items():
+        dirs[k] = d / max(1.0, np.linalg.norm(d))
+    predicted = sum(float(np.vdot(bar["bar_" + k], d)) for k, d in dirs.items())
+
+    def perturb(t: float) -> float:
+        return float(
+            execute(
+                graph, {**fit, **{k: fit[k] + t * v for k, v in dirs.items()}}
+            ).outputs["pair_energy"]
+        )
+
+    for h in (1.0e-4, 3e-5):
+        np.testing.assert_allclose(
+            (perturb(h) - perturb(-h)) / (2 * h), predicted, atol=2e-8, rtol=0
+        )

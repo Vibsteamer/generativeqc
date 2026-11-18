@@ -15,9 +15,12 @@ from ..tensor.ir import (
 )
 from ..tensor.program import Program
 from ..tensor.types import Index, IndexSpace, TensorSpec
+from .f12_density_fitting import robust_fitted_operator
 
 
-def opposite_spin_projected_pair(na: int, nb: int, obs: int, extended: int) -> Program:
+def opposite_spin_projected_pair(
+    na: int, nb: int, obs: int, extended: int, *, auxiliaries: int | None = None
+) -> Program:
     """Unordered alpha-i/beta-j pair in different frames spanning the same space.
 
     Inputs are orbital-frame Coulomb, f12, f12², Coulomb*f12 and half kinetic
@@ -32,8 +35,10 @@ def opposite_spin_projected_pair(na: int, nb: int, obs: int, extended: int) -> P
     Weights 3/8 (direct) and 1/8 (flipped) include the cusp amplitudes before
     the strong-orthogonality projection. There is exactly one conventional
     determinant per alpha-virtual/beta-virtual pair. All raw matrices remain
-    differentiable. Nuclear response and the assembly of the source integral
-    tiles are separate from this projected pair functional.
+    differentiable. With auxiliaries given, Coulomb-fit and raw operator
+    three-center blocks build the molecular tiles directly. Both spin legs
+    share the same operator metric. Nuclear source and orbital response
+    remain the molecular caller's responsibility.
     """
     if any(type(n) is not int for n in (na, nb, obs, extended)) or not (
         0 < na < obs and 0 < nb < obs < extended
@@ -74,20 +79,41 @@ def opposite_spin_projected_pair(na: int, nb: int, obs: int, extended: int) -> P
     def rect(t: Node, l: Node, r: Node) -> Node:
         return einsum("pq,p,q->pq", t, l, r)
 
+    if auxiliaries is not None and (type(auxiliaries) is not int or auxiliaries < 1):
+        raise ValueError(
+            "A density-fitted opposite-spin pair needs a positive fit space"
+        )
+    if auxiliaries is not None:
+        fit_space = IndexSpace("fitting_basis", "auxiliary", auxiliaries)
+        A, B = Index("a", fit_space), Index("b", fit_space)
+        dl, dr = field("fit_i_alpha", A, p), field("fit_j_beta", A, q)
+
+    def block(name: str) -> Node:
+        if auxiliaries is None:
+            return field(name, p, q)
+        raw_right = field("raw_" + name + "_j_beta", A, q)
+        if name == "coulomb":
+            return einsum("ap,aq->pq", dl, raw_right)
+        return robust_fitted_operator(
+            dl,
+            field("raw_" + name + "_i_alpha", A, p),
+            dr,
+            raw_right,
+            field("metric_" + name, A, B),
+        )
+
     w = weight(einsum("p,q->pq", i, j))
-    g = field("coulomb", p, q)
-    f = weight(field("geminal", p, q))
-    ff = weight(field("squared_geminal", p, q))
-    uf = weight(field("double_commutator", p, q))
+    g = block("coulomb")
+    f = weight(block("geminal"))
+    ff = weight(block("squared_geminal"))
+    uf = weight(block("double_commutator"))
     qf = add(
         rect(f, mask(p, na, extended), mask(q, nb, extended)),
         rect(f, mask(p, na, obs), mask(q, nb, obs)),
         coefficients=(1, -1),
     )
     pf = add(f, qf, coefficients=(1, -1))
-    linear = add(
-        dot(field("geminal_coulomb", p, q), w), dot(g, pf), coefficients=(1, -1)
-    )
+    linear = add(dot(block("geminal_coulomb"), w), dot(g, pf), coefficients=(1, -1))
     norm = add(dot(w, ff), dot(f, pf), coefficients=(1, -1))
     # f F f = half the local kinetic double commutator, the symmetric
     # f²(F+K) term, and the negative exchange expectation. Use QFQ-F to
@@ -128,5 +154,8 @@ def opposite_spin_projected_pair(na: int, nb: int, obs: int, extended: int) -> P
             "method": "UHF opposite-spin SP 3C(FIX), explicit spin-flipped geminal",
             "source_frame": "equal extended subspace, spin-dependent occupied/virtual partitions",
             "units": "Hartree; one ordered alpha/beta pair",
+            "integrals": "three-center density fitted"
+            if auxiliaries is not None
+            else "supplied pair matrices",
         },
     )
