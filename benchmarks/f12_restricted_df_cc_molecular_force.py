@@ -3,6 +3,7 @@
 import json
 from functools import partial
 
+from benchmarks.f12_cc_benchmark_center import check_center
 from benchmarks.f12_closed_shell_cc_molecular import molecular_cc_correlation
 from benchmarks.f12_h2_cc_molecular_force import validate
 from benchmarks.f12_molecular_force_composition import (
@@ -16,9 +17,7 @@ def main() -> None:
     args = endpoint_arguments()
     panel = json.loads(args.panel.read_bytes())
     if "cc_reference" not in panel:
-        raise ValueError(
-            "an independent fixed-geminal CC energy and two full Cartesian reference grids are required"
-        )
+        raise ValueError("independent fixed-geminal CC reference data required")
     geometry = panel["geometry"]
     if geometry.get("multiplicity", 1) != 1:
         raise ValueError("closed-shell molecular reference required")
@@ -33,7 +32,10 @@ def main() -> None:
             molecular_cc_correlation, auxiliary_batch_size=control
         ),
     )
-    validate(measured, panel)
+    if panel.get("validation_scope") == "benchmark_center_and_native_direction":
+        check_center(measured, panel)
+    else:
+        validate(measured, panel)
     measured["scope"] = (
         "Restricted DF-CC fixed geminal and analytic nuclear force. The conventional CC energy, amplitude residual, Lambda and stationary Hamiltonian weights operate on Q batches and at most two virtual indices. The same fully relaxed CABS singles and geminal sources are used throughout."
     )
