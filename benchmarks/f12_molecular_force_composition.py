@@ -145,7 +145,9 @@ def calculate_panel(args: Namespace, target: dict) -> dict:
             "centers": np.ascontiguousarray(xyz[template["atom"]]),
             "manifest": np.asarray(json.dumps({**meta, "geometry_bohr": geometry})),
         }
-        tensors, costs = forward_integrals(topology, args.sink_library)
+        tensors, costs = forward_integrals(
+            topology, args.sink_library, budget_mib=args.budget_mib
+        )
         if len(costs) != 10 or any(rec["device_bytes"] <= 0 for rec in costs.values()):
             raise ValueError("missing GPU integral source")
         factor, whitening = metric_whitener(tensors["metric"], args.component_library)
@@ -198,7 +200,9 @@ def calculate_panel(args: Namespace, target: dict) -> dict:
         explicit = native_contraction(case, ws, wh, indices)
     else:
         explicit = central_one.gradient(ws, wh, args.budget_mib << 20)
-    sinks = contract_live_weights(topology, obs.explicit_weights, args.sink_library)
+    sinks = contract_live_weights(
+        topology, obs.explicit_weights, args.sink_library, budget_mib=args.budget_mib
+    )
     energy, forces = full_result(
         obs, explicit.gradient, sinks["gradient_Eh_per_bohr"], ordinary
     )
