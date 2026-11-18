@@ -5,6 +5,7 @@ import pytest
 from generativeqc_compiler.mp2.f12_molecular_pair import extended_df_fock
 from generativeqc_compiler.mp2.f12_unrestricted import (
     unrestricted_extended_df_fock,
+    unrestricted_pair_coupling,
     unrestricted_pair_vx,
 )
 from generativeqc_compiler.tensor import Program, execute, transpose_program
@@ -124,3 +125,47 @@ def test_invalid_orbital_spaces() -> None:
         unrestricted_extended_df_fock(0, 0, 3, 4)
     with pytest.raises(ValueError):
         unrestricted_pair_vx((2, 2, 1), (1, 2, 2), channel="alpha_alpha")
+
+
+@pytest.mark.parametrize("channel", ["alpha_beta", "alpha_alpha", "beta_beta"])
+def test_coupling_and_gap_on_full_two_electron_space(channel: str) -> None:
+    rng = np.random.default_rng(31763)
+    left = (2, 2, 3)
+    right = (1, 3, 2) if channel == "alpha_beta" else left
+    n, m = sum(left), sum(right)
+    sl, sr = channel.split("_")
+    fl, fr = (rng.normal(size=(size, size)) for size in (n, m))
+    fl = (fl + fl.T) / 2
+    fr = fl if sl == sr else (fr + fr.T) / 2
+    gem = rng.normal(size=(n, m))
+    ol, vl, _ = left
+    ore, vr, _ = right
+    vsl = slice(ol, ol + vl)
+    vsr = slice(ore, ore + vr)
+    gel = np.diag(fl)[vsl]
+    ger = np.diag(fr)[vsr]
+    ei, ej = np.asarray(fl[ol - 1, ol - 1]), np.asarray(fr[0, 0])
+    inputs = {
+        "occupied_energy_i": ei,
+        "occupied_energy_j": ej,
+        "virtual_energies_" + sl: gel,
+        "virtual_energies_" + sr: ger,
+        "virtual_cabs_fock_" + sl: fl[vsl, ol + vl :],
+        "virtual_cabs_fock_" + sr: fr[vsr, ore + vr :],
+        "geminal_virtual_cabs": gem[vsl, ore + vr :],
+        "geminal_cabs_virtual": gem[ol + vl :, vsr],
+    }
+    va, vb = np.eye(n)[:, vsl], np.eye(m)[:, vsr]
+    olp, orp = np.eye(n)[:, :ol], np.eye(m)[:, :ore]
+    p = np.kron(np.eye(n) - olp @ olp.T, np.eye(m) - orp @ orp.T) - np.kron(
+        va @ va.T, vb @ vb.T
+    )
+    f = np.kron(fl, np.eye(m)) + np.kron(np.eye(n), fr)
+    ref = (f @ p @ gem.ravel()).reshape(n, m)[vsl, vsr]
+    plan = unrestricted_pair_coupling(left, right, channel=channel)
+    actual = execute(plan, inputs).outputs
+    np.testing.assert_allclose(actual["c"], ref, atol=1e-13, rtol=0)
+    np.testing.assert_allclose(
+        actual["gap"], gel[:, None] + ger[None, :] - ei - ej, atol=1e-13, rtol=0
+    )
+    _check_vjp(plan, inputs, rng)

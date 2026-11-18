@@ -1,6 +1,6 @@
 """Unrestricted extended-frame sources for real MP2-F12 pair projections."""
 
-from ..tensor.ir import Node, add, einsum, input_tensor, slice_tensor
+from ..tensor.ir import Node, add, broadcast, einsum, input_tensor, slice_tensor
 from ..tensor.program import Program
 from ..tensor.types import Index, IndexSpace, TensorSpec
 
@@ -61,21 +61,9 @@ def unrestricted_extended_df_fock(
     )
 
 
-def unrestricted_pair_vx(
-    left: tuple[int, int, int], right: tuple[int, int, int], *, channel: str
-) -> Program:
-    """V and X matrix elements of a spin-conserving ordered F12 pair.
-
-    Axes in each spin frame are occupied, orbital virtual, then CABS. Given
-    external bra and ket occupied spin pairs, let f and g mean the geminal and
-    Coulomb operators. V = <bra|g Q f|ket>, X = <bra|f Q f|ket> use the
-    strong-orthogonality projector Q = (1-O1)(1-O2) - V1 V2, with V1,V2
-    the *orbital* virtual subspaces. Subtract its three disjoint complement
-    blocks from the full-space unfitted (or consistently fitted) gf and f²
-    integrals. Independent left/right matrix elements also allow a caller to
-    select the exchange ket for same-spin pairs. Spin factors and the 3C(FIX)
-    B/C contributions belong to the subsequent Hylleraas functional.
-    """
+def _pair_spins(
+    left: tuple[int, int, int], right: tuple[int, int, int], channel: str
+) -> tuple[str, str]:
     spins = {
         "alpha_alpha": ("alpha", "alpha"),
         "alpha_beta": ("alpha", "beta"),
@@ -91,6 +79,26 @@ def unrestricted_pair_vx(
             "Both electrons of a same-spin pair need the same orbital frame"
         )
 
+    return spins[channel]
+
+
+def unrestricted_pair_vx(
+    left: tuple[int, int, int], right: tuple[int, int, int], *, channel: str
+) -> Program:
+    """V and X matrix elements of a spin-conserving ordered F12 pair.
+
+    Axes in each spin frame are occupied, orbital virtual, then CABS. Given
+    external bra and ket occupied spin pairs, let f and g mean the geminal and
+    Coulomb operators. V = <bra|g Q f|ket>, X = <bra|f Q f|ket> use the
+    strong-orthogonality projector Q = (1-O1)(1-O2) - V1 V2, with V1,V2
+    the *orbital* virtual subspaces. Subtract its three disjoint complement
+    blocks from the full-space unfitted (or consistently fitted) gf and f²
+    integrals. Independent left/right matrix elements also allow a caller to
+    select the exchange ket for same-spin pairs. Spin factors and the 3C(FIX)
+    B/C contributions belong to the subsequent Hylleraas functional.
+    """
+    spins = _pair_spins(left, right, channel)
+
     def ranges(
         space: tuple[int, int, int], spin: str, name: str
     ) -> tuple[Index, Index, Index]:
@@ -102,8 +110,8 @@ def unrestricted_pair_vx(
             Index(name, frame, occ + vir, occ + vir + cabs),
         )
 
-    lo, lb, lc = ranges(left, spins[channel][0], "p")
-    ro, rb, rc = ranges(right, spins[channel][1], "q")
+    lo, lb, lc = ranges(left, spins[0], "p")
+    ro, rb, rc = ranges(right, spins[1], "q")
     linear = [_field("geminal_coulomb_element")]
     norm = [_field("squared_geminal_element")]
     for block, axes in (
@@ -122,5 +130,59 @@ def unrestricted_pair_vx(
         provenance={
             "method": "spin-orbital strongly orthogonal F12 V/X",
             "channel": channel,
+        },
+    )
+
+
+def unrestricted_pair_coupling(
+    left: tuple[int, int, int], right: tuple[int, int, int], *, channel: str
+) -> Program:
+    """Compute C_ab = <ab|(F1+F2) Q f12|ij> and the positive MP2 energy gap.
+
+    Use one ordered spin-conserving geminal column in its alpha/beta frames.
+    Projecting a one-body Fock action onto two orbital virtuals leaves only
+    the virtual×CABS and CABS×virtual geminal rectangles. Both legs of like-spin
+    pairs share a physical Fock block and virtual spectrum, with a common VJP.
+    Summing or antisymmetrizing upstream geminal columns remains linear.
+    """
+    spin_left, spin_right = _pair_spins(left, right, channel)
+
+    def fock_block(
+        size: tuple[int, int, int], spin: str
+    ) -> tuple[Node, Node, Index, Index]:
+        occ, vir, cabs = size
+        frame = IndexSpace("extended_" + spin, "orbital", occ + vir + cabs, spin=spin)
+        a = Index("a", frame, occ, occ + vir)
+        c = Index("c", frame, occ + vir, occ + vir + cabs)
+        return (
+            _field("virtual_cabs_fock_" + spin, a, c),
+            _field("virtual_energies_" + spin, a),
+            a,
+            c,
+        )
+
+    f_l, e_l, a, c = fock_block(left, spin_left)
+    if spin_left == spin_right:
+        f_r, e_r, r_vir, d = f_l, e_l, a, c
+    else:
+        f_r, e_r, r_vir, d = fock_block(right, spin_right)
+    b = Index("b", r_vir.space, r_vir.start, r_vir.stop)
+    lr = _field("geminal_virtual_cabs", a, d)
+    rl = _field("geminal_cabs_virtual", c, b)
+    coupling = add(einsum("ac,cb->ab", f_l, rl), einsum("ac,bc->ab", lr, f_r))
+    axes = coupling.spec.indices
+    occupied = add(_field("occupied_energy_i"), _field("occupied_energy_j"))
+    gap = add(
+        broadcast(e_l, axes, (0,)),
+        broadcast(e_r, axes, (1,)),
+        broadcast(occupied, axes, ()),
+        coefficients=(1, 1, -1),
+    )
+    return Program(
+        {"c": coupling, "gap": gap},
+        provenance={
+            "method": "spin-orbital strongly orthogonal F12 doubles coupling",
+            "channel": channel,
+            "convention": "ordered pair, semicanonical orbital energies, positive MP2 gap",
         },
     )
