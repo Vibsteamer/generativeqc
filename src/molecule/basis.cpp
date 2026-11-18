@@ -29,11 +29,7 @@ double odd_double_factorial(unsigned angular_power) noexcept {
   return value;
 }
 
-}  // namespace
-
-std::vector<CartesianComponent> cartesian_components(unsigned l) {
-  if (l > kMaximumPublicAngularMomentum)
-    throw std::invalid_argument("Cartesian components support l<=5");
+std::vector<CartesianComponent> enumerate_components(unsigned l) {
   std::vector<CartesianComponent> components;
   components.reserve(cartesian_count(l));
   // CCA/libcint order: x power decreases first; for a fixed x power, y
@@ -48,9 +44,9 @@ std::vector<CartesianComponent> cartesian_components(unsigned l) {
   return components;
 }
 
-std::vector<AoExpansion> ao_expansions(unsigned l,
-                                       generativeqc_basis_representation representation) {
-  const std::vector<CartesianComponent> cartesian = cartesian_components(l);
+std::vector<AoExpansion> expand_components(unsigned l,
+                                           generativeqc_basis_representation representation,
+                                           const std::vector<CartesianComponent>& cartesian) {
   if (representation == GENERATIVEQC_BASIS_CARTESIAN || l < 2) {
     std::vector<AoExpansion> expansions;
     expansions.reserve(cartesian.size());
@@ -157,6 +153,24 @@ std::vector<AoExpansion> ao_expansions(unsigned l,
     expansions.push_back(std::move(expansion));
   }
   return expansions;
+}
+
+}  // namespace
+
+std::vector<CartesianComponent> cartesian_components(unsigned l) {
+  if (l > kMaximumPublicAngularMomentum)
+    throw std::invalid_argument("Cartesian components support l<=5");
+  return enumerate_components(l);
+}
+
+std::vector<AoExpansion> ao_expansions(unsigned l,
+                                       generativeqc_basis_representation representation) {
+  return expand_components(l, representation, cartesian_components(l));
+}
+
+std::vector<AoExpansion> complementary_spherical_expansions(unsigned l) {
+  if (l > 6) throw std::invalid_argument("Complementary spherical expansions support l<=6");
+  return expand_components(l, GENERATIVEQC_BASIS_SPHERICAL, enumerate_components(l));
 }
 
 std::size_t ao_count(const core::System& system) noexcept {

@@ -13,3 +13,10 @@ channel, the summed matrix element, and the six nuclear derivatives with
 independent integrals and two-step finite differences. This measures the
 scalar pseudopotential contribution to one-electron integrals. Molecular
 energies and forces also require the SCF and correlation response.
+
+The complementary consumer uses the native regular-solid-harmonic expansion for
+all 13 real i functions and its own term storage. Public orbital packers still
+have their original bounds. The complete-shell regression checks ordering,
+phase and normalization against libcint for d through i. Off-center tests
+cover the entire i-by-s block, including all four semilocal channels, and
+independently displace the potential and basis centers along each axis.
