@@ -149,3 +149,73 @@ def fixed_pair_cc_residual(occupied: int, virtual: int, *, diagonal: bool) -> Pr
             "ordered_pair_sum": "folded into one unordered spatial pair",
         },
     )
+
+
+def fixed_pair_geminal_energy(occupied: int, virtual: int) -> Program:
+    """Geminal terms in restricted F12a and F12b energies for one *ordered* pair.
+
+    Sum both orders for m != n. Supply the occupied-projector V_ij (the full
+    Q12 used by the ordinary F12 Hylleraas functional), ordered rows of B and X
+    in the occupied-pair basis, and C_ab at the same reference. The energy uses
+    connected t2 in the common C_ab term. The separate F12b back-coupling input
+    includes the disconnected singles product. Add conventional CC correlation
+    and the reference separately. All source tensors, including the entire
+    symmetric occupied Fock block, remain differentiable.
+    """
+    if any(type(n) is not int or n < 1 for n in (occupied, virtual)):
+        raise ValueError("positive occupied and virtual active spaces required")
+    occ = IndexSpace("occupied", "occupied", occupied)
+    vir = IndexSpace("virtual", "virtual", virtual)
+    i, j = Index("i", occ), Index("j", occ)
+    a, b = Index("a", vir), Index("b", vir)
+    v = _source("v_occupied", i, j)
+    x = _source("x_row", i, j)
+    b_row = _source("b_row", i, j)
+    g = _source("fock_occupied", i, j)
+    c = _source("fock_coupling_vv", a, b)
+    t2 = _source("t2", i, j, a, b)
+    rb = _source("back_coupling", i, j)
+    sel = TensorSpec(
+        (i,), role="input", differentiable=False, representation="restricted_spatial"
+    )
+    m = input_tensor("select_m", sel)
+    n = input_tensor("select_n", sel)
+
+    def fixed_action(matrix: Node) -> Node:
+        # Contract this row with the complete fixed-amplitude tensor T_op^ij.
+        return add(
+            matrix,
+            transpose(matrix, (1, 0)),
+            coefficients=(Fraction(3, 8), Fraction(1, 8)),
+        )
+
+    bx = fixed_action(x)
+    common = add(
+        v,
+        fixed_action(b_row),
+        einsum("ik,kj->ij", g, bx),
+        einsum("ik,jk->ij", bx, g),
+        einsum("ab,ijab->ij", c, t2),
+        coefficients=(2, 1, -1, -1, 1),
+    )
+
+    def spin_contract(values: Node) -> Node:
+        # The energy contracts (2T_mn^ij - T_nm^ij) for this fixed ordered mn.
+        weighted = add(
+            values,
+            transpose(values, (1, 0)),
+            coefficients=(Fraction(5, 8), Fraction(-1, 8)),
+        )
+        return einsum("i,i->", m, einsum("ij,j->i", weighted, n))
+
+    return Program(
+        {
+            "f12a_geminal_energy": spin_contract(common),
+            "f12b_extra_energy": spin_contract(rb),
+        },
+        provenance={
+            "operation": "restricted ordered CC-F12 geminal energy terms",
+            "reference": "Knizia Eqs. (4.125)-(4.127)",
+            "pair_enumeration": "ordered; diagonal visited once",
+        },
+    )
