@@ -18,9 +18,11 @@ from generativeqc_compiler.tensor.ad_program import transpose_program
 from benchmarks._f12_cuda import cuda_runner
 
 
-def qualify(source: dict, reference: dict, run: Callable) -> dict:
+def solve_fixed_sources(
+    source: dict, run: Callable, *, source_pullback: bool = False
+) -> dict:
     """Use one occupied spatial orbital. The dense conventional tensors are diagnostic-sized."""
-    obs = source["h"].shape[0]
+    obs = source["f"].shape[0]
     if (
         not 2 <= obs <= 24
         or source["f"].shape != (obs, obs)
@@ -94,60 +96,103 @@ def qualify(source: dict, reference: dict, run: Callable) -> dict:
         [co["correlation_energy"], e["f12a_geminal_energy"], e["f12b_extra_energy"]]
     )
     packed = np.r_[t1.ravel(), t2[0, 0][upper]]
-    lam = reference["lambda_source"]
-    q2 = np.zeros_like(t2)
-    q2[0, 0][upper] = lam[n:]
-    # Split symmetric-pair adjoints by their actual output coordinates; fold input duals at the end.
-    cv = run(
-        transpose_program(
-            conventional,
-            ("correlation_energy", "singles_residual", "doubles_residual"),
-            inputs=("t1", "t2"),
-        ).program,
-        {
-            **cq,
-            "bar_correlation_energy": np.array(1.0),
-            "bar_singles_residual": lam[:n][None, :],
-            "bar_doubles_residual": q2,
-        },
-    ).outputs
-    fv = run(
-        transpose_program(fixed, ("singles_m", "doubles_mn"), inputs=("t1",)).program,
-        {**fq, "bar_singles_m": lam[:n], "bar_doubles_mn": q2[0, 0]},
-    ).outputs
-    ev = run(
-        transpose_program(
-            energy,
-            ("f12a_geminal_energy", "f12b_extra_energy"),
-            inputs=("t2", "back_coupling"),
-        ).program,
-        {
-            **eq,
-            "bar_f12a_geminal_energy": np.array(1.0),
-            "bar_f12b_extra_energy": np.array(1.0),
-        },
-    ).outputs
-    bv = run(
-        transpose_program(back, ("back_coupling",), inputs=("t1", "t2")).program,
-        {**bq, "bar_back_coupling": ev["bar_back_coupling"]},
-    ).outputs
-    bar1 = cv["bar_t1"][0] + fv["bar_t1"][0] + bv["bar_t1"][0]
-    bar2 = (cv["bar_t2"] + ev["bar_t2"] + bv["bar_t2"])[0, 0]
-    packed2 = bar2[upper].copy()
-    off = upper[0] != upper[1]
-    packed2[off] += bar2[(upper[1][off], upper[0][off])]
-    errors = {
-        "max_amplitude_vs_oracle": float(
-            np.max(abs(packed - reference["oracle_amplitudes"]))
-        ),
-        "max_component_energy_Eh": float(
-            np.max(abs(components - reference["components_Eh"]))
-        ),
-        "max_lambda_equation_residual": float(np.max(abs(np.r_[bar1, packed2]))),
-    }
+
+    def adjoint(
+        lam: np.ndarray, *, all_sources: bool = False
+    ) -> tuple[np.ndarray, dict]:
+        q2 = np.zeros_like(t2)
+        q2[0, 0][upper] = lam[n:]
+        # Split symmetric-pair adjoints by their actual output coordinates; fold input duals at the end.
+        cv = run(
+            transpose_program(
+                conventional,
+                ("correlation_energy", "singles_residual", "doubles_residual"),
+                inputs=None if all_sources else ("t1", "t2"),
+            ).program,
+            {
+                **cq,
+                "bar_correlation_energy": np.array(1.0),
+                "bar_singles_residual": lam[:n][None, :],
+                "bar_doubles_residual": q2,
+            },
+        ).outputs
+        fv = run(
+            transpose_program(
+                fixed,
+                ("singles_m", "doubles_mn"),
+                inputs=None if all_sources else ("t1",),
+            ).program,
+            {**fq, "bar_singles_m": lam[:n], "bar_doubles_mn": q2[0, 0]},
+        ).outputs
+        ev = run(
+            transpose_program(
+                energy,
+                ("f12a_geminal_energy", "f12b_extra_energy"),
+                inputs=None if all_sources else ("t2", "back_coupling"),
+            ).program,
+            {
+                **eq,
+                "bar_f12a_geminal_energy": np.array(1.0),
+                "bar_f12b_extra_energy": np.array(1.0),
+            },
+        ).outputs
+        bv = run(
+            transpose_program(
+                back, ("back_coupling",), inputs=None if all_sources else ("t1", "t2")
+            ).program,
+            {**bq, "bar_back_coupling": ev["bar_back_coupling"]},
+        ).outputs
+        bar1 = cv["bar_t1"][0] + fv["bar_t1"][0] + bv["bar_t1"][0]
+        bar2 = (cv["bar_t2"] + ev["bar_t2"] + bv["bar_t2"])[0, 0]
+        packed2 = bar2[upper].copy()
+        off = upper[0] != upper[1]
+        packed2[off] += bar2[(upper[1][off], upper[0][off])]
+        grad = np.r_[bar1, packed2]
+        if not all_sources:
+            return grad, {}
+        raw_f = np.zeros_like(source["f"])
+        raw_f[o, o] = cv["bar_foo"] + ev["bar_fock_occupied"]
+        raw_f[o, v] = cv["bar_fov"]
+        raw_f[v, v] = cv["bar_fvv"]
+        raw_g = np.zeros_like(source["eri"])
+        for key in hamiltonian:
+            if not key.startswith("f"):
+                raw_g[tuple(slices[x] for x in key)] += cv["bar_" + key]
+        raw_v = np.zeros_like(z)
+        for key, domain in (("v_vv", (v, v)), ("v_ov", (o, v)), ("v_vo", (v, o))):
+            raw_v[domain] += fv.get("bar_" + key, 0.0) + bv["bar_" + key]
+        return grad, {
+            "f": raw_f,
+            "eri": raw_g,
+            "vext": raw_v,
+            "c": ev["bar_fock_coupling_vv"] + fv["bar_fock_coupling_vv"],
+            "v": ev["bar_v_occupied"],
+            "b": ev["bar_b_row"],
+            "x": ev["bar_x_row"],
+        }
+
+    # Precondition the dual residual with the same occupied/virtual gaps as the primal.
+    # At convergence the full packed gradient is zero without a supplied Lambda.
+    lam = np.zeros_like(packed)
+    dual_gaps = np.r_[d1.ravel(), d2[0, 0][upper]]
+    dual_history = []
+    for _ in range(90):
+        derivative, _ = adjoint(lam)
+        error = float(np.max(abs(derivative)))
+        if not np.isfinite(error):
+            raise FloatingPointError("non-finite CC amplitude Lagrangian derivative")
+        dual_history.append(error)
+        if error < 1e-10:
+            break
+        lam += derivative / dual_gaps
+    else:
+        raise ValueError(f"CC Lambda solve failed to converge: {dual_history[-1]}")
+    bars = adjoint(lam, all_sources=True)[1] if source_pullback else {}
     return {
-        "passed": bool(history[-1] < 1e-10 and max(errors.values()) < 2e-9),
-        "errors": errors,
+        "amplitudes": packed,
+        "lambda": lam,
+        "source_cotangents": bars,
+        "lambda_residual_history": dual_history,
         "ordered_component_energies_Eh": components.tolist(),
         "components": ["ordinary_correlation", "F12a_common", "F12b_extra"],
         "residual_history": history,
@@ -157,6 +202,28 @@ def qualify(source: dict, reference: dict, run: Callable) -> dict:
         "virtuals": n,
         "independent_amplitudes": packed.size,
     }
+
+
+def qualify(source: dict, reference: dict, run: Callable) -> dict:
+    result = solve_fixed_sources(source, run)
+    errors = {
+        "max_amplitude_vs_oracle": float(
+            np.max(abs(result.pop("amplitudes") - reference["oracle_amplitudes"]))
+        ),
+        "max_lambda_vs_oracle": float(
+            np.max(abs(result.pop("lambda") - reference["lambda_source"]))
+        ),
+        "max_component_energy_Eh": float(
+            np.max(
+                abs(
+                    result["ordered_component_energies_Eh"] - reference["components_Eh"]
+                )
+            )
+        ),
+        "max_lambda_equation_residual": result["lambda_residual_history"][-1],
+    }
+    result.pop("source_cotangents")
+    return {**result, "passed": max(errors.values()) < 2e-9, "errors": errors}
 
 
 def main() -> None:
