@@ -1,6 +1,8 @@
 """Pair-tiled restricted CC-F12 matrix elements and the CCSD-F12b-specific back coupling."""
 
-from ..tensor.ir import Node, add, einsum, input_tensor
+from fractions import Fraction
+
+from ..tensor.ir import Node, add, einsum, input_tensor, transpose
 from ..tensor.program import Program
 from ..tensor.types import Index, IndexSpace, TensorSpec
 
@@ -79,4 +81,71 @@ def _source(name: str, *axes: Index) -> Node:
         TensorSpec(
             axes, role="input", differentiable=True, representation="restricted_spatial"
         ),
+    )
+
+
+def fixed_pair_cc_residual(occupied: int, virtual: int, *, diagonal: bool) -> Program:
+    """Fixed-cusp correction to ordinary spatial CC singles/doubles for one unordered pair.
+
+    For m<n the second ordered geminal is the electron-coordinate transpose
+    of the first. The caller adds doubles_mn to R[m,n], its transpose to R[n,m],
+    and singles_m/singles_n to the corresponding rows. For m=n apply only
+    doubles_mn and singles_m once. Free indices address active CC orbitals.
+    The geminal factor has unit slope at the origin. The standard singlet and
+    triplet cusp coefficients are 1/2 and 1/4, respectively.
+    """
+    if type(diagonal) is not bool or any(
+        type(n) is not int or n < 1 for n in (occupied, virtual)
+    ):
+        raise ValueError("positive active spaces and a boolean diagonal flag required")
+    occ = IndexSpace("occupied", "occupied", occupied)
+    vir = IndexSpace("virtual", "virtual", virtual)
+    k, a, b = Index("k", occ), Index("a", vir), Index("b", vir)
+    t1 = _source("t1", k, a)
+    vv, ov, vo = _source("v_vv", a, b), _source("v_ov", k, b), _source("v_vo", a, k)
+    c = _source("fock_coupling_vv", a, b)
+    # V_ak*t_kb and t_ka*V_kb from Eq. (4.123) belong to distinct ordered blocks.
+    source = add(
+        vv,
+        c,
+        einsum("ak,kb->ab", vo, t1),
+        einsum("ka,kb->ab", t1, ov),
+        coefficients=(1, 1, -1, -1),
+    )
+    selector_spec = TensorSpec(
+        (k,), role="input", differentiable=False, representation="restricted_spatial"
+    )
+    m = input_tensor("select_m", selector_spec)
+    if diagonal:
+        outputs = {
+            "doubles_mn": add(source, coefficients=(Fraction(1, 2),)),
+            "singles_m": add(einsum("ak,k->a", vo, m), coefficients=(Fraction(1, 2),)),
+        }
+    else:
+        n = input_tensor("select_n", selector_spec)
+        # Fold the mn and nm contributions of the full ordered spatial sum.
+        outputs = {
+            "doubles_mn": add(
+                source,
+                transpose(source, (1, 0)),
+                coefficients=(Fraction(3, 8), Fraction(1, 8)),
+            ),
+            "singles_m": add(
+                einsum("ak,k->a", vo, n),
+                einsum("ka,k->a", ov, n),
+                coefficients=(Fraction(5, 8), Fraction(-1, 8)),
+            ),
+            "singles_n": add(
+                einsum("ak,k->a", vo, m),
+                einsum("ka,k->a", ov, m),
+                coefficients=(Fraction(-1, 8), Fraction(5, 8)),
+            ),
+        }
+    return Program(
+        outputs,
+        provenance={
+            "operation": "CCSD-F12a/b ordinary residual additions",
+            "reference": "Knizia Eqs. (3.23), (4.123),(4.124)",
+            "ordered_pair_sum": "folded into one unordered spatial pair",
+        },
     )
