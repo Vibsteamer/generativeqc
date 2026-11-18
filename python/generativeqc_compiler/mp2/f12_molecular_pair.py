@@ -21,7 +21,13 @@ def _dot(left: Node, right: Node) -> Node:
 
 
 def _fitted_blocks(
-    orbital: IndexSpace, auxiliaries: int, occupied: int, obs: int, diagonal: bool
+    orbital: IndexSpace,
+    auxiliaries: int,
+    occupied: int,
+    obs: int,
+    diagonal: bool,
+    *,
+    pair_prefix: str = "",
 ) -> dict[str, Node]:
     ri = orbital.size
     aux = Index("a", IndexSpace("fitting_basis", "auxiliary", auxiliaries))
@@ -36,6 +42,7 @@ def _fitted_blocks(
         return inputs[name]
 
     def sides(name: str) -> tuple[Node, Node]:
+        name = pair_prefix + name
         left = source(name + "_i", (aux, orb))
         return left, left if diagonal else source(name + "_j", (aux, orb))
 

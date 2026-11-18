@@ -1,5 +1,17 @@
 # Restricted explicitly correlated CC residual components
 
+For multi-occupied restricted molecules the canonical Fock is diagonal, but
+its orbital derivative can be off diagonal. Retain the occupied-pair
+overlap between different bra and ket geminals for the corresponding Fock
+adjoint. The full strong-orthogonality projector subtracts OBS×OBS and the
+two occupied×complementary blocks. With Coulomb on the left, its companion
+V matrix can be nonsymmetric in the pair indices. The multi-occupied
+fixed-source diagnostic assembles singlet and triplet contributions for all
+ordered active pairs. It uses a combined residual during iteration and
+cross-checks the final residual using the separate pair programs. A matched
+PySCF conventional RCC residual and explicit cusp-spin sums can test this
+diagnostic independently on the same two-electron-integral sources.
+
 The bounded molecular H₂ driver builds all ordinary and geminal inputs from a
 single spherical AO geometry and carries stationary CC/Lambda weights through
 the robust three-center integrals, operator metrics, CABS and orbital response.

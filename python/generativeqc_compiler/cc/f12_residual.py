@@ -84,6 +84,53 @@ def _source(name: str, *axes: Index) -> Node:
     )
 
 
+def all_pair_cc_residual(occupied: int, virtual: int) -> Program:
+    """Collect all active geminal pairs for repeated restricted CC iterations.
+
+    The same fixed singlet/triplet amplitudes as fixed_pair_cc_residual are
+    contracted here over ordered orbital indices. This route stores the
+    external pair blocks up to (occupied,occupied,virtual,virtual), as does
+    the diagnostic amplitude solver; the one-pair programs remain available
+    for streaming larger sources.
+    """
+    if any(type(n) is not int or n < 1 for n in (occupied, virtual)):
+        raise ValueError("positive occupied and virtual spaces required")
+    occ = IndexSpace("occupied", "occupied", occupied)
+    vir = IndexSpace("virtual", "virtual", virtual)
+    i, j, k = (Index(s, occ) for s in "ijk")
+    a, b = (Index(s, vir) for s in "ab")
+    vv = _source("v_vv", i, j, a, b)
+    vo = _source("v_vo", i, j, a, k)
+    ov = _source("v_ov", i, j, k, b)
+    c = _source("c", i, j, a, b)
+    t1 = _source("t1", k, a)
+    source = add(
+        vv,
+        c,
+        einsum("ijak,kb->ijab", vo, t1),
+        einsum("ka,ijkb->ijab", t1, ov),
+        coefficients=(1, 1, -1, -1),
+    )
+    return Program(
+        {
+            "singles": add(
+                einsum("ijaj->ia", vo),
+                einsum("jiaj->ia", vo),
+                coefficients=(Fraction(5, 8), Fraction(-1, 8)),
+            ),
+            "doubles": add(
+                source,
+                transpose(source, (1, 0, 2, 3)),
+                coefficients=(Fraction(3, 8), Fraction(1, 8)),
+            ),
+        },
+        provenance={
+            "operation": "spin-restricted fixed-geminal CC residual additions for every active pair",
+            "reference": "Knizia Eqs. (4.123),(4.124)",
+        },
+    )
+
+
 def fixed_pair_cc_residual(occupied: int, virtual: int, *, diagonal: bool) -> Program:
     """Fixed-cusp correction to ordinary spatial CC singles/doubles for one unordered pair.
 
