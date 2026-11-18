@@ -129,3 +129,26 @@ def test_multipair_source_lagrangian_agrees_with_symmetric_variations() -> None:
         )
         obs.append(out.sum() + np.vdot(one, l) + np.vdot(two, ll))
     np.testing.assert_allclose((obs[1] - obs[0]) / (2 * h), exact, atol=2e-8, rtol=0)
+
+
+def test_atomic_translation_control_and_molecular_displacement_coverage() -> None:
+    from benchmarks.f12_h2_cc_molecular_force import _directional_coverage
+
+    steps = ("0.0004", "0.0002")
+    atom = {
+        "geometry": {"elements": ["F"]},
+        "native_displacements": [
+            {"name": "translation_x", "direction": [[1, 0, 0]], "step": float(h)}
+            for h in steps
+        ],
+    }
+    translations = [
+        {"direction": "translation_x", "step_bohr": float(h)} for h in steps
+    ]
+    assert _directional_coverage(translations, atom, steps)
+    assert not _directional_coverage(translations[::-1] + translations[:1], atom, steps)
+    molecule = {"geometry": {"elements": ["H", "H"]}}
+    assert not _directional_coverage(translations, molecule, steps)
+    atom["native_displacements"][0]["direction"] = [[0, 0, 0]]
+    with pytest.raises(ValueError, match="sole center"):
+        _directional_coverage(translations, atom, steps)

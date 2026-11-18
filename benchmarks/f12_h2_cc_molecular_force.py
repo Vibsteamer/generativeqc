@@ -14,6 +14,33 @@ from benchmarks.f12_molecular_force_composition import (
 )
 
 
+def _directional_coverage(arms: list, target: dict, steps: tuple[str, ...]) -> bool:
+    if len(target["geometry"]["elements"]) == 1:
+        # A field-free isolated atom has no internal bond coordinate. Its
+        # independent Cartesian comparison still covers X, Y, Z at both steps.
+        inputs = target["native_displacements"]
+        if (
+            len(inputs) != len(steps)
+            or {row["step"] for row in inputs} != {float(h) for h in steps}
+            or any(
+                row["name"] != "translation_x"
+                or not np.array_equal(row["direction"], [[1.0, 0.0, 0.0]])
+                for row in inputs
+            )
+        ):
+            raise ValueError(
+                "the atomic translation control must displace its sole center along x"
+            )
+        names = ("translation_x",)
+    else:
+        names = ("mixed", "bond")
+    expected = {(name, float(step)) for name in names for step in steps}
+    return (
+        len(arms) == len(expected)
+        and {(arm["direction"], arm["step_bohr"]) for arm in arms} == expected
+    )
+
+
 def validate(report: dict, target: dict) -> dict:
     oracle = target["cc_reference"]
     forces = np.asarray(report["total_force_Eh_per_bohr"])
@@ -25,19 +52,19 @@ def validate(report: dict, target: dict) -> dict:
         if (
             forces.shape != (len(target["geometry"]["elements"]), 3)
             or ref.shape != forces.shape
+            or not np.isfinite(ref).all()
+            or not np.isfinite(forces).all()
         ):
             raise ValueError(
                 "all molecular Cartesian derivatives are required at each step"
             )
         errors.append(float(np.max(abs(forces - ref))))
     arms = report["native_directional_checks"]
-    directions = {(a["direction"], a["step_bohr"]) for a in arms}
     checks = {
         **common_checks(report, target),
         "independent_energy": energy_error <= 5e-11,
         "independent_cartesian_two_steps": max(errors) <= 2e-6,
-        "native_directions": directions
-        == {(direction, float(h)) for direction in ("mixed", "bond") for h in steps}
+        "native_directions": _directional_coverage(arms, target, steps)
         and max(a["max_error_Eh_per_bohr"] for a in arms) <= 2e-6,
         "relaxed_cc_residual": report["cc_residual"] <= 1e-10
         and report["lambda_residual"] <= 1e-10,
@@ -48,7 +75,10 @@ def validate(report: dict, target: dict) -> dict:
         phase="complete",
         checks=checks,
         passed=all(checks.values()),
-        scope="Two-electron fixed-geminal restricted CC-F12a/b equations, robust external V, fully relaxed molecular force. Independent same-equation determinant solver and integral sources.",
+        scope=oracle.get(
+            "scope",
+            "Two-electron fixed-geminal restricted CC-F12a/b equations, robust external V, fully relaxed molecular force. Independent same-equation determinant solver and integral sources.",
+        ),
         total_energy_error_Eh=energy_error,
         independent_force_max_errors_Eh_per_bohr=dict(zip(steps, errors, strict=True)),
     )
