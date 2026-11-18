@@ -10,77 +10,10 @@ from pathlib import Path
 
 import numpy as np
 from generativeqc._f12_cabs import cabs_singles
-from generativeqc_compiler.mp2.f12_opposite_spin import opposite_spin_projected_pair
-from generativeqc_compiler.mp2.f12_unrestricted import (
-    projected_same_spin_f12_pair,
-    unrestricted_extended_df_fock,
-)
+from generativeqc._f12_spin_pairs import molecular_pair_energies
+from generativeqc_compiler.mp2.f12_unrestricted import unrestricted_extended_df_fock
 
 from benchmarks._f12_cuda import add_molecular_graph_budget, cuda_runner
-
-
-def pair_operands(
-    data: dict,
-    src: dict,
-    fock: dict,
-    sl: str,
-    sr: str,
-    nl: int,
-    nr: int,
-    n: int,
-    i: int,
-    j: int,
-) -> dict[str, np.ndarray]:
-    """Select the orbital and fit tensors for one occupied spin pair."""
-    dl, dr = src["fit_" + sl][:, i], src["fit_" + sr][:, j]
-    raw_c = src["raw_coulomb_" + sr][:, j]
-    if sl == sr:
-        vals = {
-            "select_i": np.eye(nl)[i],
-            "select_j": np.eye(nr)[j],
-            "fock": fock["fock_" + sl],
-            "exchange": fock["exchange_" + sl],
-            "fit_i": dl,
-            "fit_j": dr,
-            "raw_coulomb_j": raw_c,
-        }
-    else:
-        vals = {
-            "select_i": np.eye(n)[i],
-            "select_j": np.eye(n)[j],
-            "cross_overlap": data["cross_overlap"],
-            "fit_i_alpha": dl,
-            "fit_j_beta": dr,
-            "raw_coulomb_j_beta": raw_c,
-            **fock,
-        }
-    for op, rel in (
-        ("geminal", "f12"),
-        ("squared_geminal", "f12_squared"),
-        ("geminal_coulomb", "f12_over_coulomb"),
-        ("double_commutator", "double_commutator"),
-    ):
-        la, rb = (
-            data["raw/" + op + "/" + sl][:, i],
-            data["raw/" + op + "/" + sr][:, j],
-        )
-        if sl == sr:
-            vals.update(
-                {
-                    "raw_" + rel + "_i": la,
-                    "raw_" + rel + "_j": rb,
-                    "metric_" + rel: data["metric/" + op],
-                }
-            )
-        else:
-            vals.update(
-                {
-                    "raw_" + op + "_i_alpha": la,
-                    "raw_" + op + "_j_beta": rb,
-                    "metric_" + op: data["metric/" + op],
-                }
-            )
-    return vals
 
 
 def evaluate(
@@ -122,45 +55,29 @@ def evaluate(
     corrections = []
     doubles = []
     expected = {(p["spin"], *p["pair"]): p for p in reference["pairs"]}
-    for sa, sb in ((0, 0), (0, 1), (1, 1)):
-        nl, nr = occs[sa], occs[sb]
-        sl, sr = names[sa], names[sb]
-        same = sa == sb
-        graph = (
-            projected_same_spin_f12_pair(nl, obs - nl, n - obs, auxiliaries=aux)
-            if same
-            else opposite_spin_projected_pair(nl, nr, obs, n, auxiliaries=aux)
+    for pair in molecular_pair_energies((oa, ob, obs, n, aux), data, src, fock, run):
+        sl, sr = pair.spins
+        i, j = pair.occupied_indices
+        e, u = pair.f12, pair.mp2
+        ref = expected[(sl + "_" + sr, i, j)]
+        diff = max(abs(e - ref["F12_Eh"]), abs(u - ref["ordinary_Eh"]))
+        if not np.isfinite(diff) or diff > 2e-9:
+            raise ValueError(f"Spin pair {sl}/{sr} {i},{j} differs by {diff}")
+        corrections.append(e)
+        doubles.append(u)
+        checkpoints.append(
+            {
+                "case": "NH2_D_f12",
+                "scope": "density fitted pair",
+                "spin": sl + "_" + sr,
+                "ij": [i, j],
+                "F12_Eh": e,
+                "ordinary_Eh": u,
+                "error_Eh": diff,
+            }
         )
-        for i in range(nl):
-            for j in range(i + 1 if same else 0, nr):
-                vals = pair_operands(data, src, fock, sl, sr, nl, nr, n, i, j)
-                # Prepared CUDA requires contiguous row-major source buffers.
-                result = run(
-                    graph, {k: np.ascontiguousarray(a) for k, a in vals.items()}
-                ).outputs
-                e, u = (
-                    float(result["pair_energy"]),
-                    float(result["ordinary_pair_energy"]),
-                )
-                ref = expected[(sl + "_" + sr, i, j)]
-                diff = max(abs(e - ref["F12_Eh"]), abs(u - ref["ordinary_Eh"]))
-                if not np.isfinite(diff) or diff > 2e-9:
-                    raise ValueError(f"Spin pair {sl}/{sr} {i},{j} differs by {diff}")
-                corrections.append(e)
-                doubles.append(u)
-                checkpoints.append(
-                    {
-                        "case": "NH2_D_f12",
-                        "scope": "density fitted pair",
-                        "spin": sl + "_" + sr,
-                        "ij": [i, j],
-                        "F12_Eh": e,
-                        "ordinary_Eh": u,
-                        "error_Eh": diff,
-                    }
-                )
-                if checkpoint:
-                    checkpoint(checkpoints)
+        if checkpoint:
+            checkpoint(checkpoints)
     total = reference["UHF_Eh"] + sum(single) + sum(corrections) + sum(doubles)
     errors = {
         "F12_Eh": abs(sum(corrections) - reference["F12_increment_Eh"]),

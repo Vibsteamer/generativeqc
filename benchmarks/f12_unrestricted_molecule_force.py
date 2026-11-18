@@ -9,15 +9,11 @@ from pathlib import Path
 
 import numpy as np
 from generativeqc._f12_cabs import cabs_singles
-from generativeqc_compiler.mp2.f12_opposite_spin import opposite_spin_projected_pair
-from generativeqc_compiler.mp2.f12_unrestricted import (
-    projected_same_spin_f12_pair,
-    unrestricted_extended_df_fock,
-)
+from generativeqc._f12_spin_pairs import occupied_pair_blocks, pair_operands
+from generativeqc_compiler.mp2.f12_unrestricted import unrestricted_extended_df_fock
 from generativeqc_compiler.tensor import Program, linearize
 
 from benchmarks._f12_cuda import add_molecular_graph_budget, cuda_runner
-from benchmarks.f12_unrestricted_molecule import pair_operands
 
 
 def evaluate(
@@ -62,14 +58,7 @@ def evaluate(
         "UHF_Eh": float(tangent["reference_gradient"]),
     }
     logs = []
-    for sl, sr in (("alpha", "alpha"), ("alpha", "beta"), ("beta", "beta")):
-        nl, nr = occ[sl], occ[sr]
-        same = sl == sr
-        g = (
-            projected_same_spin_f12_pair(nl, obs - nl, n - obs, auxiliaries=aux)
-            if same
-            else opposite_spin_projected_pair(nl, nr, obs, n, auxiliaries=aux)
-        )
+    for sl, sr, nl, nr, g, pairs in occupied_pair_blocks((oa, ob, obs, n, aux)):
         live = tuple(
             node.attrs["name"]
             for node in g.live_nodes
@@ -78,31 +67,30 @@ def evaluate(
             and not node.attrs["name"].startswith("select_")
         )
         j = linearize(g, live, outputs=("ordinary_pair_energy", "pair_energy")).program
-        for i in range(nl):
-            for k in range(i + 1 if same else 0, nr):
-                feeds = [
-                    pair_operands(t, s, f, sl, sr, nl, nr, n, i, k)
-                    for t, s, f in zip(dirs, src, [F, dF], strict=True)
-                ]
-                diff = physical_jvp(j, live, *feeds)
-                dg, df = (
-                    float(diff["d_ordinary_pair_energy"]),
-                    float(diff["d_pair_energy"]),
-                )
-                if not np.all(np.isfinite([dg, df])):
-                    raise ValueError(f"Non-finite {sl}/{sr} pair derivative {i},{k}")
-                gradients["ordinary_UMP2_Eh"] += dg
-                gradients["F12_increment_Eh"] += df
-                logs.append(
-                    {
-                        "case": "NH2_D_f12",
-                        "spin": sl + "_" + sr,
-                        "ij": [i, k],
-                        "ordinary_gradient": dg,
-                        "F12_gradient": df,
-                    }
-                )
-                checkpoint(logs)
+        for i, k in pairs:
+            feeds = [
+                pair_operands(t, s, f, sl, sr, nl, nr, n, i, k)
+                for t, s, f in zip(dirs, src, [F, dF], strict=True)
+            ]
+            diff = physical_jvp(j, live, *feeds)
+            dg, df = (
+                float(diff["d_ordinary_pair_energy"]),
+                float(diff["d_pair_energy"]),
+            )
+            if not np.all(np.isfinite([dg, df])):
+                raise ValueError(f"Non-finite {sl}/{sr} pair derivative {i},{k}")
+            gradients["ordinary_UMP2_Eh"] += dg
+            gradients["F12_increment_Eh"] += df
+            logs.append(
+                {
+                    "case": "NH2_D_f12",
+                    "spin": sl + "_" + sr,
+                    "ij": [i, k],
+                    "ordinary_gradient": dg,
+                    "F12_gradient": df,
+                }
+            )
+            checkpoint(logs)
     gradients["total_Eh"] = sum(gradients.values())
     errors = {}
     for h, entry in reference["steps"].items():
