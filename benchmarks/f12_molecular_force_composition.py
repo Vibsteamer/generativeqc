@@ -145,6 +145,11 @@ def endpoint_arguments() -> Namespace:
         action="store_true",
         help="Resolve analytic CABS singles and F12 pair forces for component extrapolation.",
     )
+    parser.add_argument(
+        "--cabs-relative-cutoff",
+        type=float,
+        help="Override the projected auxiliary Gram cutoff for a rank-verified basis.",
+    )
     parser.add_argument("--arch", required=True)
     add_molecular_graph_budget(parser)
     return parser.parse_args()
@@ -214,12 +219,15 @@ def calculate_panel(
             np.zeros((columns, columns)),
         )
 
+    projector = partial(cabs_projector, library=lib)
+    if args.cabs_relative_cutoff is not None:
+        projector = partial(projector, relative_cutoff=args.cabs_relative_cutoff)
     reverse = partial(
         chain,
         metric_gram=metric_gram,
         physical_fock=physical_fock,
         run=run,
-        projector=partial(cabs_projector, library=lib),
+        projector=projector,
         singles=partial(cabs_singles, library=lib, spin_weight=2),
         full_rank_constraint=full_rank_constraint,
         molecular_correlation=molecular_correlation,
@@ -432,6 +440,7 @@ def calculate_panel(
         "case": name,
         "passed": False,
         "phase": "central_complete",
+        "cabs_relative_cutoff_override": args.cabs_relative_cutoff,
         "total_energy_Eh": energy,
         "reference_energy_Eh": obs.reference_energy,
         "increment_Eh": obs.increment_energy,

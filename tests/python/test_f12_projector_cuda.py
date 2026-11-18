@@ -111,6 +111,15 @@ class CABSProjectorDevice(unittest.TestCase):
             result.frame @ result.frame.T, result.kernel, rtol=2e-12, atol=2e-12
         )
 
+    def test_high_cardinal_small_resolved_projected_direction(self) -> None:
+        overlap = np.diag([1.0, 1.0, 6e-11])
+        self.assertEqual(self.run_kernel(overlap, 1).rank, 1)
+        recovered = self.run_kernel(
+            overlap, 1, relative_cutoff=1e-11, expected_rank=2
+        )
+        self.assertEqual(recovered.rank, 2)
+        self.check_frame(recovered, overlap, 1)
+
     def test_partial_rank_and_cross_subspace_pullback(self) -> None:
         rng = np.random.default_rng(3209)
         a = np.array([[1.2, 0.12], [0.12, 1.7]])

@@ -79,9 +79,11 @@ def test_full_rank_cabs_response_is_opt_in(
     for name in paths:
         argv.extend(["--" + name, name])
     if selected:
-        argv.append("--full-rank-cabs-response")
+        argv.extend(["--full-rank-cabs-response", "--cabs-relative-cutoff", "1e-11"])
     monkeypatch.setattr(sys, "argv", argv)
-    assert endpoint_arguments().full_rank_cabs_response is selected
+    args = endpoint_arguments()
+    assert args.full_rank_cabs_response is selected
+    assert args.cabs_relative_cutoff == (1e-11 if selected else None)
 
 
 def test_isolated_singles_adjoint_and_pair_difference_at_two_steps() -> None:
