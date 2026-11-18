@@ -1,4 +1,4 @@
-// Qualification adapter for contracted, real molecular DF and F12 shell adjoints.
+// Qualification adapter for contracted, real molecular DF and F12 shell values and adjoints.
 // Cartesian ordering is CCA. Callers own shell-to-atom and pure-to-Cartesian maps.
 #include <algorithm>
 #include <cmath>
@@ -21,16 +21,20 @@ namespace gi = generativeqc::integrals;
 #define SINK_DEVICE
 #ifdef GQC_SINK_COULOMB
 #define SINK_EXPORT gqc_f12_weighted_shells_coulomb_host_reference
+#define FORWARD_EXPORT gqc_f12_cartesian_shells_coulomb_host_reference
 #else
 #define SINK_EXPORT gqc_f12_weighted_shells_geminal_host_reference
+#define FORWARD_EXPORT gqc_f12_cartesian_shells_geminal_host_reference
 #endif
 #elif defined(__CUDACC__)
 #define SINK_HD __host__ __device__
 #define SINK_DEVICE __device__
 #ifdef GQC_SINK_COULOMB
 #define SINK_EXPORT gqc_f12_weighted_shells_coulomb
+#define FORWARD_EXPORT gqc_f12_cartesian_shells_coulomb
 #else
 #define SINK_EXPORT gqc_f12_weighted_shells_geminal
+#define FORWARD_EXPORT gqc_f12_cartesian_shells_geminal
 #endif
 #else
 #error "Use NVCC for the CUDA sink or explicitly build the separate host reference"
@@ -61,56 +65,112 @@ SINK_DEVICE poly::Vec3 center(const ShellBatch& data, Index shell) {
   return {xyz[0], xyz[1], xyz[2]};
 }
 
+struct ShellBlock {
+  bool metric;
+  poly::Vec3 A, B, C;
+  int la, lb, lc, start, ncart, first_a, first_b, first_c, count_a, count_b, count_c;
+
+  SINK_DEVICE ShellBlock(const ShellBatch& data, int ncenter, int block) {
+    const auto* shells = data.block_shells + Size(block) * ncenter;
+    metric = ncenter == 2;
+    const Index sa = shells[0], sb = metric ? sa : shells[1], sc = shells[ncenter - 1];
+    A = center(data, sa);
+    B = center(data, sb);
+    C = center(data, sc);
+    la = data.angular[sa];
+    lb = metric ? 0 : data.angular[sb];
+    lc = data.angular[sc];
+    start = data.weight_offsets[block];
+    ncart = data.weight_offsets[block + 1] - start;
+    first_a = data.primitive_offsets[sa];
+    first_b = data.primitive_offsets[sb];
+    first_c = data.primitive_offsets[sc];
+    count_a = data.primitive_offsets[sa + 1] - first_a;
+    count_b = metric ? 1 : data.primitive_offsets[sb + 1] - first_b;
+    count_c = data.primitive_offsets[sc + 1] - first_c;
+  }
+
+  template <bool Responses>
+  SINK_DEVICE poly::Response evaluate(const ShellBatch& data, int cart, int i, int j, int k, int op,
+                                      const gi::FittedSlater& fit) const {
+    const int nb = cart_size(lb), nc = cart_size(lc);
+    const auto a = component(la, cart / (nc * nb)), b = component(lb, (cart / nc) % nb),
+               c = component(lc, cart % nc);
+#ifdef GQC_SINK_COULOMB
+    return poly::evaluate(metric, data.exponents[i], A, a, metric ? 0. : data.exponents[j], B, b,
+                          data.exponents[k], C, c, 0., Responses);
+#else
+    return poly::evaluate(metric, data.exponents[i], A, a, metric ? 0. : data.exponents[j], B, b,
+                          data.exponents[k], C, c, static_cast<gi::GeminalProduct>(op), fit,
+                          Responses);
+#endif
+  }
+};
+
+SINK_DEVICE void compensated_add(double x, double& sum, double& correction) {
+  const double adjusted = x - correction;
+  const double next = sum + adjusted;
+  correction = (next - sum) - adjusted;
+  sum = next;
+}
+
+// Each lane owns one unweighted Cartesian source element and writes it once.
+// The generated provider exits at its scalar result before angular-center response.
+SINK_DEVICE void cartesian_values(ShellBatch data, int ncenter, int op, const gi::FittedSlater& fit,
+                                  int block, int lane, int stride, double* result) {
+  const ShellBlock shell(data, ncenter, block);
+  for (int cart = lane; cart < shell.ncart; cart += stride) {
+    double sum = 0., correction = 0.;
+    for (int di = 0; di < shell.count_a; ++di) {
+      const int i = shell.first_a + di;
+      for (int dj = 0; dj < shell.count_b; ++dj) {
+        const int j = shell.first_b + dj;
+        const double ab = data.radial[i] * (shell.metric ? 1. : data.radial[j]);
+        for (int dk = 0; dk < shell.count_c; ++dk) {
+          const int k = shell.first_c + dk;
+          const double coeff = ab * data.radial[k];
+          if (coeff != 0.) {
+            const double value = shell.evaluate<false>(data, cart, i, j, k, op, fit).value;
+            compensated_add(coeff * value, sum, correction);
+          }
+        }
+      }
+    }
+    result[shell.start + cart] = sum;
+  }
+}
+
 // Each lane accumulates disjoint Cartesian/primitive products. Combining lane
 // sums within one block requires neither inter-block atomics nor global scratch.
 SINK_DEVICE void weighted_terms(ShellBatch data, int ncenter, int op, const gi::FittedSlater& fit,
                                 int block, int lane, int stride, double (&sum)[channels]) {
-  const auto* shells = data.block_shells + Size(block) * ncenter;
-  const bool metric = ncenter == 2;
-  const Index sa = shells[0], sb = metric ? sa : shells[1], sc = shells[ncenter - 1];
-  const auto A = center(data, sa), B = center(data, sb), C = center(data, sc);
-  const int la = data.angular[sa], lb = metric ? 0 : data.angular[sb], lc = data.angular[sc];
-  const int nb = cart_size(lb), nc = cart_size(lc);
-  const auto* weights = data.weights + data.weight_offsets[block];
-  const int ncart = data.weight_offsets[block + 1] - data.weight_offsets[block];
-  const int first_a = data.primitive_offsets[sa], first_b = data.primitive_offsets[sb],
-            first_c = data.primitive_offsets[sc];
-  const int count_a = data.primitive_offsets[sa + 1] - first_a,
-            count_b = metric ? 1 : data.primitive_offsets[sb + 1] - first_b,
-            count_c = data.primitive_offsets[sc + 1] - first_c;
-  const Size terms = Size(ncart) * count_a * count_b * count_c;
+  const ShellBlock shell(data, ncenter, block);
+  const auto* weights = data.weights + shell.start;
+  const Size terms = Size(shell.ncart) * shell.count_a * shell.count_b * shell.count_c;
   double correction[channels]{};
   for (Size term = lane; term < terms; term += stride) {
-    const int cart = term % ncart;
+    const int cart = term % shell.ncart;
     if (weights[cart] == 0.) continue;
-    const Size prim = term / ncart;
-    const int k = first_c + prim % count_c, j = first_b + (prim / count_c) % count_b,
-              i = first_a + prim / (Size(count_c) * count_b);
+    const Size prim = term / shell.ncart;
+    const int k = shell.first_c + prim % shell.count_c,
+              j = shell.first_b + (prim / shell.count_c) % shell.count_b,
+              i = shell.first_a + prim / (Size(shell.count_c) * shell.count_b);
     const double w =
-        weights[cart] * data.radial[i] * (metric ? 1. : data.radial[j]) * data.radial[k];
+        weights[cart] * data.radial[i] * (shell.metric ? 1. : data.radial[j]) * data.radial[k];
     if (w == 0.) continue;
-    const auto a = component(la, cart / (nc * nb)), b = component(lb, (cart / nc) % nb),
-               c = component(lc, cart % nc);
-#ifdef GQC_SINK_COULOMB
-    const auto r = poly::evaluate(metric, data.exponents[i], A, a, metric ? 0. : data.exponents[j],
-                                  B, b, data.exponents[k], C, c);
-#else
-    const auto r =
-        poly::evaluate(metric, data.exponents[i], A, a, metric ? 0. : data.exponents[j], B, b,
-                       data.exponents[k], C, c, static_cast<gi::GeminalProduct>(op), fit);
-#endif
+    const auto r = shell.evaluate<true>(data, cart, i, j, k, op, fit);
     const double values[channels] = {r.value,    r.first.x,  r.first.y, r.first.z, r.second.x,
                                      r.second.y, r.second.z, r.third.x, r.third.y, r.third.z};
-    for (int q = 0; q < channels; ++q) {
-      const double adjusted = w * values[q] - correction[q];
-      const double next = sum[q] + adjusted;
-      correction[q] = (next - sum[q]) - adjusted;
-      sum[q] = next;
-    }
+    for (int q = 0; q < channels; ++q) compensated_add(w * values[q], sum[q], correction[q]);
   }
 }
 
 #ifndef GQC_SINK_HOST_REFERENCE
+__global__ void cartesian_blocks(ShellBatch data, int ncenter, int op, gi::FittedSlater fit,
+                                 double* result) {
+  cartesian_values(data, ncenter, op, fit, blockIdx.x, threadIdx.x, threads, result);
+}
+
 __global__ void weighted_blocks(ShellBatch data, int ncenter, int op, gi::FittedSlater fit,
                                 double* result) {
   __shared__ double partial[channels][threads];
@@ -162,7 +222,7 @@ bool supported(ShellBatch data, int ncenter, int nshell, int nprimitive, int nbl
       return false;
   const auto finite = [](double x) { return std::isfinite(x); };
   return std::all_of(data.centers, data.centers + Size(nshell) * 3, finite) &&
-         std::all_of(data.weights, data.weights + nweights, finite);
+         (!data.weights || std::all_of(data.weights, data.weights + nweights, finite));
 }
 
 // One exact-sized global allocation. Layout is doubles, followed by int32s.
@@ -184,23 +244,21 @@ struct DeviceMemory {
   }
 };
 #endif
-}  // namespace
-
 // Status: 0 success, -1 incompatible/malformed ABI data, -2 explicit storage
 // budget exceeded, -3 nonfinite scientific output, >0 CUDA runtime error.
 // device_bytes reports required explicit device-buffer bytes even if over budget.
 // CUDA runtime context, code, stack, and caches belong to the CUDA driver.
-extern "C" int SINK_EXPORT(int ncenter, int op, double beta, int nshell, int nprimitive, int nblock,
-                           int nweights, const Index* angular, const Index* prim_offsets,
-                           const double* exponents, const double* radial, const double* centers,
-                           const Index* block_shells, const Index* weight_offsets,
-                           const double* weights, double* result, Size max_device_bytes,
-                           Size* device_bytes) {
+template <bool Forward>
+int run_integrals(int ncenter, int op, double beta, int nshell, int nprimitive, int nblock,
+                  int nweights, const Index* angular, const Index* prim_offsets,
+                  const double* exponents, const double* radial, const double* centers,
+                  const Index* block_shells, const Index* weight_offsets, const double* weights,
+                  double* result, Size max_device_bytes, Size* device_bytes) {
   if (!device_bytes) return -1;
   *device_bytes = 0;
   if ((ncenter != 2 && ncenter != 3) || nshell <= 0 || nprimitive <= 0 || nblock <= 0 ||
       nweights <= 0 || !angular || !prim_offsets || !exponents || !radial || !centers ||
-      !block_shells || !weight_offsets || !weights || !result || !max_device_bytes)
+      !block_shells || !weight_offsets || (!Forward && !weights) || !result || !max_device_bytes)
     return -1;
   gi::FittedSlater fit{};
 #ifdef GQC_SINK_COULOMB
@@ -210,12 +268,13 @@ extern "C" int SINK_EXPORT(int ncenter, int op, double beta, int nshell, int npr
       !gi::make_fitted_slater(beta, gi::SlaterFitNormalization::negative_exponential, fit))
     return -1;
 #endif
+  const Size result_size = Forward ? Size(nweights) : Size(nblock) * channels;
   Layout layout;
   const Size exponent_pos = layout.take<double>(nprimitive),
              radial_pos = layout.take<double>(nprimitive),
              center_pos = layout.take<double>(Size(nshell) * 3),
-             weight_pos = layout.take<double>(nweights),
-             result_pos = layout.take<double>(Size(nblock) * channels),
+             weight_pos = layout.take<double>(Forward ? 0 : nweights),
+             result_pos = layout.take<double>(result_size),
              angular_pos = layout.take<Index>(nshell),
              primitive_pos = layout.take<Index>(Size(nshell) + 1),
              shell_pos = layout.take<Index>(Size(nblock) * ncenter),
@@ -227,9 +286,13 @@ extern "C" int SINK_EXPORT(int ncenter, int op, double beta, int nshell, int npr
   if (!supported(host, ncenter, nshell, nprimitive, nblock, nweights)) return -1;
 #ifdef GQC_SINK_HOST_REFERENCE
   for (int block = 0; block < nblock; ++block) {
-    double sums[channels]{};
-    weighted_terms(host, ncenter, op, fit, block, 0, 1, sums);
-    std::copy_n(sums, channels, result + Size(block) * channels);
+    if constexpr (Forward) {
+      cartesian_values(host, ncenter, op, fit, block, 0, 1, result);
+    } else {
+      double sums[channels]{};
+      weighted_terms(host, ncenter, op, fit, block, 0, 1, sums);
+      std::copy_n(sums, channels, result + Size(block) * channels);
+    }
   }
 #else
   DeviceMemory buffer;
@@ -244,24 +307,53 @@ extern "C" int SINK_EXPORT(int ncenter, int op, double beta, int nshell, int npr
   upload(doubles(exponent_pos), exponents, nprimitive);
   upload(doubles(radial_pos), radial, nprimitive);
   upload(doubles(center_pos), centers, Size(nshell) * 3);
-  upload(doubles(weight_pos), weights, nweights);
+  if constexpr (!Forward) upload(doubles(weight_pos), weights, nweights);
   upload(indices(angular_pos), angular, nshell);
   upload(indices(primitive_pos), prim_offsets, Size(nshell) + 1);
   upload(indices(shell_pos), block_shells, Size(nblock) * ncenter);
   upload(indices(offset_pos), weight_offsets, Size(nblock) + 1);
   if (status != cudaSuccess) return status;
-  const ShellBatch gpu{indices(angular_pos), indices(primitive_pos), indices(shell_pos),
-                       indices(offset_pos),  doubles(exponent_pos),  doubles(radial_pos),
-                       doubles(center_pos),  doubles(weight_pos)};
+  const ShellBatch gpu{indices(angular_pos),  indices(primitive_pos),
+                       indices(shell_pos),    indices(offset_pos),
+                       doubles(exponent_pos), doubles(radial_pos),
+                       doubles(center_pos),   Forward ? nullptr : doubles(weight_pos)};
   // clang-format off
-  weighted_blocks<<<nblock, threads>>>(gpu, ncenter, op, fit, doubles(result_pos));
+  if constexpr (Forward)
+    cartesian_blocks<<<nblock, threads>>>(gpu,ncenter,op,fit,doubles(result_pos));
+  else
+    weighted_blocks<<<nblock, threads>>>(gpu, ncenter, op, fit, doubles(result_pos));
   // clang-format on
   status = cudaGetLastError();
   if (status != cudaSuccess) return status;
-  status = cudaMemcpy(result, doubles(result_pos), Size(nblock) * channels * sizeof(double),
-                      cudaMemcpyDeviceToHost);
+  status =
+      cudaMemcpy(result, doubles(result_pos), result_size * sizeof(double), cudaMemcpyDeviceToHost);
   if (status != cudaSuccess) return status;
 #endif
   const auto finite = [](double x) { return std::isfinite(x); };
-  return std::all_of(result, result + Size(nblock) * channels, finite) ? 0 : -3;
+  return std::all_of(result, result + result_size, finite) ? 0 : -3;
+}
+}  // namespace
+
+extern "C" int SINK_EXPORT(int ncenter, int op, double beta, int nshell, int nprimitive, int nblock,
+                           int nweights, const Index* angular, const Index* prim_offsets,
+                           const double* exponents, const double* radial, const double* centers,
+                           const Index* block_shells, const Index* weight_offsets,
+                           const double* weights, double* result, Size max_device_bytes,
+                           Size* device_bytes) {
+  return run_integrals<false>(ncenter, op, beta, nshell, nprimitive, nblock, nweights, angular,
+                              prim_offsets, exponents, radial, centers, block_shells,
+                              weight_offsets, weights, result, max_device_bytes, device_bytes);
+}
+
+// Raw contracted Cartesian values use exactly the shell and element ordering
+// expected by ShellProjection.spherical_values(). No AO weights are inputs.
+extern "C" int FORWARD_EXPORT(int ncenter, int op, double beta, int nshell, int nprimitive,
+                              int nblock, int ncart, const Index* angular,
+                              const Index* prim_offsets, const double* exponents,
+                              const double* radial, const double* centers,
+                              const Index* block_shells, const Index* cart_offsets, double* result,
+                              Size max_device_bytes, Size* device_bytes) {
+  return run_integrals<true>(ncenter, op, beta, nshell, nprimitive, nblock, ncart, angular,
+                             prim_offsets, exponents, radial, centers, block_shells, cart_offsets,
+                             nullptr, result, max_device_bytes, device_bytes);
 }
