@@ -3,6 +3,7 @@
 from collections.abc import Callable
 
 import numpy as np
+from generativeqc_compiler.cc.f12_geminal_energy import all_pair_geminal_energy
 from generativeqc_compiler.cc.f12_residual import all_pair_cc_residual
 from generativeqc_compiler.tensor.ad_program import transpose_program
 
@@ -10,6 +11,7 @@ from benchmarks.f12_restricted_multipair_cc import (
     _graphs,
     conventional_inputs,
     fixed_residual_inputs,
+    geminal_energy_inputs,
 )
 
 
@@ -24,7 +26,8 @@ def prepare_lagrangian_gradient(
     o, v = t1.shape
     if not 1 <= o <= 8 or v < 1 or o + v > 48 or t2.shape != (o, o, v, v):
         raise ValueError("bounded spatial pair amplitude dimensions required")
-    cc, _, back, energy = _graphs(o, v)
+    cc, *_ = _graphs(o, v)
+    energy = all_pair_geminal_energy(o, v)
     conv = transpose_program(
         cc,
         ("correlation_energy", "singles_residual", "doubles_residual"),
@@ -33,46 +36,18 @@ def prepare_lagrangian_gradient(
     fixed = transpose_program(
         all_pair_cc_residual(o, v), ("singles", "doubles"), inputs=("t1",)
     ).program
-    bgrad = transpose_program(back, ("back_coupling",), inputs=("t1", "t2")).program
     egrad = transpose_program(
-        energy,
-        ("f12a_geminal_energy", "f12b_extra_energy"),
-        inputs=("t2", "back_coupling"),
+        energy, tuple(energy.outputs), inputs=("t1", "t2")
     ).program
     ham = conventional_inputs(src, o)
     cvfeed = {**ham, "t1": t1, "t2": t2}
     fvfeed = {**fixed_residual_inputs(src, o), "t1": t1}
-    ge1 = np.zeros_like(t1)
-    ge2 = np.zeros_like(t2)
-    eye = np.eye(o)
     unit = np.array(1.0)
-    for m, n in np.ndindex(o, o):
-        z = src["external"][m, n]
-        g = {
-            "v_vv": z[o:, o:],
-            "v_vo": z[o:, :o],
-            "v_ov": z[:o, o:],
-            "t1": t1,
-            "t2": t2,
-        }
-        rb = run(back, g).outputs["back_coupling"]
-        e = {
-            "select_m": eye[m],
-            "select_n": eye[n],
-            "v_occupied": src["v"][m, n],
-            "x_row": src["x"][m, n],
-            "b_row": src["b"][m, n],
-            "fock_occupied": ham["foo"],
-            "fock_coupling_vv": src["c"][m, n],
-            "t2": t2,
-            "back_coupling": rb,
-            "bar_f12a_geminal_energy": unit,
-            "bar_f12b_extra_energy": unit,
-        }
-        ev = run(egrad, e).outputs
-        bv = run(bgrad, {**g, "bar_back_coupling": ev["bar_back_coupling"]}).outputs
-        ge1 += bv["bar_t1"]
-        ge2 += bv["bar_t2"] + ev["bar_t2"]
+    sources = geminal_energy_inputs(src, t1, t2)
+    energy_bars = run(
+        egrad, {**sources, **{"bar_" + k: unit for k in energy.outputs}}
+    ).outputs
+    ge1, ge2 = energy_bars["bar_t1"], energy_bars["bar_t2"]
 
     def gradient(l1: np.ndarray, l2: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         # The source derivatives of the geminal energy are independent of Lambda.
@@ -126,7 +101,8 @@ def relaxed_source_weights(
 ) -> dict[str, np.ndarray]:
     """Differentiate the stationary Lagrangian with respect to the ordinary and geminal sources."""
     o, v = t1.shape
-    cc, _, back, energy = _graphs(o, v)
+    cc, *_ = _graphs(o, v)
+    energy = all_pair_geminal_energy(o, v)
     cor = all_pair_cc_residual(o, v)
     ham = conventional_inputs(src, o)
     all_fixed = fixed_residual_inputs(src, o)
@@ -136,20 +112,11 @@ def relaxed_source_weights(
         inputs=tuple(ham),
     ).program
     fg = transpose_program(cor, ("singles", "doubles"), inputs=tuple(all_fixed)).program
-    cg = transpose_program(
-        back, ("back_coupling",), inputs=("v_ov", "v_vo", "v_vv")
-    ).program
+    gem = geminal_energy_inputs(src, t1, t2)
     eg = transpose_program(
         energy,
-        ("f12a_geminal_energy", "f12b_extra_energy"),
-        inputs=(
-            "v_occupied",
-            "x_row",
-            "b_row",
-            "fock_occupied",
-            "fock_coupling_vv",
-            "back_coupling",
-        ),
+        tuple(energy.outputs),
+        inputs=tuple(k for k in gem if k not in ("t1", "t2")),
     ).program
     one = np.array(1.0)
     normal = run(
@@ -175,49 +142,17 @@ def relaxed_source_weights(
             result["f"][tuple(rs[k] for k in key[1:])] += normal["bar_" + key]
         else:
             result["eri"][tuple(rs[k] for k in key)] += normal["bar_" + key]
-    eye = np.eye(o)
-    external = result["external"]
+    ebar = run(eg, {**gem, **{"bar_" + k: one for k in energy.outputs}}).outputs
+    result["f"][:o, :o] += ebar["bar_foo"]
+    for k in ("v", "x", "b"):
+        result[k] += ebar["bar_" + k]
+    result["c"] += fixed["bar_c"] + ebar["bar_c"]
     for name, block in (
         ("v_vv", (rs["v"], rs["v"])),
         ("v_vo", (rs["v"], rs["o"])),
         ("v_ov", (rs["o"], rs["v"])),
     ):
-        external[(slice(None), slice(None), *block)] = fixed["bar_" + name]
-    result["c"] += fixed["bar_c"]
-    for m, n in np.ndindex(o, o):
-        z = src["external"][m, n]
-        vf = {
-            "v_vv": z[o:, o:],
-            "v_vo": z[o:, :o],
-            "v_ov": z[:o, o:],
-            "t1": t1,
-            "t2": t2,
-        }
-        rb = run(back, vf).outputs["back_coupling"]
-        ef = {
-            "select_m": eye[m],
-            "select_n": eye[n],
-            "v_occupied": src["v"][m, n],
-            "x_row": src["x"][m, n],
-            "b_row": src["b"][m, n],
-            "fock_occupied": ham["foo"],
-            "fock_coupling_vv": src["c"][m, n],
-            "t2": t2,
-            "back_coupling": rb,
-            "bar_f12a_geminal_energy": one,
-            "bar_f12b_extra_energy": one,
-        }
-        ee = run(eg, ef).outputs
-        bj = run(cg, {**vf, "bar_back_coupling": ee["bar_back_coupling"]}).outputs
-        for name, field in (
-            ("v_occupied", "v"),
-            ("x_row", "x"),
-            ("b_row", "b"),
-            ("fock_coupling_vv", "c"),
-        ):
-            result[field][m, n] += ee["bar_" + name]
-        result["f"][:o, :o] += ee["bar_fock_occupied"]
-        external[m, n, o:, o:] += bj["bar_v_vv"]
-        external[m, n, :o, o:] += bj["bar_v_ov"]
-        external[m, n, o:, :o] += bj["bar_v_vo"]
+        result["external"][(slice(None), slice(None), *block)] = (
+            fixed["bar_" + name] + ebar["bar_" + name]
+        )
     return result

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 from generativeqc_compiler.cc.doubles import build_ccsd_program
+from generativeqc_compiler.cc.f12_geminal_energy import all_pair_geminal_energy
 from generativeqc_compiler.cc.f12_residual import (
     all_pair_cc_residual,
     f12b_geminal_back_coupling,
@@ -37,6 +38,17 @@ def fixed_residual_inputs(src: dict, o: int) -> dict:
         "v_vo": z[:, :, o:, :o],
         "v_ov": z[:, :, :o, o:],
         "c": src["c"],
+    }
+
+
+def geminal_energy_inputs(src: dict, t1: np.ndarray, t2: np.ndarray) -> dict:
+    o = len(t1)
+    return {
+        **fixed_residual_inputs(src, o),
+        **{k: src[k] for k in ("v", "x", "b")},
+        "foo": src["f"][:o, :o],
+        "t1": t1,
+        "t2": t2,
     }
 
 
@@ -164,9 +176,16 @@ def solve_all_pair_cc(src: dict, run: Callable) -> dict:
         t2 += 0.5 * (two + two.transpose(1, 0, 3, 2)) / gaps2
     else:
         raise ArithmeticError("multi-occupied CC-F12 failed to converge")
-    energies, last_one, last_two = fixed_source_cc_equations(src, t1, t2, run)
-    if max(float(abs(last_one - one).max()), float(abs(last_two - two).max())) > 1e-10:
-        raise ValueError("ordered and folded geminal residuals differ")
+    energy = run(
+        all_pair_geminal_energy(o, v), geminal_energy_inputs(src, t1, t2)
+    ).outputs
+    energies = np.array(
+        [
+            float(r["correlation_energy"]),
+            float(energy["f12a_geminal_energy"]),
+            float(energy["f12b_extra_energy"]),
+        ]
+    )
     return {
         "t1": t1,
         "t2": t2,
