@@ -49,15 +49,11 @@ GQC_STG_HD inline bool make_fitted_slater(double beta, SlaterFitNormalization no
  * For the two-electron kinetic energy, the latter is one half of
  * [f1,[T1+T2,f2]]. Shared fits may pass the same object for both arguments.
  * The pair multiplicities and geminal normalizations are explicit. */
-template <typename Geometry, unsigned MaximumOrder, unsigned UnitGaussianSlots = 0>
-GQC_STG_HD bool make_fitted_geminal_geometry(const double* exponents, const double* centers,
-                                             unsigned order, GeminalProduct op,
-                                             const FittedSlater& left, const FittedSlater& right,
-                                             Geometry& geometry) {
-  double t;
-  if (!bind_eri_centers<Geometry, MaximumOrder, UnitGaussianSlots>(exponents, centers, order,
-                                                                   geometry, t))
-    return false;
+template <unsigned MaximumOrder>
+GQC_STG_HD bool fitted_geminal_moments(unsigned order, double t, double rho, GeminalProduct op,
+                                       const FittedSlater& left, const FittedSlater& right,
+                                       double* moments) {
+  if (!moments || order > MaximumOrder) return false;
   const bool linear = op == GeminalProduct::factor || op == GeminalProduct::factor_over_distance;
   if (!linear && op != GeminalProduct::product && op != GeminalProduct::gradient_product)
     return false;
@@ -78,7 +74,7 @@ GQC_STG_HD bool make_fitted_geminal_geometry(const double* exponents, const doub
           weight *= 4. * left.exponent[i] * right.exponent[j];
       }
       if (!range_isfinite(weight) ||
-          !gaussian_geminal_moments<MaximumOrder>(order, t, geometry.rho, z, kernel, primitive))
+          !gaussian_geminal_moments<MaximumOrder>(order, t, rho, z, kernel, primitive))
         return false;
       for (unsigned n = 0; n <= order; ++n) {
         const double addend = weight * primitive[n] - compensation[n];
@@ -90,9 +86,21 @@ GQC_STG_HD bool make_fitted_geminal_geometry(const double* exponents, const doub
   }
   for (unsigned n = 0; n <= order; ++n) {
     if (!range_isfinite(sum[n])) return false;
-    geometry.boys[n] = sum[n];
+    moments[n] = sum[n];
   }
   return true;
+}
+
+template <typename Geometry, unsigned MaximumOrder, unsigned UnitGaussianSlots = 0>
+GQC_STG_HD bool make_fitted_geminal_geometry(const double* exponents, const double* centers,
+                                             unsigned order, GeminalProduct op,
+                                             const FittedSlater& left, const FittedSlater& right,
+                                             Geometry& geometry) {
+  double t;
+  return bind_eri_centers<Geometry, MaximumOrder, UnitGaussianSlots>(exponents, centers, order,
+                                                                    geometry, t) &&
+         fitted_geminal_moments<MaximumOrder>(order, t, geometry.rho, op, left, right,
+                                               geometry.boys);
 }
 }  // namespace generativeqc::integrals
 

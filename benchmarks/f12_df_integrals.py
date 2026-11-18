@@ -13,28 +13,106 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from generativeqc_compiler.integral.df_derivatives_cuda import (
+    emit_df_derivatives_cpu,
+    emit_df_derivatives_cuda,
+)
 from generativeqc_compiler.integral.f12_df import emit_f12_df_component
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def adapter_source(components: list[tuple[str, ...]]) -> str:
+def polynomial_adapter(
+    components: list[tuple[str, ...]], cuda: bool
+) -> tuple[list[str], list[str]]:
+    """Map the same archive to one bounded angular dispatcher for all shells."""
+    if not components or any(
+        len(sig) not in (2, 3)
+        or any(
+            not isinstance(a, str) or any(axis not in "xyz" for axis in a) for a in sig
+        )
+        for sig in components
+    ):
+        raise ValueError("expected two or three Cartesian angular components")
+    emitter = emit_df_derivatives_cuda if cuda else emit_df_derivatives_cpu
+    maximum_orbital = max(
+        (len(a) for sig in components if len(sig) == 3 for a in sig[:2]), default=0
+    )
+    maximum_aux = max(
+        len(a) for sig in components for a in (sig if len(sig) == 2 else sig[2:])
+    )
+    if maximum_orbital > 4 or maximum_aux > 5:
+        raise ValueError("polynomial response domain ends at orbital g, auxiliary h")
+    through_h = maximum_orbital == 4 or maximum_aux == 5
+    through_g = maximum_aux == 4 and not through_h
+    suffix = "_auxiliary_h" if through_h else "_auxiliary_g" if through_g else ""
+    header = emitter(
+        auxiliary_h=through_h,
+        auxiliary_g=through_g,
+        maximum_orbital=max(3, maximum_orbital),
+        fitted_geminal=True,
+    )
+    declarations = [
+        header,
+        f"namespace poly = generativeqc::scf::generated_f12_df{suffix}_derivatives;",
+    ]
+    calls = []
+    for index, sig in enumerate(components):
+        method = "metric" if len(sig) == 2 else "three_center"
+        args = []
+        for k, angular in enumerate(sig):
+            pos = 6 + 3 * k
+            powers = ",".join(str(angular.count(axis)) for axis in "xyz")
+            args.extend(
+                [
+                    f"in[{3 + k}]",
+                    f"{{in[{pos}],in[{pos + 1}],in[{pos + 2}]}}",
+                    "{" + powers + "}",
+                ]
+            )
+        parts = ("first", "third") if len(sig) == 2 else ("first", "second", "third")
+        stores = [
+            f"out[{2 + 3 * k + j}]=r.{part}.{axis};"
+            for k, part in enumerate(parts)
+            for j, axis in enumerate("xyz")
+        ]
+        calls.extend(
+            [
+                f"    case {index}: {{",
+                f"      auto r=poly::{method}(" + ",".join([*args, "op", "fit"]) + ");",
+                "      out[0]=1.; out[1]=r.value;",
+                "      " + " ".join(stores),
+                "      break;",
+                "    }",
+            ]
+        )
+    return declarations, calls
+
+
+def adapter_source(
+    components: list[tuple[str, ...]], *, polynomial: bool = False, cuda: bool = False
+) -> str:
     """A batched test consumer for the same generated host/device functions."""
-    functions = [
-        emit_f12_df_component(signature, f"component_{i}")
-        for i, signature in enumerate(components)
-    ]
-    cases = [
-        f"    case {i}: out[0] = component_{i}(in+3,in+6,op,fit,fit,out+1); break;"
-        for i in range(len(components))
-    ]
+    if polynomial:
+        functions, cases = polynomial_adapter(components, cuda)
+    else:
+        functions = [
+            emit_f12_df_component(signature, f"component_{i}")
+            for i, signature in enumerate(components)
+        ]
+        cases = [
+            f"    case {i}: out[0] = component_{i}(in+3,in+6,op,fit,fit,out+1); break;"
+            for i in range(len(components))
+        ]
     return (
         "\n".join(
             [
                 '#include "integrals/f12_geminal.hpp"',
                 "#include <cmath>",
                 "#ifdef __CUDACC__",
-                "#define GQC_F12_COMPONENT_HD __host__ __device__",
+                "#define GQC_F12_COMPONENT_HD __device__"
+                if polynomial
+                else "#define GQC_F12_COMPONENT_HD __host__ __device__",
                 "#else",
                 "#define GQC_F12_COMPONENT_HD",
                 "#endif",
@@ -81,7 +159,9 @@ def adapter_source(components: list[tuple[str, ...]]) -> str:
     )
 
 
-def check(fixture: dict[str, Any], build: Path, arch: str | None) -> dict[str, Any]:
+def check(
+    fixture: dict[str, Any], build: Path, arch: str | None, *, polynomial: bool = False
+) -> dict[str, Any]:
     """Compile and execute a complete test batch on the explicitly chosen device."""
     compiler = shutil.which("nvcc" if arch else "c++")
     cache = shutil.which("sccache") or shutil.which("ccache")
@@ -92,7 +172,9 @@ def check(fixture: dict[str, Any], build: Path, arch: str | None) -> dict[str, A
     build.mkdir(parents=True, exist_ok=True)
     components = [tuple(row) for row in fixture["components"]]
     source = build / ("primitives.cu" if arch else "primitives.cpp")
-    source.write_text(adapter_source(components))
+    source.write_text(
+        adapter_source(components, polynomial=polynomial, cuda=arch is not None)
+    )
     obj, lib = build / "primitives.o", build / "primitives.so"
     flags = ["-arch=" + arch, "-Xcompiler=-fPIC"] if arch else ["-fPIC"]
     start = time.perf_counter()
@@ -162,6 +244,9 @@ def check(fixture: dict[str, Any], build: Path, arch: str | None) -> dict[str, A
     np.testing.assert_allclose(translation / scale[:, None], 0.0, atol=2e-12, rtol=0)
     return {
         "backend": "cuda-fp64" if arch else "host-fp64",
+        "angular_evaluation": "bounded polynomial"
+        if polynomial
+        else "component-specific",
         "cache": cache_version,
         "cache_before": cache_before,
         "cache_after": cache_after,
@@ -193,12 +278,18 @@ def main() -> None:
     parser.add_argument("--cache", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--arch")
+    parser.add_argument("--polynomial", action="store_true")
     args = parser.parse_args()
     if os.environ.get("GENERATIVEQC_TEST_CUDA") == "1" and not args.arch:
         raise ValueError(
             "Allocated GPU validation requires an explicit CUDA architecture"
         )
-    result = check(json.loads(args.fixture.read_text()), args.cache, args.arch)
+    result = check(
+        json.loads(args.fixture.read_text()),
+        args.cache,
+        args.arch,
+        polynomial=args.polynomial,
+    )
     args.output.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
 
 

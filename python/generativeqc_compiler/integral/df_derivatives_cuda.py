@@ -226,6 +226,7 @@ def emit_df_derivatives_cuda(
     auxiliary_h: bool = False,
     scalar_type: str = "double",
     maximum_orbital: int = 3,
+    fitted_geminal: bool = False,
 ) -> str:
     """Share base axis moments and Boys values across all independent centers.
 
@@ -245,6 +246,10 @@ def emit_df_derivatives_cuda(
     three-center response. Zero preserves Coulomb. Long-range production uses
     only the FP64 policy; other emitted candidates need separate qualification.
 
+    Fitted Slater operators replace the ordinary Boys vector with the analytic
+    moments of the selected geminal in FP64. The shell bounds, value/derivative
+    polynomials and physical translation relation remain shared.
+
     The optional float candidate narrows polynomial inputs, DAG temporaries,
     moment products and derivative sums, not just the output storage. Gaussian
     geometry and Boys preparation retain FP64 before an explicit narrowing
@@ -252,6 +257,8 @@ def emit_df_derivatives_cuda(
     This compiler candidate alone does not admit a production force path; its
     consumer must own qualification and pre-scatter strict recovery.
     """
+    if fitted_geminal and scalar_type != "double":
+        raise ValueError("fitted-geminal nuclear response requires FP64")
     if scalar_type not in ("double", "float"):
         raise ValueError("scalar type must be double or float")
     if maximum_orbital not in (3, 4) or (maximum_orbital == 4 and not auxiliary_h):
@@ -276,7 +283,9 @@ __device__ __noinline__ void axis_polynomial(unsigned a,unsigned b,unsigned c,
     if auxiliary_g and auxiliary_h:
         raise ValueError("select one auxiliary derivative domain")
     auxiliary_maximum = 5 if auxiliary_h else 4 if auxiliary_g else 3
-    lines = [prefix.replace("__DF_BOYS__", emit_df_boys_cuda())]
+    lines = [
+        prefix.replace("__DF_BOYS__", "" if fitted_geminal else emit_df_boys_cuda())
+    ]
     for a, b, c in product(
         range(auxiliary_maximum + 2),
         range(maximum_orbital + 2),
@@ -319,8 +328,7 @@ __device__ __noinline__ Response evaluate(bool metric,double alpha,Vec3 A,Angula
   const double invalid=NAN;
   if (order(a)>3 || order(b)>3 || order(c)>3 || !(alpha>0) || !(gamma>0) ||
       (!metric && !(beta>0))) return {invalid,{invalid,invalid,invalid},{invalid,invalid,invalid},{invalid,invalid,invalid}};
-  Geometry geometry;
-  prepare_geometry(alpha,A,beta,B,gamma,C,order(a)+order(b)+order(c),geometry,nullptr,omega);
+__DF_EVALUATE_GEOMETRY__
   const auto& pa=geometry.pa;const auto& pb=geometry.pb;const auto& dx=geometry.dx;
   __DF_MOMENT_INPUTS__
   const __DF_ARITHMETIC__ sx=geometry.sx,sy=geometry.sy,ip=geometry.ip,iq=geometry.iq;
@@ -368,6 +376,40 @@ __device__ __forceinline__ Response three_center(double alpha,Vec3 A,Angular a,
 #endif
 """,
     ]
+    # The optional fitted Slater source has its own radial moments and name.
+    # Both operators use the same Gaussian angular polynomials and atom derivatives.
+    default_preparation = (
+        "  Geometry geometry;\n"
+        "  prepare_geometry(alpha,A,beta,B,gamma,C,order(a)+order(b)+order(c),geometry,nullptr,omega);"
+    )
+    radial_header = ""
+    radial_parameters = "double omega=0.0"
+    radial_arguments = "omega"
+    if fitted_geminal:
+        radial_header = '#include "integrals/f12_geminal.hpp"\n'
+        parameters = "integrals::GeminalProduct op,const integrals::FittedSlater& fit"
+        radial_parameters, radial_arguments = parameters, "op,fit"
+        # The largest total is g,g,h with a single nuclear raise (F14).
+        max_order = auxiliary_maximum + 2 * maximum_orbital + 1
+        geometry_source = (
+            emit_df_geometry_cuda(
+                moments=(
+                    f"if (!integrals::fitted_geminal_moments<{max_order}>"
+                    "(total+1,rho*distance,rho,op,fit,fit,g.f)) return false;"
+                )
+            )
+            .replace("void prepare_geometry(", "bool prepare_geometry(")
+            .replace("BoysWork* work=nullptr", parameters)
+            .removesuffix("}")
+            + "  return true;\n}"
+        )
+        default_preparation = (
+            "  Geometry geometry;\n"
+            "  if (!prepare_geometry(alpha,A,beta,B,gamma,C,order(a)+order(b)+order(c),geometry,op,fit))\n"
+            "    return {invalid,{invalid,invalid,invalid},{invalid,invalid,invalid},{invalid,invalid,invalid}};"
+        )
+    else:
+        geometry_source = emit_df_geometry_cuda(range_separated=True)
     # Raw and weighted consumers compile this same definition in separate TUs.
     # Device functions need internal linkage, including their NVCC host stubs.
     source = (
@@ -390,9 +432,11 @@ __device__ __forceinline__ Response three_center(double alpha,Vec3 A,Angular a,
             "__DF_ALPHA__", "primitive_alpha" if scalar_type == "float" else "alpha"
         )
         .replace("__DF_BETA__", "primitive_beta" if scalar_type == "float" else "beta")
-        .replace(
-            "__DF_GEOMETRY_PREPARATION__", emit_df_geometry_cuda(range_separated=True)
-        )
+        .replace("#include <cmath>\n", "#include <cmath>\n" + radial_header, 1)
+        .replace("double omega=0.0", radial_parameters)
+        .replace("gamma,C,c,omega);", "gamma,C,c," + radial_arguments + ");")
+        .replace("__DF_EVALUATE_GEOMETRY__", default_preparation)
+        .replace("__DF_GEOMETRY_PREPARATION__", geometry_source)
         .replace("__device__", "static __device__")
     )
     if auxiliary_g:
@@ -434,6 +478,10 @@ __device__ __forceinline__ Response three_center(double alpha,Vec3 A,Angular a,
         source = source.replace(
             "GENERATIVEQC_GENERATED_DF_", "GENERATIVEQC_GENERATED_DF_FP32_"
         ).replace("generated_df_", "generated_df_fp32_")
+    if fitted_geminal:
+        source = source.replace(
+            "GENERATIVEQC_GENERATED_DF_", "GENERATIVEQC_GENERATED_F12_DF_"
+        ).replace("generated_df_", "generated_f12_df_")
     return source
 
 
@@ -443,6 +491,7 @@ def emit_df_derivatives_cpu(
     auxiliary_h: bool = False,
     scalar_type: str = "double",
     maximum_orbital: int = 3,
+    fitted_geminal: bool = False,
 ) -> str:
     """Lower the same generated DF derivative algebra to ordinary host C++.
 
@@ -456,6 +505,7 @@ def emit_df_derivatives_cpu(
         auxiliary_h=auxiliary_h,
         scalar_type=scalar_type,
         maximum_orbital=maximum_orbital,
+        fitted_geminal=fitted_geminal,
     )
     if auxiliary_h:
         source = source.replace(
@@ -484,4 +534,6 @@ def emit_df_derivatives_cpu(
     source = source.replace("static __device__", "inline")
     source = source.replace("__forceinline__", "inline")
     source = source.replace("__noinline__", "")
+    if fitted_geminal:
+        source = source.replace("_DERIVATIVES_CUH", "_DERIVATIVES_CPU_HPP")
     return source
