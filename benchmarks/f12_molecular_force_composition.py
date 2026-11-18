@@ -21,6 +21,7 @@ from numpy.typing import ArrayLike
 
 from benchmarks._f12_cuda import add_molecular_graph_budget, cuda_runner
 from benchmarks.df_reference_response import DFReferenceSession
+from benchmarks.f12_cabs_h_batch import CabsHShells
 from benchmarks.f12_molecular_frame import chain
 from benchmarks.f12_molecular_integral_forward import forward_integrals
 from benchmarks.f12_molecular_fock import compensated_fock
@@ -94,6 +95,7 @@ def endpoint_arguments() -> Namespace:
         "panel",
     ):
         parser.add_argument("--" + option, required=True, type=Path)
+    parser.add_argument("--cabs-h-one-electron-library", type=Path)
     parser.add_argument("--arch", required=True)
     add_molecular_graph_budget(parser)
     return parser.parse_args()
@@ -156,20 +158,42 @@ def calculate_panel(args: Namespace, target: dict) -> dict:
     ):
         raise ValueError("two- and three-center layout and MP2 geometry disagree")
 
-    def geometry_sources(xyz: np.ndarray) -> tuple:
+    has_h = any(s["angular_momentum"] == 5 for s in case["shells"])
+    h_library = getattr(args, "cabs_h_one_electron_library", None)
+    if has_h and h_library is None:
+        raise ValueError(
+            "combined h-shell basis requires the CABS h one-electron library"
+        )
+    central_one = None
+
+    def geometry_sources(xyz: np.ndarray, *, derivative: bool = False) -> tuple:
+        nonlocal central_one
         geometry = xyz.tolist()
         topology = {
             **template,
             "centers": np.ascontiguousarray(xyz[template["atom"]]),
             "manifest": np.asarray(json.dumps({**meta, "geometry_bohr": geometry})),
         }
-        tensors, costs = forward_integrals(topology, args.sink_library)
+        tensors, costs = forward_integrals(
+            topology, args.sink_library, budget_mib=args.budget_mib
+        )
         if len(costs) != 10 or any(rec["device_bytes"] <= 0 for rec in costs.values()):
             raise ValueError("missing GPU integral source")
         factor, whitening = metric_whitener(tensors["metric"], args.component_library)
-        overlap, hcore, one_cost = combined_matrices(
-            {**case, "coordinates_bohr": geometry}, indices, args.session_library
-        )
+        frame_case = {**case, "coordinates_bohr": geometry}
+        if has_h:
+            high = CabsHShells(frame_case, indices, topology, h_library)
+            overlap, hcore, one_cost = high.matrices(
+                args.session_library,
+                derivatives=derivative,
+                max_bytes=args.budget_mib << 20,
+            )
+            if derivative:
+                central_one = high
+        else:
+            overlap, hcore, one_cost = combined_matrices(
+                frame_case, indices, args.session_library
+            )
         atomic = len(indices)
         if (
             one_cost["device_bytes"] <= 0
@@ -192,7 +216,7 @@ def calculate_panel(args: Namespace, target: dict) -> dict:
             {"integrals": costs, "metric": whitening, "one_electron": one_cost},
         )
 
-    data, topology, forward_cost = geometry_sources(base_xyz)
+    data, topology, forward_cost = geometry_sources(base_xyz, derivative=True)
     scalar_checkpoint_seconds = None
     with DFReferenceSession(
         args.session_library, args.scf_inputs / (name + "_central.in")
@@ -229,10 +253,14 @@ def calculate_panel(args: Namespace, target: dict) -> dict:
             canonical=canonical,
         )
     del data
-    explicit = native_contraction(
-        case, obs.explicit_weights["overlap"], obs.explicit_weights["hcore_ao"], indices
+    ws, wh = obs.explicit_weights["overlap"], obs.explicit_weights["hcore_ao"]
+    if central_one is None:
+        explicit = native_contraction(case, ws, wh, indices)
+    else:
+        explicit = central_one.gradient(ws, wh, args.budget_mib << 20)
+    sinks = contract_live_weights(
+        topology, obs.explicit_weights, args.sink_library, budget_mib=args.budget_mib
     )
-    sinks = contract_live_weights(topology, obs.explicit_weights, args.sink_library)
     energy, forces = full_result(
         obs, explicit.gradient, sinks["gradient_Eh_per_bohr"], ordinary
     )
