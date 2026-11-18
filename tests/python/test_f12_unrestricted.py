@@ -1,9 +1,12 @@
 """Spin-dependent extended Coulomb/exchange and F12 projector controls."""
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 from generativeqc_compiler.mp2.f12_molecular_pair import extended_df_fock
 from generativeqc_compiler.mp2.f12_unrestricted import (
+    projected_same_spin_f12_pair,
     unrestricted_extended_df_fock,
     unrestricted_pair_coupling,
     unrestricted_pair_vx,
@@ -169,3 +172,39 @@ def test_coupling_and_gap_on_full_two_electron_space(channel: str) -> None:
         actual["gap"], gel[:, None] + ger[None, :] - ei - ej, atol=1e-13, rtol=0
     )
     _check_vjp(plan, inputs, rng)
+
+
+def test_molecular_high_spin_pair() -> None:
+    fixture = (
+        Path(__file__).parents[1] / "reference_data/f12/psi4_h2_triplet_projected.npz"
+    )
+    with np.load(fixture, allow_pickle=False) as ds:
+        graph = projected_same_spin_f12_pair(*map(int, ds["space"]))
+        ref = float(ds["reference_pair_energy"])
+        feeds = {
+            k: ds[k]
+            for k in ds
+            if k not in {"reference_pair_energy", "space", "psi4_ump2_total", "beta"}
+        }
+    value = float(execute(graph, feeds).outputs["pair_energy"])
+    assert abs(ref) > 1e-4
+    np.testing.assert_allclose(value, ref, atol=2e-11, rtol=0)
+    reverse = transpose_program(graph, ("pair_energy",)).program
+    weights = execute(reverse, {**feeds, "bar_pair_energy": np.array(1.0)}).outputs
+    rng = np.random.default_rng(41713)
+    dsources = {}
+    for key, source in feeds.items():
+        if key.startswith("select"):
+            continue
+        tangent = rng.normal(size=source.shape)
+        if key in ("fock", "exchange"):
+            tangent = (tangent + tangent.T) / 2
+        dsources[key] = tangent / max(1.0, np.linalg.norm(tangent))
+    slope = sum(float(np.vdot(weights["bar_" + k], d)) for k, d in dsources.items())
+
+    def at(t: float) -> float:
+        changed = {**feeds, **{k: feeds[k] + t * d for k, d in dsources.items()}}
+        return float(execute(graph, changed).outputs["pair_energy"])
+
+    for h in (3e-4, 1e-4):
+        np.testing.assert_allclose(slope, (at(h) - at(-h)) / (2 * h), atol=2e-8, rtol=0)

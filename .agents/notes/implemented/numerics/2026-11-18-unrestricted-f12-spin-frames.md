@@ -26,3 +26,7 @@ source; opposite-spin electrons have their own occupied and virtual spaces.
 The returned positive semicanonical gap is separate from the coupling. Dense
 two-particle projectors, actual bent NH2 integrals and two-step ingredient
 derivative checks exercise all three spin channels.
+
+## Polarized (same-spin) fixed-cusp pair
+
+The normalized antisymmetric spatial determinant of an alpha/alpha or beta/beta pair is a pure triplet with fixed amplitude 1/4. Use the spin-specific Fock and positive exchange in the spatial 3C projection, then antisymmetrize both Coulomb and doubles couplings. Each unordered virtual determinant occurs twice in a full ordered square. Eliminating it once gives the subtractions from both V and B; the energy factors for these dressed terms are 1/2 and 1/16. A two-electron H₂ triplet at 3 bohr tests this energy against an explicit antisymmetric determinant-space variational solve, including the B commutator. It does not exercise the mixed-spin cusp sector. The spin projectors and amplitude convention follow the fixed-amplitude method. [MP2-F12 equations](https://psi4.github.io/psi4docs/master/mp2f12.html)

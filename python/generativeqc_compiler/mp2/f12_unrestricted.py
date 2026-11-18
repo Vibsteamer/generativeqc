@@ -1,8 +1,20 @@
 """Unrestricted extended-frame sources for real MP2-F12 pair projections."""
 
-from ..tensor.ir import Node, add, broadcast, einsum, input_tensor, slice_tensor
+from fractions import Fraction
+
+from ..tensor.ir import (
+    Node,
+    add,
+    broadcast,
+    einsum,
+    input_tensor,
+    multiply,
+    slice_tensor,
+    transpose,
+)
 from ..tensor.program import Program
 from ..tensor.types import Index, IndexSpace, TensorSpec
+from .f12_molecular_pair import projected_f12_pair
 
 
 def _field(name: str, *axes: Index) -> Node:
@@ -184,5 +196,59 @@ def unrestricted_pair_coupling(
             "method": "spin-orbital strongly orthogonal F12 doubles coupling",
             "channel": channel,
             "convention": "ordered pair, semicanonical orbital energies, positive MP2 gap",
+        },
+    )
+
+
+def projected_same_spin_f12_pair(
+    occupied: int, virtuals: int, cabs: int, *, auxiliaries: int | None = None
+) -> Program:
+    """Energy correction for one unordered pair of distinct like-spin occupied orbitals.
+
+    F and positive K belong to this spin of the unrestricted reference. The
+    spatial integral projection then uses only this frame. The fixed cusp
+    amplitude is 1/4 for a normalized triplet determinant. Eliminate each
+    conventional doubly excited determinant once; summing over the full ordered
+    virtual square introduces a factor of one half. Frozen pairs are scheduled
+    by the caller. This functional requires neither spin adaptation of the entire
+    molecule nor shared alpha and beta spatial orbitals.
+    """
+    if type(occupied) is not int or occupied < 2:
+        raise ValueError("A same-spin electron pair needs two occupied orbitals")
+    terms = projected_f12_pair(
+        occupied, virtuals, cabs, diagonal=False, auxiliaries=auxiliaries
+    ).outputs
+
+    def difference(name: str) -> Node:
+        return add(
+            terms[name + "_direct"], terms[name + "_exchange"], coefficients=(1, -1)
+        )
+
+    coulomb = terms["g"]
+    antisym_g = add(coulomb, transpose(coulomb, (1, 0)), coefficients=(1, -1))
+    coupling = difference("c")
+    scaled = multiply(coupling, terms["inverse_gap"])
+    linear = add(
+        difference("v"),
+        einsum("ab,ab->", antisym_g, scaled),
+        coefficients=(1, Fraction(-1, 2)),
+    )
+    shifted_b = add(
+        difference("b"),
+        multiply(terms["occupied_fock_sum"], difference("x")),
+        coefficients=(1, -1),
+    )
+    quadratic = add(
+        shifted_b,
+        einsum("ab,ab->", coupling, scaled),
+        coefficients=(1, Fraction(-1, 2)),
+    )
+    energy = add(linear, quadratic, coefficients=(Fraction(1, 2), Fraction(1, 16)))
+    return Program(
+        {"pair_energy": energy},
+        provenance={
+            "method": "same-spin semicanonical MP2-F12/3C(FIX) increment",
+            "units": "Hartree",
+            "active_pair": "one unordered pair i<j; either alpha/alpha or beta/beta",
         },
     )
