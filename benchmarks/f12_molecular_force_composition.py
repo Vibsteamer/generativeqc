@@ -121,7 +121,7 @@ def write_measurement(path: Path, result: dict) -> None:
     tmp.replace(path)
 
 
-def endpoint_arguments() -> Namespace:
+def endpoint_arguments(*, split_cc: bool = False) -> Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     for option in (
         "scf-inputs",
@@ -150,6 +150,11 @@ def endpoint_arguments() -> Namespace:
         type=float,
         help="Override the projected auxiliary Gram cutoff for a rank-verified basis.",
     )
+    if split_cc:
+        parser.add_argument(
+            "--cc-role", choices=("complete", "center", "signed"), default="complete"
+        )
+        parser.add_argument("--cc-step", type=float, choices=(0.0002, 0.0004))
     parser.add_argument("--arch", required=True)
     add_molecular_graph_budget(parser)
     return parser.parse_args()
@@ -176,9 +181,22 @@ def calculate_panel(
     full_rank_constraint: bool = False,
     molecular_correlation: Callable | None = None,
     reference_singles_only: bool = False,
+    cc_role: str = "complete",
 ) -> dict:
     """Compute and checkpoint central Cartesian E/F and requested native energy displacements."""
     name = target["molecule"]
+    if cc_role not in ("complete", "center", "signed") or (
+        cc_role != "complete"
+        and (
+            molecular_correlation is None
+            or central_component
+            or reference_singles_only
+            or target.get("validation_scope") != "benchmark_center_and_native_direction"
+        )
+    ):
+        raise ValueError(
+            "split roles require the restricted molecular CC benchmark panel"
+        )
     if reference_singles_only and (
         molecular_correlation
         or central_component
@@ -325,6 +343,106 @@ def calculate_panel(
             topology,
             {"integrals": costs, "metric": whitening, "one_electron": one_cost},
         )
+
+    def signed_pair(arm: dict) -> dict:
+        tick = time.monotonic()
+        vector = np.array(arm["direction"])
+        h = arm["step"]
+        endpoints = []
+        signed_components = []
+        arm_energies = (
+            arm["mp2_and_hf_Eh"]
+            if ordinary is not None
+            else [(None, hf) for hf in arm["hf_energies_Eh"]]
+        )
+        for sign, filename, (emp2, ehf) in zip(
+            (1, -1), arm["files"], arm_energies, strict=True
+        ):
+            xyz = base_xyz + sign * h * vector
+            atoms = (
+                (args.scf_inputs / filename).read_text().splitlines()[1 : len(xyz) + 1]
+            )
+            if not np.array_equal(
+                xyz, [[float(a) for a in line.split()[1:]] for line in atoms]
+            ):
+                raise ValueError(
+                    "finite-difference native SCF and integral geometries disagree"
+                )
+            moved, _, source_cost = geometry_sources(xyz)
+            with DFReferenceSession(
+                args.session_library, args.scf_inputs / filename
+            ) as point:
+                snap = point.snapshot()
+                if abs(snap["energy"] - ehf) > 5e-11:
+                    raise ValueError("displaced ordinary and F12 SCF energies disagree")
+                ix = np.ix_(rows, rows)
+                for key, scf_key in (("overlap", "overlap"), ("hcore_ao", "hcore")):
+                    np.testing.assert_allclose(
+                        moved[key][ix], snap[scf_key], atol=2e-8, rtol=0
+                    )
+                moved["coefficients"] = with_reference_orbitals(
+                    moved["coefficients"], rows, snap["coefficients"]
+                )
+                increment, _, components = reverse(moved, pullback=False)
+            del moved
+            # Archived MP2 totals already include the HF energy at this displaced geometry.
+            base_energy = (
+                snap["energy"]
+                if ordinary is None
+                else (
+                    emp2
+                    if arm.get("ordinary_total_only")
+                    else snap["energy"] + (emp2 - ehf)
+                )
+            )
+            endpoints.append(float(base_energy + increment))
+            signed_components.append(
+                {
+                    "sign": sign,
+                    "reference_energy_Eh": float(snap["energy"]),
+                    **(
+                        {"ordinary_corr_Eh": float(base_energy - snap["energy"])}
+                        if ordinary is not None
+                        else {}
+                    ),
+                    **(
+                        {
+                            "integral_device_bytes": {
+                                key: receipt["device_bytes"]
+                                for key, receipt in source_cost["integrals"].items()
+                            }
+                        }
+                        if cc_role == "signed"
+                        else {}
+                    ),
+                    "increment_Eh": increment,
+                    **components,
+                }
+            )
+        return {
+            "direction": arm["name"],
+            "step_bohr": h,
+            "energies_Eh": endpoints,
+            "energy_components": signed_components,
+            "seconds": time.monotonic() - tick,
+        }
+
+    if cc_role == "signed":
+        step = getattr(args, "cc_step", None)
+        signed = [
+            signed_pair(arm)
+            for arm in target["native_displacements"]
+            if step is None or arm["step"] == step
+        ]
+        return {
+            "case": name,
+            "phase": "signed_pairs_complete",
+            "selected_step_bohr": step,
+            "passed": False,
+            "signed_pairs": signed,
+            "graph_gpu_programs": programs,
+            "composition_seconds": time.monotonic() - begin,
+        }
 
     data, topology, forward_cost = geometry_sources(base_xyz, derivative=True)
 
@@ -484,97 +602,42 @@ def calculate_panel(
         ),
     }
     write_measurement(args.output, checkpoint)
+    if cc_role == "center":
+        return checkpoint
     for arm in target["native_displacements"]:
-        tick = time.monotonic()
-        vector = np.array(arm["direction"])
-        h = arm["step"]
-        endpoints = []
-        signed_components = []
-        arm_energies = (
-            arm["mp2_and_hf_Eh"]
-            if ordinary is not None
-            else [(None, hf) for hf in arm["hf_energies_Eh"]]
+        measured_pair = signed_pair(arm)
+        check = project_signed_pair(
+            measured_pair, arm["direction"], forces, split_report
         )
-        for sign, filename, (emp2, ehf) in zip(
-            (1, -1), arm["files"], arm_energies, strict=True
-        ):
-            xyz = base_xyz + sign * h * vector
-            atoms = (
-                (args.scf_inputs / filename).read_text().splitlines()[1 : len(xyz) + 1]
-            )
-            if not np.array_equal(
-                xyz, [[float(a) for a in line.split()[1:]] for line in atoms]
-            ):
-                raise ValueError(
-                    "finite-difference native SCF and integral geometries disagree"
-                )
-            moved, _, _cost = geometry_sources(xyz)
-            with DFReferenceSession(
-                args.session_library, args.scf_inputs / filename
-            ) as point:
-                snap = point.snapshot()
-                if abs(snap["energy"] - ehf) > 5e-11:
-                    raise ValueError("displaced ordinary and F12 SCF energies disagree")
-                ix = np.ix_(rows, rows)
-                for key, scf_key in (("overlap", "overlap"), ("hcore_ao", "hcore")):
-                    np.testing.assert_allclose(
-                        moved[key][ix], snap[scf_key], atol=2e-8, rtol=0
-                    )
-                moved["coefficients"] = with_reference_orbitals(
-                    moved["coefficients"], rows, snap["coefficients"]
-                )
-                increment, _, components = reverse(moved, pullback=False)
-            del moved
-            # Archived MP2 totals already include the HF energy at this displaced geometry.
-            base_energy = (
-                snap["energy"]
-                if ordinary is None
-                else (
-                    emp2
-                    if arm.get("ordinary_total_only")
-                    else snap["energy"] + (emp2 - ehf)
-                )
-            )
-            endpoints.append(float(base_energy + increment))
-            signed_components.append(
-                {
-                    "sign": sign,
-                    "reference_energy_Eh": float(snap["energy"]),
-                    **(
-                        {"ordinary_corr_Eh": float(base_energy - snap["energy"])}
-                        if ordinary is not None
-                        else {}
-                    ),
-                    "increment_Eh": increment,
-                    **components,
-                }
-            )
-        error = abs(-(endpoints[0] - endpoints[1]) / (2 * h) - np.vdot(forces, vector))
-        component_errors = {}
-        if split_report:
-            resolved = split_report["component_forces_Eh_per_bohr"]
-            for term in ("f12_pair", "cabs_singles", "reference", "ordinary_corr"):
-                field = term + ("_energy_Eh" if term != "ordinary_corr" else "_Eh")
-                plus, minus = (point[field] for point in signed_components)
-                projected = np.vdot(resolved[term], vector)
-                component_errors[term] = float(
-                    abs(projected + (plus - minus) / (2 * h))
-                )
-        df_checks.append(
-            {
-                "direction": arm["name"],
-                "step_bohr": h,
-                "energies_Eh": endpoints,
-                "energy_components": signed_components,
-                "component_force_errors_Eh_per_bohr": component_errors,
-                "seconds": time.monotonic() - tick,
-                "max_error_Eh_per_bohr": error,
-            }
-        )
+        df_checks.append(check)
         write_measurement(args.output, checkpoint)
     checkpoint["native_directional_checks"] = checkpoint.pop("displacements")
     checkpoint["composition_seconds"] = time.monotonic() - begin
     return checkpoint
+
+
+def project_signed_pair(
+    pair: dict, direction: list, forces: np.ndarray, split_report: dict
+) -> dict:
+    """Compare a signed energy pair to center forces on the same direction."""
+    vector = np.asarray(direction)
+    endpoints = pair["energies_Eh"]
+    signed_components = pair["energy_components"]
+    h = pair["step_bohr"]
+    error = abs(-(endpoints[0] - endpoints[1]) / (2 * h) - np.vdot(forces, vector))
+    component_errors = {}
+    if split_report:
+        resolved = split_report["component_forces_Eh_per_bohr"]
+        for term in ("f12_pair", "cabs_singles", "reference", "ordinary_corr"):
+            field = term + ("_energy_Eh" if term != "ordinary_corr" else "_Eh")
+            plus, minus = (point[field] for point in signed_components)
+            projected = np.vdot(resolved[term], vector)
+            component_errors[term] = float(abs(projected + (plus - minus) / (2 * h)))
+    return {
+        **pair,
+        "component_force_errors_Eh_per_bohr": component_errors,
+        "max_error_Eh_per_bohr": error,
+    }
 
 
 def common_checks(result: dict, target: dict) -> dict:
