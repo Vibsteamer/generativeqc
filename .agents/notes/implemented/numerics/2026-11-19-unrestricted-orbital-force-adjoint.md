@@ -13,5 +13,22 @@ that already include occupied/virtual relaxation would count the rotation twice.
 
 The dense CUDA implementation checks its explicit device allocation budget,
 including the pivoted LU workspace. The existing tensor orbital action remains
-available for matrix-free solves. Formation of the molecular DF blocks, nuclear
-right-hand sides, electronic driver and fixed gradients remains with the caller.
+available for matrix-free solves. The adjoint accepts independently supplied nuclear
+right-hand sides and fixed gradients for callers with an existing response driver.
+
+The molecular entry can construct all nuclear equations from AO overlap,
+core-Hamiltonian, Coulomb three-center and Coulomb-metric tangents. The project
+TensorIR projects them into both spin frames and forms the shared Coulomb and
+same-spin exchange derivatives, the occupied metric-density response and six
+fixed gradient contractions. A central whitener W and density-fitted factors B
+are supplied in the same gauge. Using the symmetric differential
+`dB = W dR - (W dJ Wᵀ) B / 2` preserves the exact derivative of the fitted
+Coulomb product without differentiating a particular triangular factor.
+
+A displaced inverse-metric Fock test moves the occupied density in its overlap
+metric and also holds it fixed, isolating the three channels independently for
+both spins and for either empty-spin limit. For the NH2 doublet, all 3,519
+nuclear elements agree with a differentiated Cholesky control within 4.5e-14.
+The four AO derivative arrays, central frame and electronic energy weights
+remain caller inputs. Two additional direct F12/frame gradient contributions
+and the reference force are supplied separately to the force assembly.
