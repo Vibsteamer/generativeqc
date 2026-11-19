@@ -1,0 +1,7 @@
+# Independent CCSD and triples focal increments
+
+The conventional triples contribution can be calculated in a different basis from the CCSD correction. To support this choice, the focal assembler accepts an independently calculated CCSD-minus-MP2 series and a conventional (T) series. At each cardinal of the CCSD increment the two electronic methods must share a basis, fitted auxiliary policy, and correlated space. The combined post-MP2 input remains the appropriate representation when a solver returns the whole correction together.
+
+The assembler checks roles so supplying triples twice or omitting triples from a split recipe cannot silently change the energy. Each input supplies its own force on the same ordered electronic surface. Constant extrapolation weights from the native CBS plan apply to both energy and force. The existing native exponential HF law is available for HF plus CABS singles. Its exponent and the inverse-power exponents for correlation are explicit recipe inputs.
+
+The regression uses independent exponential and inverse-power error models for four components, three cardinal pairs, and two displacements. A separate replay uses the three original HW6F1 members with native ha-D/T F12 components, conventional aug-T CCSD minus MP2, and conventional aug-T (T). At these matching high-order bases the split and combined high-order corrections reproduce each other. This check covers the arithmetic and its inputs. A convergence claim for a different high-order pair requires actual data at that pair.

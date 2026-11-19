@@ -700,11 +700,18 @@ srun --partition=main --gres=gpu:5090:1 --nodes=1 --ntasks=1 \
 `generativeqc.experimental.f12_focal.combine` accepts independently evaluated
 energy and Cartesian force contributions from a single geometry. Pass a
 `FocalSeries` for HF plus CABS singles, a second series for ordinary MP2
-correlation plus the explicit F12 pair correction, and one `post_mp2`
-difference evaluated in a matched high-level basis. A single upper term selects
-a finite endpoint. Supplying a lower term and a positive power selects the
-two-point inverse-power limit. Each series can have its own family, for example
-a parent HF series and a heavy-augmented correlation series. Use the same
+correlation plus the explicit F12 pair correction, and a high-level correction.
+Use the role `post_mp2` for a combined correction. To treat conventional
+(T) separately, use `ccsd_minus_mp2` for the matched CCSD minus MP2 increment
+and pass the `triples` term or series by keyword. Each correction accepts
+a single term or its own cardinal pair. Difference CCSD and MP2 using the same
+orbital basis, fitted auxiliary policy and correlated space at each cardinal.
+
+A single upper term selects a finite endpoint. Giving a lower term and a
+positive exponent selects an inverse-power limit. For an exponential HF plus
+CABS limit use `FocalSeries(upper, lower, alpha, extrapolation="exponential")`.
+Each series can have its own family and cardinal pair, including parent,
+heavy-augmented and fully augmented basis sets. Use the same
 surface identity for all terms, including ordered coordinates, electronic root,
 ECP and frozen-core convention, and distinct basis identities for different
 cardinals. Returned weights apply to both energy (Eh) and force (Eh/bohr).
