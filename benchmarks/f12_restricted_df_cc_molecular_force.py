@@ -4,7 +4,7 @@ import json
 from functools import partial
 
 from benchmarks.f12_cc_benchmark_center import check_center
-from benchmarks.f12_cc_signed_roles import identity, qualify_role
+from benchmarks.f12_cc_signed_roles import identity, physical_gpu, qualify_role
 from benchmarks.f12_closed_shell_cc_molecular import molecular_cc_correlation
 from benchmarks.f12_h2_cc_molecular_force import validate
 from benchmarks.f12_molecular_force_composition import (
@@ -18,6 +18,8 @@ def main() -> None:
     args = endpoint_arguments(split_cc=True)
     if args.cc_step is not None and args.cc_role != "signed":
         raise ValueError("--cc-step applies only to the signed role")
+    if args.cc_sign is not None and args.cc_step is None:
+        raise ValueError("--cc-sign requires --cc-step on a signed role")
     panel = json.loads(args.panel.read_bytes())
     if "cc_reference" not in panel:
         raise ValueError("independent fixed-geminal CC reference data required")
@@ -38,6 +40,8 @@ def main() -> None:
         cc_role=args.cc_role,
     )
     if args.cc_role != "complete":
+        measured["physical_gpu"] = physical_gpu(args.arch)
+        write_measurement(args.output, measured)
         qualify_role(measured, args.cc_role, panel, shared_identity)
     elif panel.get("validation_scope") == "benchmark_center_and_native_direction":
         check_center(measured, panel)

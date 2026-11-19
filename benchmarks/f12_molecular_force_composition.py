@@ -155,6 +155,7 @@ def endpoint_arguments(*, split_cc: bool = False) -> Namespace:
             "--cc-role", choices=("complete", "center", "signed"), default="complete"
         )
         parser.add_argument("--cc-step", type=float, choices=(0.0002, 0.0004))
+        parser.add_argument("--cc-sign", choices=("plus", "minus"))
     parser.add_argument("--arch", required=True)
     add_molecular_graph_budget(parser)
     return parser.parse_args()
@@ -344,6 +345,10 @@ def calculate_panel(
             {"integrals": costs, "metric": whitening, "one_electron": one_cost},
         )
 
+    requested_sign = {"plus": 1, "minus": -1, None: None}[
+        getattr(args, "cc_sign", None)
+    ]
+
     def signed_pair(arm: dict) -> dict:
         tick = time.monotonic()
         vector = np.array(arm["direction"])
@@ -358,6 +363,8 @@ def calculate_panel(
         for sign, filename, (emp2, ehf) in zip(
             (1, -1), arm["files"], arm_energies, strict=True
         ):
+            if requested_sign is not None and sign != requested_sign:
+                continue
             xyz = base_xyz + sign * h * vector
             atoms = (
                 (args.scf_inputs / filename).read_text().splitlines()[1 : len(xyz) + 1]
@@ -407,10 +414,12 @@ def calculate_panel(
                     ),
                     **(
                         {
+                            "scf_input_sha256": target["scf_input_sha256"][filename],
+                            "scf_filename": filename,
                             "integral_device_bytes": {
                                 key: receipt["device_bytes"]
                                 for key, receipt in source_cost["integrals"].items()
-                            }
+                            },
                         }
                         if cc_role == "signed"
                         else {}
@@ -438,6 +447,7 @@ def calculate_panel(
             "case": name,
             "phase": "signed_pairs_complete",
             "selected_step_bohr": step,
+            "selected_sign": requested_sign,
             "passed": False,
             "signed_pairs": signed,
             "graph_gpu_programs": programs,
