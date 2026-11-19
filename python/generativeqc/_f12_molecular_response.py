@@ -108,7 +108,7 @@ def molecular_reference_response(
             raise ValueError(f"reference {name} disagrees with the molecular AO source")
     c = state["coefficients"]
     inputs = {**data, "coefficients": with_reference_orbitals(frame, rows, c)}
-    energy, weights, _ = evaluate_sources(inputs, pullback=True)
+    energy, weights, checks = evaluate_sources(inputs, pullback=True)
     if not np.isfinite(energy) or not np.isfinite(state["energy"]):
         raise ValueError("nonfinite molecular energy")
     weights = dict(weights)
@@ -125,10 +125,9 @@ def molecular_reference_response(
         rotation, state["energies"], occ, maximum_bytes=maximum_bytes
     )
     forces, stats = session.response(fock_seed, bar_c, maximum_bytes=maximum_bytes)
+    diagnostics = {**stats, "canonical_bytes": allocated}
+    if "cabs_response" in checks:
+        diagnostics["cabs_response"] = checks["cabs_response"]
     return F12ReferenceResponse(
-        float(energy),
-        float(state["energy"]),
-        forces,
-        weights,
-        {**stats, "canonical_bytes": allocated},
+        float(energy), float(state["energy"]), forces, weights, diagnostics
     )

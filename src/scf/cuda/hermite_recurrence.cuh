@@ -8,24 +8,26 @@
 // dimensions include kinetic-operator raising and the zero recurrence boundary.
 namespace generativeqc::scf::cuda_execution {
 
-template <typename Scalar>
+template <typename Scalar, int IDimension = kHermiteIDimension, int JDimension = kHermiteJDimension,
+          int TDimension = kHermiteTDimension>
 struct HermiteCoefficients {
-  Scalar data[kHermiteIDimension * kHermiteJDimension * kHermiteTDimension];
+  static_assert(IDimension > 0 && JDimension > 0 && TDimension >= IDimension + JDimension);
+  Scalar data[IDimension * JDimension * TDimension];
 
   GENERATIVEQC_ERI_DEVICE inline Scalar& at(unsigned i, unsigned j, unsigned t) {
-    return data[(i * kHermiteJDimension + j) * kHermiteTDimension + t];
+    return data[(i * JDimension + j) * TDimension + t];
   }
   GENERATIVEQC_ERI_DEVICE inline const Scalar& at(unsigned i, unsigned j, unsigned t) const {
-    return data[(i * kHermiteJDimension + j) * kHermiteTDimension + t];
+    return data[(i * JDimension + j) * TDimension + t];
   }
 };
 
-template <typename Scalar>
-GENERATIVEQC_ERI_DEVICE inline void fill_hermite(unsigned maximum_i, unsigned maximum_j,
-                                                 Scalar product, Scalar center_a, Scalar center_b,
-                                                 double alpha, double beta,
-                                                 HermiteCoefficients<Scalar>& coefficients) {
-  for (int item = 0; item < kHermiteIDimension * kHermiteJDimension * kHermiteTDimension; ++item) {
+template <typename Scalar, int IDimension, int JDimension, int TDimension>
+GENERATIVEQC_ERI_DEVICE inline void fill_hermite(
+    unsigned maximum_i, unsigned maximum_j, Scalar product, Scalar center_a, Scalar center_b,
+    double alpha, double beta,
+    HermiteCoefficients<Scalar, IDimension, JDimension, TDimension>& coefficients) {
+  for (int item = 0; item < IDimension * JDimension * TDimension; ++item) {
     coefficients.data[item] = scalar<Scalar>(0.0);
   }
   using Real = EvaluationReal<Scalar>;

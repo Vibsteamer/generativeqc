@@ -27,6 +27,11 @@ def main() -> None:
     parser.add_argument("--cxx", default=shutil.which("c++"))
     parser.add_argument("--arch", default="sm_89")
     parser.add_argument("--backend", choices=["host", "cuda"], default="cuda")
+    parser.add_argument(
+        "--cabs-h",
+        action="store_true",
+        help="Build a separately named FP64 variant for combined-basis h/h/h sources.",
+    )
     args = parser.parse_args()
     cuda = args.backend == "cuda"
     compiler = args.nvcc if cuda else args.cxx
@@ -34,7 +39,8 @@ def main() -> None:
         parser.error("selected backend compiler is unavailable")
     launcher = resolve_compiler_cache()
     out = args.output_dir.resolve()
-    build = out / args.backend
+    domain_suffix = "_cabs_h" if args.cabs_h else ""
+    build = out / (args.backend + domain_suffix)
     build.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("CCACHE_BASEDIR", str(REPO))
     stats = [str(launcher.path), "--show-stats"]
@@ -57,6 +63,8 @@ def main() -> None:
         common += ["-arch=sm_" + arch, "-Xcompiler=-fPIC"]
     else:
         common += ["-x", "c++", "-fPIC", "-DGQC_SINK_HOST_REFERENCE"]
+    if args.cabs_h:
+        common.append("-DGQC_F12_CABS_H")
     emit = emit_df_derivatives_cuda if cuda else emit_df_derivatives_cpu
     objects = []
 
@@ -72,7 +80,10 @@ def main() -> None:
     for operator in ("coulomb", "geminal"):
         header = build / ("molecular-" + operator + ".hpp")
         content = emit(
-            auxiliary_h=True, maximum_orbital=4, fitted_geminal=operator == "geminal"
+            auxiliary_h=True,
+            maximum_orbital=5 if args.cabs_h else 4,
+            fitted_geminal=operator == "geminal",
+            cabs_h=args.cabs_h,
         )
         if not header.exists() or header.read_text() != content:
             header.write_text(content)
@@ -81,7 +92,9 @@ def main() -> None:
         run(common + flags + ["-c", str(source), "-o", str(obj)], operator)
         objects.append(str(obj))
     suffix = "" if cuda else "_host"
-    target = out / ("libgqc_f12_molecular_integral_sink" + suffix + ".so")
+    target = out / (
+        "libgqc_f12_molecular_integral_sink" + domain_suffix + suffix + ".so"
+    )
     # A failed relink must leave the last ready library intact.
     temporary_target = target.with_suffix(".linking.so")
     link_flags = ["-arch=sm_" + arch] if cuda else []

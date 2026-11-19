@@ -5,6 +5,46 @@ from ..tensor.program import Program
 from ..tensor.types import Index, IndexSpace, TensorSpec
 
 
+def full_rank_cabs_cotangent(atomic: int, obs: int) -> Program:
+    """Differentiate C.T S C=I and R.T S C=0 in the complete complement.
+
+    R is an S-orthonormal basis of the fixed orbital AO span, embedded in the
+    combined AO basis. For G=bar_C the invariant moment C.T G is symmetric.
+    Thus bar_S = -sym(R R.T G C.T) - C sym(C.T G) C.T / 2. This formula
+    omits rotations into discarded directions and requires the full CABS rank.
+    """
+    if type(atomic) is not int or type(obs) is not int or not 0 < obs < atomic:
+        raise ValueError("Expected a nonempty full CABS complement")
+    ao = IndexSpace("combined_atomic", "ao", atomic)
+    orbital = IndexSpace("orbital_basis", "orbital", obs)
+    comp = IndexSpace("cabs_frame", "orbital", atomic - obs)
+    a, i, r = Index("a", ao), Index("i", orbital), Index("r", comp)
+    frame = input_tensor("frame", TensorSpec((a, r), role="input"))
+    bar = input_tensor("frame_bar", TensorSpec((a, r), role="input"))
+    reference = input_tensor("orbital_frame", TensorSpec((a, i), role="input"))
+    moment = einsum("ar,as->rs", frame, bar)
+    rotation = add(moment, transpose(moment, (1, 0)), coefficients=("1/2", "1/2"))
+    projected = einsum("ai,ir->ar", reference, einsum("bi,br->ir", reference, bar))
+    cross = einsum("ar,br->ab", projected, frame)
+    normalization = einsum("ar,br->ab", einsum("as,sr->ar", frame, rotation), frame)
+    weight = add(
+        cross,
+        transpose(cross, (1, 0)),
+        normalization,
+        coefficients=("-1/2", "-1/2", "-1/2"),
+    )
+    return Program(
+        {
+            "overlap_bar": weight,
+            "gauge_skew": add(moment, transpose(moment, (1, 0)), coefficients=(1, -1)),
+        },
+        provenance={
+            "operation": "full-rank CABS constraint cotangent",
+            "derivative_order": 1,
+        },
+    )
+
+
 def frame_kernel_cotangent(atomic: int, rank: int) -> Program:
     """Map bar_C to a symmetric bar_K for K = C C.T, with C.T S C = I.
 

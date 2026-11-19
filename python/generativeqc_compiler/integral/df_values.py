@@ -308,15 +308,19 @@ def build_df_axis_moment(
     ``maximum_orbital=4`` explicitly extends only that h domain to g/g/h:
     values end at F13 and responses at F14. At most one orbital center can
     carry the internally raised h power; a metric's first center may reach i.
+    For the combined OBS/OptRI F12 space, maximum_orbital=5 opts the axis
+    polynomial into h/h/h (F15 for values, F16 for one raised center).
+    Other consumers retain their own shell admission and storage bounds.
     An optional diagnostic set collects the nonconstant recurrence states visited
     by this same builder, before expression simplification or backend CSE.
     """
     powers = (a, b, c)
-    if maximum_orbital not in (3, 4) or (
-        maximum_orbital == 4 and not (auxiliary_h or auxiliary_h_derivative)
-    ):
+    if maximum_orbital not in (3, 4, 5):
+        raise ValueError("maximum orbital angular momentum must be 3, 4, or 5")
+    if maximum_orbital >= 4 and not (auxiliary_h or auxiliary_h_derivative):
+        shell = "g" if maximum_orbital == 4 else "h"
         raise ValueError(
-            "orbital g requires the explicit auxiliary-through-h moment domain"
+            f"orbital {shell} requires the explicit auxiliary-through-h moment domain"
         )
     maximum = (
         6

@@ -41,6 +41,11 @@ namespace gi = generativeqc::integrals;
 #endif
 
 namespace {
+#ifdef GQC_F12_CABS_H
+constexpr int maximum_combined_l = 5;
+#else
+constexpr int maximum_combined_l = 4;
+#endif
 constexpr int channels = 10;
 constexpr int threads = 64;
 using Index = std::int32_t;
@@ -205,7 +210,8 @@ bool supported(ShellBatch data, int ncenter, int nshell, int nprimitive, int nbl
     Size primitive_count = 1;
     for (int q = 0; q < ncenter; ++q) {
       const int s = shells[q];
-      if (s < 0 || s >= nshell || (ncenter == 3 && q < 2 && data.angular[s] > 4)) return false;
+      if (s < 0 || s >= nshell || (ncenter == 3 && q < 2 && data.angular[s] > maximum_combined_l))
+        return false;
       cart_count *= cart_size(data.angular[s]);
       const Size length = data.primitive_offsets[s + 1] - data.primitive_offsets[s];
       if (primitive_count > UINT64_MAX / length) return false;

@@ -15,6 +15,7 @@ from generativeqc_compiler.mp2.f12_density_fitting import (
     molecular_orbital_sources,
 )
 from generativeqc_compiler.tensor.ad_program import transpose_program
+from generativeqc_compiler.tensor.program import Program
 
 from benchmarks._f12_cuda import cuda_runner
 from benchmarks.f12_molecular_pairs import factor_inputs, fock_plan, pair_plan
@@ -94,7 +95,8 @@ def evaluate(
     *,
     pullback: bool,
     singles: Callable | None = None,
-    record_energy: Callable[[float], None] | None = None,
+    singles_only: bool = False,
+    record_energy: Callable[[float, dict[str, float]], None] | None = None,
     physical_fock: Callable | None = None,
 ) -> tuple[float, dict, dict]:
     """Evaluate the F12 increment, optionally composing a native singles action.
@@ -105,14 +107,22 @@ def evaluate(
     energy is included here, and no implicit reference-program fallback exists.
     """
     occ, obs, ri = map(int, data["space"])
+    if singles_only and singles is None:
+        raise ValueError("CABS-only response requires a singles functional")
+    operators = () if singles_only else OPERATORS
     aux = len(data["metric"])
     plan = source_plan(len(data["coefficients"]), ri, occ, aux)
+    if singles_only:
+        plan = Program(
+            {k: plan.outputs[k] for k in ("hcore", "raw_coulomb")},
+            provenance=plan.provenance,
+        )
     source = {
         k: data[k]
         for k in (
             "coefficients",
             "hcore_ao",
-            *("ao_" + op for op in ("coulomb", *OPERATORS)),
+            *("ao_" + op for op in ("coulomb", *operators)),
         )
     }
     mapped = run(plan, source).outputs
@@ -130,7 +140,7 @@ def evaluate(
         "fit": fitted,
         "raw_coulomb_all": mapped["raw_coulomb"],
         "raw_occupied": np.ascontiguousarray(mapped["raw_coulomb"][:, :occ]),
-        **{"metric_" + op: data["metric_" + op] for op in OPERATORS},
+        **{"metric_" + op: data["metric_" + op] for op in operators},
     }
     mol["raw_coulomb"] = mol["raw_occupied"]
     fock = fock_plan(occ, ri, aux)
@@ -153,11 +163,13 @@ def evaluate(
         for k in (
             "fit",
             "raw_coulomb",
-            *("raw_" + o for o in OPERATORS),
-            *("metric_" + o for o in OPERATORS),
+            *("raw_" + o for o in operators),
+            *("metric_" + o for o in operators),
         )
     }
     total = 0.0
+    pair_sum = 0.0
+    singles_energy = 0.0
     if singles is not None:
         singles_energy, singles_bar = singles(fock_out["fock"], occ, pullback=pullback)
         total += float(singles_energy)
@@ -165,11 +177,14 @@ def evaluate(
             if singles_bar is None or singles_bar.shape != fock_out["fock"].shape:
                 raise ValueError("CABS singles must supply the complete Fock cotangent")
             fock_bars["bar_fock"] += singles_bar
-    for first, second in zip(*np.triu_indices(occ), strict=True):
+    pairs = () if singles_only else zip(*np.triu_indices(occ), strict=True)
+    for first, second in pairs:
         i, j = int(first), int(second)
         pair = pair_plan(occ, obs - occ, ri - obs, diagonal=i == j, auxiliaries=aux)
         feeds = factor_inputs(mol, i, j, fock_out)
-        total += float(run(pair, feeds).outputs["pair_energy"])
+        pair_energy = float(run(pair, feeds).outputs["pair_energy"])
+        total += pair_energy
+        pair_sum += pair_energy
         if not pullback:
             continue
         bars = run(
@@ -185,9 +200,18 @@ def evaluate(
             else:
                 column = i if name.endswith("_i") else j
                 pair_bars[name[:-2]][:, column] += value
+    components = {
+        "f12_pair_energy_Eh": pair_sum,
+        "cabs_singles_energy_Eh": float(singles_energy),
+    }
     if record_energy is not None:
-        record_energy(total)
-    intermediates = {**mapped, "fit": fitted, **fock_out}
+        record_energy(total, components)
+    intermediates = {
+        **mapped,
+        "fit": fitted,
+        **fock_out,
+        "energy_components": components,
+    }
     if not pullback:
         return total, {}, intermediates
     fock_back = run(
@@ -206,14 +230,14 @@ def evaluate(
     seeds = {
         "bar_hcore": fock_back["bar_hcore"],
         "bar_raw_coulomb": raw_bar,
-        **{"bar_raw_" + op: pair_bars["raw_" + op] for op in OPERATORS},
+        **{"bar_raw_" + op: pair_bars["raw_" + op] for op in operators},
     }
     source_back = run(
         transpose_program(plan, tuple(plan.outputs)).program, {**source, **seeds}
     ).outputs
     result = {key.removeprefix("bar_"): value for key, value in source_back.items()}
     result["metric"] = fit_back["metric_bar"]
-    result.update({"metric_" + op: pair_bars["metric_" + op] for op in OPERATORS})
+    result.update({"metric_" + op: pair_bars["metric_" + op] for op in operators})
     return total, result, intermediates
 
 

@@ -180,6 +180,7 @@ def contract_live_weights(
     host_reference: bool = False,
     budget_mib: int = 512,
     coulomb_library: Path | None = None,
+    singles_only: bool = False,
 ) -> dict:
     """Run each channel on the supplied AO adjoints and sum its nuclear gradient.
 
@@ -203,20 +204,26 @@ def contract_live_weights(
     labels = metadata.get("integral_channels")
     if labels is not None and (len(labels) != len(channels) or set(labels) != channels):
         raise ValueError("partial or unexpected declared integral channels")
-    if set(explicit_weights) - {"overlap", "hcore_ao"} != channels:
+    operators = ("coulomb",) if singles_only else tuple(_OPCODES)
+    needed = {channel_name(group, op) for group in ("metric", "ao") for op in operators}
+    if set(explicit_weights) - {"overlap", "hcore_ao"} != needed:
         raise ValueError(
-            "the explicit adjoint set must contain all ten integral channels"
+            "the explicit adjoint set must contain all required integral channels"
         )
     functions = {
-        "geminal": bind(library, "geminal", host_reference),
         "coulomb": bind(coulomb_library or library, "coulomb", host_reference),
     }
+    if not singles_only:
+        functions["geminal"] = bind(library, "geminal", host_reference)
+    else:
+        # Stored channel fixtures describe the combined pair + singles functional.
+        references = None
     topology = {k: layout[k] for k in layout if not k.startswith("weights_")}
     rows = {}
     total = np.zeros((len(metadata["elements"]), 3))
     for group in ("metric", "ao"):
         projection = ShellProjection(topology, group)
-        for operator in _OPCODES:
+        for operator in operators:
             label = channel_name(group, operator)
             pack_start = time.monotonic()
             weights = projection.pack(explicit_weights[label])
