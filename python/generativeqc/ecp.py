@@ -146,16 +146,20 @@ class ECPIntegrals:
         *,
         orbital_coefficients: np.ndarray | None = None,
         coefficient_derivatives: np.ndarray | None = None,
+        device: str = "cpu",
     ) -> np.ndarray:
         """Differentiate a fixed real weight contracted with V or C.T @ V @ C.
 
         C uses the same AO row order as the matrices and can be rectangular.
         Supply dC[atom, xyz] for a moving orbital frame. Alpha and beta frames
         can be contracted independently and their gradients added. The result
-        uses the positive energy-derivative sign.
+        uses the positive energy-derivative sign. CUDA evaluates and returns
+        the whole Cartesian panel in one call.
         """
         if self.local_derivative is None or self.nonlocal_derivative is None:
             raise ValueError("ECP derivatives were not requested")
+        if device not in {"cpu", "cuda"}:
+            raise ValueError("ECP gradient device must be cpu or cuda")
         if np.iscomplexobj(weights):
             raise TypeError("ECP weights must be real")
         weights = np.asarray(weights, dtype=np.float64)
@@ -166,7 +170,7 @@ class ECPIntegrals:
                 raise ValueError("orbital coefficient derivatives require their frame")
             if weights.shape != self.local.shape:
                 raise ValueError("ECP weights must match the full AO matrix")
-            ao_weights = weights
+            frame = None
         else:
             frame = np.asarray(orbital_coefficients)
             if (
@@ -180,19 +184,27 @@ class ECPIntegrals:
                 raise ValueError(
                     "ECP orbital frame and weights require matching finite dimensions"
                 )
-            ao_weights = frame @ weights @ frame.T
-        gradient = np.einsum("axij,ij->ax", self.local_derivative, ao_weights)
-        gradient += np.einsum("axij,ij->ax", self.nonlocal_derivative, ao_weights)
+        motion = None
         if coefficient_derivatives is not None:
             motion = np.asarray(coefficient_derivatives)
             if (
                 motion.dtype != np.float64
-                or motion.shape != (*gradient.shape, *frame.shape)
+                or motion.shape != (*self.local_derivative.shape[:2], *frame.shape)
                 or not np.isfinite(motion).all()
             ):
                 raise ValueError(
                     "ECP frame derivatives must match atom, Cartesian and orbital dimensions"
                 )
+        if device == "cuda":
+            from ._ecp_cuda import prepare, projected_inputs
+
+            program, feeds = projected_inputs(self, weights, frame, motion)
+            with prepare(program) as owner:
+                return owner.execute(feeds).outputs["gradient"]
+        ao_weights = weights if frame is None else frame @ weights @ frame.T
+        gradient = np.einsum("axij,ij->ax", self.local_derivative, ao_weights)
+        gradient += np.einsum("axij,ij->ax", self.nonlocal_derivative, ao_weights)
+        if motion is not None:
             # The scalar residual ECP is real and symmetric; W need not be.
             frame_weights = self.matrix @ frame @ (weights + weights.T)
             gradient += np.einsum("axij,ij->ax", motion, frame_weights)
