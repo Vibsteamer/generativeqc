@@ -16,6 +16,7 @@ from generativeqc.f12_orbital_response import (
     unrestricted_source_orbital_adjoint,
 )
 
+from benchmarks.f12_cabs_h_batch import CabsHShells
 from benchmarks.f12_molecular_integral_forward import forward_integrals
 from benchmarks.f12_molecular_one_electron import native_contraction
 from benchmarks.f12_molecular_one_electron_forward import combined_matrices
@@ -81,6 +82,7 @@ def gaussian_sources(
     component_library: ctypes.CDLL,
     budget_mib: int,
     frame_output: dict[str, np.ndarray] | None = None,
+    cabs_h_shells: CabsHShells | None = None,
 ) -> tuple:
     """Build ten operators, S/H, and an OBS-orthogonal geometric CABS on CUDA."""
     start = time.monotonic()
@@ -104,9 +106,14 @@ def gaussian_sources(
         operators, costs = forward_integrals(
             layout, sink_library, budget_mib=budget_mib
         )
-    overlap, hcore, one = combined_matrices(
-        basis, combined_order, one_electron_library, maximum_bytes=budget_mib << 20
-    )
+    if cabs_h_shells is None:
+        overlap, hcore, one = combined_matrices(
+            basis, combined_order, one_electron_library, maximum_bytes=budget_mib << 20
+        )
+    else:
+        overlap, hcore, one = cabs_h_shells.matrices(
+            one_electron_library, derivatives=True, max_bytes=budget_mib << 20
+        )
     if (
         len(costs) != 10
         or any(
@@ -122,6 +129,7 @@ def gaussian_sources(
         overlap[np.ix_(permutation, permutation)],
         obs,
         expected_rank=ext - obs,
+        relative_cutoff=science["options"].get("cabs_relative_cutoff", 1e-9),
         library=component_library,
     )
     inputs = spin_ao_inputs(
@@ -204,6 +212,7 @@ def gaussian_orbital_forces(
     one_electron_forward_library: Path | None = None,
     projector_library: ctypes.CDLL | None = None,
     frame_output: dict[str, np.ndarray] | None = None,
+    cabs_h_shells: CabsHShells | None = None,
 ) -> tuple[np.ndarray, dict, dict[str, np.ndarray]]:
     """Project central electronic weights through the native Gaussian nuclear gradients.
 
@@ -260,11 +269,17 @@ def gaussian_orbital_forces(
         permutation = _permutation(geometry["layout"]["ao_permutation"], size)
         if not np.array_equal(permutation[:space[2]], geometry["layout"]["obs_to_combined_source"]):
             raise ValueError("OBS embedding disagrees with the orbital frame")
-        overlap, _, one_forward = combined_matrices(
-            basis, order, one_electron_forward_library, maximum_bytes=budget_mib << 20,
-        )
+        if cabs_h_shells is None:
+            overlap, _, one_forward = combined_matrices(
+                basis, order, one_electron_forward_library, maximum_bytes=budget_mib << 20,
+            )
+        else:
+            overlap, _, one_forward = cabs_h_shells.matrices(
+                one_electron_forward_library, derivatives=True, max_bytes=budget_mib << 20
+            )
         projector = cabs_projector(overlap[np.ix_(permutation, permutation)], space[2],
-                                   expected_rank=dims[3] - space[2], library=projector_library)
+                                   expected_rank=dims[3] - space[2], library=projector_library,
+                                   relative_cutoff=geometry["options"].get("cabs_relative_cutoff", 1e-9))
         complement = np.empty_like(projector.frame)
         complement[permutation] = projector.frame
         frame_overlap = unrestricted_frame_overlap_weights(central, complement, direct, run)
@@ -287,12 +302,15 @@ def gaussian_orbital_forces(
     gauss = contract_live_weights(
         layout, operators, sink_library, budget_mib=budget_mib
     )
-    one = native_contraction(
-        geometry["combined_basis"],
-        corrected["overlap_ao"],
-        corrected["hcore_ao"],
-        np.asarray(geometry["layout"]["native_to_source"]),
-    )
+    if cabs_h_shells is None:
+        one = native_contraction(
+            basis, corrected["overlap_ao"], corrected["hcore_ao"],
+            np.asarray(geometry["layout"]["native_to_source"]),
+        )
+    else:
+        one = cabs_h_shells.gradient(
+            corrected["overlap_ao"], corrected["hcore_ao"], budget_mib << 20
+        )
     ref = np.asarray(reference_forces)
     if (
         ref.shape != (len(geometry["combined_basis"]["elements"]), 3)

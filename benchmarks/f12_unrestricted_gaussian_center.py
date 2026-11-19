@@ -11,6 +11,7 @@ from generativeqc._f12_cabs import cabs_singles
 from generativeqc._f12_unrestricted import unrestricted_mp2_f12_ao_response
 from generativeqc.f12_orbital_response import unrestricted_frame_overlap_weights
 
+from benchmarks.f12_cabs_h_batch import CabsHShells
 from benchmarks.f12_unrestricted_gaussian import (
     gaussian_orbital_forces,
     gaussian_sources,
@@ -27,6 +28,7 @@ def center_energy_forces(
     *,
     sink_library: Path,
     forward_library: Path,
+    cabs_h_one_electron_library: Path | None = None,
     projector_library: ctypes.CDLL,
     canonical_library: ctypes.CDLL,
     orbital_library: ctypes.CDLL,
@@ -45,6 +47,23 @@ def center_energy_forces(
     oa, ob, n, ext, q = space
     if tuple(snapshot["occupations"]) != (oa, ob) or snapshot["nbf"] != n:
         raise ValueError("The snapshot and geometry have different spin spaces")
+    high = None
+    basis = geometry["combined_basis"]
+    maximum_l = max(shell["angular_momentum"] for shell in basis["shells"])
+    if maximum_l > 5:
+        raise ValueError("The combined one-electron basis supports at most h shells")
+    if maximum_l == 5:
+        if cabs_h_one_electron_library is None:
+            raise ValueError(
+                "The combined h-shell basis requires its one-electron CUDA library"
+            )
+        with np.load(layout_path, allow_pickle=False) as layout:
+            high = CabsHShells(
+                basis,
+                geometry["layout"]["native_to_source"],
+                layout,
+                cabs_h_one_electron_library,
+            )
     ao, embedding, complement, order, so, hcore, forward = gaussian_sources(
         space,
         science_path=geometry_path,
@@ -54,6 +73,7 @@ def center_energy_forces(
         one_electron_library=forward_library,
         component_library=projector_library,
         budget_mib=budget_mib,
+        cabs_h_shells=high,
     )
     overlap = np.asarray(snapshot["overlap"]).reshape(n, n)
     norms = np.sqrt(np.diag(overlap) / np.diag(so))
@@ -127,6 +147,7 @@ def center_energy_forces(
             orbital_response_library=orbital_library,
             budget_mib=budget_mib,
             orbital_response_output=response,
+            cabs_h_shells=high,
         )
     energy = {
         "UHF_Eh": float(snapshot["energy"]),

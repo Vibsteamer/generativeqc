@@ -1,7 +1,33 @@
 """Check the spin-frame mapping when combined Gaussian shells interleave OBS and CABS."""
 import numpy as np
+import pytest
 
 from benchmarks.f12_unrestricted_gaussian import spin_ao_inputs
+
+
+@pytest.mark.parametrize(
+    ("angular_momentum", "message"),
+    [(5, "h-shell basis requires"), (6, "at most h shells")],
+)
+def test_unrestricted_center_requires_a_matching_angular_provider(
+    tmp_path, angular_momentum, message
+):
+    import json
+
+    from benchmarks.f12_unrestricted_gaussian_center import center_energy_forces
+
+    geometry = tmp_path / "geometry.json"
+    geometry.write_text(json.dumps({
+        "layout": {"space": [2, 0, 2, 20, 8]},
+        "combined_basis": {"shells": [{"angular_momentum": angular_momentum}]},
+    }))
+    with pytest.raises(ValueError, match=message):
+        center_energy_forces(
+            geometry, tmp_path / "layout.npz", tmp_path / "snapshot.in",
+            {"occupations": (2, 0), "nbf": 2}, {}, None,
+            sink_library=tmp_path / "sink", forward_library=tmp_path / "forward",
+            projector_library=None, canonical_library=None, orbital_library=None,
+        )
 
 
 def test_spin_frames_preserve_physical_ao_matrix_elements():
