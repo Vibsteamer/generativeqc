@@ -140,18 +140,63 @@ class ECPIntegrals:
     def matrix(self) -> typing.Any:
         return self.local + self.nonlocal_
 
-    def contract(self, weights: typing.Any) -> typing.Any:
-        """Contract fixed arbitrary real AO weights, including nonsymmetric ones."""
-        if self.local_derivative is None:
+    def contract(
+        self,
+        weights: typing.Any,
+        *,
+        orbital_coefficients: np.ndarray | None = None,
+        coefficient_derivatives: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Differentiate a fixed real weight contracted with V or C.T @ V @ C.
+
+        C uses the same AO row order as the matrices and can be rectangular.
+        Supply dC[atom, xyz] for a moving orbital frame. Alpha and beta frames
+        can be contracted independently and their gradients added. The result
+        uses the positive energy-derivative sign.
+        """
+        if self.local_derivative is None or self.nonlocal_derivative is None:
             raise ValueError("ECP derivatives were not requested")
         if np.iscomplexobj(weights):
             raise TypeError("ECP weights must be real")
         weights = np.asarray(weights, dtype=np.float64)
-        if weights.shape != self.local.shape or not np.isfinite(weights).all():
-            raise ValueError("ECP weights must be finite and match the full AO matrix")
-        return np.einsum(
-            "axij,ij->ax", self.local_derivative + self.nonlocal_derivative, weights
-        )
+        if not np.isfinite(weights).all():
+            raise ValueError("ECP weights must be finite")
+        if orbital_coefficients is None:
+            if coefficient_derivatives is not None:
+                raise ValueError("orbital coefficient derivatives require their frame")
+            if weights.shape != self.local.shape:
+                raise ValueError("ECP weights must match the full AO matrix")
+            ao_weights = weights
+        else:
+            frame = np.asarray(orbital_coefficients)
+            if (
+                frame.ndim != 2
+                or frame.dtype != np.float64
+                or frame.shape[0] != self.local.shape[0]
+                or not frame.shape[1]
+                or weights.shape != (frame.shape[1], frame.shape[1])
+                or not np.isfinite(frame).all()
+            ):
+                raise ValueError(
+                    "ECP orbital frame and weights require matching finite dimensions"
+                )
+            ao_weights = frame @ weights @ frame.T
+        gradient = np.einsum("axij,ij->ax", self.local_derivative, ao_weights)
+        gradient += np.einsum("axij,ij->ax", self.nonlocal_derivative, ao_weights)
+        if coefficient_derivatives is not None:
+            motion = np.asarray(coefficient_derivatives)
+            if (
+                motion.dtype != np.float64
+                or motion.shape != (*gradient.shape, *frame.shape)
+                or not np.isfinite(motion).all()
+            ):
+                raise ValueError(
+                    "ECP frame derivatives must match atom, Cartesian and orbital dimensions"
+                )
+            # The scalar residual ECP is real and symmetric; W need not be.
+            frame_weights = self.matrix @ frame @ (weights + weights.T)
+            gradient += np.einsum("axij,ij->ax", motion, frame_weights)
+        return gradient
 
 
 def ecp_integrals(

@@ -17,7 +17,7 @@ from generativeqc import (
     Calculator,
     ElementBasis,
 )
-from generativeqc.ecp import ecp_integrals, resolve_ecp
+from generativeqc.ecp import ECPIntegrals, ecp_integrals, resolve_ecp
 from generativeqc.profiles import canonical_hash
 
 
@@ -642,3 +642,43 @@ def test_all_radial_powers_and_d_projector_libcint(
             - detached_reference(xyz - delta, power=power, d_projector=True)
         ) / 8e-5
         np.testing.assert_allclose(actual[:, 1 + d], expected, atol=1e-8, rtol=2e-7)
+
+
+def test_projected_ecp_gradient_on_moving_rectangular_frame() -> None:
+    rng = np.random.default_rng(58733)
+    coefficients = rng.normal(size=(5, 3))
+    weights = rng.normal(size=(3, 3))
+    matrix = rng.normal(size=(5, 5))
+    matrix = (matrix + matrix.T) / 2
+    direction = rng.normal(size=(2, 3, 5, 5))
+    direction = (direction + direction.swapaxes(-1, -2)) / 2
+    frame_motion = rng.normal(size=(2, 3, 5, 3))
+    integrals = ECPIntegrals(
+        matrix * 0.25, matrix * 0.75, direction * 0.25, direction * 0.75,
+        64, 16, "cpu", "fixture",
+    )
+    for moving in (False, True):
+        velocity = frame_motion if moving else np.zeros_like(frame_motion)
+        actual = integrals.contract(
+            weights, orbital_coefficients=coefficients,
+            coefficient_derivatives=velocity if moving else None,
+        )
+        for step in (2e-5, 1e-5):
+            plus = coefficients + step * velocity
+            minus = coefficients - step * velocity
+            ep = np.einsum(
+                "ij,axki,axkl,axlj->ax", weights, plus, matrix + step * direction, plus
+            )
+            em = np.einsum(
+                "ij,axki,axkl,axlj->ax", weights, minus, matrix - step * direction, minus
+            )
+            np.testing.assert_allclose(actual, (ep - em) / (2 * step), atol=3e-8, rtol=0)
+    with pytest.raises(ValueError, match="require their frame"):
+        integrals.contract(matrix, coefficient_derivatives=frame_motion)
+    with pytest.raises(ValueError, match="dimensions"):
+        integrals.contract(weights, orbital_coefficients=coefficients.T)
+    with pytest.raises(ValueError, match="atom, Cartesian"):
+        integrals.contract(
+            weights, orbital_coefficients=coefficients,
+            coefficient_derivatives=frame_motion[:1],
+        )
