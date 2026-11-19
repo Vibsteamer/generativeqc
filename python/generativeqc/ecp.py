@@ -200,12 +200,13 @@ class ECPIntegrals:
 
     def occupied_expectation_gradient(
         self,
-        occupied: np.ndarray,
-        virtual: np.ndarray,
+        occupied: np.ndarray | tuple[np.ndarray, np.ndarray],
+        virtual: np.ndarray | tuple[np.ndarray, np.ndarray],
         overlap_derivatives: np.ndarray,
-        virtual_occupied_response: np.ndarray,
+        virtual_occupied_response: np.ndarray | tuple[np.ndarray, np.ndarray],
         *,
         occupation: int = 1,
+        device: str = "cpu",
     ) -> np.ndarray:
         """Nuclear derivative of the scalar ECP expectation in occupied orbitals.
 
@@ -213,34 +214,75 @@ class ECPIntegrals:
         columns at the reference geometry. Supply dS in the same AO basis and
         the solved virtual-occupied coefficient response Uvo, both ordered by
         atom and Cartesian component. Use occupation 2 for a restricted
-        determinant, or add separate alpha and beta results with occupation 1.
+        determinant. For UHF, pass pairs of alpha/beta occupied, virtual and
+        response arrays with occupation 1 to receive (2, atom, xyz). On CUDA
+        both spins share the AO inputs and all Cartesian components are returned
+        in one host transfer.
         """
         occupation = checked_integer(occupation, "orbital occupation", low=1, high=2)
-        co, cv, ds, uvo = map(
-            np.asarray,
-            (occupied, virtual, overlap_derivatives, virtual_occupied_response),
+        if device not in {"cpu", "cuda"}:
+            raise ValueError("ECP expectation device must be cpu or cuda")
+        pair = (
+            isinstance(occupied, tuple)
+            and len(occupied) == 2
+            and all(np.ndim(c) == 2 for c in occupied)
         )
+        if pair:
+            if occupation != 1 or not all(
+                isinstance(x, tuple) and len(x) == 2
+                for x in (virtual, virtual_occupied_response)
+            ):
+                raise ValueError(
+                    "a spin pair requires paired frames and responses with occupation 1"
+                )
+            frames = tuple(zip(occupied, virtual, virtual_occupied_response, strict=True))
+        else:
+            frames = ((occupied, virtual, virtual_occupied_response),)
+        ds = np.asarray(overlap_derivatives)
         nao = self.local.shape[0]
         if self.local_derivative is None or self.nonlocal_derivative is None:
             raise ValueError("ECP derivatives were not requested")
         directions = self.local_derivative.shape[:2]
         if (
-            co.ndim != 2
-            or cv.ndim != 2
-            or co.shape[0] != nao
-            or cv.shape[0] != nao
-            or ds.shape != (*directions, nao, nao)
-            or uvo.shape != (*directions, cv.shape[1], co.shape[1])
+            ds.shape != (*directions, nao, nao)
+            or ds.dtype != np.float64
+            or not np.isfinite(ds).all()
         ):
-            raise ValueError(
-                "ECP orbitals and response require matching AO and orbital dimensions"
-            )
-        if any(
-            a.dtype != np.float64 or not np.isfinite(a).all() for a in (co, cv, ds, uvo)
-        ):
-            raise ValueError(
-                "ECP orbitals and response must be finite real double precision"
-            )
+            raise ValueError("ECP overlap derivatives must be finite with matching AO dimensions")
+        blocks = []
+        for frame in frames:
+            co, cv, uvo = map(np.asarray, frame)
+            if (
+                co.ndim != 2
+                or cv.ndim != 2
+                or co.shape[0] != nao
+                or cv.shape[0] != nao
+                or uvo.shape != (*directions, cv.shape[1], co.shape[1])
+            ):
+                raise ValueError(
+                    "ECP orbitals and response require matching AO and orbital dimensions"
+                )
+            if any(
+                a.dtype != np.float64 or not np.isfinite(a).all() for a in (co, cv, uvo)
+            ):
+                raise ValueError("ECP orbitals and response must be finite real double precision")
+            blocks.append((co, cv, uvo))
+        if device == "cuda":
+            from ._ecp_occupied_cuda import inputs, prepare
+
+            program, feeds = inputs(self, ds, blocks, occupation)
+            with prepare(program) as owner:
+                gradients = owner.execute(feeds).outputs["gradient"]
+            return gradients if pair else gradients[0]
+        results = [
+            self._occupied_spin_gradient(co, cv, ds, uvo, occupation)
+            for co, cv, uvo in blocks
+        ]
+        return np.stack(results) if pair else results[0]
+
+    def _occupied_spin_gradient(
+        self, co: np.ndarray, cv: np.ndarray, ds: np.ndarray, uvo: np.ndarray, occupation: int
+    ) -> np.ndarray:
         vco = self.matrix @ co
         gradient = self.contract(co @ co.T)
         # The symmetric occupied rotation follows from d(Co.T @ S @ Co) = 0.
