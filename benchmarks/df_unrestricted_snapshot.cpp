@@ -16,7 +16,8 @@ void require(bool ok, const char* err) {
   if (!ok) throw std::runtime_error(err);
 }
 
-void read_shells(std::istream& input, core::System& sys, std::size_t count) {
+void read_shells(std::istream& input, core::System& sys, std::size_t count,
+                 unsigned maximum_angular_momentum) {
   require(count > 0 && count <= 100000, "invalid reference shell count");
   sys.shells.resize(count);
   for (auto& shell : sys.shells) {
@@ -27,7 +28,8 @@ void read_shells(std::istream& input, core::System& sys, std::size_t count) {
     for (auto& p : shell.primitives) input >> p.exponent >> p.coefficient;
   }
   std::string detail;
-  if (!input || molecule::validate_and_normalize(sys, detail) != GENERATIVEQC_STATUS_SUCCESS)
+  if (!input || molecule::validate_and_normalize(sys, detail, maximum_angular_momentum) !=
+                    GENERATIVEQC_STATUS_SUCCESS)
     throw std::runtime_error("invalid basis: " + detail);
 }
 
@@ -58,8 +60,8 @@ int main(int argc, char** argv) try {
   for (auto& a : sys.atoms)
     input >> a.atomic_number >> a.position[0] >> a.position[1] >> a.position[2];
   auto aux = sys;
-  read_shells(input, sys, orbital_shells);
-  read_shells(input, aux, aux_shells);
+  read_shells(input, sys, orbital_shells, 4);
+  read_shells(input, aux, aux_shells, 5);
   input >> std::ws;
   require(input.eof(), "trailing reference data");
   scf::ScfOptions options;
