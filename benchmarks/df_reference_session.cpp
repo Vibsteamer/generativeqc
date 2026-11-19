@@ -49,7 +49,9 @@ int guarded(Action action, char* error, std::size_t capacity) noexcept {
   return 1;
 }
 
-void shells(std::istream& input, core::System& system, std::size_t count) {
+enum class ShellRole { Orbital, Fitting };
+
+void shells(std::istream& input, core::System& system, std::size_t count, ShellRole role) {
   system.shells.resize(count);
   for (auto& shell : system.shells) {
     std::size_t primitives{};
@@ -60,7 +62,9 @@ void shells(std::istream& input, core::System& system, std::size_t count) {
   }
   require(bool(input), "truncated reference basis");
   std::string detail;
-  if (molecule::validate_and_normalize(system, detail) != GENERATIVEQC_STATUS_SUCCESS)
+  // Match the native SDK contract for the DF fitting basis and the orbital basis.
+  const unsigned maximum_l = role == ShellRole::Fitting ? 5U : 4U;
+  if (molecule::validate_and_normalize(system, detail, maximum_l) != GENERATIVEQC_STATUS_SUCCESS)
     throw std::invalid_argument(detail);
 }
 
@@ -93,8 +97,8 @@ extern "C" int gqc_df_session_create(const char* path, int device, void** output
         for (auto& atom : state->orbital.atoms)
           input >> atom.atomic_number >> atom.position[0] >> atom.position[1] >> atom.position[2];
         auto auxiliary = state->orbital;
-        shells(input, state->orbital, orbital_shells);
-        shells(input, auxiliary, auxiliary_shells);
+        shells(input, state->orbital, orbital_shells, ShellRole::Orbital);
+        shells(input, auxiliary, auxiliary_shells, ShellRole::Fitting);
         input >> std::ws;
         require(input.eof(), "unexpected trailing reference input");
         require(state->orbital.electron_count >= 2 && state->orbital.electron_count % 2 == 0,
