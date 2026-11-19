@@ -12,6 +12,7 @@ from ..tensor import (
     multiply,
     slice_tensor,
     transpose,
+    transpose_program,
 )
 
 
@@ -187,4 +188,51 @@ def unrestricted_df_nuclear_direction(
             "method": "canonical DF-UHF AO nuclear equation and fixed gradients",
             "df_metric_gauge": "symmetric",
         },
+    )
+
+
+def unrestricted_df_nuclear_weights(
+    nalpha: int,
+    nbeta: int,
+    orbitals: int,
+    auxiliaries: int,
+    ao_functions: int,
+    *,
+    include_direct: bool = False,
+) -> Program:
+    """Transpose the nuclear equations into four symmetric Gaussian weights.
+
+    Feed the solved occupied/virtual adjoint as the RHS cotangent and one as
+    each fixed energy-gradient cotangent. Full Frobenius weights include both
+    off-diagonal entries and contract directly with physical integral sinks.
+    """
+    primal = unrestricted_df_nuclear_direction(
+        nalpha, nbeta, orbitals, auxiliaries, ao_functions
+    )
+    fields = {
+        "doverlap": "overlap_ao",
+        "dhcore": "hcore_ao",
+        "dmetric": "coulomb_metric",
+        "dthree_center": "ao_coulomb",
+    }
+    reverse = transpose_program(
+        primal, tuple(primal.outputs), inputs=tuple(fields)
+    ).program
+    outputs = {}
+    for key, name in fields.items():
+        weight = reverse.outputs["bar_" + key]
+        axes = (0, 2, 1) if key == "dthree_center" else (1, 0)
+        pair = add(weight, transpose(weight, axes), coefficients=("1/2", "1/2"))
+        if include_direct:
+            spec = TensorSpec(pair.spec.indices, role="input", differentiable=True)
+            pair = add(pair, input_tensor("direct_" + name, spec))
+            if key == "doverlap":
+                pair = add(
+                    pair,
+                    input_tensor("frame_alpha", spec),
+                    input_tensor("frame_beta", spec),
+                )
+        outputs[name] = pair
+    return Program(
+        outputs, provenance={"method": "symmetric DF-UHF nuclear source cotangents"}
     )

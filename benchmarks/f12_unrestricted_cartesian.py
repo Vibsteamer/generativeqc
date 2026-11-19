@@ -14,6 +14,7 @@ from generativeqc._f12_spin_force import spin_source_force
 from generativeqc._f12_unrestricted import unrestricted_mp2_f12_source_pullback
 from generativeqc.f12_orbital_response import (
     unrestricted_nuclear_source_terms,
+    unrestricted_nuclear_source_weights,
     unrestricted_orbital_forces,
 )
 
@@ -28,6 +29,7 @@ def evaluate(
     *,
     orbital_response: Path | None = None,
     nuclear_sources: Path | None = None,
+    nuclear_weights_output: Path | None = None,
     library: ctypes.CDLL | None = None,
     maximum_bytes: int = 1536 << 20,
     response_output: Path | None = None,
@@ -77,6 +79,16 @@ def evaluate(
                 library=library,
                 maximum_bytes=maximum_bytes,
             )
+        if nuclear_weights_output is not None:
+            if nuclear_sources is None:
+                raise ValueError(
+                    "Gaussian nuclear weights require the central DF source frame"
+                )
+            with np.load(nuclear_sources / "central.npz", allow_pickle=False) as center:
+                source_weights = unrestricted_nuclear_source_weights(
+                    spec, center, orbital.rotations, run
+                )
+            np.savez(nuclear_weights_output, **source_weights)
         metrics = {
             "orbital_rotations": len(orbital.rotations),
             "orbital_gradient_Eh_per_bohr": orbital.orbital_gradient.tolist(),
@@ -179,6 +191,11 @@ def main() -> None:
         help="Assemble orbital right-hand sides and six fixed terms from AO derivatives",
     )
     parser.add_argument(
+        "--nuclear-weights-output",
+        type=Path,
+        help="Write the four Gaussian orbital-response weights for the nuclear integral providers",
+    )
+    parser.add_argument(
         "--response-output",
         type=Path,
         help="Save the adjoint, orbital gradient and final forces",
@@ -187,6 +204,8 @@ def main() -> None:
     add_molecular_graph_budget(parser)
     args = parser.parse_args()
     graph_mode = args.orbital_response is None or args.nuclear_sources is not None
+    if args.nuclear_weights_output is not None and args.nuclear_sources is None:
+        parser.error("--nuclear-weights-output requires --nuclear-sources")
     if args.nuclear_sources is not None and args.orbital_response is None:
         parser.error("--nuclear-sources requires --orbital-response")
     if graph_mode and (args.arch is None or args.cache is None):
@@ -217,6 +236,7 @@ def main() -> None:
         checkpoint,
         orbital_response=args.orbital_response,
         nuclear_sources=args.nuclear_sources,
+        nuclear_weights_output=args.nuclear_weights_output,
         library=library,
         maximum_bytes=args.budget_mib << 20,
         response_output=args.response_output,

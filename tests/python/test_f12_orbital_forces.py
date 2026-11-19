@@ -59,7 +59,10 @@ def test_native_transposed_solve_force_sign_and_single_spin(oa: int, ob: int) ->
 def test_ao_nuclear_equations_against_displaced_unwhitened_fock(
     oa: int, ob: int
 ) -> None:
-    from generativeqc.f12_orbital_response import unrestricted_nuclear_source_terms
+    from generativeqc.f12_orbital_response import (
+        unrestricted_nuclear_source_terms,
+        unrestricted_nuclear_source_weights,
+    )
     from generativeqc_compiler.tensor import execute
 
     rng = np.random.default_rng(71)
@@ -102,6 +105,36 @@ def test_ao_nuclear_equations_against_displaced_unwhitened_fock(
     built = unrestricted_nuclear_source_terms(
         (oa, ob, n, q), central, directions, 1, execute
     )
+    z = rng.normal(size=built.nuclear_rhs.shape[-1])
+    weights = unrestricted_nuclear_source_weights((oa, ob, n, q), central, z, execute)
+    sources = {
+        "doverlap": "overlap_ao",
+        "dhcore": "hcore_ao",
+        "dmetric": "metric/coulomb",
+        "dthree_center": "ao_coulomb",
+    }
+    direct = {k: rng.normal(size=v.shape) for k, v in weights.items()}
+    frame_overlap = {spin: rng.normal(size=(ao, ao)) for spin in spins}
+    effective = unrestricted_nuclear_source_weights(
+        (oa, ob, n, q),
+        central,
+        z,
+        execute,
+        direct_weights=direct,
+        frame_overlap=frame_overlap,
+    )
+    for key, w in weights.items():
+        reference = w + direct[key]
+        if key == "overlap_ao":
+            reference = reference + frame_overlap["alpha"] + frame_overlap["beta"]
+        np.testing.assert_allclose(effective[key], reference, atol=2e-12)
+    for a, tangent in enumerate(directions):
+        projected = sum(np.vdot(tangent[k], weights[w]) for k, w in sources.items())
+        assert projected == pytest.approx(
+            built.nuclear_rhs[0, a] @ z
+            + sum(v[0, a] for v in built.fixed_gradients.values()),
+            abs=1e-11,
+        )
     for axis, tan in enumerate(directions):
         h = 1e-5
         sm = [c.T @ tan["doverlap"] @ c for _, c, *_ in frame]
