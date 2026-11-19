@@ -1,0 +1,7 @@
+# Public scalar-ECP CUDA DF-UHF orbital g candidate
+
+The original BrH₂ and IH₂ neutral doublets use spherical aug-cc-pVQZ-PP-F12 on the halogen, the parent cc-pVQZ-F12 on hydrogen, ECP10MDF or ECP28MDF, and an explicit JK fitting basis. The private full-basis native solver produced both spin densities, nine force components and 36 signed geometry energies per molecule. Public initialization and batch preparation also require basis admission and a cold-start test.
+
+This change selects the fitted one-electron and three-center operator domains for these spherical doublets, and checks the state again in the prepared method and unrestricted Fock execution. Other systems retain their existing unrestricted orbital boundary. Coordinate ordering is arbitrary. The raw quadrature keeps the original matrix and derivative tolerances. Explicit bromine refinement on a g orbital allows the previously qualified 640×112 upper grid. The integral angular momentum of the pseudo-potential channels remains independent of the orbital angular momentum.
+
+Local validation exercised both original Q-basis capability inventories, the two native translation units, and negative charge, spin, topology and angular tests. Physical acceptance of the public candidate requires a new L20 build and independent original-geometry energy, all Cartesian forces and signed energies at both step lengths. The scientific comparison uses the same diagnostic JK fit and fixed DF memory budget as the private reference.

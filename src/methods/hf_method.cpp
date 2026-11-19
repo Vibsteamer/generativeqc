@@ -13,6 +13,7 @@
 #include "methods/batch_capabilities.hpp"
 #include "methods/scf_common_options.hpp"
 #include "runtime/execution_context.hpp"
+#include "scf/cuda/df_spin_domain.hpp"
 #include "scf/fleet.hpp"
 #include "scf/fock_prepared.hpp"
 #include "scf/hf_fock_work.hpp"
@@ -459,9 +460,10 @@ static void prepare_ecp_df_uhf(core::System& system, const scf::ScfOptions& opti
     supported &= br || (atom.atomic_number == 53 && atom.ecp_core == 28);
     bromine |= br;
   }
+  const unsigned limit = scf::cuda_execution::fitted_halogen_dihydride_doublet(system) ? 4U : 3U;
   if (!supported || halogens != 1 ||
       std::any_of(system.shells.begin(), system.shells.end(),
-                  [](const auto& s) { return s.angular_momentum > 3; }) ||
+                  [limit](const auto& s) { return s.angular_momentum > limit; }) ||
       std::any_of(auxiliary->shells.begin(), auxiliary->shells.end(),
                   [](const auto& s) { return s.angular_momentum > 5; }))
     throw MethodError(GENERATIVEQC_STATUS_NOT_IMPLEMENTED,

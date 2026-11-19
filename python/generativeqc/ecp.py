@@ -23,14 +23,37 @@ from .basis import BasisSet, validate_ecp_data
 from .elements import checked_integer
 
 
+def g_shell_halogen_dihydride(basis, atoms):
+    """Return whether orbital g quadrature was qualified for this atom/core topology."""
+    if not isinstance(basis, BasisSet) or basis.representation != "spherical":
+        return False
+    elements = sorted(a.atomic_number for a in atoms)
+    if elements not in ([1, 1, 35], [1, 1, 53]):
+        return False
+    hydrogen = basis.by_element.get(1)
+    heavy = basis.by_element.get(elements[-1])
+    return (
+        hydrogen is not None
+        and hydrogen.ecp_core_electrons == 0
+        and heavy is not None
+        and heavy.ecp_core_electrons == {35: 10, 53: 28}[elements[-1]]
+    )
+
+
 def fitted_uhf_hydride_domain(basis, atoms, charge, multiplicity):
     """Scalar small-core monohalogen hydrides covered by native CUDA DF-UHF."""
-    if charge != 0 or multiplicity != 2 or not isinstance(basis, BasisSet) or basis.representation != "spherical":
+    if (
+        charge != 0
+        or multiplicity != 2
+        or not isinstance(basis, BasisSet)
+        or basis.representation != "spherical"
+    ):
         return False
+    shell_limit = 4 if g_shell_halogen_dihydride(basis, atoms) else 3
     heavy = []
     for atom in atoms:
         entry = basis.by_element.get(atom.atomic_number)
-        if entry is None or any(s.angular_momentum > 3 for s in entry.shells):
+        if entry is None or any(s.angular_momentum > shell_limit for s in entry.shells):
             return False
         if atom.atomic_number != 1 or entry.ecp_core_electrons:
             heavy.append((atom.atomic_number, entry.ecp_core_electrons))
@@ -39,6 +62,7 @@ def fitted_uhf_hydride_domain(basis, atoms, charge, multiplicity):
 
 def resolve_ecp(basis: typing.Any, atoms: typing.Any) -> typing.Any:
     """Resolve immutable source records to atom-mapped scalar residual terms."""
+    shell_limit = 4 if g_shell_halogen_dihydride(basis, atoms) else 3
     cores, terms = [], []
     metadata = basis.by_element if isinstance(basis, BasisSet) else {}
     for atom_index, atom in enumerate(atoms):
@@ -61,8 +85,12 @@ def resolve_ecp(basis: typing.Any, atoms: typing.Any) -> typing.Any:
             raise NotImplementedError(
                 "ECP local channel must be s/p/d/f/g; projectors at most f"
             )
-        if any(s.angular_momentum > 3 for s in element.shells):
-            raise NotImplementedError("ECP execution supports orbital s/p/d/f shells")
+        if any(s.angular_momentum > shell_limit for s in element.shells):
+            raise NotImplementedError(
+                "ECP execution supports orbital s/p/d/f shells"
+                if shell_limit == 3
+                else "scalar-ECP dihydride orbital shells extend through g"
+            )
         for potential in potentials:
             if set(potential) - {
                 "ecp_type",
@@ -101,9 +129,14 @@ def resolve_ecp(basis: typing.Any, atoms: typing.Any) -> typing.Any:
     if terms:
         # Applies to mixed all-electron/ECP atoms too.
         for atom in atoms:
-            if any(s.angular_momentum > 3 for s in metadata[atom.atomic_number].shells):
+            if any(
+                s.angular_momentum > shell_limit
+                for s in metadata[atom.atomic_number].shells
+            ):
                 raise NotImplementedError(
                     "ECP execution supports orbital s/p/d/f shells"
+                    if shell_limit == 3
+                    else "scalar-ECP dihydride orbital shells extend through g"
                 )
     return tuple(cores), tuple(terms)
 
