@@ -202,6 +202,26 @@ def join_measurements(
         )
     ]
     check_center(report, panel)
+    independent = panel["cc_reference"].get("independent_cartesian_forces_Eh_per_bohr")
+    if independent is not None:
+        errors = {}
+        if set(independent) != {"0.0004", "0.0002"}:
+            raise ValueError("both independent Cartesian force steps required")
+        for step, values in independent.items():
+            reference = np.asarray(values)
+            if reference.shape != force.shape or not np.isfinite(reference).all():
+                raise ValueError("invalid independent Cartesian reference")
+            errors[step] = float(np.max(np.abs(force - reference)))
+        report["independent_cartesian_errors_Eh_per_bohr"] = errors
+        report["checks"]["independent_cartesian_two_steps"] = (
+            max(errors.values()) <= 2e-6
+        )
+        report["independent_cartesian_status"] = (
+            "qualified"
+            if report["checks"]["independent_cartesian_two_steps"]
+            else "review"
+        )
+        report["passed"] = all(report["checks"].values())
     return report
 
 
@@ -312,7 +332,7 @@ def join(panel_path: Path, center_path: Path, *signed_paths: Path) -> dict:
     )
     report["scope"] = (
         "Restricted CC-F12b central energy, analytic force and both signed step sizes. "
-        "Independent full Cartesian validation is recorded separately."
+        "See independent_cartesian_status for coverage of all Cartesian coordinates."
     )
     return report
 
