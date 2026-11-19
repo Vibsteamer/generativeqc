@@ -23,3 +23,14 @@ nine first-derivative matrices in both nonaxial BrH₂/Q and IH₂/Q geometries.
 The two grids and independent signed displacements provide checks for
 angular integration and nuclear translation. End-to-end SCF and correlated
 nuclear derivatives retain their own qualification.
+
+## Molecular evidence
+
+On an FP64 L20, the finer BrH₂ grid (512 radial, 96 polar) gave maximum
+matrix and nuclear derivative differences of 2.32 × 10⁻¹⁰ Eh and
+8.34 × 10⁻⁹ Eh/bohr against the screened libcint control. The finer IH₂
+grid (224 radial, 44 polar) gave 2.74 × 10⁻¹³ Eh and 4.38 × 10⁻¹² Eh/bohr.
+Both full Q orbital bases contain 27 heavy-center g functions. Their
+same-center g projections onto the lower-angular projectors vanish.
+Use a displaced g center to measure finite g-projector matrix elements and
+nuclear derivatives before extrapolating these data to other geometries.
