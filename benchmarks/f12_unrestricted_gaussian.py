@@ -11,6 +11,7 @@ from generativeqc._f12_cabs import cabs_projector
 from generativeqc.elements import atomic_number
 from generativeqc.f12_orbital_response import (
     unrestricted_canonical_source_seeds,
+    unrestricted_frame_overlap_weights,
     unrestricted_nuclear_source_weights,
     unrestricted_source_orbital_adjoint,
 )
@@ -187,7 +188,7 @@ def gaussian_orbital_forces(
     central: Mapping[str, np.ndarray],
     orbital_adjoint: np.ndarray | None,
     direct: Mapping[str, np.ndarray],
-    frame_overlap: Mapping[str, np.ndarray],
+    frame_overlap: Mapping[str, np.ndarray] | None,
     geometry: dict,
     layout: Mapping[str, np.ndarray],
     reference_forces: np.ndarray,
@@ -200,6 +201,9 @@ def gaussian_orbital_forces(
     canonical_output: dict[str, np.ndarray] | None = None,
     orbital_response_library: ctypes.CDLL | None = None,
     orbital_response_output: dict[str, np.ndarray] | None = None,
+    one_electron_forward_library: Path | None = None,
+    projector_library: ctypes.CDLL | None = None,
+    frame_output: dict[str, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, dict, dict[str, np.ndarray]]:
     """Project central electronic weights through the native Gaussian nuclear gradients.
 
@@ -247,6 +251,27 @@ def gaussian_orbital_forces(
         )
         if orbital_response_output is not None:
             orbital_response_output.update(driver=driver, rotations=orbital_adjoint)
+    frame_resources = {}
+    if frame_overlap is None:
+        if one_electron_forward_library is None:
+            raise ValueError("Regenerating the nuclear frame requires the combined-AO overlap provider")
+        size = int(layout["ao_sizes"][0])
+        order = _permutation(geometry["layout"]["native_to_source"], size)
+        permutation = _permutation(geometry["layout"]["ao_permutation"], size)
+        if not np.array_equal(permutation[:space[2]], geometry["layout"]["obs_to_combined_source"]):
+            raise ValueError("OBS embedding disagrees with the orbital frame")
+        overlap, _, one_forward = combined_matrices(
+            basis, order, one_electron_forward_library, maximum_bytes=budget_mib << 20,
+        )
+        projector = cabs_projector(overlap[np.ix_(permutation, permutation)], space[2],
+                                   expected_rank=dims[3] - space[2], library=projector_library)
+        complement = np.empty_like(projector.frame)
+        complement[permutation] = projector.frame
+        frame_overlap = unrestricted_frame_overlap_weights(central, complement, direct, run)
+        if frame_output is not None:
+            frame_output.update(frame_overlap)
+        frame_resources = {"one_electron": one_forward, "rank": projector.rank,
+                           "cutoff_margin": projector.cutoff_margin}
     corrected = unrestricted_nuclear_source_weights(
         space,
         central,
@@ -282,6 +307,7 @@ def gaussian_orbital_forces(
         {
             "Gaussian": gauss,
             "canonical_unresolved_torque": gauge,
+            "regenerated_frame": frame_resources,
             "one_electron_gradient": one.gradient.tolist(),
             "one_electron_resources": one.resources,
         },
