@@ -2,6 +2,7 @@
 
 from ..tensor.ir import Node, add, einsum, input_tensor, slice_tensor, transpose
 from ..tensor.program import Program
+from ..tensor.robust_density_fit import robust_fitted_operator
 from ..tensor.types import Index, IndexSpace, TensorSpec
 
 
@@ -61,19 +62,6 @@ def molecular_orbital_sources(
         provenance={
             "operation": "AO to shared OBS/CABS frame with full source and frame adjoints"
         },
-    )
-
-
-def robust_fitted_operator(
-    fit_left: Node, raw_left: Node, fit_right: Node, raw_right: Node, metric: Node
-) -> Node:
-    """Robust non-Coulomb integral for two Coulomb-fitted density tiles."""
-    residual = add(
-        raw_right, einsum("ab,br->ar", metric, fit_right), coefficients=(1, -1)
-    )
-    return add(
-        einsum("al,ar->lr", fit_left, residual),
-        einsum("bl,br->lr", raw_left, fit_right),
     )
 
 

@@ -145,6 +145,11 @@ def endpoint_arguments() -> Namespace:
         action="store_true",
         help="Resolve analytic CABS singles and F12 pair forces for component extrapolation.",
     )
+    parser.add_argument(
+        "--cabs-relative-cutoff",
+        type=float,
+        help="Override the projected auxiliary Gram cutoff for a rank-verified basis.",
+    )
     parser.add_argument("--arch", required=True)
     add_molecular_graph_budget(parser)
     return parser.parse_args()
@@ -169,10 +174,40 @@ def calculate_panel(
     *,
     central_component: Callable | None = None,
     full_rank_constraint: bool = False,
+    molecular_correlation: Callable | None = None,
+    reference_singles_only: bool = False,
 ) -> dict:
     """Compute and checkpoint central Cartesian E/F and requested native energy displacements."""
     name = target["molecule"]
-    ordinary = target["ordinary"]
+    if reference_singles_only and (
+        molecular_correlation
+        or central_component
+        or getattr(args, "component_forces", False)
+    ):
+        raise ValueError(
+            "standalone HF+CABS response requires its own molecular calculation"
+        )
+    ordinary = (
+        target["ordinary"]
+        if molecular_correlation is None and not reference_singles_only
+        else None
+    )
+    if ordinary is None and getattr(args, "component_forces", False):
+        raise ValueError(
+            "MP2 component-force resolution requires the ordinary MP2 route"
+        )
+    conventional = (
+        {
+            "ordinary_corr_Eh": ordinary["correlation_energy_Eh"],
+            "conventional_input": target["ordinary_receipt"],
+        }
+        if ordinary is not None
+        else {
+            "correlation_input": "self-consistent native molecular CC and fixed geminal sources"
+            if not reference_singles_only
+            else "native reference and CABS singles only"
+        }
+    )
     spec = target["geometry"]
     lib = ctypes.CDLL(str(args.component_library.resolve()))
     canonical = partial(canonical_frame_seed, library=lib)
@@ -197,14 +232,19 @@ def calculate_panel(
             np.zeros((columns, columns)),
         )
 
+    projector = partial(cabs_projector, library=lib)
+    if args.cabs_relative_cutoff is not None:
+        projector = partial(projector, relative_cutoff=args.cabs_relative_cutoff)
     reverse = partial(
         chain,
         metric_gram=metric_gram,
         physical_fock=physical_fock,
         run=run,
-        projector=partial(cabs_projector, library=lib),
+        projector=projector,
         singles=partial(cabs_singles, library=lib, spin_weight=2),
         full_rank_constraint=full_rank_constraint,
+        molecular_correlation=molecular_correlation,
+        singles_only=reference_singles_only,
     )
     begin = time.monotonic()
     case = combined_basis_for_geometry(target)
@@ -240,9 +280,14 @@ def calculate_panel(
             "manifest": np.asarray(json.dumps({**meta, "geometry_bohr": geometry})),
         }
         tensors, costs = forward_integrals(
-            topology, args.sink_library, budget_mib=args.budget_mib
+            topology,
+            args.sink_library,
+            budget_mib=args.budget_mib,
+            coulomb_only=reference_singles_only,
         )
-        if len(costs) != 10 or any(rec["device_bytes"] <= 0 for rec in costs.values()):
+        if len(costs) != (2 if reference_singles_only else 10) or any(
+            rec["device_bytes"] <= 0 for rec in costs.values()
+        ):
             raise ValueError("missing GPU integral source")
         factor, whitening = metric_whitener(tensors["metric"], args.component_library)
         frame_case = {**case, "coordinates_bohr": geometry}
@@ -325,15 +370,16 @@ def calculate_panel(
                     "case": name,
                     "passed": False,
                     "phase": "central_energy_complete",
-                    "total_energy_Eh": full_energy(reference, increment, ordinary),
+                    "total_energy_Eh": full_energy(reference, increment, ordinary)
+                    if ordinary is not None
+                    else reference + increment,
                     "reference_energy_Eh": reference,
                     "increment_Eh": increment,
                     **components,
-                    "ordinary_corr_Eh": ordinary["correlation_energy_Eh"],
+                    **conventional,
                     "forward_resources": forward_cost,
                     "graph_gpu_programs": programs,
                     "physical_fock_projections": fock_projections,
-                    "conventional_input": target["ordinary_receipt"],
                     "scalar_checkpoint_seconds": scalar_checkpoint_seconds,
                 },
             )
@@ -346,11 +392,21 @@ def calculate_panel(
             run,
             canonical=canonical,
         )
-        explicit, sinks = contract_explicit(obs, singles_only=False)
+        explicit, sinks = contract_explicit(obs, singles_only=reference_singles_only)
         obs = obs._replace(explicit_weights={})
-        energy, forces = full_result(
-            obs, explicit.gradient, sinks["gradient_Eh_per_bohr"], ordinary
-        )
+        if ordinary is None:
+            energy = obs.reference_energy + obs.increment_energy
+            one = np.asarray(explicit.gradient)
+            two = np.asarray(sinks["gradient_Eh_per_bohr"])
+            if one.shape != obs.reference_forces.shape or two.shape != one.shape:
+                raise ValueError("incompatible relaxed Cartesian force contributions")
+            forces = obs.reference_forces - one - two
+            if not np.isfinite(energy) or not np.isfinite(forces).all():
+                raise ValueError("nonfinite molecular CC endpoint")
+        else:
+            energy, forces = full_result(
+                obs, explicit.gradient, sinks["gradient_Eh_per_bohr"], ordinary
+            )
         if getattr(args, "component_forces", False):
             tick = time.monotonic()
             single = molecular_reference_response(
@@ -393,22 +449,26 @@ def calculate_panel(
         "case": name,
         "passed": False,
         "phase": "central_complete",
+        "cabs_relative_cutoff_override": args.cabs_relative_cutoff,
         "total_energy_Eh": energy,
         "reference_energy_Eh": obs.reference_energy,
         "increment_Eh": obs.increment_energy,
         **central_components,
         **split_report,
-        "ordinary_corr_Eh": ordinary["correlation_energy_Eh"],
+        **conventional,
         "total_force_Eh_per_bohr": forces.tolist(),
         "central_seconds": central_seconds,
         "scalar_checkpoint_seconds": scalar_checkpoint_seconds,
         "forward_resources": forward_cost,
         "displacements": df_checks,
         "forward_input": "native GPU from supplied geometry and explicit contracted shells",
-        "conventional_input": target["ordinary_receipt"],
         "force_terms": {
             "reference_plus_orbital": obs.reference_forces.tolist(),
-            "ordinary_correlation": ordinary["correlation_forces_Eh_per_bohr"],
+            **(
+                {"ordinary_correlation": ordinary["correlation_forces_Eh_per_bohr"]}
+                if ordinary is not None
+                else {}
+            ),
             "explicit_one_electron_gradient": explicit.gradient.tolist(),
             "explicit_two_three_gradient": sinks["gradient_Eh_per_bohr"],
         },
@@ -417,7 +477,11 @@ def calculate_panel(
         "one_electron_resources": explicit.resources,
         "physical_fock_projections": fock_projections,
         "graph_gpu_programs": programs,
-        "reused_ordinary_central_seconds": ordinary["central_seconds"],
+        **(
+            {"reused_ordinary_central_seconds": ordinary["central_seconds"]}
+            if ordinary is not None
+            else {}
+        ),
     }
     write_measurement(args.output, checkpoint)
     for arm in target["native_displacements"]:
@@ -426,8 +490,13 @@ def calculate_panel(
         h = arm["step"]
         endpoints = []
         signed_components = []
+        arm_energies = (
+            arm["mp2_and_hf_Eh"]
+            if ordinary is not None
+            else [(None, hf) for hf in arm["hf_energies_Eh"]]
+        )
         for sign, filename, (emp2, ehf) in zip(
-            (1, -1), arm["files"], arm["mp2_and_hf_Eh"], strict=True
+            (1, -1), arm["files"], arm_energies, strict=True
         ):
             xyz = base_xyz + sign * h * vector
             atoms = (
@@ -458,16 +527,24 @@ def calculate_panel(
             del moved
             # Archived MP2 totals already include the HF energy at this displaced geometry.
             base_energy = (
-                emp2
-                if arm.get("ordinary_total_only")
-                else snap["energy"] + (emp2 - ehf)
+                snap["energy"]
+                if ordinary is None
+                else (
+                    emp2
+                    if arm.get("ordinary_total_only")
+                    else snap["energy"] + (emp2 - ehf)
+                )
             )
             endpoints.append(float(base_energy + increment))
             signed_components.append(
                 {
                     "sign": sign,
                     "reference_energy_Eh": float(snap["energy"]),
-                    "ordinary_corr_Eh": float(base_energy - snap["energy"]),
+                    **(
+                        {"ordinary_corr_Eh": float(base_energy - snap["energy"])}
+                        if ordinary is not None
+                        else {}
+                    ),
                     "increment_Eh": increment,
                     **components,
                 }

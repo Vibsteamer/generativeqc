@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 from generativeqc_compiler.cc.f12_residual import (
     f12b_geminal_back_coupling,
+    fixed_pair_cc_residual,
     standard_v_tile,
 )
 from generativeqc_compiler.tensor.ad_program import transpose_program
@@ -111,12 +112,45 @@ def compare(data: dict, run: Callable) -> dict:
     }
 
 
+def compare_fixed_pair(data: dict, run: Callable) -> dict:
+    """Compare the physical R1/R2 source and its adjoints to an independent pair sum."""
+    occupied, virtual = data["t1"].shape
+    graph = fixed_pair_cc_residual(occupied, virtual, diagonal="select_n" not in data)
+    names = ["t1", "v_vv", "v_ov", "v_vo", "fock_coupling_vv"]
+    feeds = {k: data[k] for k in [*names, "select_m"]}
+    if "select_n" in data:
+        feeds["select_n"] = data["select_n"]
+    result = run(graph, feeds).outputs
+    errors = {
+        key: float(np.max(abs(val - data["expected_" + key])))
+        for key, val in result.items()
+    }
+    seeds = {"bar_" + key: data["seed_" + key] for key in result}
+    bars = run(
+        transpose_program(graph, tuple(result)).program, {**feeds, **seeds}
+    ).outputs
+    slope = sum(
+        np.vdot(bars["bar_" + name], data["direction_" + name]) for name in names
+    )
+    slope_errors = abs(slope - data["expected_slopes"])
+    return {
+        "passed": bool(max(errors.values()) < 2e-11 and max(slope_errors) < 1e-9),
+        "residual_errors": errors,
+        "source_vjp_errors_two_step": slope_errors.tolist(),
+    }
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--arch", required=True)
     p.add_argument("--cache", type=Path, required=True)
     p.add_argument("--fixture", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
+    p.add_argument(
+        "--fixed-pair-fixture",
+        type=Path,
+        help="Run the fixed-geminal ordinary R1/R2 correction with its matched independent CABS and finite-difference references.",
+    )
     args = p.parse_args()
     run, metrics = cuda_runner(args.arch, args.cache)
     rows = {}
@@ -137,6 +171,22 @@ def main() -> None:
                 )
                 + "\n"
             )
+    if args.fixed_pair_fixture:
+        with np.load(args.fixed_pair_fixture, allow_pickle=False) as arrays:
+            for name in ("diagonal", "ordered"):
+                prefix = name + "_"
+                rows["ordinary_" + name] = compare_fixed_pair(
+                    {
+                        key.removeprefix(prefix): arrays[key]
+                        for key in arrays
+                        if key.startswith(prefix)
+                    },
+                    run,
+                )
+        args.output.write_text(
+            json.dumps({"rows": rows, "programs": metrics}, indent=2, allow_nan=False)
+            + "\n"
+        )
     if not all(r["passed"] for r in rows.values()):
         raise SystemExit(1)
 

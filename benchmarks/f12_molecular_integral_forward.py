@@ -48,9 +48,10 @@ def forward_integrals(
     library: Path,
     *,
     host_reference: bool = False,
+    coulomb_only: bool = False,
     budget_mib: int = 512,
 ) -> tuple[dict[str, np.ndarray], dict[str, dict]]:
-    """Return ten native integral tensors and their execution records, keyed by operator."""
+    """Return requested integral tensors and their execution records, keyed by operator."""
     if not 0 < budget_mib <= (2**64 - 1) >> 20:
         raise ValueError("invalid forward device-memory budget")
     budget = budget_mib << 20
@@ -81,16 +82,16 @@ def forward_integrals(
     geometry = np.asarray(manifest["geometry_bohr"])
     if not np.array_equal(geometry[common["atom"]], common["centers"]):
         raise ValueError("molecular and shell coordinates disagree")
-    funcs = {
-        k: bind_forward(library, k, host_reference) for k in ("geminal", "coulomb")
-    }
+    kinds = ("coulomb",) if coulomb_only else ("coulomb", "geminal")
+    funcs = {k: bind_forward(library, k, host_reference) for k in kinds}
+    ops = {"coulomb": _OPCODES["coulomb"]} if coulomb_only else _OPCODES
     tensors, resources = {}, {}
     for group in ("metric", "ao"):
         projection = ShellProjection(common, group)
         offsets, blocks = projection.offsets, projection.blocks
         nblocks, ncenters = blocks.shape
         ncart = int(offsets[-1])
-        for op, opcode in _OPCODES.items():
+        for op, opcode in ops.items():
             label = group if op == "coulomb" and group == "metric" else group + "_" + op
             start = time.monotonic()
             raw = np.full(ncart, np.nan)

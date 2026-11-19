@@ -59,8 +59,16 @@ def compare(row: dict, native: dict, gates: dict) -> dict:
             "maximum_stationarity",
         )
     }
+    displacements = row["independent_displacements"]
+    if len(displacements) != 2 or {p["step_bohr"] for p in displacements} != {
+        0.0004,
+        0.0002,
+    }:
+        raise ValueError(
+            "two distinct symmetric displacements of the same coordinate are required"
+        )
     directions = []
-    for pair in row["independent_displacements"]:
+    for pair in displacements:
         step = pair["step_bohr"]
         ccsd_fd = -(
             pair["plus"]["reference_ccsd"] - pair["minus"]["reference_ccsd"]
@@ -118,10 +126,17 @@ def main() -> None:
     parser.add_argument("--input-dir", type=Path, required=True)
     parser.add_argument("--component-executable", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--expected-components", type=int, default=6)
     args = parser.parse_args()
     fixture = json.loads((args.input_dir / "comparison_inputs.json").read_text())
-    if len(fixture["rows"]) != 6 or len({r["case"] for r in fixture["rows"]}) != 6:
-        raise ValueError("Expected six unique retained methane/DZ method identities")
+    if (
+        args.expected_components < 1
+        or len(fixture["rows"]) != args.expected_components
+        or len({r["case"] for r in fixture["rows"]}) != args.expected_components
+    ):
+        raise ValueError(
+            "each expected retained method and geometry must have a unique case"
+        )
     result = {
         "scope": "Native DF-CCSD central E/F plus retained CCSD(T); two-step independent CCSD and (T) directional force checks",
         "rows": [],
