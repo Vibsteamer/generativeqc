@@ -53,3 +53,18 @@ of its unresolved antisymmetric torque, counting each pair once. This norm is
 invariant under rotations of an exactly degenerate stationary subspace. A gap
 across the occupation boundary below the configured resolution requires a
 separately resolved electronic root before the calculation can proceed.
+
+The Gaussian-force path can now build the electronic driver from the canonical
+Fock cotangents. Both spin densities contribute to the Coulomb contraction, and
+exchange uses the factors for the corresponding spin. The driver uses the same
+MO ordering and auxiliary metric as the coupled Hessian. With the resulting
+adjoint, the reverse AO integral contractions supply the nuclear projections
+directly. A rotations-only solve therefore needs zero nuclear right-hand sides.
+The public API for supplied nuclear directions still requires nonempty forces.
+
+On the NH₂ doublet with the DZ-F12 basis, the L20 source-derived driver agreed
+with the archived independent driver to 5.74e-16 across 391 elements. All nine
+recomposed forces agreed with signed differences of 36 displaced energies to
+2.65e-8 and 5.25e-8 hartree/bohr for steps of 0.0002 and 0.0001 bohr. This
+qualification used supplied direct F12 AO cotangents, CABS overlap weights,
+central DF factors, and a matched UHF reference.
