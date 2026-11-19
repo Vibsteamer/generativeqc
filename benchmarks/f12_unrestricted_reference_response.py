@@ -22,6 +22,7 @@ def evaluate(
     fixture_name: str = "nh2_D_uhf_cphf.npz",
     case_name: str = "NH2_D_f12",
     coordinate: str = "H1 z",
+    solution_output: Path | None = None,
 ) -> dict:
     with np.load(directory / fixture_name, allow_pickle=False) as z:
         oa, ob, n, aux = map(int, z["space"])
@@ -63,6 +64,8 @@ def evaluate(
         raise ValueError(
             f"Coupled UHF orbital response differs from the reference: residual={residual}, error={error}"
         )
+    if solution_output is not None:
+        np.save(solution_output, result.solution, allow_pickle=False)
     return {
         "case": case_name,
         "iterations": result.iterations,
@@ -84,6 +87,11 @@ def main() -> None:
     parser.add_argument("--fixture-name", default="nh2_D_uhf_cphf.npz")
     parser.add_argument("--case-name", default="NH2_D_f12")
     parser.add_argument("--coordinate", default="H1 z")
+    parser.add_argument(
+        "--solution-output",
+        type=Path,
+        help="Save the verified alpha/beta rotation vector.",
+    )
     add_molecular_graph_budget(parser)
     a = parser.parse_args()
     run, metrics = cuda_runner(a.arch, a.cache, max_bytes=a.budget_mib << 20)
@@ -93,6 +101,7 @@ def main() -> None:
         fixture_name=a.fixture_name,
         case_name=a.case_name,
         coordinate=a.coordinate,
+        solution_output=a.solution_output,
     )
     a.output.write_text(
         json.dumps({"rows": [row], "programs": metrics}, indent=2, allow_nan=False)
