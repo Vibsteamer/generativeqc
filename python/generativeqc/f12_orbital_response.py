@@ -1,10 +1,13 @@
 """Coupled unrestricted orbital response for real, canonical DF-UHF F12 forces."""
 
 import ctypes
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import NamedTuple
 
 import numpy as np
+from generativeqc_compiler.mp2.f12_unrestricted_reference import (
+    unrestricted_df_nuclear_direction,
+)
 
 from . import _native
 from .elements import checked_integer
@@ -25,6 +28,63 @@ def _block(value: np.ndarray, shape: tuple[int, ...], name: str) -> np.ndarray:
     ):
         raise ValueError(f"{name} must contain finite FP64 values of shape {shape}")
     return array.ravel(order="C")
+
+
+class UnrestrictedNuclearSourceTerms(NamedTuple):
+    nuclear_rhs: np.ndarray
+    fixed_gradients: dict[str, np.ndarray]
+
+
+def unrestricted_nuclear_source_terms(
+    space: tuple[int, int, int, int],
+    central: Mapping[str, np.ndarray],
+    directions: Iterable[Mapping[str, np.ndarray]],
+    atoms: int,
+    run: Callable,
+) -> UnrestrictedNuclearSourceTerms:
+    """Build DF-UHF orbital equations and six fixed terms on the supplied backend.
+
+    Iterate over the raw AO tangents in atom-major x,y,z order. Each direction
+    supplies doverlap, dhcore, dthree_center and dmetric. Both spin frames use
+    the same central metric whitener and AO basis. The dense central df blocks
+    must use that whitener. Fock and overlap seeds are in the corresponding
+    central MO frame. No orbital derivative or preassembled nuclear RHS enters.
+    """
+    oa, ob, n, q = space
+    n_atoms = checked_integer(atoms, "atoms", low=1)
+    coeff = np.asarray(central["coefficients_alpha"])
+    if coeff.ndim != 2:
+        raise ValueError("Expected an AO-by-OBS alpha coefficient matrix")
+    program = unrestricted_df_nuclear_direction(oa, ob, n, q, coeff.shape[0])
+    keys = ("dmetric", "dthree_center", "doverlap", "dhcore")
+    spin_pairs = (("alpha", oa), ("beta", ob))
+    fields = {"whitener": central["whitener"]}
+    for spin, occ in spin_pairs:
+        for key in ("coefficients", "df", "fock_seed", "overlap_seed"):
+            name = f"{key}_{spin}"
+            fields[name] = central[name]
+        if occ:
+            name = f"occupied_energies_{spin}"
+            fields[name] = central[name]
+    rhs = np.zeros((n_atoms, 3, oa * (n - oa) + ob * (n - ob)))
+    fixed = {
+        f"{key}_{spin}": np.empty((n_atoms, 3))
+        for spin, _ in spin_pairs
+        for key in ("fixed_fock", "metric_density", "fixed_overlap")
+    }
+    for (atom, axis), tangent in zip(np.ndindex(n_atoms, 3), directions, strict=True):
+        inputs = {**fields, **{key: tangent[key] for key in keys}}
+        result = run(program, inputs).outputs
+        rhs[atom, axis] = np.concatenate(
+            [result["rhs_" + spin].ravel() for spin, occ in spin_pairs if occ]
+        )
+        for key, channel in fixed.items():
+            channel[atom, axis] = result[key].item()
+    if not np.isfinite(rhs).all() or any(
+        not np.isfinite(a).all() for a in fixed.values()
+    ):
+        raise ValueError("Nonfinite DF-UHF nuclear equation or fixed gradient")
+    return UnrestrictedNuclearSourceTerms(rhs, fixed)
 
 
 def unrestricted_orbital_forces(

@@ -10,6 +10,8 @@ from ..tensor import (
     einsum,
     input_tensor,
     multiply,
+    slice_tensor,
+    transpose,
 )
 
 
@@ -73,5 +75,116 @@ def unrestricted_df_orbital_action(
         provenance={
             "method": "coupled canonical DF-UHF occupied-virtual response",
             "layout": "virtual-major",
+        },
+    )
+
+
+def unrestricted_df_nuclear_direction(
+    nalpha: int, nbeta: int, orbitals: int, auxiliaries: int, ao_functions: int
+) -> Program:
+    """Canonical UHF nuclear equation and fixed gradient terms from AO tangents.
+
+    Supply raw three-center Coulomb derivatives and their two-center metric
+    derivative in the common fitting basis. W is a fixed central whitener with
+    W J Wᵀ = I. The symmetric gauge dB = W dR − (W dJ Wᵀ) B / 2 yields the
+    physical derivative of the DF product Bᵀ B for any such W. Coefficients and
+    orbital energies are the central SCF root. Fock and overlap seeds represent
+    the observable's fixed canonical-frame contractions in each spin basis.
+    """
+    dims = (nalpha, nbeta, orbitals, auxiliaries, ao_functions)
+    if (
+        any(type(x) is not int for x in dims)
+        or min(nalpha, nbeta) < 0
+        or nalpha + nbeta == 0
+        or max(nalpha, nbeta) >= orbitals
+        or auxiliaries < 1
+        or ao_functions < orbitals
+    ):
+        raise ValueError("Invalid spin occupations, OBS, AO or fitting dimensions")
+    aux = IndexSpace("f12_fitting", "auxiliary", auxiliaries)
+    ao = IndexSpace("AO", "orbital", ao_functions)
+    a, t = Index("a", aux), Index("t", aux)
+    m, n = Index("m", ao), Index("n", ao)
+
+    def source(name: str, *axes: Index) -> Node:
+        return input_tensor(name, TensorSpec(axes, role="input", differentiable=True))
+
+    w = source("whitener", a, t)
+    dj = source("dmetric", a, t)
+    dr = source("dthree_center", t, m, n)
+    ds, dh = source("doverlap", m, n), source("dhcore", m, n)
+    metric = einsum("av,bv->ab", einsum("at,tv->av", w, dj), w)
+    traces, dtraces, metric_traces, fields = [], [], [], {}
+    for spin, o in (("alpha", nalpha), ("beta", nbeta)):
+        frame = IndexSpace("obs_" + spin, "orbital", orbitals, spin=spin)
+        p, q = Index("p", frame), Index("q", frame)
+        c = _field(spin, "coefficients", m, p)
+        b = _field(spin, "df", a, p, q)
+        seed, sseed = (
+            _field(spin, "fock_seed", p, q),
+            _field(spin, "overlap_seed", p, q),
+        )
+        raw_mo = einsum("tmp,mq->tqp", einsum("tmn,np->tmp", dr, c), c)
+        db = add(
+            einsum("at,tpq->apq", w, raw_mo),
+            einsum("at,tpq->apq", metric, b),
+            coefficients=(1, "-1/2"),
+        )
+        sm = einsum("mp,mq->pq", c, einsum("mn,nq->mq", ds, c))
+        hm = einsum("mp,mq->pq", c, einsum("mn,nq->mq", dh, c))
+        if o:
+            occ = (0, o)
+            full = (0, orbitals)
+            auxiliary = (0, auxiliaries)
+            oo = slice_tensor(b, (auxiliary, occ, occ))
+            doo = slice_tensor(db, (auxiliary, occ, occ))
+            bo, dbo = (slice_tensor(x, (auxiliary, full, occ)) for x in (b, db))
+            soo = slice_tensor(sm, (occ, occ))
+            traces.append(einsum("aii->a", oo))
+            dtraces.append(einsum("aii->a", doo))
+            metric_traces.append(einsum("aij,ij->a", oo, soo))
+            ex = einsum("api,aqi->pq", dbo, bo)
+            dcore = add(hm, ex, transpose(ex, (1, 0)), coefficients=(1, -1, -1))
+            metric_exchange = einsum("apj,aqj->pq", einsum("api,ij->apj", bo, soo), bo)
+            eps = _field(spin, "occupied_energies", Index("i", frame, 0, o))
+        else:
+            dcore, metric_exchange, eps = hm, None, None
+        fields[spin] = o, b, db, sm, dcore, metric_exchange, eps, seed, sseed
+
+    charge, dcharge, metric_charge = add(*traces), add(*dtraces), add(*metric_traces)
+    outputs = {}
+    for spin, (
+        o,
+        b,
+        db,
+        sm,
+        dcore,
+        metric_exchange,
+        eps,
+        seed,
+        sseed,
+    ) in fields.items():
+        explicit = add(
+            dcore, einsum("apq,a->pq", b, dcharge), einsum("apq,a->pq", db, charge)
+        )
+        gmetric = einsum("apq,a->pq", b, metric_charge, coefficient=-1)
+        if metric_exchange is not None:
+            gmetric = add(gmetric, metric_exchange)
+        outputs["fixed_fock_" + spin] = einsum("pq,pq->", seed, explicit)
+        outputs["metric_density_" + spin] = einsum("pq,pq->", seed, gmetric)
+        outputs["fixed_overlap_" + spin] = einsum("pq,pq->", sseed, sm)
+        if o:
+            vo = ((o, orbitals), (0, o))
+            outputs["rhs_" + spin] = add(
+                einsum("ai,i->ai", slice_tensor(sm, vo), eps),
+                slice_tensor(explicit, vo),
+                slice_tensor(gmetric, vo),
+                coefficients=(1, -1, -1),
+            )
+    return Program(
+        outputs,
+        provenance={
+            "method": "canonical DF-UHF AO nuclear equation and fixed gradients",
+            "df_metric_gauge": "symmetric",
         },
     )

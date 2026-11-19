@@ -4,7 +4,7 @@ import argparse
 import ctypes
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
 from functools import partial
 from pathlib import Path
 
@@ -12,7 +12,10 @@ import numpy as np
 from generativeqc._f12_cabs import cabs_singles
 from generativeqc._f12_spin_force import spin_source_force
 from generativeqc._f12_unrestricted import unrestricted_mp2_f12_source_pullback
-from generativeqc.f12_orbital_response import unrestricted_orbital_forces
+from generativeqc.f12_orbital_response import (
+    unrestricted_nuclear_source_terms,
+    unrestricted_orbital_forces,
+)
 
 from benchmarks._f12_cuda import add_molecular_graph_budget, cuda_runner
 
@@ -24,6 +27,7 @@ def evaluate(
     checkpoint: Callable,
     *,
     orbital_response: Path | None = None,
+    nuclear_sources: Path | None = None,
     library: ctypes.CDLL | None = None,
     maximum_bytes: int = 1536 << 20,
     response_output: Path | None = None,
@@ -39,13 +43,37 @@ def evaluate(
     else:
         with np.load(orbital_response, allow_pickle=False) as archive:
             spec = tuple(map(int, archive["space"]))
+            source_terms = None
+            if nuclear_sources is None:
+                rhs, fixed = archive["nuclear_rhs"], archive["fixed_gradients"]
+            else:
+
+                def tangents() -> Iterator[Mapping[str, np.ndarray]]:
+                    for atom, axis in np.ndindex(archive["reference_forces"].shape):
+                        with np.load(
+                            nuclear_sources / f"tangent_{atom}{axis}.npz",
+                            allow_pickle=False,
+                        ) as tangent:
+                            yield tangent
+
+                with np.load(
+                    nuclear_sources / "central.npz", allow_pickle=False
+                ) as center:
+                    source_terms = unrestricted_nuclear_source_terms(
+                        spec, center, tangents(), len(archive["reference_forces"]), run
+                    )
+                rhs = source_terms.nuclear_rhs
+                fixed = (
+                    *archive["other_fixed_gradients"],
+                    *source_terms.fixed_gradients.values(),
+                )
             orbital = unrestricted_orbital_forces(
                 spec,
                 archive,
                 archive["electronic_driver"],
-                archive["nuclear_rhs"],
+                rhs,
                 archive["reference_forces"],
-                archive["fixed_gradients"],
+                fixed,
                 library=library,
                 maximum_bytes=maximum_bytes,
             )
@@ -59,6 +87,14 @@ def evaluate(
                 rotations=orbital.rotations,
                 orbital_gradient=orbital.orbital_gradient,
                 forces=orbital.forces,
+                **(
+                    {
+                        "nuclear_rhs": source_terms.nuclear_rhs,
+                        **source_terms.fixed_gradients,
+                    }
+                    if source_terms is not None
+                    else {}
+                ),
             )
     if spec[:2] != (5, 4):
         raise ValueError(
@@ -138,6 +174,11 @@ def main() -> None:
         help="Solve the coupled orbital adjoint and assemble the Cartesian forces on the device",
     )
     parser.add_argument(
+        "--nuclear-sources",
+        type=Path,
+        help="Assemble orbital right-hand sides and six fixed terms from AO derivatives",
+    )
+    parser.add_argument(
         "--response-output",
         type=Path,
         help="Save the adjoint, orbital gradient and final forces",
@@ -145,7 +186,10 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     add_molecular_graph_budget(parser)
     args = parser.parse_args()
-    if args.orbital_response is None and (args.arch is None or args.cache is None):
+    graph_mode = args.orbital_response is None or args.nuclear_sources is not None
+    if args.nuclear_sources is not None and args.orbital_response is None:
+        parser.error("--nuclear-sources requires --orbital-response")
+    if graph_mode and (args.arch is None or args.cache is None):
         parser.error(
             "--arch and --cache are required for the source-tangent evaluation"
         )
@@ -153,7 +197,7 @@ def main() -> None:
         parser.error("--response-output requires --orbital-response")
     run, metrics = (
         cuda_runner(args.arch, args.cache, max_bytes=args.budget_mib << 20)
-        if args.orbital_response is None
+        if graph_mode
         else (None, [])
     )
     library = ctypes.CDLL(args.component_library)
@@ -172,6 +216,7 @@ def main() -> None:
         partial(cabs_singles, library=library),
         checkpoint,
         orbital_response=args.orbital_response,
+        nuclear_sources=args.nuclear_sources,
         library=library,
         maximum_bytes=args.budget_mib << 20,
         response_output=args.response_output,
