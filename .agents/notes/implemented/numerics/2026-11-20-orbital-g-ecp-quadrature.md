@@ -34,3 +34,11 @@ Both full Q orbital bases contain 27 heavy-center g functions. Their
 same-center g projections onto the lower-angular projectors vanish.
 Use a displaced g center to measure finite g-projector matrix elements and
 nuclear derivatives before extrapolating these data to other geometries.
+
+A nonphysical control places all three iodine g contractions on one
+hydrogen site of the same 197-AO geometry. The largest g-row scalar
+integral and derivative are 4.74 Eh and 4.61 Eh/bohr. On the 224 × 44 L20
+grid, the maximum differences across those g rows were 6.58 × 10⁻¹⁴ Eh
+and 6.31 × 10⁻¹⁴ Eh/bohr against independent libcint matrices. This
+control tests finite g projections and contributes no molecular energy
+or training label.
