@@ -14,3 +14,12 @@ extern "C" GENERATIVEQC_API int generativeqc_canonical_frame_seed_cuda_v1(
     int device, int dimension, int occupied, double gap_threshold, double stationarity_threshold,
     std::size_t maximum_bytes, const double* energies, const double* rotation_gradient,
     double* fock_seed, std::size_t* device_bytes, char* error, std::size_t error_size);
+
+/** Full OBS canonical Fock and overlap multipliers for an unrestricted orbital
+ * cotangent. Reject an unresolved occupied/virtual frontier and a nonstationary
+ * degenerate block. The returned norm counts each unresolved pair once. */
+extern "C" GENERATIVEQC_API int generativeqc_canonical_full_frame_seeds_cuda_v1(
+    int device, int dimension, int occupied, double gap_threshold, double stationarity_threshold,
+    std::size_t maximum_bytes, const double* energies, const double* rotation_gradient,
+    double* fock_seed, double* overlap_seed, double* unresolved_torque, std::size_t* device_bytes,
+    char* error, std::size_t error_size);

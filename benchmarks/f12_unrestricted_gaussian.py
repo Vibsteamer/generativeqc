@@ -9,7 +9,10 @@ from pathlib import Path
 import numpy as np
 from generativeqc._f12_cabs import cabs_projector
 from generativeqc.elements import atomic_number
-from generativeqc.f12_orbital_response import unrestricted_nuclear_source_weights
+from generativeqc.f12_orbital_response import (
+    unrestricted_canonical_source_seeds,
+    unrestricted_nuclear_source_weights,
+)
 
 from benchmarks.f12_molecular_integral_forward import forward_integrals
 from benchmarks.f12_molecular_one_electron import native_contraction
@@ -191,6 +194,9 @@ def gaussian_orbital_forces(
     run: Callable,
     *,
     budget_mib: int = 512,
+    canonical_energies: Mapping[str, np.ndarray] | None = None,
+    canonical_library: ctypes.CDLL | None = None,
+    canonical_output: dict[str, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, dict, dict[str, np.ndarray]]:
     """Project central electronic weights through the native Gaussian nuclear gradients.
 
@@ -214,6 +220,20 @@ def gaussian_orbital_forces(
         raise ValueError(
             "Gaussian integral providers require the same spin space and shell geometry"
         )
+    gauge = {}
+    if canonical_energies is not None:
+        seeds, gauge = unrestricted_canonical_source_seeds(
+            space[:2],
+            central,
+            canonical_energies,
+            direct,
+            run,
+            library=canonical_library,
+            maximum_bytes=budget_mib << 20,
+        )
+        central = {**central, **seeds}
+        if canonical_output is not None:
+            canonical_output.update(seeds)
     corrected = unrestricted_nuclear_source_weights(
         space,
         central,
@@ -248,6 +268,7 @@ def gaussian_orbital_forces(
         forces,
         {
             "Gaussian": gauss,
+            "canonical_unresolved_torque": gauge,
             "one_electron_gradient": one.gradient.tolist(),
             "one_electron_resources": one.resources,
         },

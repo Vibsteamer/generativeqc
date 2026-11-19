@@ -5,12 +5,16 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import NamedTuple
 
 import numpy as np
+from generativeqc_compiler.method.canonical_frame_response import (
+    orbital_rotation_cotangent,
+)
 from generativeqc_compiler.mp2.f12_unrestricted_reference import (
     unrestricted_df_nuclear_direction,
     unrestricted_df_nuclear_weights,
 )
 
 from . import _native
+from ._canonical_frame import canonical_full_frame_seeds
 from .elements import checked_integer
 
 
@@ -48,6 +52,66 @@ def _nuclear_center(
             name = f"occupied_energies_{spin}"
             fields[name] = central[name]
     return fields
+
+
+def unrestricted_canonical_source_seeds(
+    occupations: tuple[int, int],
+    coefficients: Mapping[str, np.ndarray],
+    energies: Mapping[str, np.ndarray],
+    frame_cotangents: Mapping[str, np.ndarray],
+    run: Callable,
+    *,
+    gap_threshold: float = 1e-8,
+    stationarity_threshold: float = 1e-9,
+    maximum_bytes: int = 128 << 20,
+    device_id: int = 0,
+    library: ctypes.CDLL | None = None,
+) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+    """Build central Fock and overlap weights from the two spin frame cotangents.
+
+    Supply matching OBS columns, canonical energies and AO coefficient cotangents
+    from one reference. A cotangent with complete OBS+CABS columns is accepted;
+    the separate CABS frame response consumes the complement columns. The full
+    OBS seeds include occupied/virtual couplings with the relaxed DF-UHF Fock.
+    The caller applies orbital response only once through its coupled equation.
+    """
+    result, torques = {}, {}
+    for spin, occ in zip(("alpha", "beta"), occupations, strict=True):
+        c = np.asarray(coefficients["coefficients_" + spin])
+        e = np.asarray(energies[spin])
+        bar = np.asarray(frame_cotangents["coefficients_" + spin])
+        n = e.size
+        if (
+            c.ndim != 2
+            or c.shape[1] != n
+            or e.shape != (n,)
+            or bar.ndim != 2
+            or bar.shape[0] != c.shape[0]
+            or bar.shape[1] < n
+            or any(v.dtype != np.float64 for v in (c, e, bar))
+            or not np.isfinite(e).all()
+        ):
+            raise ValueError(
+                "Inconsistent canonical orbitals, energies or AO frame cotangents"
+            )
+        graph = orbital_rotation_cotangent(c.shape[0], n)
+        m = run(
+            graph, {"coefficients": c, "frame_bar": np.ascontiguousarray(bar[:, :n])}
+        ).outputs["rotation_gradient"]
+        f, s, t, _ = canonical_full_frame_seeds(
+            m,
+            e,
+            occ,
+            gap_threshold=gap_threshold,
+            stationarity_threshold=stationarity_threshold,
+            maximum_bytes=maximum_bytes,
+            device_id=device_id,
+            library=library,
+        )
+        result["fock_seed_" + spin] = f
+        result["overlap_seed_" + spin] = s
+        torques[spin] = t
+    return result, torques
 
 
 def unrestricted_nuclear_source_terms(
