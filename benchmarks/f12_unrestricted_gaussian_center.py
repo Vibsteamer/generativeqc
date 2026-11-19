@@ -8,14 +8,62 @@ from pathlib import Path
 
 import numpy as np
 from generativeqc._f12_cabs import cabs_singles
+from generativeqc._f12_spin_fock import spin_fock
 from generativeqc._f12_unrestricted import unrestricted_mp2_f12_ao_response
 from generativeqc.f12_orbital_response import unrestricted_frame_overlap_weights
+from generativeqc_compiler.mp2.f12_density_fitting import molecular_orbital_sources
+from generativeqc_compiler.tensor import Index, Program, TensorSpec, einsum, input_tensor
 
 from benchmarks.f12_cabs_h_batch import CabsHShells
+from benchmarks.f12_molecular_metric import metric_whitener
 from benchmarks.f12_unrestricted_gaussian import (
     gaussian_orbital_forces,
     gaussian_sources,
 )
+
+
+def shell_reference_fit(
+    space: tuple[int, int, int, int, int],
+    ao: Mapping[str, np.ndarray],
+    energies: Mapping[str, np.ndarray],
+    run: Callable,
+) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+    """Transform and whiten the Gaussian OBS factors and check both physical Focks."""
+    oa, ob, n, _, q = space
+    atomic = ao["overlap_ao"].shape[0]
+    transform = molecular_orbital_sources(atomic, n, 0, q).outputs
+    raw = transform["raw_coulomb"]
+    a = raw.spec.indices[0]
+    b = Index("b", a.space)
+    w = input_tensor("whitener", TensorSpec((a, b), role="input"))
+    graph = Program({"df": einsum("ab,bpq->apq", w, raw), "hcore": transform["hcore"]})
+    central = {"whitener": ao["metric_whitener"]}
+    fock_inputs = {}
+    for spin, occ in (("alpha", oa), ("beta", ob)):
+        c = np.ascontiguousarray(ao["coefficients_" + spin][:, :n])
+        inputs = {
+            "coefficients": c,
+            "ao_coulomb": ao["ao_coulomb"],
+            "hcore_ao": ao["hcore_ao"],
+            "whitener": central["whitener"],
+        }
+        values = run(graph, inputs).outputs
+        df = values["df"]
+        central["coefficients_" + spin] = c
+        central["df_" + spin] = df
+        central["occupied_energies_" + spin] = energies[spin][:occ]
+        fock_inputs["hcore_" + spin] = values["hcore"]
+        fock_inputs["raw_coulomb_" + spin] = df
+        if occ:
+            fock_inputs["fit_" + spin] = np.ascontiguousarray(df[:, :occ, :])
+    focks = spin_fock((oa, ob, n, q), fock_inputs, run)
+    errors = {
+        spin: float(np.max(abs(focks["fock_" + spin] - np.diag(energies[spin]))))
+        for spin in ("alpha", "beta")
+    }
+    if any(not np.isfinite(v) or v > 2e-8 for v in errors.values()):
+        raise ValueError(f"Shell DF Fock differs from the UHF reference: {errors}")
+    return central, errors
 
 
 def center_energy_forces(
@@ -23,12 +71,13 @@ def center_energy_forces(
     layout_path: Path,
     snapshot_input: Path,
     snapshot: dict,
-    central: Mapping[str, np.ndarray],
+    central: Mapping[str, np.ndarray] | None,
     run: Callable,
     *,
     sink_library: Path,
     forward_library: Path,
     cabs_h_one_electron_library: Path | None = None,
+    metric_library: Path | None = None,
     projector_library: ctypes.CDLL,
     canonical_library: ctypes.CDLL,
     orbital_library: ctypes.CDLL,
@@ -37,8 +86,9 @@ def center_energy_forces(
 ) -> tuple[dict, np.ndarray, dict]:
     """Evaluate a matched canonical UHF snapshot and its Gaussian F12 correlation response.
 
-    Central OBS coefficients, DF factors and whitener must refer to the same
-    fitted Hamiltonian. The integral forward, energy pullback and metric
+    With central=None the CUDA metric and the shell integrals determine the
+    orbital-response factors of both spins. A supplied center must match the
+    same fitted Hamiltonian. The integral forward, energy pullback and metric
     derivative share one CABS frame; its columns and cotangents never cross a
     process boundary. Reference forces are those of the supplied UHF root.
     """
@@ -84,7 +134,17 @@ def center_energy_forces(
             abs(scale * hcore - np.asarray(snapshot["hcore"]).reshape(n, n))
         ),
     }
-    whiten = np.asarray(central["whitener"])
+    fit_diagnostics = {}
+    if central is None:
+        if metric_library is None:
+            raise ValueError(
+                "Building the shell DF factors requires the CUDA metric library"
+            )
+        whiten, fit_diagnostics["metric"] = metric_whitener(
+            ao["metric/coulomb"], metric_library, budget_bytes=budget_mib << 20
+        )
+    else:
+        whiten = np.asarray(central["whitener"])
     errors["whitening"] = np.max(
         abs(whiten @ ao["metric/coulomb"] @ whiten.T - np.eye(q))
     )
@@ -107,20 +167,25 @@ def center_energy_forces(
         errors["gram_" + spin] = np.max(
             abs(frame.T @ ao["overlap_ao"] @ frame - np.eye(ext))
         )
-        errors["mo_" + spin] = np.max(abs(c - central["coefficients_" + spin]))
-        if occ:
-            errors["occupation_" + spin] = np.max(
-                abs(energies[spin][:occ] - central["occupied_energies_" + spin])
-            )
-            transformed = (c.T @ ao["ao_coulomb"] @ c).reshape(q, n * n)
-            errors["df_" + spin] = np.max(
-                abs((whiten @ transformed).reshape(q, n, n) - central["df_" + spin])
-            )
+        if central is not None:
+            errors["mo_" + spin] = np.max(abs(c - central["coefficients_" + spin]))
+            if occ:
+                errors["occupation_" + spin] = np.max(
+                    abs(energies[spin][:occ] - central["occupied_energies_" + spin])
+                )
+                transformed = (c.T @ ao["ao_coulomb"] @ c).reshape(q, n * n)
+                errors["df_" + spin] = np.max(
+                    abs((whiten @ transformed).reshape(q, n, n) - central["df_" + spin])
+                )
         ao["coefficients_" + spin] = frame
     errors = {k: float(v) for k, v in errors.items()}
     if any(not np.isfinite(v) or v > 2e-7 for v in errors.values()):
         raise ValueError(
             f"UHF state or Coulomb fit differs from the shell geometry: {errors}"
+        )
+    if central is None:
+        central, fit_diagnostics["canonical_Fock_errors_Eh"] = shell_reference_fit(
+            space, ao, energies, run
         )
     terms, direct = unrestricted_mp2_f12_ao_response(
         space,
@@ -172,6 +237,7 @@ def center_energy_forces(
         forces,
         {
             "active_pairs": terms.active_pairs,
+            "shell_reference_fit": fit_diagnostics,
             "root_errors": errors,
             "forward": forward,
             "nuclear_response": sinks,

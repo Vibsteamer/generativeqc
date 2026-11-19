@@ -86,3 +86,42 @@ def test_spin_frame_metric_weights_match_independent_moving_frames():
         h = 1e-5
         finite = (energy(h, spin) - energy(-h, spin)) / (2 * h)
         np.testing.assert_allclose(np.vdot(weights[spin], ds), finite, atol=2e-8)
+
+
+@pytest.mark.parametrize("beta_occupation", [0, 1])
+def test_shell_reference_fit_recovers_both_canonical_focks(beta_occupation):
+    from benchmarks.f12_unrestricted_gaussian_center import shell_reference_fit
+    from generativeqc_compiler.tensor import execute
+
+    rng = np.random.default_rng(813)
+    frame, _ = np.linalg.qr(rng.normal(size=(4, 4)))
+    # AO operators are diagonal in an underlying rotated basis. The spin MOs
+    # label its first three orbitals in two different orders.
+    spectrum = np.array([-2.0, -0.8, 0.4, 0.9])
+    coulomb_diagonals = rng.normal(size=(2, 4)) * 0.1
+    whitener = np.array([[1.1, 0.2], [0.0, 0.7]])
+    ao = {
+        "overlap_ao": np.eye(4),
+        "hcore_ao": (frame * spectrum) @ frame.T,
+        "ao_coulomb": np.stack([(frame * v) @ frame.T for v in coulomb_diagonals]),
+        "metric_whitener": whitener,
+        "coefficients_alpha": frame,
+        "coefficients_beta": frame[:, [1, 0, 2, 3]],
+    }
+    fitted = whitener @ coulomb_diagonals
+    charge = fitted[:, :2].sum(axis=1) + beta_occupation * fitted[:, 1]
+    energies, expected = {}, {}
+    for spin, occ, order in (("alpha", 2, [0, 1, 2]), ("beta", beta_occupation, [1, 0, 2])):
+        factors = fitted[:, order]
+        expected[spin] = np.stack([np.diag(v) for v in factors])
+        eps = spectrum[order] + charge @ factors
+        eps[:occ] -= np.sum(factors[:, :occ] ** 2, axis=0)
+        energies[spin] = eps
+    space = (2, beta_occupation, 3, 4, 2)
+    central, errors = shell_reference_fit(space, ao, energies, execute)
+    assert max(errors.values()) < 1e-13
+    for spin in energies:
+        np.testing.assert_allclose(central["df_" + spin], expected[spin], atol=1e-13)
+    energies["beta"][2] += 1e-4
+    with pytest.raises(ValueError, match="Shell DF Fock differs"):
+        shell_reference_fit(space, ao, energies, execute)
