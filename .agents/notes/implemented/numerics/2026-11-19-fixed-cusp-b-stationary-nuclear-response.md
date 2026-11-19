@@ -1,0 +1,7 @@
+# Nuclear response for the fixed-cusp CC-F12 B contractions
+
+A five-occupied restricted root consumes 45 entries of the full four-occupied B tensor. The 15 upper-triangle pairs determine their direct and exchange partners. Each reverse seed combines precisely the ordered partners that reuse its primal value. A nonzero weight outside this domain requires another B equation and is rejected.
+
+The B transpose uses the projected pair graph, the common extended Fock and positive exchange, the full-rank Coulomb fit and the AO-frame map. The double commutator requires its own analytic nuclear shell derivative. The CPU Libint2 adapter streams all signed derivatives for one auxiliary shell, preserving the spherical basis order and distinct center contributions without storing a full nuclear tensor. A two-center and three-center H2 control displaces every nucleus in all directions. Maximum errors across all AO entries are 3.53e-9 and 8.82e-10 at the two nuclear step lengths.
+
+On the all-electron five-occupied water root, the full Cholesky-control B contribution differs from transported signed inputs by 1.68e-10 and 3.48e-10 Eh/bohr. The seven stationary molecular correlation sources now have analytic derivatives. With signed HF and CABS energies, maximum total force differences at 0.0004 and 0.0002 bohr are 5.45e-10 and 2.98e-10 Eh/bohr. The stock B source also passes the original 2e-6 gate while the stock full comparison retains the larger common-V disagreement.
