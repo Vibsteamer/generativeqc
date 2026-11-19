@@ -62,7 +62,7 @@ __global__ void finish_forces(double* reference, const double* orbital_gradient,
 void solve(int device, int oa, int ob, int orbitals, int q, int k, int terms, const double* host,
            std::size_t count, std::size_t budget, double* z, double* g, double* force) {
   if (device < 0 || oa < 0 || ob < 0 || !(oa || ob) || std::max(oa, ob) >= orbitals || q < 1 ||
-      k < 1 || terms < 0 || !host || !z || !g || !force)
+      k < 0 || terms < 0 || (!k && terms) || !host || !z || (k && (!g || !force)))
     throw std::invalid_argument("invalid DF-UHF orbital response dimensions or buffers");
   const int va = orbitals - oa, vb = orbitals - ob;
   const auto rank = add(mul(oa, va), mul(ob, vb)), fa = factors(oa, va, q),
@@ -89,7 +89,8 @@ void solve(int device, int oa, int ob, int orbitals, int q, int k, int terms, co
   if (lwork < 1 || add(fixed_bytes, mul(lwork, sizeof(double))) > budget)
     throw std::length_error("DF-UHF LU workspace exceeds device budget");
   gpu::OwnedCudaBuffer<double> data(device, count, stream.get()), work(device, lwork, stream.get()),
-      grad(device, k, stream.get());
+      grad;
+  if (k) grad.allocate(device, k, stream.get());
   gpu::OwnedCudaBuffer<int> flags(device, rank + 1, stream.get());
   int* info = flags.get() + rank;
   cuda_resource_check(cudaMemcpyAsync(data.get(), host, mul(count, sizeof(double)),
@@ -107,25 +108,31 @@ void solve(int device, int oa, int ob, int orbitals, int q, int k, int terms, co
   solver_check(cusolverDnDgetrs(solver.handle, CUBLAS_OP_T, n, 1, matrix.get(), n, flags.get(),
                                 driver, n, info));
   check_flags(stream, info, 1, "invalid DF-UHF transpose solve");
-  const double one = 1., zero = 0.;
-  blas_check(
-      cublasDgemv(blas.handle, CUBLAS_OP_T, n, k, &one, rhs, n, driver, 1, &zero, grad.get(), 1));
-  finish_forces<<<blocks(k), 256, 0, stream.get()>>>(fixed, grad.get(), k, terms);
-  cuda_resource_check(cudaGetLastError());
+  if (k) {
+    const double one = 1., zero = 0.;
+    blas_check(
+        cublasDgemv(blas.handle, CUBLAS_OP_T, n, k, &one, rhs, n, driver, 1, &zero, grad.get(), 1));
+    finish_forces<<<blocks(k), 256, 0, stream.get()>>>(fixed, grad.get(), k, terms);
+    cuda_resource_check(cudaGetLastError());
+  }
   std::vector<double> result(add(rank, mul(2, k)));
   const auto read = [&](double* dest, const double* src, std::size_t nvalue) {
     cuda_resource_check(cudaMemcpyAsync(dest, src, mul(nvalue, sizeof(double)),
                                         cudaMemcpyDeviceToHost, stream.get()));
   };
   read(result.data(), driver, rank);
-  read(result.data() + rank, grad.get(), k);
-  read(result.data() + rank + k, fixed, k);
+  if (k) {
+    read(result.data() + rank, grad.get(), k);
+    read(result.data() + rank + k, fixed, k);
+  }
   stream.synchronize();
   if (!std::all_of(result.begin(), result.end(), [](double x) { return std::isfinite(x); }))
     throw std::runtime_error("nonfinite DF-UHF adjoint or molecular force");
   std::copy_n(result.data(), rank, z);
-  std::copy_n(result.data() + rank, k, g);
-  std::copy_n(result.data() + rank + k, k, force);
+  if (k) {
+    std::copy_n(result.data() + rank, k, g);
+    std::copy_n(result.data() + rank + k, k, force);
+  }
 }
 }  // namespace
 

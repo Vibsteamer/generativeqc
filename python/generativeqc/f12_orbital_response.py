@@ -9,6 +9,7 @@ from generativeqc_compiler.method.canonical_frame_response import (
     orbital_rotation_cotangent,
 )
 from generativeqc_compiler.mp2.f12_unrestricted_reference import (
+    unrestricted_df_canonical_driver,
     unrestricted_df_nuclear_direction,
     unrestricted_df_nuclear_weights,
 )
@@ -240,6 +241,55 @@ def unrestricted_orbital_forces(
 
     maximum_bytes bounds explicit CUDA arrays including pivot and LU workspaces.
     """
+    if np.asarray(reference_forces).size == 0:
+        raise ValueError("Expected nonempty reference forces")
+    return _solve_orbital_response(space, factors, electronic_driver, nuclear_rhs, reference_forces,
+                                   fixed_gradients, device_id, maximum_bytes, library)
+
+
+def unrestricted_source_orbital_adjoint(
+    space: tuple[int, int, int, int],
+    central: Mapping[str, np.ndarray],
+    canonical_energies: Mapping[str, np.ndarray],
+    run: Callable,
+    *,
+    device_id: int = 0,
+    maximum_bytes: int = 1536 << 20,
+    library: ctypes.CDLL | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build the canonical electronic driver and solve its transposed orbital system.
+
+    The spin DF tensors and canonical Fock cotangents must use the same MO frame
+    and shared auxiliary metric. Returns alpha-then-beta VO driver and rotations.
+    This solve does not consume nuclear RHS, forces or an external orbital adjoint.
+    """
+    oa, ob, n, q = space
+    graph = unrestricted_df_canonical_driver(*space)
+    values, factors = {}, {}
+    for spin, occ in (("alpha", oa), ("beta", ob)):
+        if not occ:
+            continue
+        df = np.asarray(central["df_" + spin])
+        seed = np.asarray(central["fock_seed_" + spin])
+        eps = _block(canonical_energies[spin], (n,), "canonical energies")
+        if df.shape != (q, n, n) or seed.shape != (n, n):
+            raise ValueError("Canonical driver and fitted MO space disagree")
+        values["df_" + spin] = df
+        values["fock_seed_" + spin] = seed
+        factors.update({key + "_" + spin: block for key, block in (
+            ("vo", df[:, occ:, :occ]), ("oo", df[:, :occ, :occ]), ("vv", df[:, occ:, occ:]),
+            ("gap", eps[occ:, None] - eps[None, :occ]))})
+    channels = run(graph, values).outputs
+    driver = np.concatenate([_block(channels[spin], (n - occ, occ), "orbital driver")
+                             for spin, occ in (("alpha", oa), ("beta", ob)) if occ])
+    # Zero coordinates select the rotations-only ABI mode. No nuclear arrays are uploaded.
+    result = _solve_orbital_response(space, factors, driver, np.empty((0, 3, driver.size)),
+                                     np.empty((0, 3)), (), device_id, maximum_bytes, library)
+    return driver, result.rotations
+
+
+def _solve_orbital_response(space, factors, electronic_driver, nuclear_rhs, reference_forces,
+                            fixed_gradients, device_id, maximum_bytes, library):
     oa, ob, n, q = (
         checked_integer(value, name)
         for value, name in zip(
@@ -260,7 +310,7 @@ def unrestricted_orbital_forces(
     ref = np.asarray(reference_forces)
     if ref.ndim != 2 or ref.shape[1] != 3:
         raise ValueError("Reference forces must have three Cartesian axes")
-    directions = checked_integer(ref.size, "Cartesian directions", low=1)
+    directions = checked_integer(ref.size, "Cartesian directions")
     terms = checked_integer(len(fixed_gradients), "fixed gradient terms")
     if 8 * rank * rank > budget:
         raise ValueError(
