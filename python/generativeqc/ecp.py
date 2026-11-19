@@ -198,6 +198,58 @@ class ECPIntegrals:
             gradient += np.einsum("axij,ij->ax", motion, frame_weights)
         return gradient
 
+    def occupied_expectation_gradient(
+        self,
+        occupied: np.ndarray,
+        virtual: np.ndarray,
+        overlap_derivatives: np.ndarray,
+        virtual_occupied_response: np.ndarray,
+        *,
+        occupation: int = 1,
+    ) -> np.ndarray:
+        """Nuclear derivative of the scalar ECP expectation in occupied orbitals.
+
+        The two real coefficient matrices have AO rows and S-orthonormal
+        columns at the reference geometry. Supply dS in the same AO basis and
+        the solved virtual-occupied coefficient response Uvo, both ordered by
+        atom and Cartesian component. Use occupation 2 for a restricted
+        determinant, or add separate alpha and beta results with occupation 1.
+        """
+        occupation = checked_integer(occupation, "orbital occupation", low=1, high=2)
+        co, cv, ds, uvo = map(
+            np.asarray,
+            (occupied, virtual, overlap_derivatives, virtual_occupied_response),
+        )
+        nao = self.local.shape[0]
+        if self.local_derivative is None or self.nonlocal_derivative is None:
+            raise ValueError("ECP derivatives were not requested")
+        directions = self.local_derivative.shape[:2]
+        if (
+            co.ndim != 2
+            or cv.ndim != 2
+            or co.shape[0] != nao
+            or cv.shape[0] != nao
+            or ds.shape != (*directions, nao, nao)
+            or uvo.shape != (*directions, cv.shape[1], co.shape[1])
+        ):
+            raise ValueError(
+                "ECP orbitals and response require matching AO and orbital dimensions"
+            )
+        if any(
+            a.dtype != np.float64 or not np.isfinite(a).all() for a in (co, cv, ds, uvo)
+        ):
+            raise ValueError(
+                "ECP orbitals and response must be finite real double precision"
+            )
+        vco = self.matrix @ co
+        gradient = self.contract(co @ co.T)
+        # The symmetric occupied rotation follows from d(Co.T @ S @ Co) = 0.
+        # Its antisymmetric gauge drops out of this trace with equal occupations.
+        normalization_weight = co @ (co.T @ vco) @ co.T
+        gradient -= np.einsum("axij,ij->ax", ds, normalization_weight)
+        gradient += 2 * np.einsum("axvi,vi->ax", uvo, cv.T @ vco)
+        return occupation * gradient
+
 
 def ecp_integrals(
     atoms: typing.Any,

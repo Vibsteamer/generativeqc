@@ -682,3 +682,37 @@ def test_projected_ecp_gradient_on_moving_rectangular_frame() -> None:
             weights, orbital_coefficients=coefficients,
             coefficient_derivatives=frame_motion[:1],
         )
+
+
+@pytest.mark.parametrize("nocc,occupation", [(3, 2), (2, 1), (1, 1), (0, 1)])
+def test_occupied_ecp_expectation_in_moving_metric(nocc: int, occupation: int) -> None:
+    rng = np.random.default_rng(50638)
+    nao = 5
+    frame, _ = np.linalg.qr(rng.normal(size=(nao, nao)))
+    co, cv = frame[:, :nocc], frame[:, nocc:]
+
+    def symmetric(x: np.ndarray) -> np.ndarray:
+        return (x + x.swapaxes(-1, -2)) / 2
+
+    matrix = symmetric(rng.normal(size=(nao, nao)))
+    dv = symmetric(rng.normal(size=(2, 3, nao, nao)))
+    ds = symmetric(rng.normal(size=dv.shape))
+    uvo = rng.normal(size=(2, 3, nao - nocc, nocc))
+    integrals = ECPIntegrals(
+        matrix, np.zeros_like(matrix), dv, np.zeros_like(dv), 64, 16, "cpu", "fixture"
+    )
+    analytic = integrals.occupied_expectation_gradient(co, cv, ds, uvo, occupation=occupation)
+
+    def displaced(step: float) -> np.ndarray:
+        trial = co + step * (cv @ uvo)
+        metric = trial.swapaxes(-1, -2) @ (np.eye(nao) + step * ds) @ trial
+        eigenvalues, vectors = np.linalg.eigh(metric)
+        orbitals = trial @ ((vectors * eigenvalues[..., None, :] ** -0.5) @ vectors.swapaxes(-1, -2))
+        projected = orbitals.swapaxes(-1, -2) @ (matrix + step * dv) @ orbitals
+        return occupation * np.trace(projected, axis1=-2, axis2=-1)
+
+    for step in (2e-5, 1e-5):
+        numerical = (displaced(step) - displaced(-step)) / (2 * step)
+        np.testing.assert_allclose(analytic, numerical, atol=1e-7, rtol=0)
+    with pytest.raises(ValueError, match="orbital dimensions"):
+        integrals.occupied_expectation_gradient(co, cv, ds, uvo[:1])
