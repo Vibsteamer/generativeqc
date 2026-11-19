@@ -1,13 +1,12 @@
 """Native tensor program for the relaxed occupied scalar ECP expectation."""
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
 import numpy as np
 from generativeqc_compiler.tensor.ir import add, einsum, input_tensor
 from generativeqc_compiler.tensor.program import Program
 from generativeqc_compiler.tensor.types import Index, IndexSpace, TensorSpec
+
+from ._ecp_cuda import prepare as prepare
 
 
 def occupied_program(natom, nao, nspin, nocc, nvir, occupation):
@@ -65,25 +64,3 @@ def inputs(integrals, ds, frames, occupation):
     feeds = dict(local=integrals.local, nonlocal_=integrals.nonlocal_, dlocal=integrals.local_derivative,
                  dnonlocal=integrals.nonlocal_derivative, ds=ds, occupied=co, virtual=cv, response=uvo)
     return occupied_program(natom, nao, nspin, nocc, nvir, occupation), feeds
-
-
-def prepare(program, *, device=0, cache=None):
-    from generativeqc_compiler.common.cuda_adapter import CudaCompilerAdapter
-    from generativeqc_compiler.common.cuda_target import cuda_target_info
-    from generativeqc_compiler.tensor.cuda_execute import PreparedCuda, compile_cuda
-    from generativeqc_compiler.tensor.cuda_plan import plan_cuda
-
-    from ._cuda_device import device_architecture
-    from ._cuda_runtime import preload_cuda_runtime_libraries
-    from .profiles import find_nvcc
-
-    target = cuda_target_info(device_architecture(device))
-    plan = plan_cuda(program, target)
-    nvcc = find_nvcc()
-    if nvcc is None:
-        raise RuntimeError("native CUDA ECP expectation requires the NVCC toolchain")
-    if cache is None:
-        cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "generativeqc" / "ecp"
-    preload_cuda_runtime_libraries()
-    artifact = compile_cuda(plan, CudaCompilerAdapter(nvcc, target), cache)
-    return PreparedCuda(plan, artifact, device=device)

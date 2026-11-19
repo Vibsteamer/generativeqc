@@ -1,3 +1,5 @@
+import os
+
 """Canonical cotangents against independently re-diagonalized Fock matrices."""
 
 import numpy as np
@@ -73,3 +75,33 @@ def test_native_bridge_rejects_invalid_inputs_before_library_load(case: str) -> 
         options["maximum_bytes"] = 0
     with pytest.raises(ValueError):
         canonical_frame_seed(m, eps, o, **options)
+
+
+@pytest.mark.skipif(
+    os.getenv("GENERATIVEQC_TEST_CUDA") != "1",
+    reason="requires native canonical CUDA kernels",
+)
+def test_full_frame_stationary_degeneracy_is_gauge_covariant() -> None:
+    from generativeqc._canonical_frame import canonical_full_frame_seeds
+
+    rng = np.random.default_rng(153)
+    m = rng.normal(size=(5, 5))
+    m[:3, :3] = (m[:3, :3] + m[:3, :3].T) / 2
+    eps = np.array([-1.0, -1.0, -1.0, 0.3, 0.8])
+    q = np.eye(5)
+    q[:3, :3] = np.linalg.qr(rng.normal(size=(3, 3)))[0]
+    f, s, g, _ = canonical_full_frame_seeds(m, eps, 3)
+    fq, sq, gq, _ = canonical_full_frame_seeds(q.T @ m @ q, eps, 3)
+    np.testing.assert_allclose(fq, q.T @ f @ q, atol=2e-13)
+    np.testing.assert_allclose(sq, q.T @ s @ q, atol=2e-13)
+    assert max(g, gq) < 1e-13 and np.max(abs(f[:3, 3:])) > 1e-3
+    with pytest.raises(RuntimeError, match="frontier"):
+        canonical_full_frame_seeds(m, eps, 2)
+    eps[1] += 4e-9
+    eps[2] += 6e-9
+    with pytest.raises(RuntimeError, match="frontier"):
+        canonical_full_frame_seeds(m, eps, 2)
+    m[0, 1] += 8e-10
+    m[0, 2] += 8e-10
+    with pytest.raises(RuntimeError, match="nonstationary"):
+        canonical_full_frame_seeds(m, eps, 3)

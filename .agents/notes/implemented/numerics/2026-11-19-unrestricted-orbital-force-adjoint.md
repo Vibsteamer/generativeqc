@@ -42,3 +42,14 @@ result in every nuclear direction using only the central electronic data.
 The coefficient tests compare the four raw arrays with an independent direct
 differentiation of the DF inverse metric, and their contraction with each of
 the nine physical AO directions reproduces the forward orbital gradient.
+
+For a resolved unrestricted reference, project the full AO coefficient
+cotangent onto the canonical OBS columns in each spin. In the relaxed Fock
+formulation every nondegenerate off-diagonal pair contributes to the Fock and
+overlap multipliers, including occupied/virtual pairs. The projection shares
+the generated scalar pair algebra with the restricted same-space implementation.
+The full branch sets the stationary degenerate block to zero and checks the norm
+of its unresolved antisymmetric torque, counting each pair once. This norm is
+invariant under rotations of an exactly degenerate stationary subspace. A gap
+across the occupation boundary below the configured resolution requires a
+separately resolved electronic root before the calculation can proceed.

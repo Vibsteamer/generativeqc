@@ -663,6 +663,18 @@ def test_projected_ecp_gradient_on_moving_rectangular_frame() -> None:
             weights, orbital_coefficients=coefficients,
             coefficient_derivatives=velocity if moving else None,
         )
+        from generativeqc._ecp_cuda import projected_inputs
+        from generativeqc_compiler.common.cuda_target import cuda_target_info
+        from generativeqc_compiler.tensor.cuda_plan import plan_cuda
+        from generativeqc_compiler.tensor.interpreter import execute
+
+        program, feeds = projected_inputs(
+            integrals, weights, coefficients, frame_motion if moving else None
+        )
+        planned = plan_cuda(program, cuda_target_info("sm_89"))
+        assert len(planned.inputs) == (7 if moving else 4)
+        assert len(planned.outputs) == 1
+        np.testing.assert_allclose(execute(program, feeds).outputs["gradient"], actual, atol=2e-13)
         for step in (2e-5, 1e-5):
             plus = coefficients + step * velocity
             minus = coefficients - step * velocity
@@ -673,6 +685,11 @@ def test_projected_ecp_gradient_on_moving_rectangular_frame() -> None:
                 "ij,axki,axkl,axlj->ax", weights, minus, matrix - step * direction, minus
             )
             np.testing.assert_allclose(actual, (ep - em) / (2 * step), atol=3e-8, rtol=0)
+    program, feeds = projected_inputs(integrals, matrix)
+    assert len(feeds) == 3
+    np.testing.assert_allclose(
+        execute(program, feeds).outputs["gradient"], integrals.contract(matrix), atol=2e-13
+    )
     with pytest.raises(ValueError, match="require their frame"):
         integrals.contract(matrix, coefficient_derivatives=frame_motion)
     with pytest.raises(ValueError, match="dimensions"):

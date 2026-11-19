@@ -6,7 +6,16 @@ It neither solves the occupied/virtual response nor supplies nuclear derivatives
 
 from fractions import Fraction
 
-from ..tensor import Index, IndexSpace, Program, TensorSpec, add, einsum, input_tensor
+from ..tensor import (
+    Index,
+    IndexSpace,
+    Program,
+    TensorSpec,
+    add,
+    einsum,
+    input_tensor,
+    multiply,
+)
 from ..tensor.ir import divide
 from ..tensor.scalar_cpp import emit_scalar_cpp
 
@@ -49,6 +58,22 @@ def canonical_pair_terms() -> tuple[Program, Program]:
 def emit_canonical_frame_cuda() -> str:
     """Emit pair rules and a guarded device schedule; no runtime imports."""
     diagnostics, multiplier = canonical_pair_terms()
+    scalar = TensorSpec(role="input")
+    seed_value, e_p, e_q = (input_tensor(k, scalar) for k in ("seed", "ep", "eq"))
+    overlap = Program(
+        {
+            "overlap": multiply(
+                seed_value,
+                add(e_p, e_q, coefficients=(Fraction(-1, 2), Fraction(-1, 2))),
+            )
+        }
+    )
+    overlap_cpp = emit_scalar_cpp(
+        overlap,
+        function_name="canonical_frame_pair_overlap",
+        input_order=("seed", "ep", "eq"),
+        output_order=("overlap",),
+    ).replace("inline bool", "__device__ inline bool")
     helpers = "\n".join(
         emit_scalar_cpp(
             graph,
@@ -66,22 +91,29 @@ def emit_canonical_frame_cuda() -> str:
         "#define GENERATIVEQC_GENERATED_CANONICAL_FRAME_CUH\n"
         "#include <cuda_runtime.h>\n#include <cstddef>\n"
         + helpers
+        + "\n"
+        + overlap_cpp
         + r"""
 namespace generativeqc::tensor {
 static __global__ void canonical_frame_seed_kernel(
     std::size_t n, std::size_t occupied, const double* energies, const double* rotation,
-    double gap_threshold, double stationarity_threshold, double* seed, int* flags) {
+    double gap_threshold, double stationarity_threshold, double* seed, int* flags,
+    double* overlap, double* unresolved_torque_squared) {
   for (std::size_t k=std::size_t(blockIdx.x)*blockDim.x+threadIdx.x; k<n*n;
        k+=std::size_t(blockDim.x)*gridDim.x) {
     const auto p=k/n, q=k%n;
     seed[k]=0.0;
+    if (overlap) overlap[k]=0.0;
     double gap, torque;
     if (!canonical_frame_pair_diagnostics(rotation[k], rotation[q*n+p],
                                          energies[p], energies[q], gap, torque)) {
       atomicExch(flags,1); continue;
     }
-    if (p==q || ((p<occupied)!=(q<occupied))) continue;
+    const bool cross = (p<occupied)!=(q<occupied);
+    if (p==q || (!overlap && cross)) continue;
     if (fabs(gap)<=gap_threshold) {
+      if (overlap && cross) atomicExch(flags+2,1);
+      if (overlap && p<q) atomicAdd(unresolved_torque_squared,torque*torque);
       if (fabs(torque)>stationarity_threshold) atomicExch(flags+1,1);
       continue;
     }
@@ -90,17 +122,20 @@ static __global__ void canonical_frame_seed_kernel(
                                         energies[p], energies[q], value)) {
       atomicExch(flags,1); continue;
     }
+    if (overlap && !canonical_frame_pair_overlap(value,energies[p],energies[q],overlap[k])) {
+      atomicExch(flags,1); continue;
+    }
     seed[k]=value;
   }
 }
 inline void launch_canonical_frame_seed(
     std::size_t n, std::size_t occupied, const double* energies, const double* rotation,
     double gap_threshold, double stationarity_threshold, double* seed, int* flags,
-    cudaStream_t stream) {
+    cudaStream_t stream, double* overlap=nullptr, double* unresolved_torque_squared=nullptr) {
   const auto count=(n*n+255)/256;
   const auto blocks=static_cast<unsigned>(count<65535 ? count : 65535);
   canonical_frame_seed_kernel<<<blocks,256,0,stream>>>(
-      n,occupied,energies,rotation,gap_threshold,stationarity_threshold,seed,flags);
+      n,occupied,energies,rotation,gap_threshold,stationarity_threshold,seed,flags,overlap,unresolved_torque_squared);
 }
 }  // namespace generativeqc::tensor
 #endif
