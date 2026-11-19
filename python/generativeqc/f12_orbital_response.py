@@ -6,6 +6,7 @@ from typing import NamedTuple
 
 import numpy as np
 from generativeqc_compiler.method.canonical_frame_response import (
+    orbital_metric_cotangent,
     orbital_rotation_cotangent,
 )
 from generativeqc_compiler.mp2.f12_unrestricted_reference import (
@@ -53,6 +54,39 @@ def _nuclear_center(
             name = f"occupied_energies_{spin}"
             fields[name] = central[name]
     return fields
+
+
+def unrestricted_frame_overlap_weights(
+    central: Mapping[str, np.ndarray],
+    complement: np.ndarray,
+    direct: Mapping[str, np.ndarray],
+    run: Callable,
+) -> dict[str, np.ndarray]:
+    """Derive the two AO overlap cotangents from the matching spin-MO/CABS frames."""
+    cabs = np.asarray(complement)
+    if cabs.ndim != 2 or not cabs.shape[1] or cabs.dtype != np.float64 or not np.isfinite(cabs).all():
+        raise ValueError("Expected finite FP64 CABS columns")
+    atomic, rank = cabs.shape
+    weights = {}
+    for spin in ("alpha", "beta"):
+        basis = np.asarray(central["coefficients_" + spin])
+        if basis.ndim != 2 or basis.shape[0] != atomic or not basis.shape[1] or basis.dtype != np.float64 or not np.isfinite(basis).all():
+            raise ValueError("OBS and CABS coefficients must share the same AO rows")
+        obs = basis.shape[1]
+        retained = obs + rank
+        bar = np.asarray(direct["coefficients_" + spin])
+        _block(bar, (atomic, retained), "extended coefficient cotangent")
+        # Relative gauge of bar and CABS columns is fixed by the forward phase convention.
+        coefficients = np.column_stack((basis, cabs))
+        mask = np.full((retained, retained), -0.5)
+        mask[:obs, obs:] = -1.0
+        mask[obs:, :obs] = 0.0
+        weight = run(orbital_metric_cotangent(atomic, retained), {
+            "coefficients": coefficients, "frame_bar": bar, "metric_blocks": mask,
+        }).outputs["overlap_bar"]
+        _block(weight, (atomic, atomic), "frame overlap cotangent")
+        weights[spin] = weight
+    return weights
 
 
 def unrestricted_canonical_source_seeds(

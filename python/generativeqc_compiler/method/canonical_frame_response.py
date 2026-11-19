@@ -15,9 +15,30 @@ from ..tensor import (
     einsum,
     input_tensor,
     multiply,
+    transpose,
 )
 from ..tensor.ir import divide
 from ..tensor.scalar_cpp import emit_scalar_cpp
+
+
+def orbital_metric_cotangent(atomic: int, retained: int) -> Program:
+    """Pull a coefficient cotangent back through the OBS/CABS metric connection.
+
+    The connection uses a symmetric metric change within OBS, a transported
+    complement, and the orthogonality constraint between the two spaces.
+    The retained-frame block factors are -1/2 on each diagonal block, -1 from OBS
+    to CABS and zero in the transposed block.
+    """
+    rotation = orbital_rotation_cotangent(atomic, retained).outputs["rotation_gradient"]
+    coefficients = rotation.inputs[0]
+    block = input_tensor("metric_blocks", TensorSpec(rotation.spec.indices, role="input"))
+    scaled = multiply(block, rotation)
+    frame = add(scaled, transpose(scaled, (1, 0)), coefficients=(Fraction(1, 2), Fraction(1, 2)))
+    rows = einsum("up,pq->uq", coefficients, frame)
+    weight = einsum("uq,vq->uv", rows, coefficients)
+    return Program({"overlap_bar": add(weight, transpose(weight, (1, 0)),
+                                       coefficients=(Fraction(1, 2), Fraction(1, 2)))},
+                   provenance={"method": "Parallel-transported OBS and CABS coefficient metric pullback"})
 
 
 def orbital_rotation_cotangent(atomic: int, orbitals: int) -> Program:
