@@ -9,10 +9,7 @@ from pathlib import Path
 
 import numpy as np
 from generativeqc._f12_cabs import cabs_singles
-from generativeqc._f12_spin_ao import unrestricted_orbital_sources
-from generativeqc._f12_spin_pairs import molecular_pair_energies
-from generativeqc._f12_unrestricted import unrestricted_mp2_f12_source_pullback
-from generativeqc_compiler.mp2.f12_unrestricted import unrestricted_extended_df_fock
+from generativeqc._f12_unrestricted import unrestricted_mp2_f12_ao_response
 from generativeqc_compiler.mp2.f12_unrestricted_force import (
     unrestricted_f12_nuclear_source_action,
 )
@@ -32,20 +29,9 @@ def evaluate(
         raise ValueError("The full-rank shared Coulomb metric branch is required")
     ao["metric_whitener"] = w
     space = tuple(ref["space"])
-    data, _ = unrestricted_orbital_sources(space, ao, run)
-    spins = (("alpha", space[0]), ("beta", space[1]))
-    args = {
-        k.removeprefix("source/"): v for k, v in data.items() if k.startswith("source/")
-    }
-    fg = unrestricted_extended_df_fock(*space[:2], *space[3:])
-    fock = run(fg, args).outputs
-    sc = sum(
-        singles(fock["fock_" + sp], occ, spin_weight=1, pullback=False)[0]
-        for sp, occ in spins
-    )
-    pair = list(molecular_pair_energies(space, data, args, fock, run))
-    mp2 = sum(p.mp2 for p in pair)
-    f12 = sum(p.f12 for p in pair)
+    energy, bars = unrestricted_mp2_f12_ao_response(space, ao, run, singles=singles)
+    mp2, f12 = energy.ordinary_mp2, energy.f12_increment
+    sc = sum(energy.cabs_singles)
     total = ref["UHF_Eh"] + sc + mp2 + f12
     eerr = max(
         abs(total - ref["total_Eh"]),
@@ -53,10 +39,10 @@ def evaluate(
         abs(sc - sum(ref["CABS_singles_Eh"])),
         abs(f12 - ref["F12_increment_Eh"]),
     )
-    if len(pair) != 36 or not np.isfinite(eerr) or eerr > 2e-8:
-        raise ValueError(f"Molecular energy mismatch: {len(pair)} pairs, error {eerr}")
-    weights = unrestricted_mp2_f12_source_pullback(space, data, run, singles=singles)
-    _, bars = unrestricted_orbital_sources(space, ao, run, orbital_weights=weights)
+    if energy.active_pairs != 36 or not np.isfinite(eerr) or eerr > 2e-8:
+        raise ValueError(
+            f"Molecular energy mismatch: {energy.active_pairs} pairs, error {eerr}"
+        )
     keys = sorted(bars)
     flat = np.concatenate([bars[k].ravel() for k in keys])
     with np.load(directory / "physical_ao_tangent.npz", allow_pickle=False) as physical:
@@ -83,7 +69,7 @@ def evaluate(
     return [
         {
             "case": "NH2_D_f12",
-            "active_pairs": len(pair),
+            "active_pairs": energy.active_pairs,
             "UMP2_Eh": mp2,
             "F12_Eh": f12,
             "CABS_singles_Eh": sc,

@@ -37,6 +37,19 @@ def unrestricted_orbital_sources(
     tile per spin is transformed at a time; this keeps workspace independent
     of the number of operators.
     """
+    return _orbital_sources(space, ao, run, orbital_weights, projected=None)
+
+
+def _orbital_sources(
+    space: tuple[int, int, int, int, int],
+    ao: dict[str, np.ndarray],
+    run: Callable,
+    orbital_weights: dict[str, np.ndarray] | None,
+    *,
+    projected: dict[str, np.ndarray] | None,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray] | None]:
+    # A combined energy/response evaluation owns the forward buffers through
+    # the reverse pass. Standalone evaluations build their own projections.
     oa, ob, obs, ext, aux = space
     if not (0 <= oa < obs and 0 <= ob < obs < ext and oa + ob > 0):
         raise ValueError("Invalid UHF occupied, OBS, or extended dimensions")
@@ -44,10 +57,13 @@ def unrestricted_orbital_sources(
     occupied = {"alpha": oa, "beta": ob}
     cross = unrestricted_cross_frame_overlap(nc, ext)
     csrc = {k: ao[k] for k in ("overlap_ao", "coefficients_alpha", "coefficients_beta")}
-    data = {
-        "space": np.array(space),
-        "cross_overlap": run(cross, csrc).outputs["cross_overlap"],
-    }
+    if projected is None:
+        data = {
+            "space": np.array(space),
+            "cross_overlap": run(cross, csrc).outputs["cross_overlap"],
+        }
+    else:
+        data = projected
     bars = None
     if orbital_weights is not None:
         bars = {
@@ -81,12 +97,12 @@ def unrestricted_orbital_sources(
             )
             graph = Program({field: frame.outputs[field]})
             item = {"coefficients": ao[co], ao_name: ao[ao_name]}
-            value = run(graph, item).outputs[field]
-            data[key] = value
+            if projected is None:
+                data[key] = run(graph, item).outputs[field]
             seed = None if bars is None else orbital_weights[key].copy()
             if op == "coulomb" and occ:
                 solve = coulomb_fit_response(aux, occ * ext)
-                raw = np.ascontiguousarray(value[:, :occ]).reshape(aux, occ * ext)
+                raw = np.ascontiguousarray(data[key][:, :occ]).reshape(aux, occ * ext)
                 fit_key = "source/fit_" + spin
                 fit_arg = {
                     "metric_whitener": ao["metric_whitener"],
@@ -98,10 +114,18 @@ def unrestricted_orbital_sources(
                     ).outputs
                 else:
                     fit_arg["fit_bar"] = orbital_weights[fit_key].reshape(aux, -1)
+                    if projected is not None:
+                        solve = Program(
+                            {
+                                k: solve.outputs[k]
+                                for k in ("three_center_bar", "metric_bar")
+                            }
+                        )
                     solved = run(solve, fit_arg).outputs
                     seed[:, :occ] += solved["three_center_bar"].reshape(aux, occ, ext)
                     bars["metric/coulomb"] += solved["metric_bar"]
-                data[fit_key] = solved["fit"].reshape(aux, occ, ext)
+                if projected is None:
+                    data[fit_key] = solved["fit"].reshape(aux, occ, ext)
             if bars is not None:
                 rev = transpose_program(graph, (field,)).program
                 weights = run(rev, {**item, "bar_" + field: seed}).outputs

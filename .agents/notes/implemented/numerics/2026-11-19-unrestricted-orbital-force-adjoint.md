@@ -68,3 +68,13 @@ recomposed forces agreed with signed differences of 36 displaced energies to
 2.65e-8 and 5.25e-8 hartree/bohr for steps of 0.0002 and 0.0001 bohr. This
 qualification used supplied direct F12 AO cotangents, CABS overlap weights,
 central DF factors, and a matched UHF reference.
+
+The common-AO response entry forms UMP2, the F12 increment, and the two CABS
+singles energies in the same spin frames as their cotangents. The reverse pair
+program also returns its two primal energies. The AO response reuses the primal
+projections owned by that evaluation, including the occupied legs needed for
+the Coulomb metric derivative. Its internal reuse is confined to one call so
+changing the geometry or orbital frame cannot reuse a stale projection.
+Frozen occupations restrict correlated pairs while all occupied orbitals still
+enter the Fock and singles equations. Small-space tests differentiate the
+combined energy along raw-AO, metric and spin-coefficient perturbations.

@@ -96,6 +96,116 @@ def _direct_fock(
         yield (matrix + matrix.T) / 2
 
 
+@pytest.mark.parametrize(
+    "occs,frozen", [((2, 1), (0, 0)), ((2, 0), (0, 0)), ((1, 2), (1, 2))]
+)
+def test_ao_energy_and_cotangents_follow_same_spin_reference(
+    occs: tuple[int, int], frozen: tuple[int, int]
+) -> None:
+    from generativeqc._f12_spin_pairs import molecular_pair_energies
+    from generativeqc._f12_unrestricted import unrestricted_mp2_f12_ao_response
+
+    rng = np.random.default_rng(6236)
+    obs, ext, aux = 3, 5, 2
+    space = (*occs, obs, ext, aux)
+
+    def symmetric(shape: tuple[int, ...]) -> np.ndarray:
+        x = rng.normal(size=shape)
+        return (x + x.swapaxes(-1, -2)) * 0.025
+
+    center = {
+        "overlap_ao": np.eye(ext),
+        "hcore_ao": np.diag(np.linspace(-2.0, 1.0, ext)) + symmetric((ext, ext)),
+        "ao_coulomb": symmetric((aux, ext, ext)),
+        "metric/coulomb": np.diag([1.1, 2.0]),
+    }
+    operators = {
+        "geminal": "f12",
+        "squared_geminal": "f12_squared",
+        "geminal_coulomb": "f12_over_coulomb",
+        "double_commutator": "double_commutator",
+    }
+    for op, raw in operators.items():
+        center["metric/" + op] = symmetric((aux, aux))
+        center["ao_" + raw] = symmetric((aux, ext, ext))
+    for spin in ("alpha", "beta"):
+        frame, _ = np.linalg.qr(np.eye(ext) + 0.03 * rng.normal(size=(ext, ext)))
+        center["coefficients_" + spin] = frame
+    direction = {key: symmetric(x.shape) for key, x in center.items()}
+    for spin in ("alpha", "beta"):
+        direction["coefficients_" + spin] = rng.normal(size=(ext, ext)) * 0.025
+
+    def forward(step: float) -> tuple[np.ndarray, int]:
+        a = {k: x + step * direction[k] for k, x in center.items()}
+        c, b = a["coefficients_alpha"], a["coefficients_beta"]
+        data = {"cross_overlap": c.T @ a["overlap_ao"] @ b}
+        sources = {}
+        for spin, occ, frame in zip(("alpha", "beta"), occs, (c, b), strict=True):
+            raw = frame.T @ a["ao_coulomb"] @ frame
+            sources["hcore_" + spin] = frame.T @ a["hcore_ao"] @ frame
+            sources["raw_coulomb_" + spin] = raw
+            if occ:
+                sources["fit_" + spin] = np.linalg.solve(
+                    a["metric/coulomb"], raw[:, :occ].reshape(aux, -1)
+                ).reshape(aux, occ, ext)
+                for op, name in operators.items():
+                    data["metric/" + op] = a["metric/" + op]
+                    data[f"raw/{op}/{spin}"] = (
+                        frame[:, :occ].T @ a["ao_" + name] @ frame
+                    )
+        fock = dict(
+            zip(("fock_alpha", "fock_beta"), _direct_fock(sources, occs), strict=True)
+        )
+        for spin, occ in zip(("alpha", "beta"), occs, strict=True):
+            fock["exchange_" + spin] = (
+                np.einsum(
+                    "Aip,Aiq->pq",
+                    sources["fit_" + spin],
+                    sources["raw_coulomb_" + spin][:, :occ],
+                )
+                if occ
+                else np.zeros((ext, ext))
+            )
+        pairs = list(
+            molecular_pair_energies(
+                space, data, sources, fock, execute, frozen_occupied=frozen
+            )
+        )
+        sc = [
+            _singles(fock["fock_" + spin], occ, spin_weight=1, pullback=False)[0]
+            for spin, occ in zip(("alpha", "beta"), occs, strict=True)
+        ]
+        return np.array(
+            [sum(p.mp2 for p in pairs), sum(p.f12 for p in pairs), *sc]
+        ), len(pairs)
+
+    ao = {
+        **center,
+        "metric_whitener": np.linalg.inv(np.linalg.cholesky(center["metric/coulomb"])),
+    }
+    energy, bars = unrestricted_mp2_f12_ao_response(
+        space,
+        ao,
+        execute,
+        singles=_singles,
+        frozen_occupied=frozen,
+        auxiliary_batch_size=1,
+    )
+    expected, count = forward(0.0)
+    assert count == energy.active_pairs
+    assert bars.keys() == center.keys()
+    np.testing.assert_allclose(
+        [energy.ordinary_mp2, energy.f12_increment, *energy.cabs_singles],
+        expected,
+        rtol=0,
+        atol=2e-13,
+    )
+    slope = sum(np.vdot(bars[k], direction[k]) for k in bars)
+    for step in (1e-4, 3e-5):
+        fd = (forward(step)[0].sum() - forward(-step)[0].sum()) / (2 * step)
+        np.testing.assert_allclose(slope, fd, rtol=0, atol=1e-8)
+
+
 @pytest.mark.parametrize("frozen", [(0, 0), (1, 0), (2, 1)])
 def test_joint_spin_pair_and_reference_vjp(frozen: tuple[int, int]) -> None:
     from generativeqc._f12_spin_pairs import molecular_pair_energies
