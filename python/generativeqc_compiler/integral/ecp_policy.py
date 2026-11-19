@@ -8,6 +8,10 @@ import typing
 
 COARSE_RADIAL_POINTS = 160
 COARSE_POLAR_POINTS = 32
+EXTENDED_RADIAL_POINTS = 384
+EXTENDED_POLAR_POINTS = 80
+MAX_CUDA_RADIAL_POINTS = 512
+MAX_CUDA_POLAR_POINTS = 96
 REFINED_RADIAL_POINTS = 224
 REFINED_POLAR_POINTS = 44
 MATRIX_ABS_TOLERANCE = 2e-9
@@ -28,6 +32,10 @@ def emit_ecp_policy_cpp() -> typing.Any:
     overload; CuMetal's standard-library fabs wrapper is host-only.
     """
     constants = (
+        ("extended_radial_points", EXTENDED_RADIAL_POINTS),
+        ("extended_polar_points", EXTENDED_POLAR_POINTS),
+        ("max_cuda_radial_points", MAX_CUDA_RADIAL_POINTS),
+        ("max_cuda_polar_points", MAX_CUDA_POLAR_POINTS),
         ("coarse_radial_points", COARSE_RADIAL_POINTS),
         ("coarse_polar_points", COARSE_POLAR_POINTS),
         ("refined_radial_points", REFINED_RADIAL_POINTS),

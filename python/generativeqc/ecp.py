@@ -23,6 +23,20 @@ from .basis import BasisSet, validate_ecp_data
 from .elements import checked_integer
 
 
+def fitted_uhf_hydride_domain(basis, atoms, charge, multiplicity):
+    """Scalar small-core monohalogen hydrides covered by native CUDA DF-UHF."""
+    if charge != 0 or multiplicity != 2 or not isinstance(basis, BasisSet) or basis.representation != "spherical":
+        return False
+    heavy = []
+    for atom in atoms:
+        entry = basis.by_element.get(atom.atomic_number)
+        if entry is None or any(s.angular_momentum > 3 for s in entry.shells):
+            return False
+        if atom.atomic_number != 1 or entry.ecp_core_electrons:
+            heavy.append((atom.atomic_number, entry.ecp_core_electrons))
+    return len(heavy) == 1 and heavy[0] in ((35, 10), (53, 28))
+
+
 def resolve_ecp(basis: typing.Any, atoms: typing.Any) -> typing.Any:
     """Resolve immutable source records to atom-mapped scalar residual terms."""
     cores, terms = [], []

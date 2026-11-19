@@ -424,10 +424,10 @@ int generativeqc_cpu_resource_inventory_version_v1() { return sizeof(void*) == 8
  * Output is transactional; neither grids, AO matrices nor a CUDA context are
  * constructed. CPU metadata cannot distinguish analytic from checked-grid
  * operators, so reserve the larger bound. CUDA retains its radial tile bound. */
-int generativeqc_resource_ecp_workspace_v1(std::size_t nao, std::size_t cartesian_nao,
+int generativeqc_resource_ecp_workspace_v2(std::size_t nao, std::size_t cartesian_nao,
                                            std::size_t atoms, std::size_t primitives,
-                                           std::size_t terms, int cuda, std::uint64_t* output) {
-  if (!output || (cuda != 0 && cuda != 1)) return 1;
+                                           std::size_t terms, int cuda, int refine, std::uint64_t* output) {
+  if (!output || (cuda != 0 && cuda != 1) || (refine != 0 && refine != 1) || (refine && !cuda)) return 1;
   if (!terms) {
     *output = 0;
     return 0;
@@ -436,8 +436,10 @@ int generativeqc_resource_ecp_workspace_v1(std::size_t nao, std::size_t cartesia
   try {
     using generativeqc::runtime::size_add;
     using generativeqc::runtime::size_mul;
-    const auto polar = generativeqc::generated::ecp_refined_polar_points;
-    const auto radial = generativeqc::generated::ecp_refined_radial_points;
+    const auto polar = refine ? generativeqc::generated::ecp_max_cuda_polar_points
+                            : generativeqc::generated::ecp_refined_polar_points;
+    const auto radial = refine ? generativeqc::generated::ecp_max_cuda_radial_points
+                             : generativeqc::generated::ecp_refined_radial_points;
     const auto points = size_mul(2, size_mul(polar, polar));
     const auto ordinal = nao > std::numeric_limits<unsigned>::max()
                              ? std::numeric_limits<unsigned>::max()
@@ -469,6 +471,13 @@ int generativeqc_resource_ecp_workspace_v1(std::size_t nao, std::size_t cartesia
   } catch (const std::overflow_error&) {
     return 1;
   }
+}
+
+int generativeqc_resource_ecp_workspace_v1(std::size_t nao, std::size_t cartesian_nao,
+                                           std::size_t atoms, std::size_t primitives,
+                                           std::size_t terms, int cuda, std::uint64_t* output) {
+  return generativeqc_resource_ecp_workspace_v2(nao, cartesian_nao, atoms, primitives, terms,
+                                                cuda, 0, output);
 }
 
 /** KS v1 host bounds use LP64 metadata and a 128-byte iteration-record

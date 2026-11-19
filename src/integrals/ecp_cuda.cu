@@ -249,13 +249,29 @@ void run(const core::System& system, unsigned radial, unsigned polar, bool deriv
     evaluate_grid(generated::ecp_refined_radial_points, generated::ecp_refined_polar_points,
                   output);
     auto failed = arena.allocate<int>(1);
-    check(cudaMemsetAsync(failed, 0, sizeof(int), stream));
-    check_grid<<<(2 * stride + 127) / 128, 128, 0, stream>>>(coarse, output, size, stride, failed);
-    check(cudaPeekAtLastError());
-    int host_failed = 0;
-    check(cudaMemcpyAsync(&host_failed, failed, sizeof(int), cudaMemcpyDeviceToHost, stream));
-    check(cudaStreamSynchronize(stream));
-    if (host_failed)
+    auto accepted = [&]() {
+      check(cudaMemsetAsync(failed, 0, sizeof(int), stream));
+      check_grid<<<(2 * stride + 127) / 128, 128, 0, stream>>>(coarse, output, size, stride, failed);
+      check(cudaPeekAtLastError());
+      int host_failed = 0;
+      check(cudaMemcpyAsync(&host_failed, failed, sizeof(int), cudaMemcpyDeviceToHost, stream));
+      check(cudaStreamSynchronize(stream));
+      return host_failed == 0;
+    };
+    bool passed = accepted();
+    if (!passed && system.refine_ecp_quadrature) {
+      const unsigned radial_levels[] = {generated::ecp_extended_radial_points,
+                                        generated::ecp_max_cuda_radial_points};
+      const unsigned polar_levels[] = {generated::ecp_extended_polar_points,
+                                       generated::ecp_max_cuda_polar_points};
+      for (unsigned level = 0; !passed && level < 2; ++level) {
+        check(cudaMemcpyAsync(coarse, output, 2 * stride * sizeof(double),
+                              cudaMemcpyDeviceToDevice, stream));
+        evaluate_grid(radial_levels[level], polar_levels[level], output);
+        passed = accepted();
+      }
+    }
+    if (!passed)
       throw std::runtime_error(
           "ECP quadrature convergence gate failed; input outside validated execution domain");
   } else {

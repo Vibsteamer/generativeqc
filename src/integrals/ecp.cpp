@@ -157,7 +157,10 @@ EcpData checked_ecp_integrals(const core::System& system, bool derivatives) {
 std::size_t ecp_workspace_capacity(const core::System& system) {
   if (system.ecp_terms.empty()) return 0;
   const auto ao_count = molecule::ao_count(system);
-  const auto polar = generated::ecp_refined_polar_points;
+  const auto polar = system.refine_ecp_quadrature ? generated::ecp_max_cuda_polar_points
+                                                : generated::ecp_refined_polar_points;
+  const auto radial = system.refine_ecp_quadrature ? generated::ecp_max_cuda_radial_points
+                                                 : generated::ecp_refined_radial_points;
   const auto angular = runtime::size_mul(2 * polar, polar);
   const auto tile = generated::ecp_cuda_radial_tile(ao_count, polar);
   const auto coordinates = runtime::size_add(1, runtime::size_mul(3, system.atoms.size()));
@@ -173,7 +176,7 @@ std::size_t ecp_workspace_capacity(const core::System& system) {
   // Grid/metadata bounds include upload copies and geometric vector growth.
   bytes = runtime::size_add(bytes, runtime::size_mul(4 * sizeof(EcpSpherePoint), angular));
   bytes = runtime::size_add(
-      bytes, runtime::size_mul(4 * sizeof(EcpRadialPoint), generated::ecp_refined_radial_points));
+      bytes, runtime::size_mul(4 * sizeof(EcpRadialPoint), radial));
   bytes = runtime::size_add(bytes, runtime::size_mul(512, ao_count));
   bytes = runtime::size_add(bytes,
                             runtime::size_mul(4 * sizeof(core::EcpTerm), system.ecp_terms.size()));
