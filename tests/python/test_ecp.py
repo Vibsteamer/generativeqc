@@ -716,3 +716,42 @@ def test_occupied_ecp_expectation_in_moving_metric(nocc: int, occupation: int) -
         np.testing.assert_allclose(analytic, numerical, atol=1e-7, rtol=0)
     with pytest.raises(ValueError, match="orbital dimensions"):
         integrals.occupied_expectation_gradient(co, cv, ds, uvo[:1])
+
+
+@pytest.mark.parametrize("occupations", [(2,), (2, 1), (1, 0), (3, 1)])
+def test_batched_relaxed_ecp_cuda_program(occupations: tuple[int, ...]) -> None:
+    from generativeqc._ecp_occupied_cuda import inputs
+    from generativeqc_compiler.common.cuda_target import cuda_target_info
+    from generativeqc_compiler.tensor.cuda_plan import plan_cuda
+    from generativeqc_compiler.tensor.interpreter import execute
+
+    rng = np.random.default_rng(124)
+    matrix = rng.normal(size=(3, 3))
+    matrix += matrix.T.copy()
+    derivative = rng.normal(size=(2, 3, 3, 3))
+    derivative += derivative.swapaxes(-1, -2).copy()
+    integrals = ECPIntegrals(
+        matrix, -0.2 * matrix, derivative, 0.25 * derivative, 32, 12, "cpu", "fixture"
+    )
+    overlap = rng.normal(size=derivative.shape)
+    overlap += overlap.swapaxes(-1, -2).copy()
+    frames = [
+        (rng.normal(size=(3, n)), rng.normal(size=(3, 3-n)), rng.normal(size=(2, 3, 3-n, n)))
+        for n in occupations
+    ]
+    occupation = 2 if len(frames) == 1 else 1
+    expected = np.stack([
+        integrals.occupied_expectation_gradient(co, cv, overlap, uvo, occupation=occupation)
+        for co, cv, uvo in frames
+    ])
+    program, feeds = inputs(integrals, overlap, frames, occupation)
+    native_plan = plan_cuda(program, cuda_target_info("sm_89"))
+    assert len(native_plan.inputs) == 8 and len(native_plan.outputs) == 1
+    assert native_plan.semantic_traffic["device_to_host_bytes"] == expected.nbytes
+    np.testing.assert_allclose(execute(program, feeds).outputs["gradient"], expected, atol=3e-13)
+    if len(frames) == 2:
+        occupied, virtual, response = zip(*frames)
+        actual = integrals.occupied_expectation_gradient(occupied, virtual, overlap, response)
+        np.testing.assert_allclose(actual, expected, atol=3e-13)
+        with pytest.raises(ValueError, match="occupation 1"):
+            integrals.occupied_expectation_gradient(occupied, virtual, overlap, response, occupation=2)
