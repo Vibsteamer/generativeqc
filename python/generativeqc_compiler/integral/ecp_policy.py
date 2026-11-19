@@ -12,6 +12,8 @@ EXTENDED_RADIAL_POINTS = 384
 EXTENDED_POLAR_POINTS = 80
 MAX_CUDA_RADIAL_POINTS = 512
 MAX_CUDA_POLAR_POINTS = 96
+ORBITAL_G_RADIAL_POINTS = 640
+ORBITAL_G_POLAR_POINTS = 112
 REFINED_RADIAL_POINTS = 224
 REFINED_POLAR_POINTS = 44
 MATRIX_ABS_TOLERANCE = 2e-9
@@ -36,6 +38,8 @@ def emit_ecp_policy_cpp() -> typing.Any:
         ("extended_polar_points", EXTENDED_POLAR_POINTS),
         ("max_cuda_radial_points", MAX_CUDA_RADIAL_POINTS),
         ("max_cuda_polar_points", MAX_CUDA_POLAR_POINTS),
+        ("orbital_g_radial_points", ORBITAL_G_RADIAL_POINTS),
+        ("orbital_g_polar_points", ORBITAL_G_POLAR_POINTS),
         ("coarse_radial_points", COARSE_RADIAL_POINTS),
         ("coarse_polar_points", COARSE_POLAR_POINTS),
         ("refined_radial_points", REFINED_RADIAL_POINTS),

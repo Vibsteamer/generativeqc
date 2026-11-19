@@ -42,3 +42,15 @@ grid, the maximum differences across those g rows were 6.58 × 10⁻¹⁴ Eh
 and 6.31 × 10⁻¹⁴ Eh/bohr against independent libcint matrices. This
 control tests finite g projections and contributes no molecular energy
 or training label.
+
+For a checked BrH₂/Q DF-UHF reference, the largest derivative difference
+between the 384 × 80 and 512 × 96 grids was 2.79 × 10⁻⁸ Eh/bohr, exceeding
+the existing 2 × 10⁻⁸ entrywise gate. The comparison to 640 × 112 passed
+on the first attempt, with all nine force components within 4.47 × 10⁻⁷
+Eh/bohr of an independent root-matched PySCF DF-UHF gradient and within
+5.05 × 10⁻⁸ Eh/bohr of the two-step native finite differences. The
+36 displaced energies all passed the original 512 × 96 check. The
+internal grid selector and concrete workspace estimate use the same
+maximum. Access requires the caller's validated refinement policy and an
+orbital g shell. Public orbital basis and method dispatch keep their
+separate admission checks.

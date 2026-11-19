@@ -262,14 +262,16 @@ void run(const core::System& system, unsigned radial, unsigned polar, bool deriv
     };
     bool passed = accepted();
     if (!passed && system.refine_ecp_quadrature) {
-      const unsigned radial_levels[] = {generated::ecp_extended_radial_points,
-                                        generated::ecp_max_cuda_radial_points};
-      const unsigned polar_levels[] = {generated::ecp_extended_polar_points,
-                                       generated::ecp_max_cuda_polar_points};
-      for (unsigned level = 0; !passed && level < 2; ++level) {
+      const auto limit = checked_ecp_grid_limit(system);
+      const EcpGridShape levels[]{
+          {generated::ecp_extended_radial_points, generated::ecp_extended_polar_points},
+          {generated::ecp_max_cuda_radial_points, generated::ecp_max_cuda_polar_points},
+          {generated::ecp_orbital_g_radial_points, generated::ecp_orbital_g_polar_points}};
+      for (const auto grid : levels) {
+        if (passed || grid.radial > limit.radial) break;
         check(cudaMemcpyAsync(coarse, output, 2 * stride * sizeof(double),
                               cudaMemcpyDeviceToDevice, stream));
-        evaluate_grid(radial_levels[level], polar_levels[level], output);
+        evaluate_grid(grid.radial, grid.polar, output);
         passed = accepted();
       }
     }

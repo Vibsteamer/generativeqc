@@ -158,13 +158,20 @@ EcpData checked_ecp_integrals(const core::System& system, bool derivatives) {
   return fine;
 }
 
+EcpGridShape checked_ecp_grid_limit(const core::System& system) {
+  if (!system.refine_ecp_quadrature)
+    return {generated::ecp_refined_radial_points, generated::ecp_refined_polar_points};
+  const bool orbital_g = std::any_of(system.shells.begin(), system.shells.end(),
+                                     [](const auto& shell) { return shell.angular_momentum == 4; });
+  if (orbital_g)
+    return {generated::ecp_orbital_g_radial_points, generated::ecp_orbital_g_polar_points};
+  return {generated::ecp_max_cuda_radial_points, generated::ecp_max_cuda_polar_points};
+}
+
 std::size_t ecp_workspace_capacity(const core::System& system) {
   if (system.ecp_terms.empty()) return 0;
   const auto ao_count = molecule::ao_count(system);
-  const auto polar = system.refine_ecp_quadrature ? generated::ecp_max_cuda_polar_points
-                                                : generated::ecp_refined_polar_points;
-  const auto radial = system.refine_ecp_quadrature ? generated::ecp_max_cuda_radial_points
-                                                 : generated::ecp_refined_radial_points;
+  const auto [radial, polar] = checked_ecp_grid_limit(system);
   const auto angular = runtime::size_mul(2 * polar, polar);
   const auto tile = generated::ecp_cuda_radial_tile(ao_count, polar);
   const auto coordinates = runtime::size_add(1, runtime::size_mul(3, system.atoms.size()));
