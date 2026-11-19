@@ -187,3 +187,45 @@ def test_ao_nuclear_equations_against_displaced_unwhitened_fock(
                     0, axis
                 ] == pytest.approx(ref, abs=2e-8)
         np.testing.assert_allclose(built.nuclear_rhs[0, axis], rhs, atol=2e-8, rtol=0)
+
+
+@pytest.mark.parametrize("occupations", [(2, 1), (2, 0), (0, 1)])
+def test_canonical_driver_matches_independent_fock_difference(occupations) -> None:
+    from generativeqc_compiler.mp2.f12_unrestricted_reference import unrestricted_df_canonical_driver
+    from generativeqc_compiler.tensor import execute
+
+    rng = np.random.default_rng(45)
+    n, q = 4, 3
+    args, blocks = {}, []
+    for spin, occupied in zip(("alpha", "beta"), occupations, strict=True):
+        if not occupied:
+            continue
+        factors = rng.normal(size=(q, n, n))
+        factors += factors.transpose(0, 2, 1)
+        seed = rng.normal(size=(n, n))
+        seed += seed.T
+        args["df_" + spin], args["fock_seed_" + spin] = factors, seed
+        trial = rng.normal(size=(n - occupied, occupied))
+        generator = np.zeros((n, n))
+        generator[occupied:, :occupied] = trial
+        generator[:occupied, occupied:] = -trial.T
+        blocks.append((spin, occupied, trial, generator, factors, seed))
+    driver = execute(unrestricted_df_canonical_driver(*occupations, n, q), args).outputs
+    analytic = sum(np.vdot(driver[s], trial) for s, _, trial, *_ in blocks)
+
+    def fock_functional(step):
+        from scipy.linalg import expm
+
+        densities = [expm(step * g)[:, :o] for _, o, _, g, _, _ in blocks]
+        densities = [c @ c.T for c in densities]
+        total_charge = sum(np.einsum("Apq,pq->A", b, d)
+                           for (_, _, _, _, b, _), d in zip(blocks, densities, strict=True))
+        value = 0.
+        for (_, _, _, _, b, y), d in zip(blocks, densities, strict=True):
+            fock = np.einsum("Apq,A->pq", b, total_charge) - np.einsum("Api,ij,Aqj->pq", b, d, b)
+            value += np.vdot(y, fock)
+        return value
+
+    h = 1e-5
+    np.testing.assert_allclose(analytic, (fock_functional(h) - fock_functional(-h)) / (2*h),
+                               rtol=2e-8, atol=2e-8)

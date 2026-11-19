@@ -80,6 +80,36 @@ def unrestricted_df_orbital_action(
     )
 
 
+def unrestricted_df_canonical_driver(
+    nalpha: int, nbeta: int, orbitals: int, auxiliaries: int
+) -> Program:
+    """Differentiate the UHF Fock matrices against spin-resolved canonical seeds."""
+    if (any(type(x) is not int for x in (nalpha, nbeta, orbitals, auxiliaries))
+            or min(nalpha, nbeta) < 0 or not nalpha + nbeta
+            or max(nalpha, nbeta) >= orbitals or auxiliaries < 1):
+        raise ValueError("Need occupied electrons and nonempty virtual and fitting spaces")
+    aux = Index("A", IndexSpace("f12_fitting", "auxiliary", auxiliaries))
+    charges, exchanges, blocks = [], {}, {}
+    for spin, occ in (("alpha", nalpha), ("beta", nbeta)):
+        if not occ:
+            continue
+        orbital = IndexSpace("OBS_" + spin, "orbital", orbitals, spin=spin)
+        p, q = Index("p", orbital), Index("q", orbital)
+        factors = _field(spin, "df", aux, p, q)
+        seed = _field(spin, "fock_seed", p, q)
+        charges.append(einsum("Apq,pq->A", factors, seed))
+        weighted = einsum("Api,ij->Apj", factors, seed)
+        exchanges[spin] = einsum("Apj,Aqj->pq", weighted, factors)
+        blocks[spin] = (occ, factors)
+    charge = add(*charges)
+    channels = {}
+    for spin, (occ, factors) in blocks.items():
+        field = add(einsum("Apq,A->pq", factors, charge), exchanges[spin], coefficients=(1, -1))
+        channels[spin] = slice_tensor(add(field, transpose(field, (1, 0))),
+                                      ((occ, orbitals), (0, occ)))
+    return Program(channels, provenance={"method": "Canonical Fock cotangent to coupled DF-UHF orbital driver"})
+
+
 def unrestricted_df_nuclear_direction(
     nalpha: int, nbeta: int, orbitals: int, auxiliaries: int, ao_functions: int
 ) -> Program:

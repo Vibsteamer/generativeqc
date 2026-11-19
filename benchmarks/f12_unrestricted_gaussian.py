@@ -12,6 +12,7 @@ from generativeqc.elements import atomic_number
 from generativeqc.f12_orbital_response import (
     unrestricted_canonical_source_seeds,
     unrestricted_nuclear_source_weights,
+    unrestricted_source_orbital_adjoint,
 )
 
 from benchmarks.f12_molecular_integral_forward import forward_integrals
@@ -184,7 +185,7 @@ def spin_ao_inputs(
 def gaussian_orbital_forces(
     space: tuple[int, int, int, int],
     central: Mapping[str, np.ndarray],
-    orbital_adjoint: np.ndarray,
+    orbital_adjoint: np.ndarray | None,
     direct: Mapping[str, np.ndarray],
     frame_overlap: Mapping[str, np.ndarray],
     geometry: dict,
@@ -197,13 +198,16 @@ def gaussian_orbital_forces(
     canonical_energies: Mapping[str, np.ndarray] | None = None,
     canonical_library: ctypes.CDLL | None = None,
     canonical_output: dict[str, np.ndarray] | None = None,
+    orbital_response_library: ctypes.CDLL | None = None,
+    orbital_response_output: dict[str, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, dict, dict[str, np.ndarray]]:
     """Project central electronic weights through the native Gaussian nuclear gradients.
 
     The two providers contract every atomic direction directly from the shared
     shell geometry, including the nuclear attraction center. No displaced or
     analytic AO derivative arrays are needed. The reference force, direct F12
-    source pullback, frame seeds and orbital adjoint must belong to this root.
+    source pullback and frame seeds must belong to this root. When the orbital
+    adjoint is omitted, form its electronic driver and solve from this same center.
     Return total forces, provider diagnostics and the four corrected weights.
     """
     manifest = json.loads(str(layout["manifest"]))
@@ -234,6 +238,15 @@ def gaussian_orbital_forces(
         central = {**central, **seeds}
         if canonical_output is not None:
             canonical_output.update(seeds)
+    if orbital_adjoint is None:
+        if canonical_energies is None:
+            raise ValueError("Computing the orbital adjoint requires canonical energies")
+        driver, orbital_adjoint = unrestricted_source_orbital_adjoint(
+            space, central, canonical_energies, run, maximum_bytes=budget_mib << 20,
+            library=orbital_response_library,
+        )
+        if orbital_response_output is not None:
+            orbital_response_output.update(driver=driver, rotations=orbital_adjoint)
     corrected = unrestricted_nuclear_source_weights(
         space,
         central,
