@@ -528,6 +528,66 @@ generativeqc::core::System compact_auxiliary_system() {
 }
 
 #if GENERATIVEQC_HAS_CUDA
+void check_cuda_g_one_electron_derivatives() {
+  using generativeqc::integrals::IntegralData;
+  using generativeqc::scf::build_cuda_one_electron_integrals;
+  using generativeqc::scf::build_cuda_one_electron_integrals_batch;
+  generativeqc::core::System first;
+  first.atoms = {{1, {-0.24, 0.13, 0.27}}, {2, {1.21, -0.73, 0.51}}, {1, {0.63, 0.46, -1.02}}};
+  first.shells = {
+      {0, 4, {{0.83, 1.0}}}, {1, 3, {{0.51, 1.0}}}, {1, 4, {{0.62, 1.0}}}, {2, 0, {{0.76, 1.0}}}};
+  first.basis_representation = GENERATIVEQC_BASIS_CARTESIAN;
+  std::string detail;
+  require(generativeqc::molecule::validate_and_normalize(first, detail, 4) ==
+              GENERATIVEQC_STATUS_SUCCESS,
+          detail.c_str());
+  auto second = first;
+  second.atoms[0].position[1] += 0.31;
+  const std::vector<generativeqc::core::System> systems{first, second};
+  std::vector<IntegralData> batch;
+  require(build_cuda_one_electron_integrals_batch(0, systems, batch, detail, true, false) ==
+              GENERATIVEQC_STATUS_SUCCESS,
+          detail.c_str());
+  require(batch.size() == systems.size(), "incorrect g derivative batch size");
+  constexpr double step = 1.0e-4;
+  for (std::size_t item = 0; item < systems.size(); ++item) {
+    IntegralData single;
+    require(build_cuda_one_electron_integrals(0, systems[item], single, detail, true, false) ==
+                GENERATIVEQC_STATUS_SUCCESS,
+            detail.c_str());
+    const auto elements = single.nbf * single.nbf;
+    const auto coordinates = systems[item].atoms.size() * 3;
+    for (const auto* output : {&single, &batch[item]})
+      require(output->ncoord == coordinates &&
+                  output->overlap_derivative.size() == elements * coordinates &&
+                  output->hcore_derivative.size() == elements * coordinates,
+              "incomplete Cartesian g derivative export");
+    for (std::size_t c = 0; c < coordinates; ++c) {
+      auto plus = systems[item], minus = systems[item];
+      plus.atoms[c / 3].position[c % 3] += step;
+      minus.atoms[c / 3].position[c % 3] -= step;
+      IntegralData ep, em;
+      require(build_cuda_one_electron_integrals(0, plus, ep, detail, false, false) ==
+                  GENERATIVEQC_STATUS_SUCCESS,
+              detail.c_str());
+      require(build_cuda_one_electron_integrals(0, minus, em, detail, false, false) ==
+                  GENERATIVEQC_STATUS_SUCCESS,
+              detail.c_str());
+      for (std::size_t k = 0; k < elements; ++k) {
+        const double ds = (ep.overlap[k] - em.overlap[k]) / (2 * step);
+        const double dh = (ep.hcore[k] - em.hcore[k]) / (2 * step);
+        for (const auto* output : {&single, &batch[item]}) {
+          const auto n = c * elements + k;
+          require(std::abs(output->overlap_derivative[n] - ds) < 3e-7,
+                  "Cartesian g overlap derivative differs from displaced values");
+          require(std::abs(output->hcore_derivative[n] - dh) < 3e-7,
+                  "Cartesian g core derivative differs from displaced values");
+        }
+      }
+    }
+  }
+}
+
 void check_cuda_nuclear_only_derivatives() {
   generativeqc::core::System system;
   system.atoms = {{1, {0.1, -0.3, 0.2}}, {2, {1.2, 0.4, -0.5}}, {3, {-0.6, 1.1, 0.8}}};
@@ -1236,6 +1296,7 @@ int main() {
     }
     if (cuda_device_available()) {
       check_cuda_nuclear_only_derivatives();
+      check_cuda_g_one_electron_derivatives();
       for (std::size_t a : {1U, 2U, 5U}) {
         // Unequal dimensions and nonsymmetric A/D expose any accidental AO
         // transpose in the flattened resident contraction. Physical integral

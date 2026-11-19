@@ -21,18 +21,25 @@ __global__ void build_cuda_one_electron_derivatives_kernel(
   const std::int64_t system_derivative_coordinate =
       derivative_coordinate < 0 ? derivative_coordinate
                                 : derivative_coordinate + batch.atom_offsets[system] * 3;
-  const Dual overlap_value =
-      contracted_overlap<Dual>(batch, system, static_cast<std::int32_t>(row),
-                               static_cast<std::int32_t>(column), system_derivative_coordinate);
-  const Dual hcore_value =
-      contracted_hcore<Dual>(batch, system, static_cast<std::int32_t>(row),
-                             static_cast<std::int32_t>(column), system_derivative_coordinate);
+  const auto base = static_cast<std::size_t>(system) * n;
+  const auto li = batch.shell_angular[batch.ao_shells[base + row]];
+  const auto lj = batch.shell_angular[batch.ao_shells[base + column]];
+  double ds, dh;
+  if (li == 4 || lj == 4) {
+    contracted_g_export_derivatives(batch, system, row, column, system_derivative_coordinate, ds,
+                                    dh);
+  } else {
+    ds = contracted_overlap<Dual>(batch, system, row, column, system_derivative_coordinate)
+             .derivative;
+    dh =
+        contracted_hcore<Dual>(batch, system, row, column, system_derivative_coordinate).derivative;
+  }
   const std::size_t matrix_offset = static_cast<std::size_t>(system) * n * n;
-  overlap[matrix_offset + row * n + column] = overlap_value.derivative;
-  hcore[matrix_offset + row * n + column] = hcore_value.derivative;
+  overlap[matrix_offset + row * n + column] = ds;
+  hcore[matrix_offset + row * n + column] = dh;
   if (row != column) {
-    overlap[matrix_offset + column * n + row] = overlap_value.derivative;
-    hcore[matrix_offset + column * n + row] = hcore_value.derivative;
+    overlap[matrix_offset + column * n + row] = ds;
+    hcore[matrix_offset + column * n + row] = dh;
   }
 }
 
