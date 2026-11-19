@@ -32,3 +32,13 @@ nuclear elements agree with a differentiated Cholesky control within 4.5e-14.
 The four AO derivative arrays, central frame and electronic energy weights
 remain caller inputs. Two additional direct F12/frame gradient contributions
 and the reference force are supplied separately to the force assembly.
+
+The reverse nuclear-source program transposes this same equation with the
+solved orbital adjoint and unit fixed-gradient seeds. It emits symmetric
+full-Frobenius weights for S, h, three-center Coulomb and the fitting metric.
+With direct energy weights and both OBS/CABS overlap responses, it adds them
+in the same generated program. A derivative integral provider can contract the
+result in every nuclear direction using only the central electronic data.
+The coefficient tests compare the four raw arrays with an independent direct
+differentiation of the DF inverse metric, and their contraction with each of
+the nine physical AO directions reproduces the forward orbital gradient.

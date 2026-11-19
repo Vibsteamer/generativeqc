@@ -7,6 +7,7 @@ from typing import NamedTuple
 import numpy as np
 from generativeqc_compiler.mp2.f12_unrestricted_reference import (
     unrestricted_df_nuclear_direction,
+    unrestricted_df_nuclear_weights,
 )
 
 from . import _native
@@ -35,6 +36,20 @@ class UnrestrictedNuclearSourceTerms(NamedTuple):
     fixed_gradients: dict[str, np.ndarray]
 
 
+def _nuclear_center(
+    central: Mapping[str, np.ndarray], oa: int, ob: int
+) -> dict[str, np.ndarray]:
+    fields = {"whitener": central["whitener"]}
+    for spin, occ in (("alpha", oa), ("beta", ob)):
+        for key in ("coefficients", "df", "fock_seed", "overlap_seed"):
+            name = f"{key}_{spin}"
+            fields[name] = central[name]
+        if occ:
+            name = f"occupied_energies_{spin}"
+            fields[name] = central[name]
+    return fields
+
+
 def unrestricted_nuclear_source_terms(
     space: tuple[int, int, int, int],
     central: Mapping[str, np.ndarray],
@@ -58,14 +73,7 @@ def unrestricted_nuclear_source_terms(
     program = unrestricted_df_nuclear_direction(oa, ob, n, q, coeff.shape[0])
     keys = ("dmetric", "dthree_center", "doverlap", "dhcore")
     spin_pairs = (("alpha", oa), ("beta", ob))
-    fields = {"whitener": central["whitener"]}
-    for spin, occ in spin_pairs:
-        for key in ("coefficients", "df", "fock_seed", "overlap_seed"):
-            name = f"{key}_{spin}"
-            fields[name] = central[name]
-        if occ:
-            name = f"occupied_energies_{spin}"
-            fields[name] = central[name]
+    fields = _nuclear_center(central, oa, ob)
     rhs = np.zeros((n_atoms, 3, oa * (n - oa) + ob * (n - ob)))
     fixed = {
         f"{key}_{spin}": np.empty((n_atoms, 3))
@@ -85,6 +93,62 @@ def unrestricted_nuclear_source_terms(
     ):
         raise ValueError("Nonfinite DF-UHF nuclear equation or fixed gradient")
     return UnrestrictedNuclearSourceTerms(rhs, fixed)
+
+
+def unrestricted_nuclear_source_weights(
+    space: tuple[int, int, int, int],
+    central: Mapping[str, np.ndarray],
+    orbital_adjoint: np.ndarray,
+    run: Callable,
+    *,
+    direct_weights: Mapping[str, np.ndarray] | None = None,
+    frame_overlap: Mapping[str, np.ndarray] | None = None,
+) -> dict[str, np.ndarray]:
+    """Prepare orbital-response gradient weights for the Gaussian nuclear sinks.
+
+    Each returned AO/metric array contracts with a derivative of the same
+    operator. Add these four arrays to the direct energy weights; separately
+    include the OBS/CABS frame overlap response. The adjoint and the central
+    seeds must describe the same electronic observable and SCF root. This
+    operation uses only central quantities and produces every atomic direction's
+    weights in one reverse evaluation. To return effective weights for these four
+    operators, supply their direct energy cotangents and both spin frame-overlap
+    cotangents. The other Gaussian operator weights pass unchanged to their sinks.
+    """
+    oa, ob, n, q = space
+    coeff = np.asarray(central["coefficients_alpha"])
+    if coeff.ndim != 2:
+        raise ValueError("Expected an AO-by-OBS alpha coefficient matrix")
+    include_direct = direct_weights is not None
+    if include_direct != (frame_overlap is not None):
+        raise ValueError(
+            "Direct Gaussian and frame-overlap weights must be supplied together"
+        )
+    graph = unrestricted_df_nuclear_weights(
+        oa, ob, n, q, coeff.shape[0], include_direct=include_direct
+    )
+    z = _block(orbital_adjoint, (oa * (n - oa) + ob * (n - ob),), "orbital adjoint")
+    fields = _nuclear_center(central, oa, ob)
+    if direct_weights is not None and frame_overlap is not None:
+        for name in ("overlap_ao", "hcore_ao", "ao_coulomb", "coulomb_metric"):
+            fields["direct_" + name] = direct_weights[
+                "metric/coulomb" if name == "coulomb_metric" else name
+            ]
+        for spin in ("alpha", "beta"):
+            fields["frame_" + spin] = frame_overlap[spin]
+    offset = 0
+    for spin, occ in (("alpha", oa), ("beta", ob)):
+        for key in ("fixed_fock", "metric_density", "fixed_overlap"):
+            fields[f"bar_{key}_{spin}"] = np.array(1.0)
+        if occ:
+            size = (n - occ) * occ
+            fields["bar_rhs_" + spin] = z[offset : offset + size].reshape(n - occ, occ)
+            offset += size
+    weights = dict(run(graph, fields).outputs)
+    weights["metric/coulomb"] = weights.pop("coulomb_metric")
+    if any(not np.isfinite(w).all() for w in weights.values()):
+        raise ValueError("Nonfinite DF-UHF nuclear source weights")
+    return weights
 
 
 def unrestricted_orbital_forces(

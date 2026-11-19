@@ -3,14 +3,26 @@
 import ctypes
 import json
 import time
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import numpy as np
 from generativeqc._f12_cabs import cabs_projector
 from generativeqc.elements import atomic_number
+from generativeqc.f12_orbital_response import unrestricted_nuclear_source_weights
 
 from benchmarks.f12_molecular_integral_forward import forward_integrals
+from benchmarks.f12_molecular_one_electron import native_contraction
 from benchmarks.f12_molecular_one_electron_forward import combined_matrices
+from benchmarks.f12_molecular_sink_live import contract_live_weights
+
+_METRICS = {
+    "metric/coulomb": "metric",
+    "metric/geminal": "metric_f12",
+    "metric/squared_geminal": "metric_f12_squared",
+    "metric/geminal_coulomb": "metric_f12_over_coulomb",
+    "metric/double_commutator": "metric_double_commutator",
+}
 
 
 def _check_geometry(science: dict, manifest: dict, snapshot_input: Path) -> None:
@@ -158,13 +170,86 @@ def spin_ao_inputs(
     ao = {
         "overlap_ao": overlap,
         "hcore_ao": hcore,
-        "metric/coulomb": operators["metric"],
-        "metric/geminal": operators["metric_f12"],
-        "metric/squared_geminal": operators["metric_f12_squared"],
-        "metric/geminal_coulomb": operators["metric_f12_over_coulomb"],
-        "metric/double_commutator": operators["metric_double_commutator"],
+        **{source: operators[name] for source, name in _METRICS.items()},
         **{k: v for k, v in operators.items() if k.startswith("ao_")},
     }
     native_obs_rows = obs_rows[order]
     block = np.ix_(native_obs_rows, native_obs_rows)
     return ao, embedding, complement, order, overlap[block], hcore[block]
+
+
+def gaussian_orbital_forces(
+    space: tuple[int, int, int, int],
+    central: Mapping[str, np.ndarray],
+    orbital_adjoint: np.ndarray,
+    direct: Mapping[str, np.ndarray],
+    frame_overlap: Mapping[str, np.ndarray],
+    geometry: dict,
+    layout: Mapping[str, np.ndarray],
+    reference_forces: np.ndarray,
+    sink_library: Path,
+    run: Callable,
+    *,
+    budget_mib: int = 512,
+) -> tuple[np.ndarray, dict, dict[str, np.ndarray]]:
+    """Project central electronic weights through the native Gaussian nuclear gradients.
+
+    The two providers contract every atomic direction directly from the shared
+    shell geometry, including the nuclear attraction center. No displaced or
+    analytic AO derivative arrays are needed. The reference force, direct F12
+    source pullback, frame seeds and orbital adjoint must belong to this root.
+    Return total forces, provider diagnostics and the four corrected weights.
+    """
+    manifest = json.loads(str(layout["manifest"]))
+    basis = geometry["combined_basis"]
+    dims = geometry["layout"]["space"]
+    if (
+        tuple(dims[:3]) + tuple(dims[4:]) != space
+        or manifest["case"] != geometry["molecule"]
+        or manifest["geometry_sha256"] != geometry["geometry"]["geometry_sha256"]
+        or manifest["elements"] != basis["elements"]
+        or manifest["geometry_bohr"] != basis["coordinates_bohr"]
+        or manifest["options"] != geometry["options"]
+    ):
+        raise ValueError(
+            "Gaussian integral providers require the same spin space and shell geometry"
+        )
+    corrected = unrestricted_nuclear_source_weights(
+        space,
+        central,
+        orbital_adjoint,
+        run,
+        direct_weights=direct,
+        frame_overlap=frame_overlap,
+    )
+    operators = {key: direct[key] for key in direct if key.startswith("ao_")}
+    operators["ao_coulomb"] = corrected["ao_coulomb"]
+    for key, name in _METRICS.items():
+        operators[name] = corrected[key] if key in corrected else direct[key]
+    gauss = contract_live_weights(
+        layout, operators, sink_library, budget_mib=budget_mib
+    )
+    one = native_contraction(
+        geometry["combined_basis"],
+        corrected["overlap_ao"],
+        corrected["hcore_ao"],
+        np.asarray(geometry["layout"]["native_to_source"]),
+    )
+    ref = np.asarray(reference_forces)
+    if (
+        ref.shape != (len(geometry["combined_basis"]["elements"]), 3)
+        or ref.dtype != np.float64
+    ):
+        raise ValueError("Expected a FP64 reference force for each nucleus")
+    forces = ref - np.asarray(gauss["gradient_Eh_per_bohr"]) - one.gradient
+    if not gauss["passes_contraction_checks"] or not np.isfinite(forces).all():
+        raise ValueError("Gaussian response failed contraction checks")
+    return (
+        forces,
+        {
+            "Gaussian": gauss,
+            "one_electron_gradient": one.gradient.tolist(),
+            "one_electron_resources": one.resources,
+        },
+        corrected,
+    )
