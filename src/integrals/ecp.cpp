@@ -21,7 +21,7 @@ struct AO {
   const core::Shell* shell;
   int primitive_offset{}, primitive_count{}, term_count{};
   double x, y, z;
-  Component components[3];
+  Component components[molecule::kMaximumAuxiliaryAoExpansionTerms];
 };
 struct Jet {
   double v[4];
@@ -45,13 +45,17 @@ EcpData ecp_integrals(const core::System& system, unsigned radial, unsigned angu
   const auto derivative_elements = runtime::size_mul(ncoord, size);
   std::vector<AO> aos;
   for (const auto& shell : system.shells) {
+    if (shell.angular_momentum > generated::ecp_max_orbital_angular)
+      throw std::invalid_argument("ECP AO shell exceeds the generated quadrature domain");
     if (shell.primitives.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
       throw std::overflow_error("ECP primitive count exceeds the generated index type");
     const auto& position = system.atoms[shell.atom_index].position;
     const auto expansions =
         molecule::ao_expansions(shell.angular_momentum, system.basis_representation);
     if (std::any_of(expansions.begin(), expansions.end(),
-                    [](const auto& expansion) { return expansion.size() > 3; }))
+                    [](const auto& expansion) {
+                      return expansion.size() > molecule::kMaximumAuxiliaryAoExpansionTerms;
+                    }))
       throw std::invalid_argument("ECP AO expansion exceeds validated domain");
     for (const auto& expansion : expansions) {
       AO ao{&shell,
@@ -177,7 +181,7 @@ std::size_t ecp_workspace_capacity(const core::System& system) {
   bytes = runtime::size_add(bytes, runtime::size_mul(4 * sizeof(EcpSpherePoint), angular));
   bytes = runtime::size_add(
       bytes, runtime::size_mul(4 * sizeof(EcpRadialPoint), radial));
-  bytes = runtime::size_add(bytes, runtime::size_mul(512, ao_count));
+  bytes = runtime::size_add(bytes, runtime::size_mul(4 * sizeof(AO), ao_count));
   bytes = runtime::size_add(bytes,
                             runtime::size_mul(4 * sizeof(core::EcpTerm), system.ecp_terms.size()));
   for (const auto& shell : system.shells)

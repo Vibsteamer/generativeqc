@@ -13,7 +13,7 @@ from .ecp_grid import emit_ecp_grid_cpp
 from .ecp_policy import emit_ecp_policy_cpp
 from .ecp_schedule import emit_ecp_schedule_cpp
 from .expr import Graph
-from .ir import ECP_MAX_ORBITAL_ANGULAR, ECP_MAX_PROJECTOR_ANGULAR, EcpRadialTerm
+from .ir import ECP_MAX_PROJECTOR_ANGULAR, EcpRadialTerm
 from .scalar_c import ScalarCEmitter
 
 
@@ -142,8 +142,13 @@ def _emit_weighted_consumer() -> typing.Any:
     return lines
 
 
+# The raw quadrature also serves private orbital-g ECP reference validation.
+# Public method and Gaussian integral lowering domains are checked separately.
+ECP_QUADRATURE_MAX_ORBITAL_ANGULAR = 4
+
+
 def emit_ecp_quadrature_cpp(
-    max_orbital_angular: int = ECP_MAX_ORBITAL_ANGULAR,
+    max_orbital_angular: int = ECP_QUADRATURE_MAX_ORBITAL_ANGULAR,
 ) -> str:
     """Emit the validated s/p/d/f projector and powers 0..4 domain.
 

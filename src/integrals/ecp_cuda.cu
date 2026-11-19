@@ -24,7 +24,7 @@ struct Component {
 struct AO {
   int atom, primitive_offset, primitive_count, term_count;
   double x, y, z;
-  Component components[3];
+  Component components[molecule::kMaximumAuxiliaryAoExpansionTerms];
 };
 struct Four {
   double v[4];
@@ -163,6 +163,8 @@ void run(const core::System& system, unsigned radial, unsigned polar, bool deriv
   std::vector<AO> aos;
   std::vector<Primitive> primitives;
   for (const auto& shell : system.shells) {
+    if (shell.angular_momentum > generated::ecp_max_orbital_angular)
+      throw std::invalid_argument("ECP AO shell exceeds the generated quadrature domain");
     const auto& atom = system.atoms[shell.atom_index];
     const auto offset = primitives.size();
     if (shell.primitives.size() > limit || offset > limit - shell.primitives.size())
@@ -170,7 +172,7 @@ void run(const core::System& system, unsigned radial, unsigned polar, bool deriv
     for (const auto& p : shell.primitives) primitives.push_back({p.exponent, p.coefficient});
     for (const auto& expansion :
          molecule::ao_expansions(shell.angular_momentum, system.basis_representation)) {
-      if (expansion.size() > 3)
+      if (expansion.size() > molecule::kMaximumAuxiliaryAoExpansionTerms)
         throw std::invalid_argument("ECP AO expansion exceeds validated domain");
       AO ao{static_cast<int>(shell.atom_index),
             static_cast<int>(offset),
