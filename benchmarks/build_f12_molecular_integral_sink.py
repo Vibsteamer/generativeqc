@@ -27,10 +27,16 @@ def main() -> None:
     parser.add_argument("--cxx", default=shutil.which("c++"))
     parser.add_argument("--arch", default="sm_89")
     parser.add_argument("--backend", choices=["host", "cuda"], default="cuda")
-    parser.add_argument(
+    shell_domain = parser.add_mutually_exclusive_group()
+    shell_domain.add_argument(
         "--cabs-h",
         action="store_true",
         help="Build a separately named FP64 variant for combined-basis h/h/h sources.",
+    )
+    shell_domain.add_argument(
+        "--cabs-i",
+        action="store_true",
+        help="Build a separately named FP64 variant for combined-basis i/i/i sources.",
     )
     args = parser.parse_args()
     cuda = args.backend == "cuda"
@@ -39,7 +45,7 @@ def main() -> None:
         parser.error("selected backend compiler is unavailable")
     launcher = resolve_compiler_cache()
     out = args.output_dir.resolve()
-    domain_suffix = "_cabs_h" if args.cabs_h else ""
+    domain_suffix = "_cabs_i" if args.cabs_i else "_cabs_h" if args.cabs_h else ""
     build = out / (args.backend + domain_suffix)
     build.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("CCACHE_BASEDIR", str(REPO))
@@ -63,7 +69,9 @@ def main() -> None:
         common += ["-arch=sm_" + arch, "-Xcompiler=-fPIC"]
     else:
         common += ["-x", "c++", "-fPIC", "-DGQC_SINK_HOST_REFERENCE"]
-    if args.cabs_h:
+    if args.cabs_i:
+        common.append("-DGQC_F12_CABS_I")
+    elif args.cabs_h:
         common.append("-DGQC_F12_CABS_H")
     emit = emit_df_derivatives_cuda if cuda else emit_df_derivatives_cpu
     objects = []
@@ -80,10 +88,11 @@ def main() -> None:
     for operator in ("coulomb", "geminal"):
         header = build / ("molecular-" + operator + ".hpp")
         content = emit(
-            auxiliary_h=True,
-            maximum_orbital=5 if args.cabs_h else 4,
+            auxiliary_h=not args.cabs_i,
+            maximum_orbital=6 if args.cabs_i else 5 if args.cabs_h else 4,
             fitted_geminal=operator == "geminal",
             cabs_h=args.cabs_h,
+            cabs_i=args.cabs_i,
         )
         if not header.exists() or header.read_text() != content:
             header.write_text(content)

@@ -7,17 +7,31 @@ from generativeqc_compiler.integral.df_values import build_df_axis_moment
 
 
 @pytest.mark.parametrize(
-    "powers", [(5, 0, 0), (5, 3, 4), (5, 5, 4), (6, 5, 4), (5, 6, 4), (5, 5, 5)]
+    "powers, maximum",
+    [
+        ((5, 0, 0), 5),
+        ((5, 3, 4), 5),
+        ((5, 5, 4), 5),
+        ((6, 5, 4), 5),
+        ((5, 6, 4), 5),
+        ((5, 5, 5), 5),
+        ((6, 6, 6), 6),
+        ((7, 6, 6), 6),
+        ((6, 7, 6), 6),
+    ],
 )
-def test_cabs_h_angular_polynomial_against_gauss_hermite(
-    powers: tuple[int, ...],
+def test_high_cabs_angular_polynomial_against_gauss_hermite(
+    powers: tuple[int, ...], maximum: int
 ) -> None:
     # Independent tensor-product Gaussian quadrature integrates the highest
-    # polynomial degree 16 exactly, including an internally raised derivative.
+    # polynomial degree 19 exactly, including an internally raised derivative.
     pa, pb, dx, sx, sy, ip, iq = (0.31, -0.24, 0.77, 0.4, 0.6, 0.45, 0.675)
     variables = {"pa": pa, "pb": pb, "dx": dx, "sx": sx, "sy": sy, "ip": ip, "iq": iq}
     graph, roots = axis_polynomial(
-        *powers, auxiliary_h_derivative=True, maximum_orbital=5
+        *powers,
+        auxiliary_h_derivative=maximum == 5,
+        auxiliary_i_derivative=maximum == 6,
+        maximum_orbital=maximum,
     )
     polynomial = np.array([graph.evaluate(root, variables) for root in roots])
     nodes, weights = np.polynomial.hermite.hermgauss(10)
@@ -45,6 +59,9 @@ def test_cabs_h_angular_polynomial_against_gauss_hermite(
         ((6, 5, 4), {"auxiliary_h": True, "maximum_orbital": 5}),
         ((6, 6, 4), {"auxiliary_h_derivative": True, "maximum_orbital": 5}),
         ((5, 5, 6), {"auxiliary_h_derivative": True, "maximum_orbital": 5}),
+        ((6, 6, 6), {"maximum_orbital": 6}),
+        ((7, 7, 6), {"auxiliary_i_derivative": True, "maximum_orbital": 6}),
+        ((6, 6, 7), {"auxiliary_i_derivative": True, "maximum_orbital": 6}),
     ],
 )
 def test_cabs_h_angular_scope(powers: tuple[int, ...], options: dict) -> None:

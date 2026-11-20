@@ -228,6 +228,7 @@ def emit_df_derivatives_cuda(
     maximum_orbital: int = 3,
     fitted_geminal: bool = False,
     cabs_h: bool = False,
+    cabs_i: bool = False,
 ) -> str:
     """Share base axis moments and Boys values across all independent centers.
 
@@ -245,6 +246,8 @@ def emit_df_derivatives_cuda(
 
     The separate molecular CABS h selection admits two combined-basis h slots
     and a fitting shell through h. It uses F16 for the highest single raise.
+    The opt-in i/i/i molecular domain uses F19. Both keep the same Gaussian
+    recurrence and physical center recovery.
     The conventional DF source inventory keeps its original orbital domain.
 
     Positive omega selects the same radial kernel in the metric and the
@@ -266,7 +269,12 @@ def emit_df_derivatives_cuda(
         raise ValueError("fitted-geminal nuclear response requires FP64")
     if scalar_type not in ("double", "float"):
         raise ValueError("scalar type must be double or float")
-    if cabs_h:
+    if cabs_i:
+        if maximum_orbital != 6 or auxiliary_h or auxiliary_g or cabs_h or scalar_type != "double":
+            raise ValueError(
+                "CABS i sources require FP64 and the explicit i/i/i response domain"
+            )
+    elif cabs_h:
         if maximum_orbital != 5 or not auxiliary_h or scalar_type != "double":
             raise ValueError(
                 "CABS h sources require FP64 and the h/h/h response domain"
@@ -292,7 +300,7 @@ __device__ __noinline__ void axis_polynomial(unsigned a,unsigned b,unsigned c,
 """
     if auxiliary_g and auxiliary_h:
         raise ValueError("select one auxiliary derivative domain")
-    auxiliary_maximum = 5 if auxiliary_h else 4 if auxiliary_g else 3
+    auxiliary_maximum = 6 if cabs_i else 5 if auxiliary_h else 4 if auxiliary_g else 3
     lines = [
         prefix.replace("__DF_BOYS__", "" if fitted_geminal else emit_df_boys_cuda())
     ]
@@ -303,12 +311,15 @@ __device__ __noinline__ void axis_polynomial(unsigned a,unsigned b,unsigned c,
     ):
         if a == b == maximum_orbital + 1 or (a > maximum_orbital + 1 and b != 0):
             continue
+        if cabs_i and a < b:
+            continue
         graph, roots = axis_polynomial(
             a,
             b,
             c,
             auxiliary_g_derivative=auxiliary_g,
             auxiliary_h_derivative=auxiliary_h,
+            auxiliary_i_derivative=cabs_i,
             maximum_orbital=maximum_orbital,
         )
         emitter = CudaEmitter(graph, {}, scalar_type=scalar_type)
@@ -467,22 +478,35 @@ __device__ __forceinline__ Response three_center(double alpha,Vec3 A,Angular a,
                 "order(a)>(metric?4U:3U) || order(b)>3 || order(c)>4",
             )
         )
-    if auxiliary_h:
-        slots = 2 * maximum_orbital + 7
+    if auxiliary_h or cabs_i:
+        slots = 2 * maximum_orbital + auxiliary_maximum + 2
+        extent = auxiliary_maximum + 1
+        shell = "i" if cabs_i else "h"
         source = (
             source.replace(
                 "GENERATIVEQC_GENERATED_DF_DERIVATIVES",
-                "GENERATIVEQC_GENERATED_DF_AUXILIARY_H_DERIVATIVES",
+                f"GENERATIVEQC_GENERATED_DF_AUXILIARY_{shell.upper()}_DERIVATIVES",
             )
-            .replace("generated_df_derivatives", "generated_df_auxiliary_h_derivatives")
-            .replace("a*20U+b*4U+c", f"a*{(maximum_orbital + 2) * 6}U+b*6U+c")
+            .replace("generated_df_derivatives", f"generated_df_auxiliary_{shell}_derivatives")
+            .replace("a*20U+b*4U+c", f"a*{(maximum_orbital + 2) * extent}U+b*{extent}U+c")
             .replace("f[11]", f"f[{slots}]")
             .replace("base[3][11]", f"base[3][{slots}]")
             .replace("raised[11],lowered[11]", f"raised[{slots}],lowered[{slots}]")
             .replace(
                 "order(a)>3 || order(b)>3 || order(c)>3",
-                f"order(a)>(metric?5U:{maximum_orbital}U) || order(b)>{maximum_orbital} || order(c)>5",
+                f"order(a)>(metric?{auxiliary_maximum}U:{maximum_orbital}U) || "
+                f"order(b)>{maximum_orbital} || order(c)>{auxiliary_maximum}",
             )
+        )
+    if cabs_i:
+        # The two product factors share one Gaussian coordinate. Reusing
+        # the same polynomial for swapped powers and means bounds generated
+        # source size, including both possible first derivative raises.
+        selector = f"  switch(a*{(maximum_orbital + 2) * extent}U+b*{extent}U+c) {{"
+        source = source.replace(
+            selector,
+            "  if(a<b) { const auto l=a; a=b; b=l; "
+            "const auto center=pa; pa=pb; pb=center; }\n" + selector,
         )
     if scalar_type == "float":
         source = source.replace(
@@ -503,6 +527,7 @@ def emit_df_derivatives_cpu(
     maximum_orbital: int = 3,
     fitted_geminal: bool = False,
     cabs_h: bool = False,
+    cabs_i: bool = False,
 ) -> str:
     """Lower the same generated DF derivative algebra to ordinary host C++.
 
@@ -518,7 +543,13 @@ def emit_df_derivatives_cpu(
         maximum_orbital=maximum_orbital,
         fitted_geminal=fitted_geminal,
         cabs_h=cabs_h,
+        cabs_i=cabs_i,
     )
+    if cabs_i:
+        source = source.replace(
+            "GENERATIVEQC_GENERATED_DF_AUXILIARY_I_DERIVATIVES_CUH",
+            "GENERATIVEQC_GENERATED_DF_AUXILIARY_I_DERIVATIVES_CPU_HPP",
+        )
     if auxiliary_h:
         source = source.replace(
             "GENERATIVEQC_GENERATED_DF_AUXILIARY_H_DERIVATIVES_CUH",

@@ -9,10 +9,18 @@
 
 #ifdef GQC_SINK_COULOMB
 #include "molecular-coulomb.hpp"
+#ifdef GQC_F12_CABS_I
+namespace poly = generativeqc::scf::generated_df_auxiliary_i_derivatives;
+#else
 namespace poly = generativeqc::scf::generated_df_auxiliary_h_derivatives;
+#endif
 #else
 #include "molecular-geminal.hpp"
+#ifdef GQC_F12_CABS_I
+namespace poly = generativeqc::scf::generated_f12_df_auxiliary_i_derivatives;
+#else
 namespace poly = generativeqc::scf::generated_f12_df_auxiliary_h_derivatives;
+#endif
 #endif
 namespace gi = generativeqc::integrals;
 
@@ -41,10 +49,15 @@ namespace gi = generativeqc::integrals;
 #endif
 
 namespace {
-#ifdef GQC_F12_CABS_H
+#if defined(GQC_F12_CABS_I)
+constexpr int maximum_combined_l = 6;
+constexpr int maximum_fitting_l = 6;
+#elif defined(GQC_F12_CABS_H)
 constexpr int maximum_combined_l = 5;
+constexpr int maximum_fitting_l = 5;
 #else
 constexpr int maximum_combined_l = 4;
+constexpr int maximum_fitting_l = 5;
 #endif
 constexpr int channels = 10;
 constexpr int threads = 64;
@@ -199,7 +212,8 @@ bool supported(ShellBatch data, int ncenter, int nshell, int nprimitive, int nbl
       data.weight_offsets[0] != 0 || data.weight_offsets[nblock] != nweights)
     return false;
   for (int s = 0; s < nshell; ++s) {
-    if (data.angular[s] < 0 || data.angular[s] > 5 || data.primitive_offsets[s] < 0 ||
+    if (data.angular[s] < 0 || data.angular[s] > maximum_fitting_l ||
+        data.primitive_offsets[s] < 0 ||
         data.primitive_offsets[s + 1] <= data.primitive_offsets[s] ||
         data.primitive_offsets[s + 1] > nprimitive)
       return false;
