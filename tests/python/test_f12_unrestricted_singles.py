@@ -97,7 +97,8 @@ def _direct_fock(
 
 
 @pytest.mark.parametrize(
-    "occs,frozen", [((2, 1), (0, 0)), ((2, 0), (0, 0)), ((1, 2), (1, 2))]
+    "occs,frozen",
+    [((2, 1), (0, 0)), ((2, 0), (0, 0)), ((1, 2), (1, 2)), ((2, 0), (2, 0))],
 )
 def test_ao_energy_and_cotangents_follow_same_spin_reference(
     occs: tuple[int, int], frozen: tuple[int, int]

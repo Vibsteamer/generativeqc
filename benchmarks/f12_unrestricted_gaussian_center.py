@@ -12,7 +12,13 @@ from generativeqc._f12_spin_fock import spin_fock
 from generativeqc._f12_unrestricted import unrestricted_mp2_f12_ao_response
 from generativeqc.f12_orbital_response import unrestricted_frame_overlap_weights
 from generativeqc_compiler.mp2.f12_density_fitting import molecular_orbital_sources
-from generativeqc_compiler.tensor import Index, Program, TensorSpec, einsum, input_tensor
+from generativeqc_compiler.tensor import (
+    Index,
+    Program,
+    TensorSpec,
+    einsum,
+    input_tensor,
+)
 
 from benchmarks.f12_cabs_h_batch import CabsHShells
 from benchmarks.f12_molecular_metric import metric_whitener
@@ -83,6 +89,7 @@ def center_energy_forces(
     orbital_library: ctypes.CDLL,
     budget_mib: int = 1536,
     response_output: dict | None = None,
+    singles_only: bool = False,
 ) -> tuple[dict, np.ndarray, dict]:
     """Evaluate a matched canonical UHF snapshot and its Gaussian F12 correlation response.
 
@@ -91,6 +98,9 @@ def center_energy_forces(
     same fitted Hamiltonian. The integral forward, energy pullback and metric
     derivative share one CABS frame; its columns and cotangents never cross a
     process boundary. Reference forces are those of the supplied UHF root.
+    With singles_only=True the CABS singles energy and its relaxed force
+    are returned separately. All occupied orbitals still enter the Fock
+    and orbital response, while the MP2 and explicit pair terms are omitted.
     """
     geometry = json.loads(geometry_path.read_bytes())
     space = tuple(geometry["layout"]["space"])
@@ -191,10 +201,16 @@ def center_energy_forces(
         space,
         ao,
         run,
+        frozen_occupied=(oa, ob) if singles_only else (0, 0),
         singles=partial(cabs_singles, library=projector_library),
     )
     frame_weights = unrestricted_frame_overlap_weights(central, complement, direct, run)
     response = {} if response_output is not None else None
+    reference_forces = (
+        np.zeros((len(basis["elements"]), 3))
+        if singles_only
+        else np.asarray(snapshot["forces"]).reshape(-1, 3)
+    )
     with np.load(layout_path, allow_pickle=False) as layout:
         forces, sinks, _ = gaussian_orbital_forces(
             (oa, ob, n, q),
@@ -204,7 +220,7 @@ def center_energy_forces(
             frame_weights,
             geometry,
             layout,
-            np.asarray(snapshot["forces"]).reshape(-1, 3),
+            reference_forces,
             sink_library,
             run,
             canonical_energies=energies,
@@ -214,19 +230,28 @@ def center_energy_forces(
             orbital_response_output=response,
             cabs_h_shells=high,
         )
-    energy = {
-        "UHF_Eh": float(snapshot["energy"]),
-        "UMP2_Eh": float(terms.ordinary_mp2),
-        "F12_Eh": float(terms.f12_increment),
-        "CABS_singles_Eh": list(terms.cabs_singles),
-    }
-    energy["total_Eh"] = (
-        energy["UHF_Eh"]
-        + energy["UMP2_Eh"]
-        + energy["F12_Eh"]
-        + sum(energy["CABS_singles_Eh"])
-    )
-    if not np.isfinite(energy["total_Eh"]) or not np.isfinite(forces).all():
+    singles = sum(terms.cabs_singles)
+    if singles_only:
+        energy = {
+            "CABS_singles_Eh": list(terms.cabs_singles),
+            "CABS_energy_Eh": singles,
+        }
+        scalar_energy = singles
+    else:
+        scalar_energy = (
+            float(snapshot["energy"])
+            + terms.ordinary_mp2
+            + terms.f12_increment
+            + singles
+        )
+        energy = {
+            "UHF_Eh": float(snapshot["energy"]),
+            "UMP2_Eh": float(terms.ordinary_mp2),
+            "F12_Eh": float(terms.f12_increment),
+            "CABS_singles_Eh": list(terms.cabs_singles),
+            "total_Eh": scalar_energy,
+        }
+    if not np.isfinite(scalar_energy) or not np.isfinite(forces).all():
         raise ValueError("Nonfinite molecular energy or force")
     if response_output is not None:
         response_output.update(
