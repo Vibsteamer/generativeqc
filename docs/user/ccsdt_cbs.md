@@ -778,6 +778,17 @@ Cartesian derivatives in bohr⁻¹ and Eh/bohr. They include movement of each
 atom's OBS and OptRI functions and the attraction to the moving nucleus.
 Set `derivatives=False` for energies that need only S and Hcore.
 
+Use `generativeqc.experimental.f12_focal.df_reference(request)` to solve the
+cold all-electron `rhf` or `uhf` root in the request's real-spherical orbital
+basis. Both Coulomb and exchange use its JKFit record and a relative metric
+cutoff of 1e-10. The result contains the DF-HF energy in Eh, its analytic
+Cartesian forces in Eh/bohr, the OBS overlap and core Hamiltonian, and the
+canonical coefficients, orbital energies, physical Fock and density of each
+spin channel. RHF returns one channel with a doubly occupied density. UHF
+returns alpha then beta. `forces=False` requests an energy and orbitals at a
+displaced geometry. The CUDA provider evaluates the DF operators with native
+host SCF control. CABS singles and their nuclear response are separate terms.
+
 The provider controls electronic execution and is responsible for the
 same-reference CCSD and MP2 differences, convergence and analytic gradients.
 The experimental dispatcher requires a provider for electronic work.
