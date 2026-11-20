@@ -763,3 +763,9 @@ Use root identity `rhf` or `uhf`, correlation space `all-active` and an identica
 JKFit and MP2Fit record for the conventional increment. The restricted
 DF-CCSD(T) provider requires CUDA. The caller must match the selected cold
 reference with the rest of the focal calculation.
+
+For a finite-difference control, plan each displaced geometry and pass its
+`post_mp2` request to `conventional_df_post_mp2_energy`. This executes the
+same native group with energy as the sole requested property. Keep the
+request identity alongside the scalar result. At the central geometry use
+`conventional_df_post_mp2` to obtain the analytic forces.

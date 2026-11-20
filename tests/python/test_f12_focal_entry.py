@@ -17,6 +17,7 @@ from generativeqc.experimental.f12_focal import (
     FocalSeries,
     FocalTerm,
     conventional_df_post_mp2,
+    conventional_df_post_mp2_energy,
     plan_singlepoint,
     singlepoint,
 )
@@ -24,7 +25,7 @@ from generativeqc.experimental.f12_focal import (
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from generativeqc.experimental.f12_focal import Backend
+    from generativeqc.experimental.f12_focal import Backend, FocalPlan
 
 
 def basis(cardinal: int, orbital: str = "sto-3g", series: str = "test") -> FocalBasis:
@@ -316,8 +317,8 @@ def test_entry_provider_reuses_native_same_reference_high_order(
             )
         return conventional_df_post_mp2(request)
 
-    def run(radius: float) -> FocalRunResult:
-        return singlepoint(
+    def plan(radius: float) -> FocalPlan:
+        return plan_singlepoint(
             [("H", (0.0, 0.0, 0.0)), ("H", (0.0, 0.0, radius))],
             FocalSeries(b),
             FocalSeries(b),
@@ -325,14 +326,20 @@ def test_entry_provider_reuses_native_same_reference_high_order(
             root_id="uhf",
             correlation_space_id="all-active",
             backend=backend,
-            provider=provider,
         )
 
-    result = run(1.4)
+    center = plan(1.4)
+    result = center.collect(provider(request) for request, _ in center.steps)
     assert result.energy != 0.0
-    h = 2e-4
-    fd = -(run(1.4 + h).energy - run(1.4 - h).energy) / (2 * h)
-    assert result.forces[1, 2] == pytest.approx(fd, abs=3e-8, rel=0)
+
+    def energy(radius: float) -> float:
+        request = next(r for r, _ in plan(radius).steps if r.role == "post_mp2")
+        return conventional_df_post_mp2_energy(request)
+
+    assert energy(1.4) == pytest.approx(result.energy, abs=2e-12, rel=0)
+    for h in (4e-4, 2e-4):
+        fd = (energy(1.4 - h) - energy(1.4 + h)) / (2 * h)
+        assert result.forces[1, 2] == pytest.approx(fd, abs=3e-8, rel=0)
 
 
 def test_native_grouped_increment_refuses_split_role() -> None:

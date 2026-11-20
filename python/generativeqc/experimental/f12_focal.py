@@ -25,6 +25,8 @@ from ..profiles import canonical_hash
 if typing.TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
 
+    from .._api_types import Result
+
 BasisRecordInput = BasisSet | str | PathLike[str]
 BasisInput = BasisRecordInput | Mapping[str | int, BasisRecordInput]
 Role = Literal[
@@ -233,15 +235,9 @@ class FocalRunResult(FocalResult):
     components: tuple[FocalEvaluation, ...]
 
 
-def conventional_df_post_mp2(request: FocalRequest) -> FocalEvaluation:
-    """Evaluate combined DF-CCSD(T) minus DF-MP2 on one native reference.
-
-    Supply canonical cold-start root ``rhf`` or ``uhf`` and correlation space
-    ``all-active``. The current grouped native interface shares one auxiliary
-    record across the SCF and correlation operators. Its return contains
-    the full CCSD(T) force, so this provider supplies the combined increment.
-    The other focal components must use the matching electronic root.
-    """
+def _native_post_mp2_components(
+    request: FocalRequest, *, with_forces: bool
+) -> tuple[Result, Result]:
     if request.role != "post_mp2":
         raise ValueError("the native grouped correction only returns the post_mp2 role")
     if (
@@ -275,28 +271,20 @@ def conventional_df_post_mp2(request: FocalRequest) -> FocalEvaluation:
             companions=(companion,),
             charge=request.charge,
             multiplicity=request.multiplicity,
-            properties=("energy", "forces"),
+            properties=("energy", "forces") if with_forces else ("energy",),
         )
     finally:
         calculator.clear_cache()
     if set(results) != {method, companion}:
         raise RuntimeError("native post_mp2 did not return both grouped components")
     high, mp2 = results[method], results[companion]
-    shape = (len(request.atoms), 3)
     for result in (high, mp2):
         if not result.converged or result.executed_backend != request.backend:
             raise RuntimeError(
                 "native post_mp2 did not converge on the requested backend"
             )
-        if (
-            result.forces is None
-            or result.forces.shape != shape
-            or not np.isfinite(result.forces).all()
-            or not math.isfinite(result.energy)
-        ):
-            raise RuntimeError(
-                "native post_mp2 requires complete finite energy and forces"
-            )
+        if not math.isfinite(result.energy):
+            raise RuntimeError("native post_mp2 requires finite component energies")
     if (
         high.correlation is None
         or mp2.correlation is None
@@ -309,12 +297,37 @@ def conventional_df_post_mp2(request: FocalRequest) -> FocalEvaluation:
     ):
         if high.basis_metadata.get(name, {}).get("basis_identity") != expected:
             raise RuntimeError(f"native post_mp2 used a different {name} basis")
+    return high, mp2
+
+
+def conventional_df_post_mp2_energy(request: FocalRequest) -> float:
+    """Compute the conventional increment in Eh for one displaced geometry."""
+    high, mp2 = _native_post_mp2_components(request, with_forces=False)
+    return high.energy - mp2.energy
+
+
+def conventional_df_post_mp2(request: FocalRequest) -> FocalEvaluation:
+    """Evaluate combined DF-CCSD(T) minus DF-MP2 on one native reference.
+
+    Supply canonical cold-start root ``rhf`` or ``uhf`` and correlation space
+    ``all-active``. The grouped native interface shares one auxiliary record
+    across the SCF and correlation operators. It returns the full CCSD(T)
+    force. The other focal components must use the matching electronic root.
+    """
+    high, mp2 = _native_post_mp2_components(request, with_forces=True)
+    for result in (high, mp2):
+        if (
+            result.forces is None
+            or result.forces.shape != (len(request.atoms), 3)
+            or not np.isfinite(result.forces).all()
+        ):
+            raise RuntimeError("native post_mp2 requires complete finite forces")
     assert high.forces is not None and mp2.forces is not None
     term = FocalTerm(
         request.surface_id,
-        basis.series_id,
-        basis.basis_id,
-        basis.cardinal,
+        request.basis.series_id,
+        request.basis.basis_id,
+        request.basis.cardinal,
         request.role,
         high.energy - mp2.energy,
         high.forces - mp2.forces,
