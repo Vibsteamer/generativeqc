@@ -37,7 +37,7 @@ from tools.generativeqc_response.implicit import (
 )
 
 from .native_tensor_cuda import CudaCCTensorExecutor
-from .uccsd_solver import PreparedUCCSD, UCCSDResult
+from .uccsd_solver import _PackedUCCSD, PreparedUCCSD, UCCSDResult
 
 if TYPE_CHECKING:
     from typing_extensions import Self
@@ -244,7 +244,7 @@ class _Counter:
     operator_actions: int = 0
 
 
-class PreparedUCCSDLambda:
+class _PackedUCCSDLambda:
     """Borrow one live UCCSD owner and solve in physical excitation coordinates.
 
     The parent/reference/feeds/options/executor must stay open and unchanged.
@@ -254,17 +254,19 @@ class PreparedUCCSDLambda:
     native execution. No dense amplitude Jacobian is built in production.
     """
 
+    _parent_type: type[_PackedUCCSD]
+
     def __init__(
         self,
-        prepared: PreparedUCCSD,
+        prepared: _PackedUCCSD,
         state: UCCSDResult,
         *,
         options: UCCSDLambdaOptions | None = None,
         solver: Any = None,
     ) -> None:
         started = time.perf_counter()
-        if not isinstance(prepared, PreparedUCCSD) or prepared._closed:
-            raise TypeError("UCCSD Lambda requires a live PreparedUCCSD")
+        if not isinstance(prepared, self._parent_type) or prepared._closed:
+            raise TypeError(f"UCCSD Lambda requires a live {self._parent_type.__name__}")
         if prepared._execution_configuration() != prepared._executor_configuration:
             raise RuntimeError("UCCSD Lambda parent executor configuration changed")
         if not isinstance(state, UCCSDResult) or not state.converged:
@@ -317,7 +319,7 @@ class PreparedUCCSDLambda:
         )
         if self.base_bytes > options.max_bytes:
             raise MemoryError("UCCSD Lambda persistent/state-map budget exceeded")
-        self.programs = build_response_programs(
+        self.programs = self._build_response_programs(
             self.layout, max_elements=options.max_bytes // 8
         )
         if self.programs.primal.logical_hash != prepared.program.logical_hash:
@@ -813,3 +815,10 @@ class PreparedUCCSDLambda:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+
+class PreparedUCCSDLambda(_PackedUCCSDLambda):
+    """Solve the fixed-orbital Lambda equations of a conventional UCCSD owner."""
+
+    _parent_type = PreparedUCCSD
+    _build_response_programs = staticmethod(build_response_programs)

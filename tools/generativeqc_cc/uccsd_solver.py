@@ -176,7 +176,7 @@ def _denominators(
             energies = getattr(snapshot, f"orbital_energies_{spin}")
             occupied = snapshot.nocc(spin)
             occ_first, occ_second = np.triu_indices(occupied, 1)
-            vir_first, vir_second = np.triu_indices(snapshot.nmo - occupied, 1)
+            vir_first, vir_second = np.triu_indices(len(energies) - occupied, 1)
             pairs_occ = energies[occ_first] + energies[occ_second]
             pairs_vir = energies[occupied + vir_first] + energies[occupied + vir_second]
             values = pairs_occ[:, None] - pairs_vir[None, :] - 2 * shift
@@ -198,6 +198,22 @@ def _denominators(
             values -= (1 if block.name.startswith("t1") else 2) * shift
         pieces.append(values.ravel())
     return immutable(np.concatenate(pieces))
+
+
+def _iteration_bytes(
+    layout: UCCSDLayout, options: SolverOptions, feed_bytes: int
+) -> int:
+    full_bytes = sum(
+        block.full_layout.storage_bytes(8) for block in layout.blocks
+    )
+    packed_bytes = layout.packed_size * 8
+    return checked_bytes(
+        feed_bytes
+        + 4 * full_bytes
+        + (12 + 4 * options.diis_size) * packed_bytes
+        + 32 * (options.diis_size + 1) ** 2,
+        "UCCSD iteration storage",
+    )
 
 
 @dataclass(frozen=True)
@@ -229,193 +245,8 @@ class UCCSDResult:
         return self.status == "converged"
 
 
-class PreparedUCCSD:
-    """Own conventional MO feeds, with bounded packed host iteration state.
-
-    Provider/snapshot identities and the complete provider cache transition are
-    admitted before AO reads. Provider and solver numeric budgets are separate
-    explicit bounds, as in existing correlated owners. Prepared feeds own host
-    storage and survive provider clearing/closing. CUDA is explicitly staged:
-    four-center integral transforms and CC contractions use CUDA, while Fock
-    transforms, feeds, checkpoints and excitation-state DIIS remain on the host.
-    No PySCF or CPU equation fallback.
-    """
-
-    def __init__(
-        self,
-        snapshot: UHFReferenceSnapshot,
-        provider: ConventionalProvider,
-        *,
-        options: SolverOptions | None = None,
-        executor: NativeCCTensorExecutor | CudaCCTensorExecutor | None = None,
-    ) -> None:
-        started = time.perf_counter()
-        if (
-            not isinstance(snapshot, UHFReferenceSnapshot)
-            or snapshot.algorithm != "UHF"
-        ):
-            raise TypeError(
-                "UCCSD requires a validated canonical UHF reference, not RHF/UKS"
-            )
-        if (
-            not isinstance(provider, ConventionalProvider)
-            or provider.snapshot.identity != snapshot.identity
-        ):
-            raise ValueError(
-                "UCCSD requires an identity-matched conventional integral provider"
-            )
-        if options is None:
-            options = SolverOptions()
-        if not isinstance(options, SolverOptions):
-            raise TypeError("UCCSD options must be SolverOptions")
-        if executor is None:
-            if provider.backend != "cpu":
-                raise ValueError("CUDA UCCSD requires an explicit CUDA tensor executor")
-            executor = NativeCCTensorExecutor(max_bytes=options.max_bytes)
-        if not isinstance(executor, (NativeCCTensorExecutor, CudaCCTensorExecutor)):
-            raise TypeError("UCCSD requires a native CPU or CUDA TensorIR executor")
-        cuda = isinstance(executor, CudaCCTensorExecutor)
-        if provider.backend != ("cuda" if cuda else "cpu"):
-            raise ValueError(
-                "UCCSD integral and tensor backends must match; no CPU fallback"
-            )
-        if isinstance(executor, CudaCCTensorExecutor) and (
-            provider.cuda_artifact is None or provider.device_id != executor.device
-        ):
-            raise ValueError(
-                "CUDA UCCSD requires a transform artifact and matching device ordinal"
-            )
-        self.reference, self.options, self.executor = snapshot, options, executor
-        self.layout = UCCSDLayout(
-            snapshot.nocc("alpha"),
-            snapshot.nocc("beta"),
-            snapshot.nmo - snapshot.nocc("alpha"),
-            snapshot.nmo - snapshot.nocc("beta"),
-        )
-        self.minimum_absolute_denominator = _denominator_minimum(
-            snapshot, self.layout, options
-        )
-        self.program = build_program(
-            self.layout.oa, self.layout.ob, self.layout.va, self.layout.vb
-        )
-        inputs = {
-            node.attrs["name"]: node.spec
-            for node in self.program.live_nodes
-            if node.op == "input"
-        }
-        conversions = {
-            name: _integral_requests(name, snapshot)
-            for name in sorted(inputs)
-            if name.startswith("g")
-        }
-        requests = tuple(
-            dict.fromkeys(
-                block
-                for contributions in conversions.values()
-                for _, block, _ in contributions
-            )
-        )
-        full_bytes = sum(
-            block.full_layout.storage_bytes(8) for block in self.layout.blocks
-        )
-        packed_bytes = self.layout.packed_size * 8
-        feed_bytes = sum(
-            spec.size * 8 for name, spec in inputs.items() if not name.startswith("t")
-        )
-        raw_bytes = sum(math.prod(block.shape) * 8 for block in requests)
-        largest = max(
-            (spec.size * 8 for name, spec in inputs.items() if name.startswith("g")),
-            default=0,
-        )
-        self.host_iteration_bytes = checked_bytes(
-            feed_bytes
-            + 4 * full_bytes
-            + (12 + 4 * options.diis_size) * packed_bytes
-            + 32 * (options.diis_size + 1) ** 2,
-            "UCCSD iteration storage",
-        )
-        host_preparation_bytes = checked_bytes(
-            feed_bytes + raw_bytes + 4 * largest + 24 * snapshot.nmo**2,
-            "UCCSD preparation storage",
-        )
-        if isinstance(executor, CudaCCTensorExecutor):
-            self.execution_peak_bytes = plan_cuda(
-                self.program, executor.compiler.target, max_bytes=executor.max_bytes
-            ).peak_bytes
-        else:
-            _, resources = emit_cpu(
-                self.program,
-                max_bytes=executor.max_bytes,
-                max_work=executor.max_work,
-                max_nodes=executor.max_nodes,
-            )
-            self.execution_peak_bytes = resources["required_bytes"]
-        self.logical_required_bytes = checked_bytes(
-            max(
-                host_preparation_bytes,
-                self.host_iteration_bytes + self.execution_peak_bytes,
-            ),
-            "UCCSD numeric storage",
-        )
-        if self.logical_required_bytes > options.max_bytes:
-            raise MemoryError(
-                f"UCCSD solver budget needs {self.logical_required_bytes} numeric bytes before integral conversion"
-            )
-        self.denominators = _denominators(snapshot, self.layout, options.level_shift)
-        feeds = {}
-        for spin, suffix in (("alpha", "aa"), ("beta", "bb")):
-            coefficients = getattr(snapshot, f"coefficients_{spin}")
-            fock = coefficients.T @ getattr(snapshot, f"fock_{spin}") @ coefficients
-            occupied = snapshot.nocc(spin)
-            for domains, axes in (
-                ("oo", (slice(0, occupied), slice(0, occupied))),
-                ("ov", (slice(0, occupied), slice(occupied, None))),
-                ("vv", (slice(occupied, None), slice(occupied, None))),
-            ):
-                feeds[f"f{domains}_{suffix}"] = immutable(fock[axes])
-        with provider._lock:
-            self.provider_peak_bytes = provider.admit(requests)
-            previous_statistics = dict(provider.statistics)
-            raw = {}
-            for block in requests:
-                result = provider.get(block)
-                if (
-                    result.reference_id != snapshot.identity
-                    or result.hamiltonian_id != snapshot.hamiltonian_id
-                ):
-                    raise ValueError(
-                        "UCCSD integral block identity does not match reference"
-                    )
-                raw[block] = immutable(result.to_host(), shape=block.shape)
-            for name, contributions in conversions.items():
-                value = np.zeros(inputs[name].shape)
-                for coefficient, block, axes in contributions:
-                    value += coefficient * raw[block].transpose(axes)
-                feeds[name] = immutable(value)
-            self.provider_statistics = MappingProxyType(
-                {
-                    name: (
-                        self.provider_peak_bytes
-                        if name == "peak_bytes"
-                        else value - previous_statistics[name]
-                    )
-                    for name, value in provider.statistics.items()
-                }
-            )
-        self.feeds = MappingProxyType(feeds)
-        self.integral_hash = canonical_hash(
-            {
-                name: sha256(value.astype("<f8", copy=False).tobytes()).hexdigest()
-                for name, value in feeds.items()
-            }
-        )
-        self.integral_backend = provider.backend
-        self.source_backend = provider.source.backend
-        self.integral_source_id = provider.source.identity
-        self.integral_request_count = len(requests)
-        self._executor_configuration = self._execution_configuration()
-        self._closed = False
-        self.preparation_seconds = time.perf_counter() - started
+class _PackedUCCSD:
+    """Shared packed amplitude iteration for admitted spin-orbital equations."""
 
     def _execution_configuration(self) -> tuple:
         return (
@@ -611,3 +442,182 @@ class PreparedUCCSD:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+
+class PreparedUCCSD(_PackedUCCSD):
+    """Own conventional MO feeds, with bounded packed host iteration state.
+
+    Provider/snapshot identities and the complete provider cache transition are
+    admitted before AO reads. Provider and solver numeric budgets are separate
+    explicit bounds, as in existing correlated owners. Prepared feeds own host
+    storage and survive provider clearing/closing. CUDA is explicitly staged:
+    four-center integral transforms and CC contractions use CUDA, while Fock
+    transforms, feeds, checkpoints and excitation-state DIIS remain on the host.
+    No PySCF or CPU equation fallback.
+    """
+
+    def __init__(
+        self,
+        snapshot: UHFReferenceSnapshot,
+        provider: ConventionalProvider,
+        *,
+        options: SolverOptions | None = None,
+        executor: NativeCCTensorExecutor | CudaCCTensorExecutor | None = None,
+    ) -> None:
+        started = time.perf_counter()
+        if (
+            not isinstance(snapshot, UHFReferenceSnapshot)
+            or snapshot.algorithm != "UHF"
+        ):
+            raise TypeError(
+                "UCCSD requires a validated canonical UHF reference, not RHF/UKS"
+            )
+        if (
+            not isinstance(provider, ConventionalProvider)
+            or provider.snapshot.identity != snapshot.identity
+        ):
+            raise ValueError(
+                "UCCSD requires an identity-matched conventional integral provider"
+            )
+        if options is None:
+            options = SolverOptions()
+        if not isinstance(options, SolverOptions):
+            raise TypeError("UCCSD options must be SolverOptions")
+        if executor is None:
+            if provider.backend != "cpu":
+                raise ValueError("CUDA UCCSD requires an explicit CUDA tensor executor")
+            executor = NativeCCTensorExecutor(max_bytes=options.max_bytes)
+        if not isinstance(executor, (NativeCCTensorExecutor, CudaCCTensorExecutor)):
+            raise TypeError("UCCSD requires a native CPU or CUDA TensorIR executor")
+        cuda = isinstance(executor, CudaCCTensorExecutor)
+        if provider.backend != ("cuda" if cuda else "cpu"):
+            raise ValueError(
+                "UCCSD integral and tensor backends must match; no CPU fallback"
+            )
+        if isinstance(executor, CudaCCTensorExecutor) and (
+            provider.cuda_artifact is None or provider.device_id != executor.device
+        ):
+            raise ValueError(
+                "CUDA UCCSD requires a transform artifact and matching device ordinal"
+            )
+        self.reference, self.options, self.executor = snapshot, options, executor
+        self.layout = UCCSDLayout(
+            snapshot.nocc("alpha"),
+            snapshot.nocc("beta"),
+            snapshot.nmo - snapshot.nocc("alpha"),
+            snapshot.nmo - snapshot.nocc("beta"),
+        )
+        self.minimum_absolute_denominator = _denominator_minimum(
+            snapshot, self.layout, options
+        )
+        self.program = build_program(
+            self.layout.oa, self.layout.ob, self.layout.va, self.layout.vb
+        )
+        inputs = {
+            node.attrs["name"]: node.spec
+            for node in self.program.live_nodes
+            if node.op == "input"
+        }
+        conversions = {
+            name: _integral_requests(name, snapshot)
+            for name in sorted(inputs)
+            if name.startswith("g")
+        }
+        requests = tuple(
+            dict.fromkeys(
+                block
+                for contributions in conversions.values()
+                for _, block, _ in contributions
+            )
+        )
+        feed_bytes = sum(
+            spec.size * 8 for name, spec in inputs.items() if not name.startswith("t")
+        )
+        raw_bytes = sum(math.prod(block.shape) * 8 for block in requests)
+        largest = max(
+            (spec.size * 8 for name, spec in inputs.items() if name.startswith("g")),
+            default=0,
+        )
+        self.host_iteration_bytes = _iteration_bytes(self.layout, options, feed_bytes)
+        host_preparation_bytes = checked_bytes(
+            feed_bytes + raw_bytes + 4 * largest + 24 * snapshot.nmo**2,
+            "UCCSD preparation storage",
+        )
+        if isinstance(executor, CudaCCTensorExecutor):
+            self.execution_peak_bytes = plan_cuda(
+                self.program, executor.compiler.target, max_bytes=executor.max_bytes
+            ).peak_bytes
+        else:
+            _, resources = emit_cpu(
+                self.program,
+                max_bytes=executor.max_bytes,
+                max_work=executor.max_work,
+                max_nodes=executor.max_nodes,
+            )
+            self.execution_peak_bytes = resources["required_bytes"]
+        self.logical_required_bytes = checked_bytes(
+            max(
+                host_preparation_bytes,
+                self.host_iteration_bytes + self.execution_peak_bytes,
+            ),
+            "UCCSD numeric storage",
+        )
+        if self.logical_required_bytes > options.max_bytes:
+            raise MemoryError(
+                f"UCCSD solver budget needs {self.logical_required_bytes} numeric bytes before integral conversion"
+            )
+        self.denominators = _denominators(snapshot, self.layout, options.level_shift)
+        feeds = {}
+        for spin, suffix in (("alpha", "aa"), ("beta", "bb")):
+            coefficients = getattr(snapshot, f"coefficients_{spin}")
+            fock = coefficients.T @ getattr(snapshot, f"fock_{spin}") @ coefficients
+            occupied = snapshot.nocc(spin)
+            for domains, axes in (
+                ("oo", (slice(0, occupied), slice(0, occupied))),
+                ("ov", (slice(0, occupied), slice(occupied, None))),
+                ("vv", (slice(occupied, None), slice(occupied, None))),
+            ):
+                feeds[f"f{domains}_{suffix}"] = immutable(fock[axes])
+        with provider._lock:
+            self.provider_peak_bytes = provider.admit(requests)
+            previous_statistics = dict(provider.statistics)
+            raw = {}
+            for block in requests:
+                result = provider.get(block)
+                if (
+                    result.reference_id != snapshot.identity
+                    or result.hamiltonian_id != snapshot.hamiltonian_id
+                ):
+                    raise ValueError(
+                        "UCCSD integral block identity does not match reference"
+                    )
+                raw[block] = immutable(result.to_host(), shape=block.shape)
+            for name, contributions in conversions.items():
+                value = np.zeros(inputs[name].shape)
+                for coefficient, block, axes in contributions:
+                    value += coefficient * raw[block].transpose(axes)
+                feeds[name] = immutable(value)
+            self.provider_statistics = MappingProxyType(
+                {
+                    name: (
+                        self.provider_peak_bytes
+                        if name == "peak_bytes"
+                        else value - previous_statistics[name]
+                    )
+                    for name, value in provider.statistics.items()
+                }
+            )
+        self.feeds = MappingProxyType(feeds)
+        self.integral_hash = canonical_hash(
+            {
+                name: sha256(value.astype("<f8", copy=False).tobytes()).hexdigest()
+                for name, value in feeds.items()
+            }
+        )
+        self.integral_backend = provider.backend
+        self.source_backend = provider.source.backend
+        self.integral_source_id = provider.source.identity
+        self.integral_request_count = len(requests)
+        self._executor_configuration = self._execution_configuration()
+        self._closed = False
+        self.preparation_seconds = time.perf_counter() - started
