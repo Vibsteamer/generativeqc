@@ -20,3 +20,19 @@ with respect to every source independently. For the bent NH₂/D molecular
 reference, the 11 retained W blocks span 36 active pairs on a 48-orbital
 OBS, 158-orbital extended frame and 198 auxiliaries. A full AO replay
 agreed with the original nine stationary W forces within 9.5e−13 Eh/Bohr.
+
+L20 job `2123765046965186560` executed 12 distinct FP64 electronic graphs
+in 73 calls. The six derivative contractions evaluated 1,596 fitting shell
+pairs per metric and 83,160 shell triples per three-center operator. Its
+returned AO and coefficient weights reproduced the separate integral and
+orbital directions within 3.31e−16 Eh/Bohr on all nine coordinates.
+An independent forward differentiation checked the signed contributions
+of each W block and each coordinate to 5.36e−13 Eh/Bohr. With the
+remaining 45 stationary source blocks and the original reference/CABS
+forces, the recomposed total matched the parent to 9.40e−13 Eh/Bohr.
+
+The archived input uses the accepted central AO integrals and the
+independently measured moving orbital and overlap directions. The Gaussian
+derivative kernels evaluated their shell values from the molecular
+geometry. The original L20 archive SHA-256 is
+`17bf7b2a37e062575859b7094b2d6be56d0b47686162117aa7833da4435e8fef`.
