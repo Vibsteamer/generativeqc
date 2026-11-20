@@ -17,8 +17,10 @@ from generativeqc_compiler.common.arrays import immutable
 from generativeqc_compiler.common.evidence import canonical_hash
 from generativeqc_compiler.common.resources import checked_bytes
 from generativeqc_compiler.tensor.cpu import emit_cpu
+from generativeqc_compiler.tensor.cuda_plan import plan_cuda
 
 from .native_tensor_cpu import NativeCCTensorExecutor
+from .native_tensor_cuda import CudaCCTensorExecutor
 from .solver import SolverOptions
 from .uccsd_lambda import _PackedUCCSDLambda
 from .uccsd_solver import (
@@ -74,7 +76,7 @@ class _FixedSourceReference:
 
 
 class _PreparedFixedSourceUCCSD(_PackedUCCSD):
-    """Solve the fixed-source equations with the native CPU tensor executor.
+    """Solve the fixed-source equations with the selected native tensor executor.
 
     The caller qualifies and supplies the ordinary and F12 feeds in the same
     canonical spin frame. This owner binds detached inputs and proposal
@@ -94,7 +96,7 @@ class _PreparedFixedSourceUCCSD(_PackedUCCSD):
         hamiltonian_id: str,
         reference_energy: float,
         options: SolverOptions | None = None,
-        executor: NativeCCTensorExecutor | None = None,
+        executor: NativeCCTensorExecutor | CudaCCTensorExecutor | None = None,
     ) -> None:
         started = time.perf_counter()
         if not isinstance(layout, UCCSDLayout):
@@ -112,8 +114,10 @@ class _PreparedFixedSourceUCCSD(_PackedUCCSD):
             raise TypeError("fixed-source UCCSD-F12b requires SolverOptions")
         if executor is None:
             executor = NativeCCTensorExecutor(max_bytes=options.max_bytes)
-        if not isinstance(executor, NativeCCTensorExecutor):
-            raise TypeError("fixed-source UCCSD-F12b requires NativeCCTensorExecutor")
+        if not isinstance(executor, (NativeCCTensorExecutor, CudaCCTensorExecutor)):
+            raise TypeError(
+                "fixed-source UCCSD-F12b requires a native CPU or CUDA tensor executor"
+            )
         self.layout, self.options, self.executor = layout, options, executor
         self.program = build_f12_program(layout)
         inputs = {
@@ -135,13 +139,18 @@ class _PreparedFixedSourceUCCSD(_PackedUCCSD):
         self.host_iteration_bytes = _iteration_bytes(
             layout, options, feed_bytes + reference_bytes
         )
-        _, resources = emit_cpu(
-            self.program,
-            max_bytes=executor.max_bytes,
-            max_work=executor.max_work,
-            max_nodes=executor.max_nodes,
-        )
-        self.execution_peak_bytes = resources["required_bytes"]
+        if isinstance(executor, CudaCCTensorExecutor):
+            self.execution_peak_bytes = plan_cuda(
+                self.program, executor.compiler.target, max_bytes=executor.max_bytes
+            ).peak_bytes
+        else:
+            _, resources = emit_cpu(
+                self.program,
+                max_bytes=executor.max_bytes,
+                max_work=executor.max_work,
+                max_nodes=executor.max_nodes,
+            )
+            self.execution_peak_bytes = resources["required_bytes"]
         preparation_bytes = (
             feed_bytes
             + reference_bytes

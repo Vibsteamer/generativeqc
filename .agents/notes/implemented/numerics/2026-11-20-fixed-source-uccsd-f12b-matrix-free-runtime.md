@@ -4,6 +4,9 @@ Status: implemented
 
 Date: 2026-11-20
 
+See the [explicit CUDA executor decision](2026-11-20-fixed-source-uccsd-f12b-cuda.md)
+for the backend extension.
+
 ## Decision
 
 A private tools owner admits canonical spin-MO Fock and integral blocks
