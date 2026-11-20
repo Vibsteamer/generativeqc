@@ -54,6 +54,8 @@ def molecular_ucc_sources(
     *,
     include_ordinary: Literal[False],
     reference_forces: bool = False,
+    reference: FocalReference | None = None,
+    expected_cabs_rank: int | None = None,
 ) -> FocalUCCFixedSources: ...
 
 
@@ -64,6 +66,8 @@ def molecular_ucc_sources(
     *,
     include_ordinary: Literal[True],
     reference_forces: bool = False,
+    reference: FocalReference | None = None,
+    expected_cabs_rank: int | None = None,
 ) -> FocalUCCEquationSources: ...
 
 
@@ -73,6 +77,8 @@ def molecular_ucc_sources(
     *,
     include_ordinary: bool,
     reference_forces: bool = False,
+    reference: FocalReference | None = None,
+    expected_cabs_rank: int | None = None,
 ) -> FocalUCCFixedSources | FocalUCCEquationSources:
     """Calculate fixed-geminal UCC equation inputs on an all-active singlet RHF or UHF root."""
     from generativeqc_compiler.tensor import execute
@@ -122,10 +128,23 @@ def molecular_ucc_sources(
             raise RuntimeError("UCC fixed-source graph executed on a different backend")
         return out
 
-    ref = df_reference(
-        request, forces=reference_forces, budget_mib=provider.budget_mib,
-        **provider._seed_options(request),
-    )
+    ref = reference
+    if ref is None:
+        ref = df_reference(
+            request,
+            forces=reference_forces,
+            budget_mib=provider.budget_mib,
+            **provider._seed_options(request),
+        )
+    elif (
+        ref.surface_id != request.surface_id
+        or ref.basis_id != request.basis.basis_id
+        or ref.executed_backend != request.backend
+        or ref.orbital_id != request.basis.orbital.identity
+        or ref.jk_fit_id != request.basis.jk_fit.identity
+        or (reference_forces and ref.forces is None)
+    ):
+        raise ValueError("CC equation sources require the matching canonical reference")
     one = one_electron_sources(
         request,
         library=provider.one_electron_library or provider.shell_library,
@@ -144,7 +163,7 @@ def molecular_ucc_sources(
         one,
         jk.joint(request, explicit=False),
         corr.joint(request, explicit=True),
-        expected_cabs_rank=None,
+        expected_cabs_rank=expected_cabs_rank,
         relative_cutoff=provider.relative_cutoff,
         library=provider.response_library,
     )

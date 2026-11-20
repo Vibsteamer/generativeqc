@@ -17,6 +17,23 @@ GENERATIVEQC_API generativeqc_status generativeqc_calculation_prepare_ucc_df_fit
     const generativeqc_method_descriptor* descriptor, const generativeqc_system* jk_fit,
     generativeqc_calculation** calculation);
 
+/** Retain the same canonical determinant that supplies the focal DF-HF arrays.
+ * All matrices use the public AO order. The returned owner outlives its SCF context. */
+typedef struct generativeqc_focal_reference generativeqc_focal_reference;
+GENERATIVEQC_API generativeqc_status generativeqc_focal_df_reference_owned_v1(
+    generativeqc_context* context, const generativeqc_system* orbital,
+    const generativeqc_system* jk_fit, int spins, int forces, size_t budget,
+    const double* initial_density, size_t initial_count, double* output, size_t count,
+    generativeqc_focal_reference** owner);
+GENERATIVEQC_API void generativeqc_focal_reference_destroy_v1(generativeqc_focal_reference* owner);
+
+/** Use a fresh full-DF UCCSD(T) plan with the retained determinant.
+ * Output is the (T) energy followed by optional analytic Cartesian forces.
+ * The two force Lagrangians use the same converged conventional amplitudes. */
+GENERATIVEQC_API generativeqc_status generativeqc_focal_ucc_triples_v1(
+    generativeqc_calculation* calculation, const generativeqc_focal_reference* owner, int forces,
+    double* output, size_t count);
+
 #ifdef __cplusplus
 }
 #endif

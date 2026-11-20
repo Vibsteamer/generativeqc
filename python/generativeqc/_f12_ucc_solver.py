@@ -64,6 +64,26 @@ def _prepare_focal_ucc(
     )
 
 
+def _primal(cc: _PreparedFixedSourceUCCSD) -> UCCSDResult:
+    state = cc.solve()
+    if not state.converged or state.correlation_energy is None:
+        raise RuntimeError(f"Molecular UCCSD-F12b amplitudes: {state.reason}")
+    return state
+
+
+def solve_focal_uccsd_f12b_energy(
+    sources: FocalUCCEquationSources,
+    *,
+    options: SolverOptions,
+    executor: NativeCCTensorExecutor | CudaCCTensorExecutor,
+) -> float:
+    """Return the replay-qualified correlation energy from the amplitude solve."""
+    with _prepare_focal_ucc(sources, options, executor) as cc:
+        state = _primal(cc)
+        assert state.correlation_energy is not None
+        return state.correlation_energy
+
+
 @contextmanager
 def _cold_state(
     sources: FocalUCCEquationSources,
@@ -72,9 +92,7 @@ def _cold_state(
     executor: NativeCCTensorExecutor | CudaCCTensorExecutor | None,
 ) -> Iterator[tuple[_PreparedFixedSourceUCCSDLambda, UCCSDResult, UCCSDLambdaResult]]:
     with _prepare_focal_ucc(sources, options, executor) as cc:
-        state = cc.solve()
-        if not state.converged:
-            raise RuntimeError(f"Molecular UCCSD-F12b amplitudes: {state.reason}")
+        state = _primal(cc)
         with _PreparedFixedSourceUCCSDLambda(
             cc, state, options=lambda_options, orbital_gap_preconditioner=True
         ) as response:
@@ -170,5 +188,6 @@ __all__ = [
     "UCCSDResult",
     "focal_ucc_source_cotangents",
     "solve_focal_uccsd_f12b",
+    "solve_focal_uccsd_f12b_energy",
     "solve_focal_uccsd_f12b_with_cotangents",
 ]
