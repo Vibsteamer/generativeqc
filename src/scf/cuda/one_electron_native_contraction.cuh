@@ -11,7 +11,7 @@
 // path, including public spherical expansion weights.
 namespace generativeqc::scf::cuda_execution {
 
-template <typename Scalar>
+template <typename Scalar, typename Coefficients = HermiteCoefficients<Scalar>>
 __device__ inline Scalar contracted_overlap(const DeviceBatch& batch, std::int32_t system,
                                             std::int32_t i, std::int32_t j,
                                             std::int64_t derivative_coordinate) {
@@ -48,10 +48,10 @@ __device__ inline Scalar contracted_overlap(const DeviceBatch& batch, std::int32
           for (unsigned second_term = 0; second_term < second_terms; ++second_term) {
             result = result + primitive_weight * first_coefficient *
                                   ao_term_coefficient(batch, ao_j, second_term) *
-                                  primitive_overlap_cartesian(batch.primitive_exponents[a], first,
-                                                              first_angular,
-                                                              batch.primitive_exponents[b], second,
-                                                              ao_angular(batch, ao_j, second_term));
+                                  primitive_overlap_cartesian<Scalar, Coefficients>(
+                                      batch.primitive_exponents[a], first, first_angular,
+                                      batch.primitive_exponents[b], second,
+                                      ao_angular(batch, ao_j, second_term));
           }
         }
       }
@@ -60,13 +60,14 @@ __device__ inline Scalar contracted_overlap(const DeviceBatch& batch, std::int32
   return result;
 }
 
-template <unsigned MaximumAngular, typename Scalar>
+template <unsigned MaximumAngular, typename Scalar,
+          typename Coefficients = HermiteCoefficients<Scalar>>
 __device__ inline __noinline__ Scalar contracted_hcore_cartesian(
     const DeviceBatch& batch, std::int32_t system, std::int64_t ao_i, std::int64_t ao_j,
     std::int32_t shell_i, std::int32_t shell_j, const Vec3<Scalar>& first,
     const Vec3<Scalar>& second, unsigned first_terms, unsigned second_terms,
     std::int64_t derivative_coordinate) {
-  static_assert(MaximumAngular <= 2 * kMaximumAngularMomentum);
+  static_assert(MaximumAngular <= kMaximumCoulombResponseOrder);
   Scalar result = scalar<Scalar>(0.0);
   for (std::int64_t a = batch.shell_primitive_offsets[shell_i];
        a < batch.shell_primitive_offsets[shell_i + 1]; ++a) {
@@ -79,14 +80,15 @@ __device__ inline __noinline__ Scalar contracted_hcore_cartesian(
         for (unsigned second_term = 0; second_term < second_terms; ++second_term) {
           const Angular second_angular = ao_angular(batch, ao_j, second_term);
           result =
-              result + weight * first_coefficient * ao_term_coefficient(batch, ao_j, second_term) *
-                           (primitive_kinetic_cartesian(batch.primitive_exponents[a], first,
-                                                        first_angular, batch.primitive_exponents[b],
-                                                        second, second_angular) +
-                            primitive_nuclear_attraction_cartesian<MaximumAngular>(
-                                batch, system, batch.primitive_exponents[a], first, first_angular,
-                                batch.primitive_exponents[b], second, second_angular,
-                                derivative_coordinate));
+              result +
+              weight * first_coefficient * ao_term_coefficient(batch, ao_j, second_term) *
+                  (primitive_kinetic_cartesian<Scalar, Coefficients>(
+                       batch.primitive_exponents[a], first, first_angular,
+                       batch.primitive_exponents[b], second, second_angular) +
+                   primitive_nuclear_attraction_cartesian<MaximumAngular, Scalar, Coefficients>(
+                       batch, system, batch.primitive_exponents[a], first, first_angular,
+                       batch.primitive_exponents[b], second, second_angular,
+                       derivative_coordinate));
         }
       }
     }
@@ -159,6 +161,27 @@ __device__ inline Scalar contracted_hcore(const DeviceBatch& batch, std::int32_t
                                            derivative_coordinate);
   }
   return scalar<Scalar>(0.0);
+}
+
+/** The Cartesian exporter admits orbital g. A kinetic integral can raise the ket
+ * by two, and Hermite recurrence reads the zero boundary at t=i+j+1.
+ * Keep this larger workspace off the through-f path. */
+__device__ inline __noinline__ void contracted_g_export_derivatives(
+    const DeviceBatch& batch, std::int32_t system, std::int32_t row, std::int32_t column,
+    std::int64_t coordinate, double& overlap, double& hcore) {
+  constexpr unsigned g = 4;
+  using Coefficients = HermiteCoefficients<Dual, g + 1, g + 3, 2 * g + 4>;
+  const auto i = static_cast<std::int64_t>(system) * batch.nbf + row;
+  const auto j = static_cast<std::int64_t>(system) * batch.nbf + column;
+  const auto si = batch.ao_shells[i], sj = batch.ao_shells[j];
+  const auto first = atom_position<Dual>(batch, batch.shell_atoms[si], coordinate);
+  const auto second = atom_position<Dual>(batch, batch.shell_atoms[sj], coordinate);
+  overlap =
+      contracted_overlap<Dual, Coefficients>(batch, system, row, column, coordinate).derivative;
+  hcore = contracted_hcore_cartesian<2 * g, Dual, Coefficients>(batch, system, i, j, si, sj, first,
+                                                                second, batch.ao_term_counts[i],
+                                                                batch.ao_term_counts[j], coordinate)
+              .derivative;
 }
 
 }  // namespace generativeqc::scf::cuda_execution

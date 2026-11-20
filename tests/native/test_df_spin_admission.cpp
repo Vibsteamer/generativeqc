@@ -118,10 +118,46 @@ void independent_source_limits() {
   require(!cuda_df_value_domain(orbital, auxiliary, policy, detail),
           "spin admission must not widen range-separated source qualification");
 }
+void fully_polarized_hydrogen_domain() {
+  using namespace generativeqc;
+  core::System dimer;
+  dimer.atoms = {{1, {0.1, 0.2, 0.3}}, {1, {-0.2, 1.4, 0.8}}};
+  dimer.basis_representation = core::kSphericalBasis;
+  dimer.multiplicity = 3;
+  dimer.shells = {{0, 4, {{1.0, 1.0}}}};
+  auto admitted = [](const core::System& sys) {
+    try {
+      scf::cuda_execution::require_cuda_df_spin_domain(sys, scf::FockSpin::Unrestricted);
+      return true;
+    } catch (const std::invalid_argument&) {
+      return false;
+    }
+  };
+  require(admitted(dimer), "orbital g in all-electron triplet hydrogen dimer");
+  auto other = dimer;
+  other.multiplicity = 1;
+  require(!admitted(other), "unqualified paired spin domain");
+  other = dimer;
+  other.charge = 1;
+  require(!admitted(other), "unqualified charged dimer");
+  other = dimer;
+  other.atoms[1].atomic_number = 2;
+  require(!admitted(other), "unqualified heteronuclear dimer");
+  other = dimer;
+  other.basis_representation = core::kCartesianBasis;
+  require(!admitted(other), "unqualified Cartesian orbital g");
+  other = dimer;
+  other.shells.front().angular_momentum = 5;
+  require(!admitted(other), "orbital h");
+  other = dimer;
+  other.ecp_terms.resize(1);
+  require(!admitted(other), "unqualified pseudopotential");
+}
 }  // namespace
 
 int main() {
   try {
+    fully_polarized_hydrogen_domain();
     public_plan_admission();
     independent_source_limits();
     resident_admission();

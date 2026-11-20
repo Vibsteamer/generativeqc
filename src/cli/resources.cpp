@@ -33,6 +33,10 @@ extern "C" int generativeqc_resource_ecp_workspace_v1(std::size_t, std::size_t, 
                                                       std::size_t, std::size_t, int,
                                                       std::uint64_t*);
 
+extern "C" int generativeqc_resource_ecp_workspace_v2(std::size_t, std::size_t, std::size_t,
+                                                      std::size_t, std::size_t, int, int,
+                                                      std::uint64_t*);
+
 namespace generativeqc::cli {
 namespace {
 using Bytes = std::uint64_t;
@@ -414,15 +418,31 @@ int resources_command(const RunOptions& options, std::span<const generativeqc_at
        {options.grid.radial_points, options.grid.angular_polar, options.grid.angular_azimuth}}};
   plan["orbital"] = topology_json(orbital);
   Bytes ecp_workspace = 0;
-  if (generativeqc_resource_ecp_workspace_v1(orbital.nbf, orbital.cartesian_nbf, atoms.size(),
+  bool halogen_uhf = options.method_name == "uhf" && !cpu && options.density_fitting == GENERATIVEQC_DENSITY_FITTING_CUDA &&
+                     options.charge == 0 && options.multiplicity == 2 && !options.auxiliary_basis_name.empty() &&
+                     basis.representation == GENERATIVEQC_BASIS_SPHERICAL && basis.core_electrons.size() == atoms.size();
+  bool bromine = false;
+  unsigned heavy = 0;
+  if (halogen_uhf) {
+    for (std::size_t i = 0; i < atoms.size(); ++i) {
+      const auto z = atoms[i].atomic_number;
+      const auto core = basis.core_electrons[i];
+      if (z == 1 && core == 0) continue;
+      ++heavy;
+      bromine |= z == 35 && core == 10;
+      halogen_uhf &= (z == 35 && core == 10) || (z == 53 && core == 28);
+    }
+    halogen_uhf &= heavy == 1;
+  }
+  if (generativeqc_resource_ecp_workspace_v2(orbital.nbf, orbital.cartesian_nbf, atoms.size(),
                                              orbital.primitives, basis.ecp_terms.size(),
-                                             cpu ? 0 : 1, &ecp_workspace))
+                                             cpu ? 0 : 1, halogen_uhf && bromine, &ecp_workspace))
     throw UsageError("ECP allocation inventory overflows native bounds");
   if (!basis.ecp_terms.empty()) {
     plan["orbital"]["ecp_terms"] = basis.ecp_terms.size();
     plan["orbital"]["ecp_core_electrons"] = basis.core_electrons;
     plan["ecp_workspace"] = ecp_workspace;
-    if (fitted) {
+    if (fitted && !halogen_uhf) {
       plan["diagnostic"] = "ECP density fitting is not qualified";
       return emit();
     }
@@ -448,7 +468,7 @@ int resources_command(const RunOptions& options, std::span<const generativeqc_at
               : expanded.identity;
     } else
       auxiliary = orbital;
-    if (auxiliary->angular > (cpu ? 4u : 3u)) {
+    if (auxiliary->angular > (halogen_uhf ? 5u : (cpu ? 4u : 3u))) {
       plan["diagnostic"] = "auxiliary angular momentum exceeds the native inventory domain";
       return emit();
     }

@@ -68,3 +68,15 @@ def test_cuda_radial_tail_and_grid_fallback(
         np.testing.assert_allclose(
             getattr(gpu, field), getattr(cpu, field), atol=2e-11, rtol=0
         )
+
+
+def test_refined_uhf_grid_only_increases_the_requested_cuda_inventory():
+    item = {
+        "atoms": 3,
+        "orbital": {"nbf": 119, "cartesian_nbf": 135, "primitives": 277, "ecp_terms": 16},
+    }
+    requests = dict(item, refine_ecp_quadrature=True)
+    normal = _ecp_workspace(item, cuda=True)
+    expanded = _ecp_workspace(requests, cuda=True)
+    assert expanded - normal == (32 * 135 + 256) * 2 * (96**2 - 44**2) + 256 * (512 - 224)
+    assert _ecp_workspace(requests, cuda=False) == _ecp_workspace(item, cuda=False)

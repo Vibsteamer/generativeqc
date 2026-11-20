@@ -17,6 +17,12 @@ struct EcpSpherePoint {
   double x, y, z, weight;
   double harmonics[16];
 };
+// Largest internally admitted checked grid for this normalized system.
+struct EcpGridShape {
+  unsigned radial, polar;
+};
+EcpGridShape checked_ecp_grid_limit(const core::System& system);
+
 struct EcpRadialPoint {
   double r, weight;
 };
