@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING
 
 import numpy as np
+
+from .elements import checked_integer
 
 if TYPE_CHECKING:
     import ctypes
@@ -86,7 +89,9 @@ def reference_cabs_singles(
     Set relax=True to solve the coupled occupied/virtual response and return
     four relaxed AO integral weights. Contract each with its positive nuclear
     derivative, then subtract their sum from the reference forces. The CABS
-    overlap cutoff must match the supplied complementary frame.
+    overlap cutoff must match the supplied complementary frame. budget_mib limits
+    the default CPU interpreter's logical retained arrays per TensorIR graph
+    and the orbital solver workspace. A supplied runner owns its graph budget.
     """
     from generativeqc_compiler.mp2.f12_frame_response import frame_kernel_cotangent
     from generativeqc_compiler.tensor import execute
@@ -121,7 +126,13 @@ def reference_cabs_singles(
     cuda = request.backend == "cuda"
     if cuda and run is None:
         raise ValueError("CABS singles on CUDA requires the FP64 CUDA TensorIR runner")
-    runner = run if run is not None else execute
+    budget = (
+        checked_integer(
+            budget_mib, "CABS tensor budget in MiB", low=1, high=(2**63 - 1) >> 20
+        )
+        << 20
+    )
+    runner = run if run is not None else partial(execute, max_bytes=budget)
 
     def checked_run(program: Program, inputs: Mapping[str, np.ndarray]) -> Execution:
         out = runner(program, inputs)

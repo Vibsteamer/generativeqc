@@ -112,6 +112,21 @@ def test_molecular_singles_and_source_response(
     result = reference_cabs_singles(
         req, ref, one, complement=projector.frame, three_center=b, metric=m, whitener=w
     )
+    if root == "rhf":
+        with pytest.raises(
+            ValueError, match="interpreter logical retained-byte budget"
+        ):
+            reference_cabs_singles(
+                req,
+                ref,
+                one,
+                complement=projector.frame,
+                three_center=b,
+                metric=m,
+                whitener=w,
+                budget_mib=1,
+                pullback=False,
+            )
     n = one.obs_ao_count
     for i, f in enumerate(focks):
         coeff = ref.coefficients[min(i, len(ref.occupied) - 1)]
