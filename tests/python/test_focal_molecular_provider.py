@@ -243,3 +243,87 @@ def test_uhf_equation_sources_against_independent_df_chemist_blocks(
                 eri -= np.einsum("Qil,Qjk->ijkl", mo[i], mo[j])
             gold = eri[ix]
         np.testing.assert_allclose(value, gold, rtol=0, atol=3e-9, err_msg=name)
+
+
+def test_public_uhf_stationary_lagrangian_on_same_molecular_frame() -> None:
+    shell = os.environ.get("GENERATIVEQC_F12_HOST_SINK")
+    if not shell:
+        pytest.skip("set GENERATIVEQC_F12_HOST_SINK for the molecular shell library")
+    from generativeqc.experimental.f12_focal import FocalUCCStationary
+    from generativeqc.experimental.uccsd_f12 import SolverOptions
+    from generativeqc_compiler.cc.uccsd_equations import build_f12_program
+    from generativeqc_compiler.cc.uccsd_layout import UCCSDLayout
+    from generativeqc_compiler.tensor import execute
+
+    provider = MolecularFocalProvider(shell_library=Path(shell), budget_mib=256)
+    q = request(XYZ, (0, 1, 2))
+    solution = provider.ucc_stationary(
+        q,
+        options=SolverOptions(residual_tolerance=3e-12, energy_tolerance=5e-13),
+        source_cotangents=True,
+    )
+    assert isinstance(solution, FocalUCCStationary)
+    sources = solution.sources
+    ref = sources.fixed.reference
+    assert (ref.surface_id, ref.basis_id, ref.executed_backend) == (
+        q.surface_id,
+        q.basis.basis_id,
+        "cpu_reference",
+    )
+    assert len({ref.jk_fit_id, sources.mp2_fit_id, sources.fixed.f12_fit_id}) == 3
+    assert solution.primal.converged and solution.dual.converged
+    # Independent dense SciPy root for the same 59 equations.
+    assert solution.primal.correlation_energy == pytest.approx(
+        -0.06269423582838254, rel=0, abs=2e-11
+    )
+    np.testing.assert_allclose(
+        solution.primal.total_energy,
+        ref.energy + solution.primal.correlation_energy,
+        rtol=0,
+        atol=1e-13,
+    )
+    layout = UCCSDLayout(2, 1, 4, 5)
+    program = build_f12_program(layout)
+    multiplier = layout.unpack_dual(solution.dual.packed_multipliers)
+    inputs = {**sources.ordinary, **sources.fixed.feeds}
+
+    def lagrangian(t: np.ndarray, feeds: dict[str, np.ndarray]) -> float:
+        out = execute(program, {**feeds, **layout.unpack(t)}).outputs
+        return float(out["correlation_energy"]) + sum(
+            float(np.vdot(multiplier[b.name], out["r" + b.name[1:]]))
+            for b in layout.blocks
+        )
+
+    t = solution.primal.packed_amplitudes
+    direction = np.cos(np.arange(len(t), dtype=float))
+    direction /= np.linalg.norm(direction)
+    for h in (4e-5, 2e-5):
+        derivative = (
+            lagrangian(t + h * direction, inputs)
+            - lagrangian(t - h * direction, inputs)
+        ) / (2 * h)
+        assert abs(derivative) < 2e-9
+
+    weights = solution.source_cotangents
+    assert weights is not None
+    assert weights.ordinary_weights.keys() == sources.ordinary.keys()
+    assert sources.fixed.feeds.keys() - weights.fixed_source_weights.keys() == {
+        "w_vo_baab"
+    }
+    assert weights.correlation_energy == pytest.approx(
+        solution.primal.correlation_energy, rel=0, abs=1e-13
+    )
+    # Perturb every active ordinary and geminal input in one reproducible
+    # direction. Contract the packed dual in the independent NumPy evaluator.
+    bars = {**weights.ordinary_weights, **weights.fixed_source_weights}
+    rng = np.random.default_rng(23014)
+    directions = {k: np.asarray(rng.standard_normal(v.shape)) for k, v in bars.items()}
+    predicted = sum(float(np.vdot(bars[k], u)) for k, u in directions.items())
+    for h in (4e-5, 2e-5):
+        plus = {**inputs, **{k: inputs[k] + h * u for k, u in directions.items()}}
+        minus = {**inputs, **{k: inputs[k] - h * u for k, u in directions.items()}}
+        derivative = (lagrangian(t, plus) - lagrangian(t, minus)) / (2 * h)
+        assert derivative == pytest.approx(predicted, rel=0, abs=5e-10)
+
+    with pytest.raises(ValueError, match="MolecularFocalProvider.cuda"):
+        provider.ucc_stationary(replace(q, backend="cuda"))

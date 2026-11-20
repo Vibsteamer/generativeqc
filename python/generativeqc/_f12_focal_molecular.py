@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -31,7 +31,29 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
+    from ._f12_cc_stationary import UCCSDF12Pullback
+    from ._f12_ucc_solver import (
+        SolverOptions,
+        UCCSDLambdaOptions,
+        UCCSDLambdaResult,
+        UCCSDResult,
+    )
     from .experimental.f12_focal import FocalEvaluation, FocalRequest
+
+
+@dataclass(frozen=True)
+class FocalUCCStationary:
+    """One fixed-cusp UCCSD-F12b solution in the canonical molecular source frame.
+
+    primal holds the correlation energy in Eh and physical amplitudes. dual
+    holds the qualified Lambda multipliers and stationarity diagnostics.
+    sources retains the same determinant and Hamiltonian for response work.
+    """
+
+    sources: FocalUCCEquationSources
+    primal: UCCSDResult
+    dual: UCCSDLambdaResult
+    source_cotangents: UCCSDF12Pullback | None
 
 
 @dataclass
@@ -88,6 +110,9 @@ class MolecularFocalProvider:
     high_order: Callable[[FocalRequest], FocalEvaluation] | None = None
     relative_cutoff: float = 1e-9
     budget_mib: int = 1536
+    _cuda_cc_target: tuple[str, Path] | None = field(
+        default=None, repr=False, compare=False
+    )
 
     @classmethod
     def cuda(
@@ -132,6 +157,7 @@ class MolecularFocalProvider:
             relative_cutoff=relative_cutoff,
             budget_mib=budget,
             high_order=high_order,
+            _cuda_cc_target=(architecture, cache_directory),
         )
 
     def ucc_fixed_sources(self, request: FocalRequest) -> FocalUCCFixedSources:
@@ -150,6 +176,80 @@ class MolecularFocalProvider:
         this same reference and the requested F12Fit.
         """
         return molecular_ucc_sources(self, request, include_ordinary=True)
+
+    def ucc_stationary(
+        self,
+        request: FocalRequest,
+        *,
+        options: SolverOptions | None = None,
+        lambda_options: UCCSDLambdaOptions | None = None,
+        source_cotangents: bool = False,
+    ) -> FocalUCCStationary:
+        """Solve T and Lambda for an all-active UHF molecular pair request.
+
+        The returned primal total is the DF-UHF energy plus fixed-cusp
+        UCCSD-F12b correlation. Obtain CABS singles separately. The CPU
+        reference uses compiled FP64 CC equations. The CUDA provider runs
+        those equations on device zero with its configured target and cache.
+        Set source_cotangents to differentiate the stationary correlation
+        energy with respect to the active ordinary and fixed MO inputs.
+        """
+        from ._f12_ucc_solver import (
+            CudaCCTensorExecutor,
+            NativeCCTensorExecutor,
+            SolverOptions,
+            UCCSDLambdaOptions,
+            solve_focal_uccsd_f12b,
+            solve_focal_uccsd_f12b_with_cotangents,
+        )
+
+        budget = (
+            checked_integer(
+                self.budget_mib,
+                "molecular focal budget in MiB",
+                low=1,
+                high=(2**63 - 1) >> 20,
+            )
+            << 20
+        )
+        if request.backend == "cuda":
+            if self._cuda_cc_target is None:
+                raise ValueError(
+                    "Construct a CUDA stationary provider with MolecularFocalProvider.cuda"
+                )
+            from ._f12_focal_runner import focal_cuda_compiler
+
+            arch, cache = self._cuda_cc_target
+            executor = CudaCCTensorExecutor(
+                max_bytes=budget, compiler=focal_cuda_compiler(arch), cache=cache
+            )
+        elif request.backend == "cpu_reference":
+            executor = NativeCCTensorExecutor(max_bytes=budget)
+        else:
+            raise ValueError(
+                "A molecular UCC stationary solve requires an explicit backend"
+            )
+        sources = self.ucc_equation_sources(request)
+        if options is None:
+            options = SolverOptions(max_bytes=budget)
+        if lambda_options is None:
+            lambda_options = UCCSDLambdaOptions(max_bytes=budget)
+        if source_cotangents:
+            primal, dual, weights = solve_focal_uccsd_f12b_with_cotangents(
+                sources,
+                options=options,
+                lambda_options=lambda_options,
+                executor=executor,
+            )
+        else:
+            primal, dual = solve_focal_uccsd_f12b(
+                sources,
+                options=options,
+                lambda_options=lambda_options,
+                executor=executor,
+            )
+            weights = None
+        return FocalUCCStationary(sources, primal, dual, weights)
 
     def _panel(self, request: FocalRequest, role: str) -> _Panel:
         host = request.backend == "cpu_reference"

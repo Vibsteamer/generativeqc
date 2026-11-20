@@ -833,6 +833,23 @@ antisymmetrized ordinary two-electron blocks, and F12Fit the geminal
 projections. `result.mp2_fit_id` identifies the ordinary correlation fit.
 The coordinate geometry determines every input to these two dictionaries.
 
+Call `solution = provider.ucc_stationary(pair_request)` for a cold
+all-active UHF fixed-cusp UCCSD-F12b solution at that geometry.
+`solution.sources.fixed.reference` holds the DF-UHF determinant,
+`solution.primal` holds the correlation energy (Eh), physical amplitudes
+and convergence history, and `solution.dual` holds the qualified Lambda
+multipliers and stationarity residuals. The primal total adds the DF-UHF
+and stationary correlation energies. CABS singles is a separate contribution.
+A provider constructed with `MolecularFocalProvider.cuda(...)` uses its
+GPU architecture, cache and memory budget for the CC residual and adjoint
+equations. On CPU, the stationary equations use the native FP64 TensorIR
+executor. Optional `options` and `lambda_options` accept `SolverOptions`
+and `UCCSDLambdaOptions` from `generativeqc.experimental.uccsd_f12`.
+With `source_cotangents=True`, the solve also returns
+`solution.source_cotangents.ordinary_weights` and `fixed_source_weights`.
+These are the derivatives of the stationary CC Lagrangian with respect
+to the active canonical MO input tensors in `solution.sources`.
+
 Use the installed `MolecularFocalProvider` to evaluate a plan step directly
 from its geometry. A single-card CUDA setup looks like this:
 

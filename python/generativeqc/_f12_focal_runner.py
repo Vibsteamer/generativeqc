@@ -10,7 +10,18 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
     import numpy as np
+    from generativeqc_compiler.common.cuda_adapter import CudaCompilerAdapter
     from generativeqc_compiler.tensor import Execution, Program
+
+
+def focal_cuda_compiler(arch: str) -> CudaCompilerAdapter:
+    from generativeqc_compiler.common.cuda_adapter import CudaCompilerAdapter
+    from generativeqc_compiler.common.cuda_target import cuda_target_info
+
+    nvcc = shutil.which("nvcc")
+    if nvcc is None:
+        raise RuntimeError("CUDA focal graph compilation requires nvcc")
+    return CudaCompilerAdapter(Path(nvcc), cuda_target_info(arch))
 
 
 def focal_cuda_runner(
@@ -21,15 +32,10 @@ def focal_cuda_runner(
     record: Callable[[dict], None] | None = None,
 ) -> Callable:
     """Create an FP64 executor for the GPU assigned to this process."""
-    from generativeqc_compiler.common.cuda_adapter import CudaCompilerAdapter
-    from generativeqc_compiler.common.cuda_target import cuda_target_info
     from generativeqc_compiler.tensor.cuda_execute import PreparedCuda, compile_cuda
     from generativeqc_compiler.tensor.cuda_plan import plan_cuda
 
-    nvcc = shutil.which("nvcc")
-    if nvcc is None:
-        raise RuntimeError("CUDA focal graph compilation requires nvcc")
-    compiler = CudaCompilerAdapter(Path(nvcc), cuda_target_info(arch))
+    compiler = focal_cuda_compiler(arch)
     compiled = {}
 
     def run(program: Program, inputs: Mapping[str, np.ndarray]) -> Execution:
