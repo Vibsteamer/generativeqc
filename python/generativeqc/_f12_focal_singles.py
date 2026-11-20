@@ -62,6 +62,32 @@ def _reference_singles(
     return energy, np.block([[-t @ t.T, t], [t.T, t.T @ t]])
 
 
+def _singles_from_fock(
+    fock: np.ndarray,
+    spectrum: np.ndarray,
+    occupied: int,
+    cuda: bool,
+    pullback: bool,
+    library: ctypes.CDLL | None,
+) -> tuple[np.ndarray, float, float, np.ndarray | None]:
+    """Use the physical extended Fock and verify its canonical orbital block."""
+    from ._f12_cabs import cabs_singles
+
+    if not np.allclose(fock, fock.T, atol=2e-8, rtol=0):
+        raise ValueError("physical extended DF Fock is asymmetric")
+    fock = (fock + fock.T) * 0.5
+    n = len(spectrum)
+    error = float(np.max(np.abs(fock[:n, :n] - np.diag(spectrum))))
+    if not np.isfinite(error) or error > 2e-8:
+        raise ValueError(f"extended Fock does not reproduce the SCF reference: {error}")
+    energy, bar = (
+        cabs_singles(fock, occupied, spin_weight=1, pullback=pullback, library=library)
+        if cuda
+        else _reference_singles(fock, occupied, pullback)
+    )
+    return fock, energy, error, bar
+
+
 def reference_cabs_singles(
     request: FocalRequest,
     reference: FocalReference,
@@ -96,7 +122,6 @@ def reference_cabs_singles(
     from generativeqc_compiler.mp2.f12_frame_response import frame_kernel_cotangent
     from generativeqc_compiler.tensor import execute
 
-    from ._f12_cabs import cabs_singles
     from ._f12_spin_ao import _orbital_sources
     from ._f12_spin_fock import spin_fock, spin_fock_pullback
 
@@ -216,21 +241,13 @@ def reference_cabs_singles(
     errors = []
     seeds = {}
     for name, k, occ in zip(("alpha", "beta"), spins, (oa, ob), strict=True):
-        f = focks["fock_" + name]
-        if not np.allclose(f, f.T, atol=2e-8, rtol=0):
-            raise ValueError("physical extended DF Fock is asymmetric")
-        f = (f + f.T) * 0.5
-        err = float(
-            np.max(np.abs(f[:obs, :obs] - np.diag(reference.orbital_energies[k])))
-        )
-        if not np.isfinite(err) or err > 2e-8:
-            raise ValueError(
-                f"extended {name} Fock does not reproduce the SCF reference: {err}"
-            )
-        energy, bar = (
-            cabs_singles(f, occ, spin_weight=1, pullback=pullback, library=library)
-            if cuda
-            else _reference_singles(f, occ, pullback)
+        f, energy, err, bar = _singles_from_fock(
+            focks["fock_" + name],
+            reference.orbital_energies[k],
+            occ,
+            cuda,
+            pullback,
+            library,
         )
         matrices.append(f)
         energies.append(energy)

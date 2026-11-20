@@ -128,7 +128,7 @@ def pair_operands(
 class PairEnergy(NamedTuple):
     spins: tuple[str, str]
     occupied_indices: tuple[int, int]
-    mp2: float
+    mp2: float | None
     f12: float
 
 
@@ -140,25 +140,36 @@ def molecular_pair_energies(
     run: Callable,
     *,
     frozen_occupied: tuple[int, int] = (0, 0),
+    include_ordinary: bool = True,
 ) -> Iterator[PairEnergy]:
     """Evaluate the orbital MP2 contribution and fixed-cusp increment per pair.
 
     The common auxiliary space is Coulomb fitted. Each spin retains its own
     extended Fock matrix and occupied/virtual MOs. The caller supplies the
     physical OBS/CABS integrals and the selected TensorIR execution backend.
+    Set include_ordinary=False when a separate MP2Fit supplies ordinary MP2.
     """
     for left, right, nl, nr, graph, pairs in occupied_pair_blocks(
         space, frozen_occupied=frozen_occupied
     ):
+        selected = (
+            graph
+            if include_ordinary
+            else Program({"pair_energy": graph.outputs["pair_energy"]})
+        )
         for i, j in pairs:
             values = pair_operands(
                 data, sources, fock, left, right, nl, nr, space[3], i, j
             )
             result = run(
-                graph, {key: np.ascontiguousarray(v) for key, v in values.items()}
+                selected, {key: np.ascontiguousarray(v) for key, v in values.items()}
             ).outputs
-            ordinary = float(result["ordinary_pair_energy"])
+            ordinary = (
+                float(result["ordinary_pair_energy"]) if include_ordinary else None
+            )
             increment = float(result["pair_energy"])
-            if not np.isfinite(ordinary) or not np.isfinite(increment):
+            if (ordinary is not None and not np.isfinite(ordinary)) or not np.isfinite(
+                increment
+            ):
                 raise ValueError(f"Nonfinite energy for {left}/{right} pair ({i}, {j})")
             yield PairEnergy((left, right), (i, j), ordinary, increment)

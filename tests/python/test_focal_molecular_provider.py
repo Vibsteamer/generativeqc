@@ -1,8 +1,11 @@
 """Public geometry provider with coincident and independent auxiliary bases."""
 
+from __future__ import annotations
+
 import os
 from dataclasses import replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
@@ -15,6 +18,11 @@ from generativeqc.experimental.f12_focal import (
     plan_singlepoint,
 )
 from generativeqc.profiles import canonical_hash
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from generativeqc_compiler.tensor import Execution, Program
 
 
 def basis(name: str, exponents: tuple[float, ...]) -> BasisSet:
@@ -384,3 +392,96 @@ def test_public_uhf_stationary_lagrangian_on_same_molecular_frame(
 
     with pytest.raises(ValueError, match="MolecularFocalProvider.cuda"):
         provider.ucc_stationary(replace(q, backend="cuda"))
+
+
+@pytest.mark.parametrize(
+    ("root", "fits"),
+    [("rhf", (0, 2, 2)), ("uhf", (0, 1, 2)), ("uhf", (0, 0, 0)), ("uhf", (0, 0, 2))],
+)
+def test_one_root_low_order_energies_and_forces(
+    root: str, fits: tuple[int, int, int]
+) -> None:
+    from unittest.mock import patch
+
+    from generativeqc import _f12_focal_molecular as owner
+    from generativeqc_compiler.tensor import execute
+
+    shell = os.environ.get("GENERATIVEQC_F12_HOST_SINK")
+    if not shell:
+        pytest.skip("requires the molecular host shell library")
+    q = request(XYZ[:2] if root == "rhf" else XYZ, fits, root)
+    provider = MolecularFocalProvider(shell_library=Path(shell))
+    independent_roles = [
+        provider(replace(q, role=role)).term for role in ("hf_cabs", q.role)
+    ]
+    with (
+        patch.object(owner, "df_reference", wraps=owner.df_reference) as scf,
+        patch.object(
+            owner, "one_electron_sources", wraps=owner.one_electron_sources
+        ) as one,
+        patch.object(
+            MolecularFocalProvider,
+            "_panel",
+            autospec=True,
+            side_effect=MolecularFocalProvider._panel,
+        ) as panel,
+    ):
+        center = provider.low_order_energy_and_forces(q)
+    assert scf.call_count == one.call_count == 1
+    assert scf.call_args.kwargs["forces"] and one.call_args.kwargs["derivatives"]
+    assert panel.call_count == len(set(fits))
+    for actual, term in zip(
+        (center.hf_cabs_forces, center.mp2_f12_correlation_forces),
+        independent_roles,
+        strict=True,
+    ):
+        np.testing.assert_allclose(actual, term.forces, atol=2e-9, rtol=0)
+
+    def forward_only(graph: Program, inputs: Mapping[str, np.ndarray]) -> Execution:
+        assert not any(k.startswith(("bar_", "dB_", "dFo_", "dFv_")) for k in inputs)
+        assert not any(
+            "force" in k or "gradient" in k or k.startswith("bar_")
+            for k in graph.outputs
+        )
+        return execute(graph, inputs)
+
+    with (
+        patch.object(owner, "df_reference", wraps=owner.df_reference) as scf,
+        patch.object(
+            owner, "one_electron_sources", wraps=owner.one_electron_sources
+        ) as one,
+        patch.object(
+            MolecularFocalProvider,
+            "_gradient",
+            side_effect=AssertionError("unexpected derivative"),
+        ),
+    ):
+        energy = replace(provider, run=forward_only).low_order_energy(
+            q, expected_cabs_rank=center.energies.cabs_rank
+        )
+    assert energy.reference.forces is None
+    assert scf.call_count == one.call_count == 1
+    assert (
+        not scf.call_args.kwargs["forces"] and not one.call_args.kwargs["derivatives"]
+    )
+    np.testing.assert_allclose(
+        energy.cabs_spin_energies,
+        center.energies.cabs_spin_energies,
+        atol=2e-10,
+        rtol=0,
+    )
+    np.testing.assert_allclose(
+        energy.ordinary_mp2_spin_energies,
+        center.energies.ordinary_mp2_spin_energies,
+        atol=2e-10,
+        rtol=0,
+    )
+    assert energy.f12_increment == pytest.approx(
+        center.energies.f12_increment, abs=2e-10, rel=0
+    )
+    for x, term in zip(
+        (energy.hf_cabs_energy, energy.mp2_f12_correlation_energy),
+        independent_roles,
+        strict=True,
+    ):
+        assert x == pytest.approx(term.energy, abs=2e-10, rel=0)

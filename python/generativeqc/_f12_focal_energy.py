@@ -1,0 +1,241 @@
+"""Forward-only all-active HF+CABS and MP2-F12/3C(FIX) on one molecular determinant."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from functools import partial
+from math import fsum, isfinite
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
+
+    import numpy as np
+    from generativeqc_compiler.tensor import Execution, Program
+
+    from ._f12_focal_molecular import MolecularFocalProvider
+    from ._f12_focal_reference import FocalReference
+    from ._f12_focal_ump2 import FocalCoulombSource
+    from .experimental.f12_focal import FocalRequest
+
+
+@dataclass(frozen=True)
+class FocalLowOrderEnergy:
+    """Single-cardinal energies in Eh. Ordinary spin energies are ordered aa, ab, bb."""
+
+    reference: FocalReference
+    cabs_rank: int
+    cabs_spin_energies: tuple[float, float]
+    ordinary_mp2_spin_energies: tuple[float, float, float]
+    f12_increment: float
+
+    @property
+    def hf_cabs_energy(self) -> float:
+        return self.reference.energy + fsum(self.cabs_spin_energies)
+
+    @property
+    def mp2_f12_correlation_energy(self) -> float:
+        return fsum((*self.ordinary_mp2_spin_energies, self.f12_increment))
+
+    @property
+    def energy(self) -> float:
+        return self.hf_cabs_energy + self.mp2_f12_correlation_energy
+
+
+@dataclass(frozen=True)
+class FocalLowOrderForces:
+    """Component energies and analytic Cartesian forces in Eh/bohr on a single root."""
+
+    energies: FocalLowOrderEnergy
+    hf_cabs_forces: np.ndarray
+    mp2_f12_correlation_forces: np.ndarray
+
+    @property
+    def forces(self) -> np.ndarray:
+        return self.hf_cabs_forces + self.mp2_f12_correlation_forces
+
+
+def _ordinary_energies(
+    reference: FocalReference,
+    spin_indices: tuple[int, int],
+    source: FocalCoulombSource,
+    run: Callable,
+) -> tuple[float, float, float]:
+    from generativeqc_compiler.mp2.ordinary_df_factors import ordinary_df_factors
+    from generativeqc_compiler.mp2.unrestricted_df_response import df_ump2_pair_response
+    from generativeqc_compiler.tensor import Program
+
+    n, q = len(reference.hcore), len(source.metric)
+    controls = {}
+    spins = ("alpha", "beta")
+    occs = tuple(reference.occupied[k] for k in spin_indices)
+    for name, k, occ in zip(spins, spin_indices, occs, strict=True):
+        if occ:
+            factor = ordinary_df_factors(n, occ, q)
+            values = {
+                "coefficients": reference.coefficients[k],
+                "ao_coulomb": source.three_center,
+                "whitener": source.whitener,
+            }
+            b = run(Program({"B": factor.outputs["B"]}), values).outputs["B"]
+            eps = reference.orbital_energies[k]
+            controls[name] = {
+                "B_" + name: b,
+                "eo_" + name: eps[:occ],
+                "ev_" + name: eps[occ:],
+            }
+    energies = []
+    for i, j in ((0, 0), (0, 1), (1, 1)):
+        ni, nj = occs[i], occs[j]
+        if not ni or not nj or (i == j and ni < 2):
+            energies.append(0.0)
+            continue
+        left, right = spins[i], spins[j]
+        pair = df_ump2_pair_response(left + "_" + right, q, ni, n - ni, nj, n - nj, 1)
+        value = run(
+            Program({"energy": pair.outputs["energy"]}),
+            {**controls[left], **controls[right]},
+        )
+        energies.append(float(value.outputs["energy"]))
+    return tuple(energies)
+
+
+def _check_request(provider: MolecularFocalProvider, request: FocalRequest) -> int:
+    from .elements import checked_integer
+
+    basis = request.basis
+    if (
+        request.role != "mp2_f12_correlation"
+        or request.correlation_space_id != "all-active"
+        or request.root_id not in ("rhf", "uhf")
+        or (request.root_id == "rhf" and request.multiplicity != 1)
+        or any(
+            x is None for x in (basis.cabs, basis.mp2_fit, basis.f12_fit, basis.beta)
+        )
+    ):
+        raise ValueError(
+            "low-order energies require an all-active RHF/UHF MP2-F12 request with its three fitting roles and OptRI"
+        )
+    cuda = request.backend == "cuda"
+    if request.backend not in ("cuda", "cpu_reference") or (
+        cuda
+        and (
+            provider.run is None
+            or provider.metric_library is None
+            or provider.response_library is None
+        )
+    ):
+        raise ValueError(
+            "low-order energies require their physical backend, CUDA metric library and graph runner"
+        )
+    return checked_integer(
+        provider.budget_mib,
+        "molecular focal budget in MiB",
+        low=1,
+        high=(2**63 - 1) >> 20,
+    )
+
+
+def molecular_low_order_energy(
+    provider: MolecularFocalProvider,
+    request: FocalRequest,
+    expected_cabs_rank: int | None,
+) -> FocalLowOrderEnergy:
+    from generativeqc_compiler.tensor import execute
+
+    from ._f12_focal_frame import canonical_pair_frame
+    from ._f12_focal_molecular import df_reference, one_electron_sources
+    from ._f12_focal_singles import _singles_from_fock
+    from ._f12_spin_ao import _orbital_sources
+    from ._f12_spin_fock import spin_fock
+    from ._f12_spin_pairs import molecular_pair_energies
+
+    budget = _check_request(provider, request)
+    cuda = request.backend == "cuda"
+    runner = provider.run or partial(execute, max_bytes=budget << 20)
+
+    def run(graph: Program, inputs: Mapping[str, np.ndarray]) -> Execution:
+        result = runner(graph, inputs)
+        if result.backend != (
+            "cuda-fp64-ordinary-stream" if cuda else "numpy-cpu-interpreter"
+        ):
+            raise RuntimeError("low-order energy graph executed on another backend")
+        return result
+
+    ref = df_reference(
+        request, forces=False, budget_mib=budget, **provider._seed_options(request)
+    )
+    one = one_electron_sources(
+        request,
+        library=provider.one_electron_library or provider.shell_library,
+        derivatives=False,
+        budget_mib=budget,
+    )
+    jk, mp2, f12 = provider._pair_panels(request)
+    space, ao, jkfit, projector = canonical_pair_frame(
+        request,
+        ref,
+        one,
+        jk.joint(request, explicit=False),
+        f12.joint(request, explicit=True),
+        expected_cabs_rank=expected_cabs_rank,
+        relative_cutoff=provider.relative_cutoff,
+        library=provider.response_library,
+    )
+    oa, ob, obs, ext, _ = space
+    distinct_jk = jk is not f12
+    data, _ = _orbital_sources(
+        space, ao, run, None, projected=None, role="pairs" if distinct_jk else "shared"
+    )
+    fock_data = data
+    if distinct_jk:
+        shared = ("overlap_ao", "hcore_ao", "coefficients_alpha", "coefficients_beta")
+        fock_ao = {**{k: ao[k] for k in shared}, **jkfit}
+        fock_data, _ = _orbital_sources(
+            (oa, ob, obs, ext, len(jk.whitener)),
+            fock_ao,
+            run,
+            None,
+            projected=None,
+            role="fock",
+        )
+
+    def sources(raw: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        return {
+            k.removeprefix("source/"): v
+            for k, v in raw.items()
+            if k.startswith("source/")
+        }
+
+    fock = spin_fock((oa, ob, ext, len(jk.whitener)), sources(fock_data), run)
+    indices = ref._pair_spin_indices(request)
+    singles = tuple(
+        _singles_from_fock(
+            fock["fock_" + s],
+            ref.orbital_energies[k],
+            ref.occupied[k],
+            cuda,
+            False,
+            provider.response_library,
+        )[1]
+        for s, k in zip(("alpha", "beta"), indices, strict=True)
+    )
+    channels = {("alpha", "alpha"): [], ("alpha", "beta"): [], ("beta", "beta"): []}
+    increments = []
+    for item in molecular_pair_energies(
+        space, data, sources(data), fock, run, include_ordinary=mp2 is f12
+    ):
+        if item.mp2 is not None:
+            channels[item.spins].append(item.mp2)
+        increments.append(item.f12)
+    ordinary = (
+        tuple(fsum(values) for values in channels.values())
+        if mp2 is f12
+        else _ordinary_energies(ref, indices, mp2.obs(request, obs), run)
+    )
+    result = FocalLowOrderEnergy(
+        ref, projector.rank, singles, ordinary, fsum(increments)
+    )
+    if not isfinite(result.energy):
+        raise ArithmeticError("nonfinite molecular low-order energy")
+    return result

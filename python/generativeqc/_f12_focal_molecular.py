@@ -12,6 +12,12 @@ from ._f12_focal_cc_sources import (
     FocalUCCFixedSources,
     molecular_ucc_sources,
 )
+from ._f12_focal_energy import (
+    FocalLowOrderEnergy,
+    FocalLowOrderForces,
+    _check_request,
+    molecular_low_order_energy,
+)
 from ._f12_focal_increment import FocalF12Sources, reference_f12_increment
 from ._f12_focal_integrals import (
     contract_live_weights,
@@ -22,7 +28,7 @@ from ._f12_focal_integrals import (
 from ._f12_focal_one_electron import FocalOneElectron, one_electron_sources
 from ._f12_focal_projector import focal_cabs_projector
 from ._f12_focal_reference import FocalReference, FocalReferenceSeed, df_reference
-from ._f12_focal_singles import reference_cabs_singles
+from ._f12_focal_singles import FocalCabsSingles, reference_cabs_singles
 from ._f12_focal_ump2 import FocalCoulombSource, reference_df_ump2
 from .elements import checked_integer
 
@@ -203,6 +209,49 @@ class MolecularFocalProvider:
             reference_seed=reference_seed,
             _cuda_cc_target=(architecture, cache_directory, record_graph),
         )
+
+    def low_order_energy(
+        self, request: FocalRequest, *, expected_cabs_rank: int | None = None
+    ) -> FocalLowOrderEnergy:
+        """Return HF+CABS and MP2-F12 energies for one all-active pair request.
+
+        A single canonical RHF or UHF determinant supplies both components.
+        Only forward integrals and electronic contractions are evaluated.
+        Pass the center CABS rank to track its differentiable branch at a displaced point.
+        """
+        return molecular_low_order_energy(self, request, expected_cabs_rank)
+
+    def low_order_energy_and_forces(self, request: FocalRequest) -> FocalLowOrderForces:
+        """Evaluate both low-order analytic forces and energies on one canonical root.
+
+        Use low_order_energy with this center's CABS rank for a displaced energy.
+        Both center roles share the physical determinant and the AO integral panels.
+        """
+        budget = _check_request(self, request)
+        reference = df_reference(
+            request, forces=True, budget_mib=budget, **self._seed_options(request)
+        )
+        one = one_electron_sources(
+            request,
+            library=self.one_electron_library or self.shell_library,
+            derivatives=True,
+            budget_mib=budget,
+        )
+        panels = self._pair_panels(request)
+        spin_mp2, increment, rank, correlation_forces = self._pair_components(
+            request, reference, one, panels, expected_cabs_rank=None
+        )
+        singles, hf_cabs_forces = self._singles_components(
+            replace(request, role="hf_cabs"),
+            reference,
+            one,
+            panels[0],
+            expected_cabs_rank=rank,
+        )
+        energies = FocalLowOrderEnergy(
+            reference, rank, singles.spin_energies, spin_mp2, increment
+        )
+        return FocalLowOrderForces(energies, hf_cabs_forces, correlation_forces)
 
     def ucc_fixed_sources(self, request: FocalRequest) -> FocalUCCFixedSources:
         """Generate W_vo, W_vv, C and the V+B-X scalar for fixed-cusp UCC.
@@ -511,7 +560,9 @@ class MolecularFocalProvider:
             ref = solution.sources.fixed.reference
         else:
             ref = df_reference(
-                request, forces=not pair, budget_mib=self.budget_mib,
+                request,
+                forces=not pair,
+                budget_mib=self.budget_mib,
                 **self._seed_options(request),
             )
         one = one_electron_sources(
@@ -561,6 +612,20 @@ class MolecularFocalProvider:
         *,
         expected_cabs_rank: int | None = None,
     ) -> tuple[float, np.ndarray]:
+        singles, forces = self._singles_components(
+            request, ref, one, jk, expected_cabs_rank=expected_cabs_rank
+        )
+        return singles.hf_cabs_energy, forces
+
+    def _singles_components(
+        self,
+        request: FocalRequest,
+        ref: FocalReference,
+        one: FocalOneElectron,
+        jk: _Panel,
+        *,
+        expected_cabs_rank: int | None,
+    ) -> tuple[FocalCabsSingles, np.ndarray]:
         projector = focal_cabs_projector(
             request,
             one,
@@ -592,17 +657,10 @@ class MolecularFocalProvider:
             coulomb_only=True,
         )
         grad += one.nuclear_gradient(w["overlap"], w["hcore"], run=self.run)
-        return singles.hf_cabs_energy, ref.forces - grad
+        return singles, ref.forces - grad
 
-    def _pair(
-        self,
-        request: FocalRequest,
-        ref: FocalReference,
-        one: FocalOneElectron,
-        *,
-        expected_cabs_rank: int | None = None,
-    ) -> tuple[float, np.ndarray]:
-        basis, n = request.basis, one.obs_ao_count
+    def _pair_panels(self, request: FocalRequest) -> tuple[_Panel, _Panel, _Panel]:
+        basis = request.basis
         assert basis.mp2_fit is not None and basis.f12_fit is not None
         f12 = self._panel(request, "f12_fit")
         jk = (
@@ -613,6 +671,36 @@ class MolecularFocalProvider:
         mp2 = next((p for p in (jk, f12) if p.fit_id == basis.mp2_fit.identity), None)
         if mp2 is None:
             mp2 = self._panel(request, "mp2_fit")
+        return jk, mp2, f12
+
+    def _pair(
+        self,
+        request: FocalRequest,
+        ref: FocalReference,
+        one: FocalOneElectron,
+        *,
+        expected_cabs_rank: int | None = None,
+    ) -> tuple[float, np.ndarray]:
+        spin_mp2, increment, _, forces = self._pair_components(
+            request,
+            ref,
+            one,
+            self._pair_panels(request),
+            expected_cabs_rank=expected_cabs_rank,
+        )
+        return float(sum(spin_mp2) + increment), forces
+
+    def _pair_components(
+        self,
+        request: FocalRequest,
+        ref: FocalReference,
+        one: FocalOneElectron,
+        panels: tuple[_Panel, _Panel, _Panel],
+        *,
+        expected_cabs_rank: int | None,
+    ) -> tuple[tuple[float, float, float], float, int, np.ndarray]:
+        n = one.obs_ao_count
+        jk, mp2, f12 = panels
         ordinary = reference_df_ump2(
             request,
             ref,
@@ -663,4 +751,4 @@ class MolecularFocalProvider:
             explicit.one_electron_weights["hcore"],
             run=self.run,
         )
-        return float(sum(ordinary.spin_energies) + explicit.energy), -grad
+        return ordinary.spin_energies, explicit.energy, explicit.cabs_rank, -grad

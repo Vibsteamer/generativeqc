@@ -49,6 +49,8 @@ Role = Literal[
 ]
 Backend = Literal["cuda", "cpu_reference"]
 MolecularFocalProvider = _f12_focal_molecular.MolecularFocalProvider
+FocalLowOrderForces = _f12_focal_molecular.FocalLowOrderForces
+FocalLowOrderEnergy = _f12_focal_molecular.FocalLowOrderEnergy
 FocalUCCEquationSources = _f12_focal_molecular.FocalUCCEquationSources
 FocalUCCFixedSources = _f12_focal_molecular.FocalUCCFixedSources
 FocalUCCStationary = _f12_focal_molecular.FocalUCCStationary
