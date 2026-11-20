@@ -70,7 +70,8 @@ class _Panel:
 class MolecularFocalProvider:
     """Evaluate geometric HF+CABS and all-active RHF/UHF MP2-F12/3C(FIX) focal terms.
 
-    Supply native F12 shell and optional separate one-electron libraries. CUDA
+    Supply native F12 shell and optional separate one-electron libraries. When
+    supplied, the latter also provides the real-spherical projections. CUDA
     uses an FP64 TensorIR runner, the device metric/response library, and the
     canonical-response ABI of the main native library. Each call solves one
     physical determinant on the backend in the request. Pass this callable as
@@ -160,6 +161,7 @@ class MolecularFocalProvider:
             budget_mib=self.budget_mib,
             ordinary_fit=role if ordinary else None,
             joint_jk=role == "jk_fit" and request.role == "mp2_f12_correlation",
+            projection_library=self.one_electron_library,
         )
         raw, _ = forward_integrals(
             layout,

@@ -155,7 +155,10 @@ def test_focal_coulomb_operators_against_libcint(host_sink: Path) -> None:
         )
 
 
-def test_raw_cartesian_spherical_projection_through_i(host_sink: Path) -> None:
+@pytest.mark.parametrize("separate_projection", [False, True])
+def test_raw_cartesian_spherical_projection_through_i(
+    host_sink: Path, tmp_path: Path, separate_projection: bool
+) -> None:
     gto = pytest.importorskip("pyscf.gto")
     req, _ = shell_inputs()
     shells = tuple(BasisShell(l, ("0.8",), (("1",),)) for l in range(7))
@@ -166,9 +169,10 @@ def test_raw_cartesian_spherical_projection_through_i(host_sink: Path) -> None:
     basis = FocalBasis(2, "test", req.basis.orbital, jk_fit=req.basis.jk_fit, cabs=cabs)
     layout = focal_shell_layout(
         replace(req, role="hf_cabs", basis=basis),
-        host_sink,
+        tmp_path / "shell-only.so" if separate_projection else host_sink,
         host_reference=True,
         budget_mib=64,
+        projection_library=host_sink if separate_projection else None,
     )
     assert layout["obs_ao_count"] == 4
     for l in range(7):

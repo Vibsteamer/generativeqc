@@ -119,12 +119,14 @@ def focal_shell_layout(
     budget_mib: int,
     ordinary_fit: str | None = None,
     joint_jk: bool = False,
+    projection_library: Path | None = None,
 ) -> dict:
     """Use OBS then OptRI rows in native real-spherical order; fitting rows start at zero.
 
     HF+CABS uses its JKFit Coulomb channels. Pair-correlation requests yield
     Gaussian integral sources in their declared F12 fit. Computing ordinary
     MP2 or forming a physical Fock requires its own declared fitting basis.
+    A separate one-electron library may supply the real-spherical projections.
     """
     if request.backend != ("cpu_reference" if host_reference else "cuda"):
         raise ValueError("focal request and integral backend disagree")
@@ -220,6 +222,8 @@ def focal_shell_layout(
             counts *= cart_sizes[column]
         layout[group + "_blocks"] = blocks
         layout[group + "_offsets"] = np.r_[0, np.cumsum(counts)].astype(np.int32)
-    for l, transform in spherical_projections(library, set(angular)).items():
+    for l, transform in spherical_projections(
+        projection_library or library, set(angular)
+    ).items():
         layout[f"transform_{l}"] = transform
     return layout
