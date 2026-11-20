@@ -114,6 +114,8 @@ class MolecularFocalProvider:
     high-order evaluator explicitly for conventional post-MP2 and triples steps.
     On all-active RHF singlet and UHF roots the provider also evaluates the same-reference difference
     between CCSD-F12b and MP2-F12 correlation energies and forces.
+    lambda_options controls the stationary multiplier solve of each CC role.
+    Its workspace is bounded by budget_mib.
     """
 
     shell_library: Path
@@ -128,6 +130,7 @@ class MolecularFocalProvider:
     _cuda_cc_target: tuple[str, Path, Callable[[dict], None] | None] | None = field(
         default=None, repr=False, compare=False
     )
+    lambda_options: UCCSDLambdaOptions | None = None
 
     @classmethod
     def cuda(
@@ -142,6 +145,7 @@ class MolecularFocalProvider:
         relative_cutoff: float = 1e-9,
         high_order: Callable[[FocalRequest], FocalEvaluation] | None = None,
         record_graph: Callable[[dict], None] | None = None,
+        lambda_options: UCCSDLambdaOptions | None = None,
     ) -> MolecularFocalProvider:
         """Use the installed CUDA backend with compiled shell and metric/response libraries.
 
@@ -172,6 +176,7 @@ class MolecularFocalProvider:
             relative_cutoff=relative_cutoff,
             budget_mib=budget,
             high_order=high_order,
+            lambda_options=lambda_options,
             _cuda_cc_target=(architecture, cache_directory, record_graph),
         )
 
@@ -270,7 +275,11 @@ class MolecularFocalProvider:
         if options is None:
             options = SolverOptions(max_bytes=budget)
         if lambda_options is None:
+            lambda_options = self.lambda_options
+        if lambda_options is None:
             lambda_options = UCCSDLambdaOptions(max_bytes=budget)
+        if lambda_options.max_bytes > budget:
+            lambda_options = replace(lambda_options, max_bytes=budget)
         if source_cotangents:
             primal, dual, weights = solve_focal_uccsd_f12b_with_cotangents(
                 sources,
