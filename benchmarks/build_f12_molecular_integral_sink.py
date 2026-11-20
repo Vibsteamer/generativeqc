@@ -118,6 +118,20 @@ def main() -> None:
         "one_electron",
     )
     objects.append(str(one_electron))
+    if cuda:
+        projector = build / "focal_ecp.o"
+        run(
+            common
+            + [
+                "-std=c++17",
+                "-c",
+                str(REPO / "benchmarks/f12_focal_ecp.cu"),
+                "-o",
+                str(projector),
+            ],
+            "focal_ecp",
+        )
+        objects.append(str(projector))
     for source in (
         REPO / "src/molecule/basis.cpp",
         REPO / "benchmarks/f12_shell_projection.cpp",
@@ -148,7 +162,15 @@ def main() -> None:
     temporary_target = target.with_suffix(".linking.so")
     link_flags = ["-arch=sm_" + arch] if cuda else []
     run(
-        [compiler, "-shared", *link_flags, *objects, "-o", str(temporary_target)],
+        [
+            compiler,
+            "-shared",
+            *link_flags,
+            *objects,
+            *(["-lcublas"] if cuda else []),
+            "-o",
+            str(temporary_target),
+        ],
         "link",
     )
     os.replace(temporary_target, target)

@@ -26,9 +26,21 @@ on the same atom cancel at scattering. This covers arbitrary orientations,
 coincident OBS/OptRI owners and distinct centers in noncollinear hydrides.
 
 The ordinary molecular ECP quadrature has a different orbital angular domain.
-Two historical through-i hydride kernels require fixed center or axial
-layouts. The experimental CUDA focal request still requires a combined-basis
-device kernel for this residual. The CPU entry uses its explicitly selected
-backend. Its matrices contain the geometry derivative of the one-electron
-Hamiltonian; complete energy and gradient consumers also require their
-fitted two-electron, orbital and response terms.
+The molecular CUDA library now includes a general off-center kernel using
+the through-i AO polynomial and radial factorization of the earlier
+three-center experiment. The host stages basis rows, ECP records and fixed
+quadrature constants. Each GPU radial tile evaluates AO values and electron
+gradients in the laboratory frame, projects all sixteen angular channels with
+FP64 cuBLAS, applies the radial potentials and scatters both AO-center and
+operator-center derivatives on the device. This direct rule uses every
+azimuth of each fixed grid and supports arbitrary atom ordering and multiple
+projector centers. The tile accounts for the dense output, a bounded cuBLAS
+workspace, and device input/staging. The two independent grid evaluations
+must satisfy the same acceptance gates as the CPU reference.
+
+The CUDA translation unit compiled and linked for sm_89. The shared scalar
+AO and radial operations were checked on the host against independent libcint
+derivatives on a tilted three-center through-i model. Real-device numerical
+acceptance uses the molecular CUDA library and the public geometry request.
+Complete energy and gradient consumers also require their fitted
+two-electron, orbital and response terms.

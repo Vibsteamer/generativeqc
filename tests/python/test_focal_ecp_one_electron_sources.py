@@ -142,5 +142,33 @@ def test_direct_semilocal_center_derivatives(symbol: str, ecp_library: Path) -> 
     )
     np.testing.assert_allclose(value.hcore, out.hcore, atol=2e-10, rtol=0)
     assert value.d_hcore is None
-    with pytest.raises(NotImplementedError, match="CUDA"):
+    with pytest.raises(RuntimeError, match="cuda one-electron kernel"):
         one_electron_sources(replace(req, backend="cuda"), library=ecp_library)
+
+
+@pytest.mark.parametrize("symbol", ["Br", "I"])
+def test_cuda_geometry_projectors_against_three_center_oracle(symbol: str) -> None:
+    """Run the built molecular CUDA artifact against fresh independent AO matrices."""
+    import os
+    from pathlib import Path
+
+    from pyscf import scf
+
+    if not (library := os.environ.get("GENERATIVEQC_F12_FOCAL_CUDA_LIBRARY")):
+        pytest.skip("requires the compiled focal CUDA library and a CUDA device")
+    xyz = np.array([[0.13, -0.16, 0.27], [1.23, 0.52, -0.39], [-0.68, 0.81, 1.43]])
+    req, oracle = _request(symbol, xyz)
+    req = replace(req, backend="cuda")
+    out = one_electron_sources(req, library=Path(library), budget_mib=160)
+    mol, h = oracle(xyz)
+    np.testing.assert_allclose(out.hcore, h, atol=2e-9, rtol=0)
+    gen = scf.RHF(mol).nuc_grad_method().hcore_generator(mol)
+    assert out.d_hcore is not None and out.executed_backend == "cuda"
+    for atom in range(3):
+        np.testing.assert_allclose(
+            out.d_hcore[atom], gen(atom) + gen(atom + 3), atol=8e-9, rtol=0
+        )
+    only = one_electron_sources(
+        req, library=Path(library), derivatives=False, budget_mib=160
+    )
+    np.testing.assert_allclose(only.hcore, h, atol=2e-9, rtol=0)

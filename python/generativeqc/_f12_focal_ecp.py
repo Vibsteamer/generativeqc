@@ -316,6 +316,12 @@ def add_projector_residual(
     )
     coarse = _grid(shells, transforms, xyz, terms, grids[0], derivatives, budget)
     fine = _grid(shells, transforms, xyz, terms, grids[1], derivatives, budget)
+    check_projector_grids(coarse, fine)
+    hcore += fine
+
+
+def check_projector_grids(coarse: np.ndarray, fine: np.ndarray) -> None:
+    """Apply identical absolute quadrature admission to CPU and CUDA operators."""
     if (
         not np.isfinite(fine).all()
         or not np.allclose(coarse[0], fine[0], rtol=0, atol=MATRIX_ABS_TOLERANCE)
@@ -325,4 +331,3 @@ def add_projector_residual(
         )
     ):
         raise ArithmeticError("focal scalar ECP quadrature grid pair did not converge")
-    hcore += fine
