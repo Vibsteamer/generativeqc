@@ -342,3 +342,68 @@ extern "C" int generativeqc_f12_cabs_projector_cuda_v2(int device, int n, int o,
   }
   return 1;
 }
+
+namespace {
+// Row-major C is column-major C^T; explicitly index its two independent
+// contractions so a second leg never discards the low word of the first.
+__global__ void operator_times_frame(const double* ao, const double* c, size_t n, size_t m,
+                                     Extended* work) {
+  for (size_t k = blockIdx.x * blockDim.x + threadIdx.x; k < n * m;
+       k += size_t(blockDim.x) * gridDim.x) {
+    const size_t row = k / m, col = k % m;
+    Extended sum{};
+    for (size_t a = 0; a < n; ++a) sum.add_product(ao[row * n + a], c[a * m + col]);
+    work[k] = sum;
+  }
+}
+__global__ void frame_times_product(const double* c, const Extended* work, size_t n, size_t m,
+                                    double* output) {
+  for (size_t k = blockIdx.x * blockDim.x + threadIdx.x; k < m * m;
+       k += size_t(blockDim.x) * gridDim.x) {
+    const size_t row = k / m, col = k % m;
+    Extended sum{};
+    for (size_t a = 0; a < n; ++a) sum.add_product(work[a * m + col], c[a * m + row]);
+    output[k] = sum.hi + sum.lo;
+  }
+}
+}  // namespace
+
+extern "C" int generativeqc_f12_cabs_congruence_cuda_v1(int device, int n, int columns,
+                                                        const double* ao, const double* frame,
+                                                        double* transformed, char* error,
+                                                        size_t error_size) {
+  try {
+    if (device < 0 || n < 1 || columns < 1 || columns > n || !ao || !frame || !transformed)
+      throw std::invalid_argument("invalid physical CABS congruence buffers or dimensions");
+    const auto nn = gpu::size_mul(n, n, "AO operator extent overflow");
+    const auto nc = gpu::size_mul(n, columns, "CABS frame extent overflow");
+    const auto cc = gpu::size_mul(columns, columns, "extended Fock extent overflow");
+    gpu::CudaDeviceScope scope(device);
+    gpu::OwnedCudaStream stream(device);
+    gpu::OwnedCudaBuffer<double> a(device, nn, stream.get()), c(device, nc, stream.get()),
+        f(device, cc, stream.get());
+    gpu::OwnedCudaBuffer<Extended> work(device, nc, stream.get());
+    cuda_resource_check(
+        cudaMemcpyAsync(a.get(), ao, nn * sizeof(double), cudaMemcpyHostToDevice, stream.get()));
+    cuda_resource_check(
+        cudaMemcpyAsync(c.get(), frame, nc * sizeof(double), cudaMemcpyHostToDevice, stream.get()));
+    operator_times_frame<<<blocks(nc), 256, 0, stream.get()>>>(a.get(), c.get(), n, columns,
+                                                               work.get());
+    frame_times_product<<<blocks(cc), 256, 0, stream.get()>>>(c.get(), work.get(), n, columns,
+                                                              f.get());
+    cuda_resource_check(cudaGetLastError());
+    std::vector<double> staged(cc);
+    cuda_resource_check(cudaMemcpyAsync(staged.data(), f.get(), cc * sizeof(double),
+                                        cudaMemcpyDeviceToHost, stream.get()));
+    stream.synchronize();
+    if (!std::all_of(staged.begin(), staged.end(), [](double x) { return std::isfinite(x); }))
+      throw std::runtime_error("nonfinite compensated CABS congruence");
+    std::copy(staged.begin(), staged.end(), transformed);
+    return 0;
+  } catch (const std::exception& ex) {
+    generativeqc_tensor::error_text(error, error_size, ex.what());
+  } catch (...) {
+    generativeqc_tensor::error_text(error, error_size, "unknown CABS congruence CUDA failure");
+  }
+  return 1;
+}
