@@ -18,6 +18,8 @@ from .. import _f12_focal_one_electron, _f12_focal_reference, _native
 from .._api_types import Atom
 from .._cbs_plan import native_cbs_plan
 from .._f12_focal_projector import focal_cabs_projector as focal_cabs_projector
+from .._f12_focal_singles import FocalCabsSingles as FocalCabsSingles
+from .._f12_focal_singles import reference_cabs_singles as reference_cabs_singles
 from .._model_resolution import snapshot_basis
 from ..basis import BasisProvenance, BasisSet
 from ..elements import SYMBOLS, atomic_number, checked_integer, electron_state

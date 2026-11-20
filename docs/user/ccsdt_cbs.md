@@ -816,3 +816,21 @@ and pass `expected_rank` when evaluating displacements. A matrix supplied as
 `cotangent` weights the invariant kernel `frame @ frame.T`. For a fixed
 weight, `einsum("ij,axij->ax", result.overlap_bar, one.d_overlap)` gives
 the positive nuclear derivative of the weighted kernel.
+
+
+To evaluate the HF+CABS component from the geometry in a source checkout,
+use `benchmarks.f12_focal_hf_cabs.molecular_hf_cabs(request, ...)`. Supply
+the F12 shell and one-electron libraries by path. CUDA also requires the
+CUDA metric library and the FP64 TensorIR runner. The provider uses the same
+canonical DF-HF state for singles and orbital relaxation, contracts the
+JKFit two- and three-center derivatives, and returns a `FocalEvaluation`
+with total energy and Cartesian forces. This full-rank JKFit path covers
+all-electron canonical RHF/UHF references with OBS virtual orbitals.
+
+For an existing reference and OBS-first integral set, call
+`reference_cabs_singles(request, reference, one, complement=frame,
+three_center=B, metric=M, whitener=W, relax=True)`. Here B has axes
+(JKFit, AO, AO), and W M Wᵀ is the identity. The result contains the total
+energy, both spin corrections and the four relaxed weights for S, Hcore,
+B and M. With `relax=False`, the returned coefficient and complementary
+kernel weights expose the separate electronic and overlap derivatives.

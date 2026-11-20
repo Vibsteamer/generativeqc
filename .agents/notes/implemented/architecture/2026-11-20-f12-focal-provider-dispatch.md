@@ -76,3 +76,24 @@ the existing symmetric pseudoinverse response for a truncated subspace and
 the inverse-metric identity when all complementary directions survive.
 Contract the returned overlap weight once with the one-electron nuclear
 Jacobian. Contributions from a nuclear-dependent observable seed enter separately.
+
+
+## Same-determinant HF+CABS forces
+
+Singles uses the extended physical spin Fock from the same orbital density and
+JKFit as DF-HF. Its OBS block must reproduce the canonical spectrum. Spin
+Fock, AO transform and metric-solve adjoints differentiate the singles
+functional with respect to the integral sources and orbital coefficients.
+The complement enters through its invariant kernel, whose fixed-rank
+overlap derivative includes mixing across a truncated spectral boundary.
+
+The antisymmetric occupied/virtual coefficient torque drives the transpose
+of the coupled spin orbital Hessian. Orthogonality contributes the
+occupied and virtual metric terms, including their mixed block. The
+existing DF nuclear-response transpose supplies the overlap, one-electron
+and JKFit weights, including the moving fitting metric. The molecular shell
+sinks and one-electron Jacobians contract these four weights. Subtract this
+correction gradient from the reference force once. A distorted H3 geometry
+tests both the closed-shell cation and neutral doublet against independent
+libcint, PySCF DF-HF and a Sylvester solve on a QR complement. The complete
+shell provider has a two-step nine-coordinate energy-difference control.
