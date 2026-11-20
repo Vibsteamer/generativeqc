@@ -113,8 +113,13 @@ class UccsdPrepared final : public PreparedCalculation {
             fitting_.auxiliary && (!fitting_.full_reference || fitting_.separate_reference_auxiliary), derivative_capacity);
       }
       const auto started = std::chrono::steady_clock::now();
+      // The retained CUDA focal determinant needs the reference J/K action
+      // for orbital response. Its nuclear derivatives use the fitted
+      // correlation and reference sources owned by unrestricted_force.
+      const bool reference_plan_forces =
+          compute_forces && !(cuda_ && focal && fitting_.full_reference);
       const auto strategy = scf::resolve_fock_build(
-          fitting_.reference_spec(compute_forces),
+          fitting_.reference_spec(reference_plan_forces),
           cuda_ ? scf::FockBackend::Cuda : scf::FockBackend::Cpu, 0, fitting_.threshold);
       scf::PreparedFockPlan reference_plan(
           physical, fitting_.reference_auxiliary(), strategy,
@@ -191,8 +196,8 @@ class UccsdPrepared final : public PreparedCalculation {
       std::optional<response::SpinResponseProblem> orbital_problem;
       if (compute_forces && (reference.nocc[0] * (reference.nbf - reference.nocc[0]) +
                              reference.nocc[1] * (reference.nbf - reference.nocc[1])))
-        orbital_problem.emplace(unrestricted_response_problem(reference, reference_plan,
-                                                              fitting_.reference_spec(true)));
+        orbital_problem.emplace(unrestricted_response_problem(
+            reference, reference_plan, fitting_.reference_spec(reference_plan_forces)));
       Result result;
       if (components & kHfComponent) {
         result.hf_component.emplace();
