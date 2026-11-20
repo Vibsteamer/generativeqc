@@ -97,3 +97,32 @@ Source construction, prior orbital response, reference force and CABS singles
 are supplied by the recorded molecular calculation for this comparison. The
 per-coordinate traversal, host staging, packed stationarity norm and final
 scalar accumulation also remain on the host.
+
+L20 jobs 2123729892435570688 and 2123734003381960704 completed the electronic
+source contractions for all nine NH2/D coordinates. The first measured H1-z.
+The second used its archived input dataset and stationary vectors to evaluate
+one fresh full pullback and contract the other eight coordinate tangents. It
+retained all 56 active device cotangents. Independent FP64 replay of the arrays
+gave a maximum elementwise error of 1.05e-17 and reproduced all eight new
+ordinary-CC and F12 source force components within 1e-10 Eh/bohr. Including
+the recorded UHF and CABS terms gave −55.84912880607278 Eh. Finite differences
+of independently reoptimized total energies agreed within 3.21e-8 Eh/bohr at
+N-x and 4.78e-8 Eh/bohr across the two H1-z spacings. The signed archives,
+source tensor hashes and numerical projections are in
+`molecular_cartesian_nh2/l20_cartesian/passed.json` in the validation area
+above. These runs consume the host-prepared moving Gaussian, spin-orbital and
+fitting-metric directions, and add the host-verified UHF and CABS contributions.
+
+The six ordinary Fock weights (oo, ov and vv in alpha and beta) can consume
+the native geometry-derived Hcore and its Cartesian derivatives directly.
+`tools/generativeqc_cc/uccsd_fock_nuclear.py` transforms the symmetric
+Fock weights into the real spherical AO basis, applies both spin orbital
+coefficient responses, and adds the independently supplied moving-MO
+Coulomb-minus-exchange derivatives. It preserves the single copy of ov
+and excludes frozen occupied rows and columns. The full CC Fock contribution
+at NH2 H1-z is +0.009285805230 Eh/bohr, with +0.070221184863 from the
+explicit AO core derivative, −0.030608596275 from the moving orbitals acting
+on Hcore, and −0.030326783358 from Coulomb and exchange. The retained native
+host execution reproduced the archived nuclear Fock force for all nine
+coordinates within 3e-10 Eh/bohr. The other 50 CC source products, UHF and
+CABS singles are separately assembled from their retained values.
