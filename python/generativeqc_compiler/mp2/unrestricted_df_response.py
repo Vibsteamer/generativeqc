@@ -13,6 +13,8 @@ def df_ump2_pair_response(
     right_occupied: int,
     right_virtuals: int,
     directions: int,
+    *,
+    source_weights: bool = False,
 ) -> Program:
     """Return energy and separate factor-/Fock-response forces for one spin pair.
 
@@ -22,13 +24,16 @@ def df_ump2_pair_response(
     orbital frame. For nuclear coordinates in Bohr the outputs are forces in
     Eh/Bohr. A complete unrestricted correlation term sums alpha_alpha,
     alpha_beta and beta_beta once each. Empty channels contribute zero and
-    do not require a graph.
+    do not require a graph. With source_weights=True, use one direction and
+    bar_force=[-1] to get energy derivatives of B, F_oo and F_vv.
     """
     if channel not in ("alpha_alpha", "alpha_beta", "beta_beta"):
         raise ValueError("expected alpha_alpha, alpha_beta or beta_beta")
     dimensions = (auxiliaries, left_occupied, left_virtuals, right_occupied, right_virtuals, directions)
     if any(type(n) is not int or n < 1 for n in dimensions):
         raise ValueError("a DF-UMP2 response graph requires positive dimensions")
+    if source_weights and directions != 1:
+        raise ValueError("a source cotangent requires a single force seed")
     left_spin, right_spin = channel.split("_")
     same = left_spin == right_spin
     if same and (left_occupied, left_virtuals) != (right_occupied, right_virtuals):
@@ -37,7 +42,8 @@ def df_ump2_pair_response(
     x = Index("x", IndexSpace("coordinate", "batch", directions))
 
     def input_(name: str, *indices: Index) -> Node:
-        return input_tensor(name, TensorSpec(indices, role="input"))
+        live = source_weights and name.startswith(("dB_", "dFo_", "dFv_"))
+        return input_tensor(name, TensorSpec(indices, role="input", differentiable=live))
 
     def spin_inputs(spin: str, nocc: int, nvir: int, olab: str, vlab: str) -> dict[str, Node]:
         o = Index(olab, IndexSpace(spin + "_occupied", "occupied", nocc, spin=spin))
@@ -82,9 +88,18 @@ def df_ump2_pair_response(
         einsum("xbc,bc->x", right["dFv"], einsum("ijab,ijac->bc", amplitude, amplitude)),
         coefficients=(weight, weight, virtual_weight, virtual_weight),
     )
+    force = add(factor_force, fock_force)
+    if source_weights:
+        from ..tensor import reshape, transpose_program
+
+        reverse = transpose_program(Program({"force": force}), ("force",)).program
+        result = {"energy": energy}
+        for name, bar in reverse.outputs.items():
+            result["bar_" + name.removeprefix("bar_d")] = reshape(bar, bar.spec.indices[1:])
+        return Program(result, provenance={"method": "ordinary unrestricted DF-MP2", "spin_pair": channel})
     return Program(
         {"energy": energy, "factor_force": factor_force, "fock_force": fock_force,
-         "force": add(factor_force, fock_force)},
+         "force": force},
         provenance={"method": "ordinary unrestricted DF-MP2", "spin_pair": channel,
                     "response": "negative complete moving-frame energy derivative"},
     )

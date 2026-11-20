@@ -834,3 +834,22 @@ three_center=B, metric=M, whitener=W, relax=True)`. Here B has axes
 energy, both spin corrections and the four relaxed weights for S, Hcore,
 B and M. With `relax=False`, the returned coefficient and complementary
 kernel weights expose the separate electronic and overlap derivatives.
+
+For the ordinary MP2 part of an all-active UHF pair request, use
+`benchmarks.f12_focal_ump2.molecular_df_ump2(request, ...)` from a source
+checkout. The shell and one-electron libraries take the same path arguments
+as the HF+CABS provider. On CUDA supply the CUDA metric and response
+libraries and an FP64 TensorIR runner. The result contains the HF energy and
+forces, the αα, αβ and ββ ordinary MP2 energies, and the relaxed correlation
+forces in Eh/bohr. It uses the request's JKFit for the determinant and its
+own MP2Fit for the pair integrals. The F12 correction must also be evaluated
+before returning the complete `mp2_f12_correlation` component.
+
+For precomputed OBS-only integral sources, pass a canonical
+`FocalReference` and two `FocalCoulombSource` values to
+`reference_df_ump2(request, reference, jk, mp2)`. Each source declares
+the surface, OBS identity, fitting identity and backend, and provides
+the raw three-center integrals, full-rank metric and matching whitener.
+The result contains the three spin energies and six relaxed weights for
+overlap, core, JKFit and MP2Fit. Contract these energy derivatives with
+their corresponding nuclear integral derivatives and negate the sum.

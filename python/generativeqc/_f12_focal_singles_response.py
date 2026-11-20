@@ -30,6 +30,43 @@ def relaxed_weights(
     relative_cutoff: float,
     budget_mib: int,
 ) -> dict[str, np.ndarray]:
+    from ._f12_focal_projector import focal_cabs_projector
+
+    projector = focal_cabs_projector(
+        request,
+        one,
+        expected_rank=frame.shape[1],
+        relative_cutoff=relative_cutoff,
+        cotangent=weights["cabs_kernel"],
+        library=library,
+    )
+    if not np.allclose(frame @ frame.T, projector.kernel, rtol=3e-7, atol=3e-7):
+        raise ValueError(
+            "CABS response must use the same fixed-rank projector as the energy"
+        )
+    return relaxed_reference_weights(
+        reference,
+        raw,
+        whitener,
+        weights,
+        projector.overlap_bar,
+        run,
+        library,
+        budget_mib,
+    )
+
+
+def relaxed_reference_weights(
+    reference: FocalReference,
+    raw: Mapping[str, np.ndarray],
+    whitener: np.ndarray,
+    weights: Mapping[str, np.ndarray],
+    overlap_seed: np.ndarray,
+    run: Callable,
+    library: ctypes.CDLL | None,
+    budget_mib: int,
+) -> dict[str, np.ndarray]:
+    """Relax a spin-orbital-invariant observable through its physical DF-HF root."""
     from generativeqc_compiler.method.canonical_frame_response import (
         orbital_metric_cotangent,
         orbital_rotation_cotangent,
@@ -46,7 +83,6 @@ def relaxed_weights(
         input_tensor,
     )
 
-    from ._f12_focal_projector import focal_cabs_projector
     from .f12_orbital_response import (
         _solve_orbital_response,
         unrestricted_nuclear_source_weights,
@@ -58,24 +94,12 @@ def relaxed_weights(
     occs = (
         reference.occupied if len(reference.occupied) == 2 else reference.occupied * 2
     )
-    obs = one.obs_ao_count
+    obs = reference.overlap.shape[0]
     aux = len(whitener)
     space = (*occs, obs, aux)
     r = sum((obs - o) * o for o in occs)
-    if request.backend == "cuda" and 8 * r * r > mb << 20:
+    if reference.executed_backend == "cuda" and 8 * r * r > mb << 20:
         raise MemoryError("dense DF-HF orbital response exceeds the requested budget")
-    projector = focal_cabs_projector(
-        request,
-        one,
-        expected_rank=frame.shape[1],
-        relative_cutoff=relative_cutoff,
-        cotangent=weights["cabs_kernel"],
-        library=library,
-    )
-    if not np.allclose(frame @ frame.T, projector.kernel, rtol=3e-7, atol=3e-7):
-        raise ValueError(
-            "CABS response must use the same fixed-rank projector as the energy"
-        )
     ss = IndexSpace("jkfit", "auxiliary", aux)
     mo = IndexSpace("obs", "orbital", obs)
     a, b = Index("A", ss), Index("B", ss)
@@ -86,7 +110,7 @@ def relaxed_weights(
     central = {"whitener": whitener}
     factors = {}
     drivers = []
-    overlap = projector.overlap_bar.copy()
+    overlap = overlap_seed.copy()
     for k, (spin, o) in enumerate(zip(("alpha", "beta"), occs, strict=True)):
         index = k if len(reference.occupied) == 2 else 0
         coeff = reference.coefficients[index]
@@ -123,7 +147,7 @@ def relaxed_weights(
             for b in (torque[:o, :o], torque[o:, o:])
         ):
             raise ValueError(
-                "CABS observable fails occupied or virtual orbital gauge invariance"
+                "electronic observable fails occupied or virtual orbital gauge invariance"
             )
         # Occupied C'=C_vir U + C_occ (-S'_oo/2). Virtual C' follows from
         # orthogonality, giving -S'_ov-U.T for its occupied component.
@@ -168,7 +192,7 @@ def relaxed_weights(
             ]
         )
 
-    if request.backend == "cuda":
+    if reference.executed_backend == "cuda":
         z = _solve_orbital_response(
             space,
             factors,

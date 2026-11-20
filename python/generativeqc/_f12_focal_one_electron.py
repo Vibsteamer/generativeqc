@@ -38,6 +38,7 @@ def one_electron_sources(
     *,
     library: str | PathLike[str],
     derivatives: bool = True,
+    orbital_only: bool = False,
     budget_mib: int = 512,
 ) -> FocalOneElectron:
     """Evaluate S and T+V on the geometry of an HF+CABS or MP2-F12 request.
@@ -45,6 +46,7 @@ def one_electron_sources(
     The supplied F12 integral library must implement the requested backend.
     Coordinates are in Bohr. Each matrix starts with all orbital AOs and then
     all atom-centered OptRI AOs, both in native real-spherical order. With
+    orbital_only=True the matrices contain just the ordinary orbital basis. With
     derivatives=True, each Jacobian has shape (atoms, 3, AOs, AOs) and includes
     the motion of both Gaussian centers and the nuclear attraction centers.
     For scalar ECPs the requested backend also evaluates through-f semilocal
@@ -55,7 +57,11 @@ def one_electron_sources(
         raise ValueError("one-electron F12 sources require an HF+CABS or MP2-F12 role")
     if request.backend not in ("cpu_reference", "cuda"):
         raise ValueError("one-electron F12 sources require cpu_reference or cuda")
-    if not request.atoms or type(derivatives) is not bool:
+    if (
+        not request.atoms
+        or type(derivatives) is not bool
+        or type(orbital_only) is not bool
+    ):
         raise ValueError(
             "one-electron F12 sources require nuclei and a boolean derivative option"
         )
@@ -66,9 +72,10 @@ def one_electron_sources(
         << 20
     )
     basis = request.basis
-    shells = pack_shells(
-        request.atoms, (("orbital", basis.orbital), ("CABS", basis.cabs)), maximum
-    )
+    groups = [("orbital", basis.orbital)]
+    if not orbital_only:
+        groups.append(("CABS", basis.cabs))
+    shells = pack_shells(request.atoms, tuple(groups), maximum)
     nuclei = [basis.orbital.by_element[a.atomic_number] for a in request.atoms]
     terms = {}
     if any(n.ecp_core_electrons for n in nuclei):

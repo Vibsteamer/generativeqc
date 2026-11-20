@@ -48,12 +48,12 @@ def _orbital_sources(
     orbital_weights: dict[str, np.ndarray] | None,
     *,
     projected: dict[str, np.ndarray] | None,
-    role: Literal["shared", "pairs", "fock", "ordinary_jk"] = "shared",
+    role: Literal["shared", "pairs", "fock", "ordinary_jk", "ordinary_fock"] = "shared",
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray] | None]:
     # A combined energy/response evaluation owns the forward buffers through
     # the reverse pass. Standalone evaluations build their own projections.
     oa, ob, obs, ext, aux = space
-    valid_frame = obs == ext if role == "ordinary_jk" else obs < ext
+    valid_frame = obs == ext if role in ("ordinary_jk", "ordinary_fock") else obs < ext
     if not (0 <= oa < obs and 0 <= ob < obs and valid_frame and oa + ob > 0):
         raise ValueError("Invalid UHF occupied, OBS, or extended dimensions")
     nc = len(ao["coefficients_alpha"])
@@ -86,7 +86,7 @@ def _orbital_sources(
     operators = tuple(_OPERATORS)
     if role == "ordinary_jk":
         operators = ("coulomb",)
-    elif role == "fock":
+    elif role in ("fock", "ordinary_fock"):
         operators = ("hcore", "coulomb")
     elif role == "pairs":
         operators = tuple(op for op in operators if op != "hcore")

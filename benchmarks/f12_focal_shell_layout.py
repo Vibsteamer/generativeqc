@@ -16,7 +16,12 @@ if TYPE_CHECKING:
 
 
 def focal_shell_layout(
-    request: FocalRequest, library: Path, *, host_reference: bool, budget_mib: int
+    request: FocalRequest,
+    library: Path,
+    *,
+    host_reference: bool,
+    budget_mib: int,
+    ordinary_fit: str | None = None,
 ) -> dict:
     """Use OBS then OptRI rows in native real-spherical order; fitting rows start at zero.
 
@@ -31,7 +36,16 @@ def focal_shell_layout(
     basis = request.basis
     if not request.atoms:
         raise ValueError("focal shell integrals require at least one atom")
-    if request.role == "hf_cabs":
+    if ordinary_fit is not None:
+        if (
+            ordinary_fit not in ("jk_fit", "mp2_fit")
+            or request.role != "mp2_f12_correlation"
+        ):
+            raise ValueError(
+                "ordinary pair sources require an explicit JKFit or MP2Fit on the pair request"
+            )
+        fit = getattr(basis, ordinary_fit)
+    elif request.role == "hf_cabs":
         fit = basis.jk_fit
     elif request.role == "mp2_f12_correlation":
         fit = basis.f12_fit
@@ -40,15 +54,15 @@ def focal_shell_layout(
     else:
         raise ValueError("focal shell integrals require an HF+CABS or MP2-F12 role")
     xyz = np.asarray([atom.position for atom in request.atoms], dtype=np.float64)
-    packed = pack_shells(
-        request.atoms,
-        (("orbital", basis.orbital), ("CABS", basis.cabs), ("fitting", fit)),
-        budget_mib << 20,
-    )
+    groups = [("orbital", basis.orbital)]
+    if ordinary_fit is None:
+        groups.append(("CABS", basis.cabs))
+    groups.append(("fitting", fit))
+    packed = pack_shells(request.atoms, tuple(groups), budget_mib << 20)
     axes = packed.angular
     angular = axes.tolist()
     ao_counts = packed.ao_counts
-    ncombined = sum(packed.shell_counts[:2])
+    ncombined = sum(packed.shell_counts[:-1])
     carts = [(l + 1) * (l + 2) // 2 for l in angular]
     combined, fitting = carts[:ncombined], carts[ncombined:]
 
@@ -77,7 +91,7 @@ def focal_shell_layout(
         "radial": packed.radial,
         "spherical_rows": rows,
         "orbital_shell_count": np.int32(ncombined),
-        "ao_sizes": np.array([sum(ao_counts[:2]), ao_counts[2]], dtype=np.int32),
+        "ao_sizes": np.array([sum(ao_counts[:-1]), ao_counts[-1]], dtype=np.int32),
         "obs_ao_count": ao_counts[0],
         "manifest": json.dumps(
             {
