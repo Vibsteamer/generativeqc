@@ -13,7 +13,11 @@ import typing
 from pathlib import Path
 
 from generativeqc_compiler.common.cuda_adapter import CudaCompilerAdapter
-from generativeqc_compiler.tensor.cuda_execute import PreparedCuda, compile_cuda
+from generativeqc_compiler.tensor.cuda_execute import (
+    CudaExecution,
+    PreparedCuda,
+    compile_cuda,
+)
 from generativeqc_compiler.tensor.cuda_plan import plan_cuda
 
 
@@ -91,8 +95,8 @@ class CudaCCTensorExecutor:
             for program in candidates:
                 self._compile(program)
 
-    def execute(self, program: object, feeds: object) -> dict[str, object]:
-        """Execute one program, closing its native CUDA arena before returning."""
+    def run(self, program: object, feeds: object) -> CudaExecution:
+        """Run a molecular TensorIR graph and return detached outputs and device metrics."""
         with self._lock:
             plan, artifact = self._compile(program)
             with self._PreparedCuda(plan, artifact, device=self.device) as prepared:
@@ -103,7 +107,11 @@ class CudaCCTensorExecutor:
                 )
             identity = program.logical_hash
             self._metrics[identity] = dict(result.metrics)
-            return dict(result.outputs)
+            return result
+
+    def execute(self, program: object, feeds: object) -> dict[str, object]:
+        """Return named tensors for CC solvers using the same bounded CUDA owner."""
+        return dict(self.run(program, feeds).outputs)
 
     @property
     def compiled_program_count(self) -> int:

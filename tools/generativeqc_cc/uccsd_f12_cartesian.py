@@ -15,8 +15,9 @@ from generativeqc_compiler.cc.uccsd_equations import build_f12_program
 from generativeqc_compiler.cc.uccsd_layout import UCCSDLayout
 from generativeqc_compiler.common.arrays import immutable
 from generativeqc_compiler.mp2.f12_unrestricted import unrestricted_extended_df_fock
-from generativeqc_compiler.tensor import linearize, transpose_program
+from generativeqc_compiler.tensor import Program, linearize, transpose_program
 
+from .native_tensor_cuda import CudaCCTensorExecutor
 from .uccsd_df_direction import (
     unrestricted_cc_df_hamiltonian,
     unrestricted_cc_df_hamiltonian_tangent,
@@ -38,6 +39,70 @@ class UCCSDF12CartesianResult:
     lambda_stationarity_norm: float
 
 
+@dataclass(frozen=True)
+class UCCSDF12Pullback:
+    correlation_energy: float
+    amplitude_residual_max: float
+    lambda_stationarity_norm: float
+    ordinary_weights: dict[str, np.ndarray]
+    fixed_source_weights: dict[str, np.ndarray]
+
+
+def unrestricted_cc_f12_stationary_pullback(
+    layout: UCCSDLayout,
+    ordinary: dict[str, np.ndarray],
+    fixed: dict[str, np.ndarray],
+    packed_amplitudes: np.ndarray,
+    packed_multipliers: np.ndarray,
+    evaluate: Callable,
+) -> UCCSDF12Pullback:
+    """Compute all active ordinary and geminal adjoints from one physical CC root.
+
+    The evaluator returns named arrays, as in CudaCCTensorExecutor.execute.
+    A single Lagrangian transpose computes amplitude stationarity and source
+    weights together; the weights can be reused for every molecular direction.
+    """
+    t = layout.unpack(packed_amplitudes)
+    dual = layout.unpack_dual(packed_multipliers)
+    cc = build_f12_program(layout)
+    inputs = {**ordinary, **fixed, **t}
+    values = evaluate(cc, inputs)
+    corr = float(values["correlation_energy"])
+    primal_max = float(
+        np.max(
+            [
+                float(np.max(np.abs(v), initial=0))
+                for k, v in values.items()
+                if k != "correlation_energy"
+            ]
+        )
+    )
+    if not isfinite(corr) or not isfinite(primal_max) or primal_max > 1e-9:
+        raise ValueError(
+            "Molecular F12 amplitudes failed fresh physical residual check"
+        )
+    adjoint = transpose_program(cc, tuple(cc.outputs)).program
+    seeds = {"bar_" + k.replace("t", "r", 1): v for k, v in dual.items()}
+    bars = evaluate(
+        adjoint, {**inputs, **seeds, "bar_correlation_energy": np.array(1.0)}
+    )
+    t_bars = {b.name: bars["bar_" + b.name] for b in layout.blocks}
+    lambda_norm = float(np.linalg.norm(layout.pack_dual(t_bars)))
+    lambda_max = max(
+        b.full_metric_weight * float(np.max(np.abs(t_bars[b.name]), initial=0))
+        for b in layout.blocks
+    )
+    if (
+        not isfinite(lambda_norm)
+        or not isfinite(lambda_max)
+        or max(lambda_norm, lambda_max) > 1e-9
+    ):
+        raise ValueError("Molecular Lambda failed fresh Lagrangian stationarity check")
+    ordinary_bars = {k: bars["bar_" + k] for k in ordinary if "bar_" + k in bars}
+    fixed_bars = {k: bars["bar_" + k] for k in fixed if "bar_" + k in bars}
+    return UCCSDF12Pullback(corr, primal_max, lambda_norm, ordinary_bars, fixed_bars)
+
+
 def unrestricted_cc_f12_energy_forces(
     space: tuple[int, int, int, int, int],
     data: dict[str, np.ndarray],
@@ -54,6 +119,7 @@ def unrestricted_cc_f12_energy_forces(
     include_cabs_singles: bool,
     frozen_occupied: tuple[int, int] = (0, 0),
     singles: Callable = cabs_singles,
+    stationary_executor: CudaCCTensorExecutor | None = None,
     block_elements: int = 262144,
 ) -> UCCSDF12CartesianResult:
     """Check one CC root, then contract its stationary Lagrangian for every nucleus.
@@ -62,6 +128,8 @@ def unrestricted_cc_f12_energy_forces(
     molecular DF sources. Each coordinate callback supplies the complete
     projected source tangent, physical Coulomb metric tangent and total UHF
     reference derivative in Eh/bohr (including internuclear repulsion).
+    A CUDA stationary executor evaluates the physical CC residual and complete
+    Lagrangian transpose on that device while other graphs use the supplied run.
     The callback is requested separately for every atom and Cartesian axis.
     CABS singles uses both full occupied spaces and is added once when enabled.
     """
@@ -69,11 +137,15 @@ def unrestricted_cc_f12_energy_forces(
         raise ValueError("Expected a positive atom count and a finite reference energy")
     if type(include_cabs_singles) is not bool:
         raise TypeError("Expected an explicit boolean CABS singles selection")
+    if stationary_executor is not None and not isinstance(
+        stationary_executor, CudaCCTensorExecutor
+    ):
+        raise TypeError(
+            "Expected a bounded CUDA executor for the CC stationary pullback"
+        )
     oa, ob, obs, ext, aux = space
     fa, fb = frozen_occupied
     layout = UCCSDLayout(oa - fa, ob - fb, obs - oa, obs - ob)
-    t = layout.unpack(packed_amplitudes)
-    dual = layout.unpack_dual(packed_multipliers)
     source = {
         k.removeprefix("source/"): v for k, v in data.items() if k.startswith("source/")
     }
@@ -85,39 +157,18 @@ def unrestricted_cc_f12_energy_forces(
     fixed = unrestricted_cc_f12_fixed_source_feeds(
         space, data, fock, whitener, run, frozen_occupied=frozen_occupied
     )
-    cc = build_f12_program(layout)
-    inputs = {**ordinary, **fixed, **t}
-    values = run(cc, inputs).outputs
-    corr = float(values["correlation_energy"])
-    primal_max = max(
-        float(np.max(np.abs(v), initial=0))
-        for k, v in values.items()
-        if k != "correlation_energy"
+    if stationary_executor is None:
+
+        def evaluate(
+            program: Program, feeds: dict[str, np.ndarray]
+        ) -> dict[str, np.ndarray]:
+            return run(program, feeds).outputs
+    else:
+        evaluate = stationary_executor.execute
+    pullback = unrestricted_cc_f12_stationary_pullback(
+        layout, ordinary, fixed, packed_amplitudes, packed_multipliers, evaluate
     )
-    if not isfinite(corr) or not isfinite(primal_max) or primal_max > 1e-9:
-        raise ValueError(
-            "Molecular F12 amplitudes failed fresh physical residual check"
-        )
-    adjoint = transpose_program(cc, tuple(cc.outputs)).program
-    seeds = {"bar_" + k.replace("t", "r", 1): v for k, v in dual.items()}
-    bars = run(
-        adjoint, {**inputs, **seeds, "bar_correlation_energy": np.array(1.0)}
-    ).outputs
-    t_bars = {b.name: bars["bar_" + b.name] for b in layout.blocks}
-    lambda_norm = float(np.linalg.norm(layout.pack_dual(t_bars)))
-    lambda_max = max(
-        b.full_metric_weight * float(np.max(np.abs(t_bars[b.name]), initial=0))
-        for b in layout.blocks
-    )
-    if (
-        not isfinite(lambda_norm)
-        or not isfinite(lambda_max)
-        or max(lambda_norm, lambda_max) > 1e-9
-    ):
-        raise ValueError("Molecular Lambda failed fresh Lagrangian stationarity check")
-    ordinary_bars = {k: bars["bar_" + k] for k in ordinary if "bar_" + k in bars}
-    fixed_bars = {k: bars["bar_" + k] for k in fixed if "bar_" + k in bars}
-    del bars, values, inputs, ordinary, fixed, t_bars
+    del ordinary, fixed
 
     singles_energies = []
     singles_bars = {}
@@ -158,14 +209,18 @@ def unrestricted_cc_f12_energy_forces(
             space, data, whitener, run, **args
         )
         ordinary_force[atom, axis] = spin_source_force(
-            ordinary_bars, dord, 0.0, run, block_elements=block_elements
+            pullback.ordinary_weights, dord, 0.0, run, block_elements=block_elements
         )
         del dord
         dfixed = unrestricted_cc_f12_fixed_source_tangent(
             space, data, fock, whitener, run, **args
         )
         fixed_force[atom, axis] = spin_source_force(
-            fixed_bars, dfixed, 0.0, run, block_elements=block_elements
+            pullback.fixed_source_weights,
+            dfixed,
+            0.0,
+            run,
+            block_elements=block_elements,
         )
         ref_force[atom, axis] = -ref_grad
         if singles_force is not None:
@@ -176,15 +231,15 @@ def unrestricted_cc_f12_energy_forces(
     if singles_force is not None:
         forces += singles_force
     return UCCSDF12CartesianResult(
-        fsum((reference_energy, corr, *singles_energies)),
+        fsum((reference_energy, pullback.correlation_energy, *singles_energies)),
         reference_energy,
-        corr,
+        pullback.correlation_energy,
         fsum(singles_energies) if include_cabs_singles else None,
         immutable(forces),
         immutable(ref_force),
         immutable(ordinary_force),
         immutable(fixed_force),
         immutable(singles_force) if singles_force is not None else None,
-        primal_max,
-        lambda_norm,
+        pullback.amplitude_residual_max,
+        pullback.lambda_stationarity_norm,
     )

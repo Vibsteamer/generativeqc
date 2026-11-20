@@ -1,6 +1,7 @@
 """Cartesian assembly checked by independent reoptimization at a displaced source."""
 
 from collections.abc import Callable
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -10,8 +11,10 @@ from generativeqc_compiler.cc.uccsd_layout import UCCSDLayout
 from generativeqc_compiler.mp2.f12_unrestricted import unrestricted_extended_df_fock
 from generativeqc_compiler.tensor import execute
 from scipy.optimize import root
+from test_cc_native_tensor_cuda import _fake_executor
 from test_f12_unrestricted_singles import _singles
 
+from tools.generativeqc_cc.native_tensor_cuda import CudaCCTensorExecutor
 from tools.generativeqc_cc.uccsd_df_direction import unrestricted_cc_df_hamiltonian
 from tools.generativeqc_cc.uccsd_f12_cartesian import (
     UCCSDF12CartesianResult,
@@ -20,7 +23,7 @@ from tools.generativeqc_cc.uccsd_f12_cartesian import (
 from tools.generativeqc_cc.uccsd_solver import _representatives
 
 
-def test_cartesian_energy_forces_and_stationarity() -> None:
+def test_cartesian_energy_forces_and_stationarity(tmp_path: Path) -> None:
     rng = np.random.default_rng(52937)
     space = (2, 1, 3, 4, 2)
     oa, ob, obs, ext, aux = space
@@ -117,7 +120,11 @@ def test_cartesian_energy_forces_and_stationarity() -> None:
         q = factors[a, k]
         return {key: q * v for key, v in tangent.items()}, q * dJ, q * dref
 
-    def cartesian(multipliers: np.ndarray, include: bool) -> UCCSDF12CartesianResult:
+    def cartesian(
+        multipliers: np.ndarray,
+        include: bool,
+        stationary_executor: CudaCCTensorExecutor | None = None,
+    ) -> UCCSDF12CartesianResult:
         return unrestricted_cc_f12_energy_forces(
             space,
             data,
@@ -130,13 +137,15 @@ def test_cartesian_energy_forces_and_stationarity() -> None:
             reference_energy=reference,
             include_cabs_singles=include,
             singles=_singles,
+            stationary_executor=stationary_executor,
             block_elements=31,
         )
 
     ep, sp, _, _ = solve_point(0.0001)
     em, sm, _, _ = solve_point(-0.0001)
+    cuda, _, compiled = _fake_executor(tmp_path)
     for include in (False, True):
-        val = cartesian(l, include)
+        val = cartesian(l, include, cuda if include else None)
         assert val.energy == pytest.approx(
             e + (si if include else 0.0), abs=2e-13, rel=0
         )
@@ -144,5 +153,6 @@ def test_cartesian_energy_forces_and_stationarity() -> None:
         np.testing.assert_allclose(val.forces, factors * expected, rtol=0, atol=1e-8)
         assert (val.cabs_singles_forces is not None) == include
         assert not val.forces.flags.writeable
+    assert len(compiled) == 2 and compiled[0] == cc.logical_hash
     with pytest.raises(ValueError, match="stationarity"):
         cartesian(l + 0.01, False)

@@ -77,3 +77,23 @@ coordinates. The complete-CC displaced-energy checks cover N-x and H1-z.
 The local CPU receipts, full source hashes and displaced roots are in
 `validation/focal-convergence-20261118/fixed_source_full_cuda/source_response/molecular_cartesian_nh2/{analytic,verified}.json`
 in the surrounding workspace.
+
+### GPU execution boundary
+
+The Cartesian driver can use a bounded `CudaCCTensorExecutor` for the fresh CC
+residual and the full stationary source pullback, independently of the runner
+used to build molecular integrals and their derivatives. The same executor's
+`run` method supplies the TensorIR result expected by the tiled molecular force
+contraction and source builders. The complete NH2/D pullback returns 38 ordinary
+Hamiltonian cotangents and 18 active fixed-cusp source cotangents, together
+with the five amplitude cotangents used to check Lambda. One redundant supplied
+F12 source drops out of the energy and residual graph.
+
+The archived L20 amplitude/Lambda solve used 27 amplitude iterations and 47
+transposed actions. Its orbital-gap GMRES iteration ran on the host. The new
+single-center comparison uses those retained T/Lambda and independently checks
+all source weights and their contraction with the physical H1-z tangent.
+Source construction, prior orbital response, reference force and CABS singles
+are supplied by the recorded molecular calculation for this comparison. The
+per-coordinate traversal, host staging, packed stationarity norm and final
+scalar accumulation also remain on the host.
