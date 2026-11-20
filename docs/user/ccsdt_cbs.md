@@ -818,6 +818,15 @@ weight, `einsum("ij,axij->ax", result.overlap_bar, one.d_overlap)` gives
 the positive nuclear derivative of the weighted kernel.
 
 
+For fixed-cusp unrestricted CC equations, call
+`provider.ucc_fixed_sources(pair_request)` on the all-active UHF pair step.
+The returned `FocalUCCFixedSources` contains the canonical DF reference,
+retained CABS rank, F12Fit identity and the `feeds` dictionary. Its six spin
+orders each have `w_vo_*`, `w_vv_*` and `c_f12_*` tensors in the reference's
+OBS frame. `fixed_geminal_energy` contains V+B−X in Eh. The extended Fock
+and positive exchange use JKFit, and the robust geminal projections use
+F12Fit. The CC amplitude and Lambda solvers consume these equation inputs.
+
 Use the installed `MolecularFocalProvider` to evaluate a plan step directly
 from its geometry. A single-card CUDA setup looks like this:
 

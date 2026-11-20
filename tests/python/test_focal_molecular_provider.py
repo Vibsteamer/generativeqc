@@ -123,3 +123,37 @@ def test_molecular_pair_all_fit_assignments(
         assert np.vdot(val.term.forces, direction) == pytest.approx(
             (minus - plus) / (2 * h), abs=2e-7, rel=0
         )
+
+
+def test_uhf_fixed_cc_feed_fitting_roles() -> None:
+    shells = os.environ.get("GENERATIVEQC_F12_HOST_SINK")
+    if not shells:
+        pytest.skip("set GENERATIVEQC_F12_HOST_SINK for molecular host integrals")
+    p = MolecularFocalProvider(shell_library=Path(shells))
+    outputs = [
+        p.ucc_fixed_sources(request(XYZ, fits))
+        for fits in ((0, 1, 2), (0, 2, 2), (2, 2, 2))
+    ]
+    a, b, same_fit = outputs
+    assert a.cabs_rank == b.cabs_rank == same_fit.cabs_rank == 3
+    assert a.reference.occupied == (2, 1) and a.reference.forces is None
+    assert a.reference.jk_fit_id != a.f12_fit_id == same_fit.reference.jk_fit_id
+    spins = ("aaaa", "abab", "abba", "baab", "baba", "bbbb")
+    assert set(a.feeds) == {
+        prefix + s for prefix in ("w_vo_", "w_vv_", "c_f12_") for s in spins
+    } | {"fixed_geminal_energy"}
+    for k in a.feeds:
+        np.testing.assert_array_equal(a.feeds[k], b.feeds[k])
+    assert not np.isclose(
+        a.feeds["fixed_geminal_energy"],
+        same_fit.feeds["fixed_geminal_energy"],
+        rtol=0,
+        atol=1e-7,
+    )
+    for suffix in ("aaaa", "bbbb"):
+        for prefix in ("w_vo_", "w_vv_", "c_f12_"):
+            v = a.feeds[prefix + suffix]
+            np.testing.assert_allclose(v, -v.swapaxes(0, 1), rtol=0, atol=1e-11)
+    np.testing.assert_allclose(
+        a.feeds["c_f12_abab"], -a.feeds["c_f12_baab"].swapaxes(0, 1), rtol=0, atol=1e-11
+    )
