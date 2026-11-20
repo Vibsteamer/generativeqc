@@ -485,3 +485,54 @@ def test_one_root_low_order_energies_and_forces(
         strict=True,
     ):
         assert x == pytest.approx(term.energy, abs=2e-10, rel=0)
+
+
+def test_rhf_focal_center_and_forward_displacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A two-electron RHF recipe has an empty triples space on each geometry."""
+    from generativeqc.experimental.f12_focal import singlepoint, singlepoint_energy
+
+    shell = os.environ.get("GENERATIVEQC_F12_HOST_SINK")
+    if not shell:
+        pytest.skip("set GENERATIVEQC_F12_HOST_SINK for molecular host integrals")
+    x = XYZ[:2].copy()
+    q = request(x, (0, 1, 1), "rhf")
+    p = MolecularFocalProvider(shell_library=Path(shell), budget_mib=800)
+    ser = FocalSeries(q.basis)
+    args = {
+        "hf_cabs": ser,
+        "correlation": ser,
+        "f12_doubles": ser,
+        "triples": ser,
+        "post_mp2": None,
+        "root_id": "rhf",
+        "correlation_space_id": "all-active",
+        "provider": p,
+        "backend": "cpu_reference",
+        "protocol_id": "h2",
+    }
+    center = singlepoint(list(zip(("H", "H"), x, strict=True)), **args)
+    assert len(center.references) == 1
+    triple = center.components[-1].term
+    assert triple.role == "triples" and triple.energy == 0 and not np.any(triple.forces)
+
+    def forbid_gradient(*args: object, **kwargs: object) -> None:
+        pytest.fail("a forward-only geometry called the integral gradient engine")
+
+    monkeypatch.setattr(MolecularFocalProvider, "_gradient", forbid_gradient)
+    for step in (2.0e-4, 4.0e-4):
+        energies = []
+        for h in (-step, step):
+            y = x.copy()
+            y[0, 0] += h
+            result = singlepoint_energy(
+                list(zip(("H", "H"), y, strict=True)), center=center, **args
+            )
+            assert result.references[q.basis.basis_id].reference.forces is None
+            assert result.cabs_ranks == center.cabs_ranks
+            assert result.components[-1].energy == 0.0
+            energies.append(result.energy)
+        assert (
+            abs((energies[0] - energies[1]) / (2 * step) - center.forces[0, 0]) < 3e-6
+        )

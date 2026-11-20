@@ -272,6 +272,33 @@ class FocalRunResult(FocalResult):
     components: tuple[FocalEvaluation, ...]
 
 
+@dataclass(frozen=True)
+class FocalMolecularResult(FocalRunResult):
+    """Analytic center with basis-specific determinants and complementary-space ranks."""
+
+    references: dict[str, FocalReferenceSeed]
+    cabs_ranks: dict[str, int]
+
+
+@dataclass(frozen=True)
+class FocalEnergyComponent:
+    """A converged forward-only molecular energy and its recipe coefficient."""
+
+    request: FocalRequest
+    energy: float
+    weight: float
+
+
+@dataclass(frozen=True)
+class FocalEnergyResult:
+    """Composed energy in Hartree and its actual forward-only component values."""
+
+    energy: float
+    components: tuple[FocalEnergyComponent, ...]
+    references: dict[str, FocalReferenceSeed]
+    cabs_ranks: dict[str, int]
+
+
 def _native_post_mp2_components(
     request: FocalRequest, *, with_forces: bool
 ) -> tuple[Result, Result]:
@@ -530,7 +557,9 @@ def combine(
     All energy and force terms must describe the same ordered geometry.
     """
     return _assemble(
-        _weighted_terms(hf_cabs, correlation, post_mp2, triples, f12_doubles=f12_doubles)
+        _weighted_terms(
+            hf_cabs, correlation, post_mp2, triples, f12_doubles=f12_doubles
+        )
     )
 
 
@@ -622,7 +651,10 @@ def plan_singlepoint(
     ):
         raise ValueError("protocol_id must be a nonempty string when supplied")
     weighted = _weighted_terms(
-        hf_cabs, correlation, post_mp2, triples,
+        hf_cabs,
+        correlation,
+        post_mp2,
+        triples,
         f12_doubles=f12_doubles,
         nuclei={atom.atomic_number for atom in geometry},
     )
@@ -763,7 +795,253 @@ def singlepoint(
         f12_doubles=f12_doubles,
         protocol_id=protocol_id,
     )
+    if (
+        isinstance(provider, MolecularFocalProvider)
+        and provider.high_order is None
+        and post_mp2 is None
+    ):
+        molecular = _molecular_f12_plan(plan, provider, forces=True)
+        assert isinstance(molecular, FocalMolecularResult)
+        return molecular
     evaluations = tuple(
         _accepted(request, provider(request)) for request, _ in plan.steps
     )
     return plan._finish(evaluations)
+
+
+def _molecular_f12_plan(
+    plan: FocalPlan,
+    provider: MolecularFocalProvider,
+    *,
+    forces: bool,
+    center: FocalMolecularResult | None = None,
+) -> FocalMolecularResult | FocalEnergyResult:
+    """Share a determinant within each physical basis for this geometry only."""
+    by_basis: dict[str, list[FocalRequest]] = {}
+    for request, _ in plan.steps:
+        by_basis.setdefault(request.basis.basis_id, []).append(request)
+    if center is not None:
+        if set(center.references) != set(by_basis):
+            raise ValueError(
+                "center and displaced recipe must use the same molecular bases"
+            )
+        provider = replace(
+            provider, reference_seed=lambda r: center.references[r.basis.basis_id]
+        )
+    roots = {}
+    ranks = {}
+    energies = {}
+    gradients = {}
+    for identity, requests in by_basis.items():
+        roles = {r.role for r in requests}
+        pair = replace(requests[0], role="mp2_f12_correlation")
+        reference = None
+        expected_rank = center.cabs_ranks.get(identity) if center is not None else None
+        if roles & {"mp2_f12_correlation", "ccsd_f12b_minus_mp2_f12"}:
+            if forces:
+                low_forces = provider.low_order_energy_and_forces(pair)
+                low = low_forces.energies
+                gradients[identity, "hf_cabs"] = low_forces.hf_cabs_forces
+                gradients[identity, "mp2_f12_correlation"] = (
+                    low_forces.mp2_f12_correlation_forces
+                )
+            else:
+                low = provider.low_order_energy(pair, expected_cabs_rank=expected_rank)
+            reference = low.reference
+            ranks[identity] = low.cabs_rank
+            energies[identity, "hf_cabs"] = low.hf_cabs_energy
+            energies[identity, "mp2_f12_correlation"] = low.mp2_f12_correlation_energy
+            if "ccsd_f12b_minus_mp2_f12" in roles:
+                key = identity, "ccsd_f12b_minus_mp2_f12"
+                if forces:
+                    energies[key], gradients[key] = (
+                        provider.f12_doubles_energy_and_forces(
+                            pair, low_order=low_forces
+                        )
+                    )
+                else:
+                    energies[key] = provider.f12_doubles_energy(
+                        pair, low_order=low, expected_cabs_rank=expected_rank
+                    )
+        elif "hf_cabs" in roles:
+            hf = replace(pair, role="hf_cabs")
+            reference = df_reference(
+                hf,
+                forces=forces,
+                budget_mib=provider.budget_mib,
+                **provider._seed_options(hf),
+            )
+            one = one_electron_sources(
+                hf,
+                library=provider.one_electron_library or provider.shell_library,
+                derivatives=forces,
+                budget_mib=provider.budget_mib,
+            )
+            jk = provider._panel(hf, "jk_fit")
+            proj = focal_cabs_projector(
+                hf,
+                one,
+                expected_rank=expected_rank,
+                relative_cutoff=provider.relative_cutoff,
+                library=provider.response_library,
+            )
+            ranks[identity] = proj.rank
+            if forces:
+                energies[identity, "hf_cabs"], gradients[identity, "hf_cabs"] = (
+                    provider._singles(
+                        hf, reference, one, jk, expected_cabs_rank=proj.rank
+                    )
+                )
+            else:
+                singles = reference_cabs_singles(
+                    hf,
+                    reference,
+                    one,
+                    complement=proj.frame,
+                    three_center=jk.data["ao_coulomb"],
+                    metric=jk.data["metric"],
+                    whitener=jk.whitener,
+                    pullback=False,
+                    relax=False,
+                    run=provider.run,
+                    library=provider.response_library,
+                    relative_cutoff=provider.relative_cutoff,
+                    budget_mib=provider.budget_mib,
+                )
+                energies[identity, "hf_cabs"] = singles.hf_cabs_energy
+        if reference is None:
+            reference = df_reference(
+                pair,
+                forces=False,
+                budget_mib=provider.budget_mib,
+                **provider._seed_options(pair),
+            )
+        if reference.executed_backend != pair.backend:
+            raise RuntimeError(
+                "molecular focal reference executed on a different backend"
+            )
+        roots[identity] = FocalReferenceSeed(pair, reference)
+        if "triples" in roles:
+            triple = replace(pair, role="triples")
+            key = identity, "triples"
+            # Fewer than three occupied spin orbitals leaves no triples determinants at any geometry.
+            if (
+                triple.root_id == "rhf"
+                and len(reference.occupied) == 1
+                and reference.occupied[0] == 1
+            ):
+                energies[key] = 0.0
+                if forces:
+                    gradients[key] = np.zeros((len(triple.atoms), 3))
+            elif forces:
+                energies[key], gradients[key] = provider.triples_energy_and_forces(
+                    triple, reference=reference
+                )
+            else:
+                energies[key] = provider.triples_energy(triple, reference=reference)
+    parts = []
+    for request, weight in plan.steps:
+        value = float(energies[request.basis.basis_id, request.role])
+        if not math.isfinite(value):
+            raise RuntimeError(f"nonfinite {request.role} molecular energy")
+        parts.append(FocalEnergyComponent(request, value, weight))
+    if not forces:
+        total = math.fsum(c.energy * c.weight for c in parts)
+        return FocalEnergyResult(total, tuple(parts), roots, ranks)
+    evaluated = []
+    for part in parts:
+        r = part.request
+        term = FocalTerm(
+            r.surface_id,
+            r.basis.series_id,
+            r.basis.basis_id,
+            r.basis.cardinal,
+            r.role,
+            part.energy,
+            gradients[r.basis.basis_id, r.role],
+        )
+        evaluated.append(_accepted(r, FocalEvaluation(term, r.backend, True)))
+    result = plan._finish(tuple(evaluated))
+    return FocalMolecularResult(
+        result.energy, result.forces, result.weights, result.components, roots, ranks
+    )
+
+
+def singlepoint_energy(
+    atoms: Iterable[Atom | tuple[str | int, Sequence[float]]],
+    hf_cabs: FocalSeries[FocalBasis],
+    correlation: FocalSeries[FocalBasis],
+    post_mp2: None = None,
+    *,
+    provider: MolecularFocalProvider,
+    root_id: str,
+    correlation_space_id: str,
+    charge: int = 0,
+    multiplicity: int = 1,
+    backend: Backend = "cuda",
+    triples: FocalBasis | FocalSeries[FocalBasis] | None = None,
+    f12_doubles: FocalBasis | FocalSeries[FocalBasis] | None = None,
+    protocol_id: str | None = None,
+    center: FocalMolecularResult | None = None,
+) -> FocalEnergyResult:
+    """Evaluate one molecular HF+CABS/MP2-F12 recipe with optional F12 doubles and (T).
+
+    Positions are in Bohr and energies in Hartree. Each basis uses one forward-only
+    determinant. Supply the analytic center to track its occupied root and CABS rank.
+    """
+    if post_mp2 is not None:
+        raise ValueError("use f12_doubles for a molecular CCSD-F12b recipe")
+    if (
+        not isinstance(provider, MolecularFocalProvider)
+        or provider.high_order is not None
+    ):
+        raise ValueError(
+            "singlepoint_energy requires the molecular provider's native energy implementations"
+        )
+    plan = plan_singlepoint(
+        atoms,
+        hf_cabs,
+        correlation,
+        None,
+        root_id=root_id,
+        correlation_space_id=correlation_space_id,
+        charge=charge,
+        multiplicity=multiplicity,
+        backend=backend,
+        triples=triples,
+        f12_doubles=f12_doubles,
+        protocol_id=protocol_id,
+    )
+    if center is not None:
+        weights = tuple(
+            (q.role, q.basis.basis_id, q.basis.cardinal, w) for q, w in plan.steps
+        )
+        if center.weights != weights or not center.references:
+            raise ValueError(
+                "center and displacement must use the same weighted focal recipe"
+            )
+        source_atoms = next(iter(center.references.values())).request.atoms
+        source_plan = plan_singlepoint(
+            source_atoms,
+            hf_cabs,
+            correlation,
+            None,
+            root_id=root_id,
+            correlation_space_id=correlation_space_id,
+            charge=charge,
+            multiplicity=multiplicity,
+            backend=backend,
+            triples=triples,
+            f12_doubles=f12_doubles,
+            protocol_id=protocol_id,
+        )
+        if any(
+            q.surface_id != center.references[q.basis.basis_id].request.surface_id
+            for q, _ in source_plan.steps
+        ):
+            raise ValueError(
+                "center and displacement must use the same electronic surface and protocol"
+            )
+    result = _molecular_f12_plan(plan, provider, forces=False, center=center)
+    assert isinstance(result, FocalEnergyResult)
+    return result
