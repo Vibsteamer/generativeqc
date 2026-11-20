@@ -701,6 +701,8 @@ srun --partition=main --gres=gpu:5090:1 --nodes=1 --ntasks=1 \
 energy and Cartesian force contributions from a single geometry. Pass a
 `FocalSeries` for HF plus CABS singles, a second series for ordinary MP2
 correlation plus the explicit F12 pair correction, and a high-level correction.
+For an MP2-F12 energy and force, explicitly pass `post_mp2=None` to `combine`,
+`plan_singlepoint`, or `singlepoint`. This evaluates just the first two series.
 Use the role `post_mp2` for a combined correction. To treat conventional
 (T) separately, use `ccsd_minus_mp2` for the matched CCSD minus MP2 increment
 and pass the `triples` term or series by keyword. Each correction accepts

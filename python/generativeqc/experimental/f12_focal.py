@@ -367,18 +367,21 @@ def conventional_df_post_mp2(request: FocalRequest) -> FocalEvaluation:
 def _weighted_terms(
     hf_cabs: FocalSeries[_Endpoint],
     correlation: FocalSeries[_Endpoint],
-    post_mp2: _Endpoint | FocalSeries[_Endpoint],
+    post_mp2: _Endpoint | FocalSeries[_Endpoint] | None,
     triples: _Endpoint | FocalSeries[_Endpoint] | None,
     *,
     nuclei: set[int] | None = None,
 ) -> list[tuple[Role, _Endpoint, float]]:
-    high = post_mp2 if isinstance(post_mp2, FocalSeries) else FocalSeries(post_mp2)
     roles: list[tuple[FocalSeries[_Endpoint], Role]] = [
         (hf_cabs, "hf_cabs"),
         (correlation, "mp2_f12_correlation"),
-        (high, "post_mp2" if triples is None else "ccsd_minus_mp2"),
     ]
+    if post_mp2 is not None:
+        high = post_mp2 if isinstance(post_mp2, FocalSeries) else FocalSeries(post_mp2)
+        roles.append((high, "post_mp2" if triples is None else "ccsd_minus_mp2"))
     if triples is not None:
+        if post_mp2 is None:
+            raise ValueError("separate triples require a ccsd_minus_mp2 increment")
         triple_series = (
             triples if isinstance(triples, FocalSeries) else FocalSeries(triples)
         )
@@ -487,13 +490,14 @@ def _assemble(weighted: list[tuple[Role, FocalTerm, float]]) -> FocalResult:
 def combine(
     hf_cabs: FocalSeries[FocalTerm],
     correlation: FocalSeries[FocalTerm],
-    post_mp2: FocalTerm | FocalSeries[FocalTerm],
+    post_mp2: FocalTerm | FocalSeries[FocalTerm] | None,
     *,
     triples: FocalTerm | FocalSeries[FocalTerm] | None = None,
 ) -> FocalResult:
     """Apply fixed coefficients to both E and -dE/dR after the electronic solves.
 
     Correlation includes ordinary MP2 correlation plus the explicit F12 pair term.
+    Pass post_mp2=None for HF+CABS plus MP2-F12 correlation alone.
     Supply a combined post_mp2 increment, or supply a ccsd_minus_mp2
     increment together with separate conventional triples. Each increment can
     have its own basis series. CCSD and MP2 must be differenced at matching
@@ -556,7 +560,7 @@ def plan_singlepoint(
     atoms: Iterable[Atom | tuple[str | int, Sequence[float]]],
     hf_cabs: FocalSeries[FocalBasis],
     correlation: FocalSeries[FocalBasis],
-    post_mp2: FocalBasis | FocalSeries[FocalBasis],
+    post_mp2: FocalBasis | FocalSeries[FocalBasis] | None,
     *,
     root_id: str,
     correlation_space_id: str,
@@ -697,7 +701,7 @@ def singlepoint(
     atoms: Iterable[Atom | tuple[str | int, Sequence[float]]],
     hf_cabs: FocalSeries[FocalBasis],
     correlation: FocalSeries[FocalBasis],
-    post_mp2: FocalBasis | FocalSeries[FocalBasis],
+    post_mp2: FocalBasis | FocalSeries[FocalBasis] | None,
     *,
     provider: Callable[[FocalRequest], FocalEvaluation],
     root_id: str,
@@ -710,6 +714,7 @@ def singlepoint(
 ) -> FocalRunResult:
     """Evaluate a geometry (Bohr) and compose energies (Eh) and forces (Eh/Bohr).
 
+    Pass post_mp2=None to evaluate only HF+CABS and MP2-F12 correlation.
     Each provider result is checked and copied before the next provider call.
     """
     if not callable(provider):

@@ -361,3 +361,48 @@ def test_native_grouped_increment_refuses_split_role() -> None:
             correlation_space_id="all-active",
             provider=provider,
         )
+
+
+def test_explicit_mp2_f12_series_dispatch_and_composition() -> None:
+    from generativeqc.experimental.f12_focal import combine
+
+    atoms = [("H", (0, 0, 0)), ("H", (0, 0, 1.4))]
+    low, high = basis(2, "def2-svp"), basis(3, "def2-tzvp")
+    hf = FocalSeries(high, low, 5.0)
+    pair = FocalSeries(high, low, 3.0)
+    options = dict(
+        root_id="rhf", correlation_space_id="all-active", backend="cpu_reference"
+    )
+    plan = plan_singlepoint(atoms, hf, pair, post_mp2=None, **options)
+    outputs = []
+
+    def evaluate(request: FocalRequest) -> FocalEvaluation:
+        cardinal = request.basis.cardinal
+        energy = {
+            "hf_cabs": -1 + cardinal**-5,
+            "mp2_f12_correlation": -0.1 - 2 * cardinal**-3,
+        }[request.role]
+        forces = np.array([[0, 0, energy], [0, 0, -energy]])
+        result = FocalEvaluation(term(request, energy, forces), request.backend, True)
+        outputs.append(result)
+        return result
+
+    result = singlepoint(atoms, hf, pair, post_mp2=None, provider=evaluate, **options)
+    assert [(v.term.role, v.term.cardinal) for v in outputs] == [
+        ("hf_cabs", 2),
+        ("hf_cabs", 3),
+        ("mp2_f12_correlation", 2),
+        ("mp2_f12_correlation", 3),
+    ]
+    h2, h3, c2, c3 = (o.term for o in outputs)
+    assembled = combine(
+        FocalSeries(h3, h2, 5.0), FocalSeries(c3, c2, 3.0), post_mp2=None
+    )
+    for value in (result, plan.collect(reversed(outputs)), assembled):
+        assert value.energy == pytest.approx(-1.1, abs=1e-14)
+        np.testing.assert_allclose(
+            value.forces, [[0, 0, -1.1], [0, 0, 1.1]], rtol=0, atol=1e-14
+        )
+        assert value.weights == result.weights
+    with pytest.raises(ValueError, match="triples require a ccsd_minus_mp2 increment"):
+        plan_singlepoint(atoms, hf, pair, post_mp2=None, triples=low, **options)
