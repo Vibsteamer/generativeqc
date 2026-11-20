@@ -9,15 +9,18 @@ namespace generativeqc::methods::detail {
 
 // Admit the tested scalar small-core halogen hydride domain. The native source
 // and spin solver independently validate the actual fitting and orbital shells.
-inline void prepare_ecp_df_uhf(core::System& system, const scf::ScfOptions& options,
-                        generativeqc_method method, const runtime::ExecutionContext& execution,
-                        const core::System* auxiliary) {
+inline void prepare_ecp_df_hf(core::System& system, const scf::ScfOptions& options,
+                              generativeqc_method method, const runtime::ExecutionContext& execution,
+                              const core::System* auxiliary) {
   if (system.ecp_terms.empty() || options.density_fitting_mode == GENERATIVEQC_DENSITY_FITTING_NONE)
     return;
-  bool supported = method == GENERATIVEQC_METHOD_UHF && execution.cuda_requested() &&
+  const bool restricted = method == GENERATIVEQC_METHOD_RHF && system.multiplicity == 1 &&
+                          system.atoms.size() == 2 && system.electron_count == 26;
+  const bool unrestricted = method == GENERATIVEQC_METHOD_UHF && system.multiplicity == 2;
+  bool supported = (restricted || unrestricted) && execution.cuda_requested() &&
                    options.density_fitting_mode == GENERATIVEQC_DENSITY_FITTING_CUDA &&
                    options.precision_mode == GENERATIVEQC_PRECISION_FP64 && auxiliary &&
-                   system.charge == 0 && system.multiplicity == 2 &&
+                   system.charge == 0 &&
                    system.basis_representation == core::kSphericalBasis;
   unsigned halogens = 0;
   bool bromine = false;
@@ -28,7 +31,8 @@ inline void prepare_ecp_df_uhf(core::System& system, const scf::ScfOptions& opti
     supported &= br || (atom.atomic_number == 53 && atom.ecp_core == 28);
     bromine |= br;
   }
-  const unsigned limit = scf::cuda_execution::fitted_halogen_dihydride_doublet(system) ? 4U : 3U;
+  const unsigned limit =
+      restricted || scf::cuda_execution::fitted_halogen_dihydride_doublet(system) ? 4U : 3U;
   if (!supported || halogens != 1 ||
       std::any_of(system.shells.begin(), system.shells.end(),
                   [limit](const auto& s) { return s.angular_momentum > limit; }) ||

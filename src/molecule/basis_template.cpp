@@ -123,10 +123,12 @@ CheckedBasisTemplate preflight(const generativeqc_basis_template_descriptor_v1& 
   }
   // Template creation lacks charge and multiplicity. The prepared method and spin solver
   // check the electronic state separately when using the extended orbital space.
-  const bool halide = atoms.size() == 3 && representation == GENERATIVEQC_BASIS_SPHERICAL &&
+  const bool halide = (atoms.size() == 2 || atoms.size() == 3) &&
+      representation == GENERATIVEQC_BASIS_SPHERICAL &&
       std::count_if(atoms.begin(), atoms.end(), [&](const auto& atom) {
         return atom.atomic_number == 1 && checked.elements[1]->ecp_core_electrons == 0;
-      }) == 2 && std::any_of(atoms.begin(), atoms.end(), [&](const auto& atom) {
+      }) == static_cast<std::ptrdiff_t>(atoms.size() - 1) &&
+      std::any_of(atoms.begin(), atoms.end(), [&](const auto& atom) {
         const auto core = checked.elements[atom.atomic_number]->ecp_core_electrons;
         return (atom.atomic_number == 35 && core == 10) || (atom.atomic_number == 53 && core == 28);
       });

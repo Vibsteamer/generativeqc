@@ -191,8 +191,10 @@ raises. The f budget/replay gate uses a 16-AO spherical fixture; larger f
 endpoint measurements qualify numerical execution only.
 
 Direct RHF/UHF and the bounded Python CUDA semilocal DFT path below provide
-complete first forces. Standalone HF ECP density fitting remains explicitly
-rejected. Native MP2/UMP2 and restricted/unrestricted CCSD/(T), including
+complete first forces. CUDA FP64 fitted HF accepts a separate spherical JKFit on
+neutral singlet HBr and HI with ECP10MDF and ECP28MDF, respectively, and on
+the supported unrestricted halogen hydrides. The restricted solver uses one
+13-orbital occupied space for the 26 explicit electrons. Native MP2/UMP2 and restricted/unrestricted CCSD/(T), including
 same-reference HF/MP2 companions and the [CBS workflow](ccsdt_cbs.md#scalar-ecp-references),
 accept supported scalar ECPs for energies and analytic first forces on CPU/CUDA.
 Explicit fitted correlation and fitted correlated-reference policies retain

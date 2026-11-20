@@ -91,7 +91,7 @@ extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_df_reference_
       prepared_ecp = sys;
       options.density_fitting_mode = cuda ? GENERATIVEQC_DENSITY_FITTING_CUDA
                                           : GENERATIVEQC_DENSITY_FITTING_CPU_REFERENCE;
-      methods::detail::prepare_ecp_df_uhf(*prepared_ecp, options,
+      methods::detail::prepare_ecp_df_hf(*prepared_ecp, options,
           spins == 1 ? GENERATIVEQC_METHOD_RHF : GENERATIVEQC_METHOD_UHF,
           runtime::ExecutionContext(context->state), &aux);
     }

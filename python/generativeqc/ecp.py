@@ -23,12 +23,12 @@ from .basis import BasisSet, validate_ecp_data
 from .elements import checked_integer
 
 
-def g_shell_halogen_dihydride(basis, atoms):
+def g_shell_halogen_hydride(basis, atoms):
     """Return whether orbital g quadrature was qualified for this atom/core topology."""
     if not isinstance(basis, BasisSet) or basis.representation != "spherical":
         return False
     elements = sorted(a.atomic_number for a in atoms)
-    if elements not in ([1, 1, 35], [1, 1, 53]):
+    if elements not in ([1, 35], [1, 53], [1, 1, 35], [1, 1, 53]):
         return False
     hydrogen = basis.by_element.get(1)
     heavy = basis.by_element.get(elements[-1])
@@ -38,6 +38,10 @@ def g_shell_halogen_dihydride(basis, atoms):
         and heavy is not None
         and heavy.ecp_core_electrons == {35: 10, 53: 28}[elements[-1]]
     )
+
+
+def g_shell_halogen_dihydride(basis, atoms):
+    return len(atoms) == 3 and g_shell_halogen_hydride(basis, atoms)
 
 
 def fitted_uhf_hydride_domain(basis, atoms, charge, multiplicity):
@@ -60,9 +64,27 @@ def fitted_uhf_hydride_domain(basis, atoms, charge, multiplicity):
     return len(heavy) == 1 and heavy[0] in ((35, 10), (53, 28))
 
 
+def fitted_hf_hydride_domain(method, basis, atoms, charge, multiplicity):
+    """Qualified CUDA fitted spin and orbital domains for small-core hydrides."""
+    if method == "uhf":
+        return fitted_uhf_hydride_domain(basis, atoms, charge, multiplicity)
+    return (
+        method == "rhf"
+        and charge == 0
+        and multiplicity == 1
+        and len(atoms) == 2
+        and g_shell_halogen_hydride(basis, atoms)
+        and all(
+            shell.angular_momentum <= 4
+            for atom in atoms
+            for shell in basis.by_element[atom.atomic_number].shells
+        )
+    )
+
+
 def resolve_ecp(basis: typing.Any, atoms: typing.Any) -> typing.Any:
     """Resolve immutable source records to atom-mapped scalar residual terms."""
-    shell_limit = 4 if g_shell_halogen_dihydride(basis, atoms) else 3
+    shell_limit = 4 if g_shell_halogen_hydride(basis, atoms) else 3
     cores, terms = [], []
     metadata = basis.by_element if isinstance(basis, BasisSet) else {}
     for atom_index, atom in enumerate(atoms):
@@ -89,7 +111,7 @@ def resolve_ecp(basis: typing.Any, atoms: typing.Any) -> typing.Any:
             raise NotImplementedError(
                 "ECP execution supports orbital s/p/d/f shells"
                 if shell_limit == 3
-                else "scalar-ECP dihydride orbital shells extend through g"
+                else "scalar-ECP hydride orbital shells extend through g"
             )
         for potential in potentials:
             if set(potential) - {
@@ -136,7 +158,7 @@ def resolve_ecp(basis: typing.Any, atoms: typing.Any) -> typing.Any:
                 raise NotImplementedError(
                     "ECP execution supports orbital s/p/d/f shells"
                     if shell_limit == 3
-                    else "scalar-ECP dihydride orbital shells extend through g"
+                    else "scalar-ECP hydride orbital shells extend through g"
                 )
     return tuple(cores), tuple(terms)
 

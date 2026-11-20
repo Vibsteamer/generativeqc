@@ -2024,11 +2024,13 @@ class Calculator:
         self, operator: str, derivative_order: int = 0, *, atoms=None
     ) -> str | None:
         """Select value and gradient operators provided by the CUDA fitted Fock source."""
-        if atoms is not None and self._fitted_ecp_uhf(self._basis, atoms, 0, 2):
-            from .ecp import g_shell_halogen_dihydride
+        if atoms is not None and self._fitted_ecp_hf(
+            self._basis, atoms, 0, 1 if self._method == _native.METHOD_RHF else 2
+        ):
+            from .ecp import g_shell_halogen_hydride
 
             if (
-                g_shell_halogen_dihydride(self._basis, atoms)
+                g_shell_halogen_hydride(self._basis, atoms)
                 and derivative_order in (0, 1)
                 and operator
                 in ("overlap", "kinetic", "nuclear_attraction", "df_three_center")
@@ -2455,16 +2457,18 @@ class Calculator:
         if not report["eligible"]:
             raise NotImplementedError("; ".join(report["reasons"]))
 
-    def _fitted_ecp_uhf(self, basis, atoms, charge, multiplicity):
-        from .ecp import fitted_uhf_hydride_domain
+    def _fitted_ecp_hf(self, basis, atoms, charge, multiplicity):
+        from .ecp import fitted_hf_hydride_domain
 
         return (
-            self._method == _native.METHOD_UHF
+            self._method in (_native.METHOD_RHF, _native.METHOD_UHF)
             and self._device_name == "cuda"
             and self._density_fitting_mode == _native.DENSITY_FITTING_CUDA
             and self._precision_mode == _native.PRECISION_FP64
             and self._auxiliary_basis is not None
-            and fitted_uhf_hydride_domain(basis, atoms, charge, multiplicity)
+            and fitted_hf_hydride_domain(
+                self._method_name, basis, atoms, charge, multiplicity
+            )
         )
 
     def _create_native_system(
@@ -2613,7 +2617,7 @@ class Calculator:
                     and self._density_fitting_mode != _native.DENSITY_FITTING_NONE
                     and not self._composite_rks_second_order
                     and self._method not in _CORRELATED_METHODS
-                    and not self._fitted_ecp_uhf(selected_basis, atoms, charge, multiplicity)
+                    and not self._fitted_ecp_hf(selected_basis, atoms, charge, multiplicity)
                 ):
                     raise NotImplementedError(
                         "ECP density-fitting execution is not yet validated"
@@ -2686,7 +2690,7 @@ class Calculator:
                 self._density_fitting_mode != _native.DENSITY_FITTING_NONE
                 and not self._composite_rks_second_order
                 and self._method not in _CORRELATED_METHODS
-                and not self._fitted_ecp_uhf(selected_basis, atoms, charge, multiplicity)
+                and not self._fitted_ecp_hf(selected_basis, atoms, charge, multiplicity)
             ):
                 raise NotImplementedError(
                     "ECP density-fitting execution is not yet validated"

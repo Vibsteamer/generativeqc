@@ -453,7 +453,7 @@ std::unique_ptr<PreparedCalculation> prepare_hf_calculation(
   resolve_hf_options(options, capabilities.method, execution);
   core::System prepared_system = system;
   if (options.density_fitting_mode != GENERATIVEQC_DENSITY_FITTING_NONE) {
-    prepare_ecp_df_uhf(prepared_system, options, capabilities.method, execution,
+    prepare_ecp_df_hf(prepared_system, options, capabilities.method, execution,
                        auxiliary ? &*auxiliary : nullptr);
     validate_density_fitting_auxiliary(system, auxiliary);
   }
@@ -485,7 +485,7 @@ std::unique_ptr<PreparedBatch> prepare_hf_batch(const Capabilities& capabilities
   resolve_hf_options(options, capabilities.method, execution);
   if (options.density_fitting_mode != GENERATIVEQC_DENSITY_FITTING_NONE)
     for (auto& system : systems)
-      prepare_ecp_df_uhf(system, options, capabilities.method, execution,
+      prepare_ecp_df_hf(system, options, capabilities.method, execution,
                        auxiliary ? &*auxiliary : nullptr);
   if (options.density_fitting_mode != GENERATIVEQC_DENSITY_FITTING_NONE && auxiliary.has_value()) {
     if (auxiliary->atoms.size() != systems.front().atoms.size()) {

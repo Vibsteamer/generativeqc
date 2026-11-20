@@ -178,6 +178,7 @@ def _basis_record(
     *,
     derivative_order: typing.Any = 1,
     library: typing.Any = None,
+    fitted_consumer: str | None = None,
 ) -> typing.Any:
     selected = _snapshot_basis(basis, representation)
     mode = (
@@ -185,16 +186,30 @@ def _basis_record(
         if isinstance(selected, BasisSet)
         else representation or "cartesian"
     )
+    operator = "df_three_center" if fitted_consumer else "eri"
     require_basis(
         selected,
         atoms,
         backend=backend,
-        operator="eri",
+        operator=operator,
+        consumer=fitted_consumer,
         derivative_order=derivative_order,
         representation=mode,
         role=role,
     )
-    shells = selected.shells_for(atoms) if isinstance(selected, BasisSet) else selected
+    if isinstance(selected, BasisSet) and fitted_consumer:
+        shells = selected.shells_for(
+            atoms,
+            backend=backend,
+            operator=operator,
+            derivative_order=derivative_order,
+            role=role,
+            consumer=fitted_consumer,
+        )
+    else:
+        shells = (
+            selected.shells_for(atoms) if isinstance(selected, BasisSet) else selected
+        )
     metadata = resolved_basis_metadata(
         selected,
         shells,
@@ -769,6 +784,18 @@ def hf_resource_request(
         )
         if method == "rhf" and multiplicity != 1:
             raise ValueError("RHF requires a closed-shell singlet")
+        from .ecp import fitted_hf_hydride_domain
+
+        fitted_hydride = (
+            fitted
+            and backend == "cuda"
+            and density_fitting == "cuda"
+            and precision == "fp64"
+            and auxiliary_basis is not None
+            and fitted_hf_hydride_domain(
+                method, selected_basis, atoms, charge, multiplicity
+            )
+        )
         orbital = _basis_record(
             atoms,
             basis,
@@ -778,6 +805,7 @@ def hf_resource_request(
             multiplicity,
             "orbital",
             library=library,
+            fitted_consumer="full_df" if fitted_hydride else None,
         )
         if max(electrons.nalpha, electrons.nbeta) > orbital["nbf"]:
             raise ValueError(
@@ -785,13 +813,7 @@ def hf_resource_request(
             )
         auxiliary = None
         if fitted:
-            from .ecp import fitted_uhf_hydride_domain
-
-            if orbital.get("ecp_terms") and not (
-                method == "uhf" and backend == "cuda" and density_fitting == "cuda"
-                and precision == "fp64" and auxiliary_basis is not None
-                and fitted_uhf_hydride_domain(selected_basis, atoms, charge, multiplicity)
-            ):
+            if orbital.get("ecp_terms") and not fitted_hydride:
                 raise NotImplementedError(
                     "ECP density-fitting execution is not yet validated"
                 )
@@ -813,6 +835,7 @@ def hf_resource_request(
                     multiplicity,
                     "auxiliary",
                     library=library,
+                    fitted_consumer="scf_df" if fitted_hydride else None,
                 )
             )
         items.append(
