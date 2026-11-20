@@ -14,15 +14,17 @@ from typing import Generic, Literal, TypeVar
 
 import numpy as np
 
-from .. import _f12_focal_one_electron, _f12_focal_reference, _native
+from .. import (
+    _f12_focal_increment,
+    _f12_focal_one_electron,
+    _f12_focal_projector,
+    _f12_focal_reference,
+    _f12_focal_singles,
+    _f12_focal_ump2,
+    _native,
+)
 from .._api_types import Atom
 from .._cbs_plan import native_cbs_plan
-from .._f12_focal_projector import focal_cabs_projector as focal_cabs_projector
-from .._f12_focal_singles import FocalCabsSingles as FocalCabsSingles
-from .._f12_focal_singles import reference_cabs_singles as reference_cabs_singles
-from .._f12_focal_ump2 import FocalCoulombSource as FocalCoulombSource
-from .._f12_focal_ump2 import FocalUMP2Weights as FocalUMP2Weights
-from .._f12_focal_ump2 import reference_df_ump2 as reference_df_ump2
 from .._model_resolution import snapshot_basis
 from ..basis import BasisProvenance, BasisSet
 from ..elements import SYMBOLS, atomic_number, checked_integer, electron_state
@@ -43,6 +45,15 @@ FocalOneElectron = _f12_focal_one_electron.FocalOneElectron
 one_electron_sources = _f12_focal_one_electron.one_electron_sources
 FocalReference = _f12_focal_reference.FocalReference
 df_reference = _f12_focal_reference.df_reference
+FocalF12Increment = _f12_focal_increment.FocalF12Increment
+FocalF12Sources = _f12_focal_increment.FocalF12Sources
+reference_f12_increment = _f12_focal_increment.reference_f12_increment
+focal_cabs_projector = _f12_focal_projector.focal_cabs_projector
+FocalCabsSingles = _f12_focal_singles.FocalCabsSingles
+reference_cabs_singles = _f12_focal_singles.reference_cabs_singles
+FocalCoulombSource = _f12_focal_ump2.FocalCoulombSource
+FocalUMP2Weights = _f12_focal_ump2.FocalUMP2Weights
+reference_df_ump2 = _f12_focal_ump2.reference_df_ump2
 
 
 @dataclass(frozen=True)

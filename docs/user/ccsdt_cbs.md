@@ -853,3 +853,21 @@ the raw three-center integrals, full-rank metric and matching whitener.
 The result contains the three spin energies and six relaxed weights for
 overlap, core, JKFit and MP2Fit. Contract these energy derivatives with
 their corresponding nuclear integral derivatives and negate the sum.
+
+For the explicit 3C(FIX) contribution from retained spin pairs, call
+`benchmarks.f12_focal_increment.molecular_f12_increment(request, ...)`.
+This source-checkout provider takes an all-active UHF pair request and the
+same native library and runner arguments as the ordinary provider. It uses
+the full joint OBS/OptRI basis in both the JKFit Fock and the independently
+fitted Gaussian operators. Its result contains the explicit F12 increment,
+its relaxed force, the active-pair count and the fixed CABS rank. Add the
+ordinary UMP2 correlation once to assemble the `mp2_f12_correlation` term.
+Supply `expected_cabs_rank` for consistent displaced-geometry checks.
+
+For already computed sources, the public experimental function
+`reference_f12_increment` takes the request, canonical DF reference,
+one-electron result, and two `FocalF12Sources` records. Its three weight
+groups differentiate the one-electron, JKFit and F12Fit operators,
+respectively. The Coulomb, geminal, squared geminal, geminal-Coulomb and
+double-commutator operators in F12Fit each provide their own two- and
+three-center nuclear derivative.

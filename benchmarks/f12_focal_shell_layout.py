@@ -22,6 +22,7 @@ def focal_shell_layout(
     host_reference: bool,
     budget_mib: int,
     ordinary_fit: str | None = None,
+    joint_jk: bool = False,
 ) -> dict:
     """Use OBS then OptRI rows in native real-spherical order; fitting rows start at zero.
 
@@ -36,6 +37,10 @@ def focal_shell_layout(
     basis = request.basis
     if not request.atoms:
         raise ValueError("focal shell integrals require at least one atom")
+    if joint_jk and (ordinary_fit is not None or request.role != "mp2_f12_correlation"):
+        raise ValueError(
+            "joint JKFit needs a molecular pair request with a combined orbital frame"
+        )
     if ordinary_fit is not None:
         if (
             ordinary_fit not in ("jk_fit", "mp2_fit")
@@ -45,7 +50,7 @@ def focal_shell_layout(
                 "ordinary pair sources require an explicit JKFit or MP2Fit on the pair request"
             )
         fit = getattr(basis, ordinary_fit)
-    elif request.role == "hf_cabs":
+    elif request.role == "hf_cabs" or joint_jk:
         fit = basis.jk_fit
     elif request.role == "mp2_f12_correlation":
         fit = basis.f12_fit

@@ -2,7 +2,7 @@
 
 import math
 from collections.abc import Callable, Mapping
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import numpy as np
 from generativeqc_compiler.tensor import Program, transpose_program
@@ -98,6 +98,7 @@ def unrestricted_mp2_f12_ao_response(
     singles: Callable = cabs_singles,
     auxiliary_batch_size: int | None = None,
     jkfit: Mapping[str, np.ndarray] | None = None,
+    component: Literal["all", "ordinary", "f12", "singles"] = "all",
 ) -> tuple[UnrestrictedF12Energy, dict[str, np.ndarray]]:
     """Evaluate the correlation and singles energies and their common AO cotangents.
 
@@ -107,9 +108,13 @@ def unrestricted_mp2_f12_ao_response(
     the physical Coulomb metric derivative. Nuclear and UHF response are
     applied by the force caller. With an independent JKFit panel, pass raw
     ao_coulomb, metric/coulomb and metric_whitener in that fit. Pair operators
-    use the primary correlation fit. Both fits share the AO rows, spin frames
+    use the primary correlation fit. Selecting one component evaluates its
+    energy and transposes its own seed through both fits and orbital frames.
+    Both fits share the AO rows, spin frames
     and physical core. JKFit integral weights have the prefix "jkfit/".
     """
+    if component not in ("all", "ordinary", "f12", "singles"):
+        raise ValueError("unknown unrestricted F12 component")
     jk_data = None
     if jkfit is not None:
         if set(jkfit) != {"ao_coulomb", "metric/coulomb", "metric_whitener"}:
@@ -150,6 +155,7 @@ def unrestricted_mp2_f12_ao_response(
         auxiliary_batch_size,
         energies=True,
         fock_data=jk_data,
+        component=component,
     )
     _, bars = _orbital_sources(space, ao, run, weights, projected=data, role=pair_role)
     assert terms is not None and bars is not None
@@ -174,6 +180,7 @@ def _projected_response(
     *,
     energies: bool,
     fock_data: dict[str, np.ndarray] | None = None,
+    component: str = "all",
 ) -> tuple[
     dict[str, np.ndarray], UnrestrictedF12Energy | None, dict[str, np.ndarray] | None
 ]:
@@ -201,9 +208,11 @@ def _projected_response(
         if k == "cross_overlap" or k.startswith(("raw/", "metric/"))
     }
     fock_bars = {k: np.zeros_like(v) for k, v in fock.items()}
-    singles_energies = []
+    singles_energies = [0.0, 0.0]
     mp2_terms, f12_terms = [], []
-    for spin, occupied in (("alpha", oa), ("beta", ob)):
+    for index, (spin, occupied) in enumerate((("alpha", oa), ("beta", ob))):
+        if component not in ("all", "singles"):
+            continue
         key = "fock_" + spin
         matrix = fock[key]
         energy, bar = singles(
@@ -212,30 +221,32 @@ def _projected_response(
         if bar is None:
             raise ValueError("Missing UHF CABS singles Fock cotangent")
         if energies:
-            singles_energies.append(float(energy))
+            singles_energies[index] = float(energy)
         fock_bars[key] += (bar + bar.T) / 2
-    for sl, sr, nl, nr, graph, pairs in occupied_pair_blocks(
-        space, frozen_occupied=frozen_occupied
-    ):
-        rev = transpose_program(graph, ("pair_energy", "ordinary_pair_energy")).program
-        kernel = rev
-        if energies:
-            kernel = Program(
-                {
-                    **rev.outputs,
-                    "ordinary_pair_energy": graph.outputs["ordinary_pair_energy"],
-                    "pair_energy": graph.outputs["pair_energy"],
-                }
-            )
+    selected = tuple(
+        name
+        for part, name in (("f12", "pair_energy"), ("ordinary", "ordinary_pair_energy"))
+        if component in ("all", part)
+    )
+    blocks = (
+        occupied_pair_blocks(space, frozen_occupied=frozen_occupied) if selected else ()
+    )
+    count = 0
+    for sl, sr, nl, nr, graph, pairs in blocks:
+        primal_graph = Program({name: graph.outputs[name] for name in selected})
+        rev = transpose_program(primal_graph, selected).program
+        kernel = Program({**rev.outputs, **primal_graph.outputs}) if energies else rev
         for i, j in pairs:
             primal = pair_operands(data, sources, fock, sl, sr, nl, nr, ext, i, j)
             feeds = {k: np.ascontiguousarray(v) for k, v in primal.items()}
-            feeds["bar_pair_energy"] = np.array(1.0)
-            feeds["bar_ordinary_pair_energy"] = np.array(1.0)
+            feeds.update({"bar_" + name: np.array(1.0) for name in selected})
             result = run(kernel, feeds).outputs
             if energies:
-                mp2_terms.append(float(result["ordinary_pair_energy"]))
-                f12_terms.append(float(result["pair_energy"]))
+                count += 1
+                if "ordinary_pair_energy" in selected:
+                    mp2_terms.append(float(result["ordinary_pair_energy"]))
+                if "pair_energy" in selected:
+                    f12_terms.append(float(result["pair_energy"]))
             # Pair operands are views into the molecular arrays. Shared metric,
             # Fock, and repeated occupied-leg entries accumulate independently.
             buffers = pair_operands(
@@ -259,7 +270,7 @@ def _projected_response(
         alpha, beta = singles_energies
         if not all(math.isfinite(value) for value in (mp2, f12, alpha, beta)):
             raise ValueError("Nonfinite unrestricted MP2-F12 or CABS energy")
-        terms = UnrestrictedF12Energy(mp2, f12, (alpha, beta), len(mp2_terms))
+        terms = UnrestrictedF12Energy(mp2, f12, (alpha, beta), count)
     jk_weights = (
         None
         if fock_data is None
