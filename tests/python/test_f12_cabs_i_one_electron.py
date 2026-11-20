@@ -137,11 +137,12 @@ def test_i_pair_cartesian_values_and_nuclear_response(libraries, angular):
     )
 
 
-def test_i_batch_compact_projection_and_nonsymmetric_weights(libraries):
+@pytest.mark.parametrize("full_basis", [False, True])
+def test_i_batch_compact_projection_and_nonsymmetric_weights(libraries, full_basis):
     gto = pytest.importorskip("pyscf.gto")
     lib = libraries["i"]
     batch = _bind(
-        lib, "i", "_batch",
+        lib, "i", "_full_batch" if full_basis else "_batch",
         [ct.c_int] * 4 + [_INT, _DOUBLE, _DOUBLE, _DOUBLE, _INT, _DOUBLE, _DOUBLE,
                           _SIZE, _SIZE, _SIZE_REF],
     )
@@ -154,19 +155,23 @@ def test_i_batch_compact_projection_and_nonsymmetric_weights(libraries):
     transform_table = np.concatenate([table.ravel() for table in transform])
     shells = np.array([(l, atom, k, k + 1) for k, (l, atom) in enumerate(zip(ang, atoms, strict=True))],
                       dtype=np.int32)
-    output = np.empty((10, 2, sum(13 * (2 * m + 1) for m in ang)))
+    pairs = [(i, j) for i in range(len(ang)) for j in range(i + 1) if full_basis or i == 2]
+    output = np.full((10, 2, sum((2 * ang[i] + 1) * (2 * ang[j] + 1) for i, j in pairs)), np.nan)
     used = _SIZE()
     args = (3, 3, 3, shells, exps, radial, _XYZ, _CHARGES, transform_table)
+    assert batch(1, *args, output, output.size, 1, ct.byref(used)) == 2
+    assert np.isnan(output).all()
     assert batch(1, *args, output, output.size, 1 << 20, ct.byref(used)) == 0
+
     def reference(xyz):
         blocks = []
-        for k in range(3):
-            pair = [2, k]
+        for i, j in pairs:
+            pair = [i, j]
             s, t, v = _libcint_values(
-                gto, (ang[2], ang[k]), (atoms[2], atoms[k]),
+                gto, (ang[i], ang[j]), (atoms[i], atoms[j]),
                 exps[pair], radial[pair], xyz,
             )
-            projected = transform[6] @ np.stack((s, t + v)) @ transform[ang[k]].T
+            projected = transform[ang[i]] @ np.stack((s, t + v)) @ transform[ang[j]].T
             blocks.append(projected.reshape(2, -1))
         return np.concatenate(blocks, axis=1)
 

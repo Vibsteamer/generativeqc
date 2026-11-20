@@ -8,20 +8,22 @@ import pytest
 from benchmarks.f12_cabs_h_batch import CabsHShells
 
 
-def test_high_weight_order_and_symmetric_assembly() -> None:
+@pytest.mark.parametrize("full_basis", [False, True])
+def test_high_weight_order_and_symmetric_assembly(full_basis: bool) -> None:
     # Interleave two h-shell AO slices and a lower shell in source order.
     rng = np.random.default_rng(4719)
     n = 24
     indices = rng.permutation(n)
     parts = [indices[:11], indices[11:13], indices[13:]]
     high = CabsHShells.__new__(CabsHShells)
+    high.full_basis = full_basis
     high.low_source = np.sort(parts[1])
     high.n = n
     high.blocks = [
         (i, j, a, b)
         for i, a in enumerate(parts)
         for j, b in enumerate(parts[: i + 1])
-        if i != 1 or j != 1
+        if full_basis or i != 1 or j != 1
     ]
     high.size = sum(len(a) * len(b) for _, _, a, b in high.blocks)
     high.charges = np.array([8, 1])
@@ -38,7 +40,13 @@ def test_high_weight_order_and_symmetric_assembly() -> None:
         )
     )
     low = high.low_source
-    S, H = high.assemble(*matrices[0][:, low[:, None], low[None, :]])
+    lower = matrices[0][:, low[:, None], low[None, :]]
+    if full_basis:
+        S, H = high.assemble()
+        with pytest.raises(ValueError, match="own lower-shell"):
+            high.assemble(*lower)
+    else:
+        S, H = high.assemble(*lower)
     np.testing.assert_array_equal(np.stack([S, H]), matrices[0])
 
     def inner(
@@ -59,7 +67,8 @@ def test_high_weight_order_and_symmetric_assembly() -> None:
     high.contract = inner
     W = rng.normal(size=(2, n, n))
     masked = W.copy()
-    masked[:, low[:, None], low[None, :]] = 0
+    if not full_basis:
+        masked[:, low[:, None], low[None, :]] = 0
     expected = np.einsum("qij,aqij->a", masked, matrices[1:]).reshape(2, 3)
     actual, _ = high.high_gradient(*W, 10 << 20)
     np.testing.assert_allclose(actual, expected, rtol=1e-13, atol=1e-13)

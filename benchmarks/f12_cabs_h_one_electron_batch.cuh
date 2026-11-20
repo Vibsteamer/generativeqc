@@ -81,17 +81,18 @@ struct Allocation {
   }
 };
 #define BATCH_EXPORT GQC_F12_CABS_ONE_ELECTRON_SYMBOL(_batch)
+#define FULL_BATCH_EXPORT GQC_F12_CABS_ONE_ELECTRON_SYMBOL(_full_batch)
 #define WEIGHTS_EXPORT GQC_F12_CABS_ONE_ELECTRON_SYMBOL(_weights)
 #else
 #define BATCH_EXPORT GQC_F12_CABS_ONE_ELECTRON_SYMBOL(_batch_host_reference)
+#define FULL_BATCH_EXPORT GQC_F12_CABS_ONE_ELECTRON_SYMBOL(_full_batch_host_reference)
 #define WEIGHTS_EXPORT GQC_F12_CABS_ONE_ELECTRON_SYMBOL(_weights_host_reference)
 #endif
-}  // namespace
 
-extern "C" int BATCH_EXPORT(int response, int ns, int nat, int nprim, const int* shell,
-                            const double* exp, const double* radial, const double* xyz,
-                            const int* charges, const double* transform, double* output,
-                            Size output_count, Size max_bytes, Size* bytes) {
+int evaluate_batch(int response, int ns, int nat, int nprim, const int* shell, const double* exp,
+                   const double* radial, const double* xyz, const int* charges,
+                   const double* transform, double* output, Size output_count, Size max_bytes,
+                   Size* bytes, bool all_pairs) {
   if ((response != 0 && response != 1) || ns < 1 || nat < 1 ||
       nat > std::numeric_limits<int>::max() / 3 || nprim < 1 || !shell || !exp || !radial || !xyz ||
       !charges || !transform || !output || !bytes)
@@ -107,8 +108,10 @@ extern "C" int BATCH_EXPORT(int response, int ns, int nat, int nprim, const int*
     primitive_end = s[3];
     for (int j = 0; j <= i; ++j) {
       const int* t = shell + Size(j) * 4;
-      if (s[0] != MaxL && t[0] != MaxL) continue;
-      if (blocks.size() >= Size(std::numeric_limits<int>::max())) return 2;
+      if (!all_pairs && s[0] != MaxL && t[0] != MaxL) continue;
+      if (blocks.size() >= Size(std::numeric_limits<int>::max()) ||
+          (all_pairs && blocks.size() >= max_bytes / sizeof(Block)))
+        return 2;
       blocks.push_back({s[0], t[0], s[1], t[1], s[2], t[2], s[3] - s[2], t[3] - t[2], nc, nsp});
       nc += ncart(s[0]) * ncart(t[0]);
       nsp += (2 * s[0] + 1) * (2 * t[0] + 1);
@@ -179,6 +182,28 @@ extern "C" int BATCH_EXPORT(int response, int ns, int nat, int nprim, const int*
 #endif
   return 0;
 }
+}  // namespace
+
+extern "C" int BATCH_EXPORT(int response, int ns, int nat, int nprim, const int* shell,
+                            const double* exp, const double* radial, const double* xyz,
+                            const int* charges, const double* transform, double* output,
+                            Size output_count, Size max_bytes, Size* bytes) {
+  return evaluate_batch(response, ns, nat, nprim, shell, exp, radial, xyz, charges, transform,
+                        output, output_count, max_bytes, bytes, false);
+}
+
+#ifdef GQC_F12_CABS_I_ONE_ELECTRON
+// Full triangular shell-pair order, including pairs below i. Point charges still exclude
+// the residual local and nonlocal ECP, which the caller composes separately.
+extern "C" int FULL_BATCH_EXPORT(int response, int ns, int nat, int nprim, const int* shell,
+                                 const double* exp, const double* radial, const double* xyz,
+                                 const int* charges, const double* transform, double* output,
+                                 Size output_count, Size max_bytes, Size* bytes) {
+  return evaluate_batch(response, ns, nat, nprim, shell, exp, radial, xyz, charges, transform,
+                        output, output_count, max_bytes, bytes, true);
+}
+#endif
+
 extern "C" int WEIGHTS_EXPORT(int nd, Size cols, const double* jac, const double* w, double* out,
                               Size max_bytes, Size* bytes) {
   if (nd <= 0 || cols == 0 || !jac || !w || !out || !bytes) return 1;
@@ -207,4 +232,5 @@ extern "C" int WEIGHTS_EXPORT(int nd, Size cols, const double* jac, const double
   return 0;
 }
 #undef BATCH_EXPORT
+#undef FULL_BATCH_EXPORT
 #undef WEIGHTS_EXPORT

@@ -1,4 +1,4 @@
-"""Assemble OBS+CABS real-spherical one-electron sources with a high-shell cohort."""
+"""Assemble OBS+CABS real-spherical one-electron sources through h or i."""
 
 import ctypes as ct
 import time
@@ -27,10 +27,14 @@ class CabsHShells:
         host_reference: bool = False,
         angular_momentum: int = 5,
         effective_charges: Sequence[int] | None = None,
+        full_basis: bool = False,
     ) -> None:
         if type(angular_momentum) is not int or angular_momentum not in (5, 6):
             raise ValueError("the one-electron cohort must be h or i")
+        if type(full_basis) is not bool or (full_basis and angular_momentum != 6):
+            raise ValueError("the full-basis batch requires the i-shell library")
         self.label = "h" if angular_momentum == 5 else "i"
+        self.full_basis = full_basis
         self.n = len(native_to_source)
         p = np.asarray(native_to_source)
         if (
@@ -88,7 +92,7 @@ class CabsHShells:
             (i, j, rows[i], rows[j])
             for i in range(ns)
             for j in range(i + 1)
-            if ls[i] == angular_momentum or ls[j] == angular_momentum
+            if full_basis or ls[i] == angular_momentum or ls[j] == angular_momentum
         ]
         self.size = sum(len(a) * len(b) for _, _, a, b in self.blocks)
         # Cross-check ownership by the complete ordered AO tuple, including shell and atom.
@@ -157,7 +161,8 @@ class CabsHShells:
         size = ct.c_size_t
         ptr = ct.POINTER(size)
         prefix = f"gqc_f12_cabs_{self.label}_one_electron"
-        self.batch = getattr(self.lib, prefix + "_batch" + suffix)
+        batch = "_full_batch" if full_basis else "_batch"
+        self.batch = getattr(self.lib, prefix + batch + suffix)
         self.batch.argtypes = [ct.c_int] * 4 + [i, d, d, d, i, d, d, size, size, ptr]
         self.batch.restype = ct.c_int
         self.contract = getattr(
@@ -200,25 +205,34 @@ class CabsHShells:
             "backend": self.backend,
             "device_bytes": used.value,
             "compact_host_bytes": result.nbytes,
-            "high_shell_pairs": len(self.blocks),
+            ("shell_pairs" if self.full_basis else "high_shell_pairs"): len(self.blocks),
             "spherical_elements_per_matrix": self.size,
             "native_seconds": time.monotonic() - t,
             "batch_calls": 1,
         }
 
     def assemble(
-        self, low_overlap: np.ndarray, low_hcore: np.ndarray
+        self, low_overlap: np.ndarray | None = None, low_hcore: np.ndarray | None = None
     ) -> tuple[np.ndarray, np.ndarray]:
+        """Return overlap and bare Hcore in source order, using the chosen cohort."""
         if self.data is None:
-            raise ValueError("missing high shell integrals")
-        size = len(self.low_source)
-        for matrix in (low_overlap, low_hcore):
-            if matrix.shape != (size, size) or not np.isfinite(matrix).all():
-                raise ValueError("expected complete finite lower-shell matrices in source AO order")
-        low = np.ix_(self.low_source, self.low_source)
+            raise ValueError("missing combined-basis integrals")
         out = np.empty((2, self.n, self.n))
-        out[0][low] = low_overlap
-        out[1][low] = low_hcore
+        if self.full_basis:
+            if low_overlap is not None or low_hcore is not None:
+                raise ValueError("the full-basis batch supplies its own lower-shell matrices")
+        else:
+            size = len(self.low_source)
+            for matrix in (low_overlap, low_hcore):
+                if (
+                    matrix is None
+                    or matrix.shape != (size, size)
+                    or not np.isfinite(matrix).all()
+                ):
+                    raise ValueError("expected complete finite lower-shell matrices in source AO order")
+            low = np.ix_(self.low_source, self.low_source)
+            out[0][low] = low_overlap
+            out[1][low] = low_hcore
         pos = 0
         for i, j, a, b in self.blocks:
             stop = pos + len(a) * len(b)
@@ -232,6 +246,7 @@ class CabsHShells:
     def high_gradient(
         self, ws: np.ndarray, wh: np.ndarray, max_bytes: int
     ) -> tuple[np.ndarray, dict]:
+        """Contract the retained native blocks, including lower blocks in full mode."""
         if self.data is None or self.data.shape[0] != 1 + 3 * len(self.charges):
             raise ValueError("no retained high shell nuclear derivatives")
         weights = np.empty((2, self.size))
@@ -276,7 +291,7 @@ class CabsHShells:
     def matrices(
         self, session_library: Path, *, derivatives: bool, max_bytes: int
     ) -> tuple[np.ndarray, np.ndarray, dict]:
-        if self.explicit_low:
+        if self.full_basis or self.explicit_low:
             raise ValueError("assemble the high-shell block with a matched lower-shell provider")
         hip = self.evaluate(derivatives=derivatives, max_bytes=max_bytes)
         s, h, low = combined_matrices(
@@ -300,7 +315,7 @@ class CabsHShells:
     def gradient(
         self, ws: np.ndarray, wh: np.ndarray, max_bytes: int
     ) -> IntegralGradient:
-        if self.explicit_low:
+        if self.full_basis or self.explicit_low:
             raise ValueError("combine the high-shell pullback with a matched lower-shell provider")
         high, hi_resources = self.high_gradient(ws, wh, max_bytes)
         low = np.ix_(self.low_source, self.low_source)
