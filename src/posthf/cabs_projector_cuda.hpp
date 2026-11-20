@@ -18,3 +18,9 @@ extern "C" GENERATIVEQC_API int generativeqc_f12_cabs_projector_cuda_v2(
     int expected_rank, const double* overlap, const double* projector_bar, double* projector,
     double* frame, std::size_t frame_capacity, double* overlap_bar, int* rank, double* margin,
     char* error, std::size_t error_size);
+
+// Accumulate both legs of C^T F C on a checked physical AO operator. All
+// arrays are row-major. The output retains both independently evaluated triangles.
+extern "C" GENERATIVEQC_API int generativeqc_f12_cabs_congruence_cuda_v1(
+    int device, int n, int columns, const double* ao, const double* frame, double* transformed,
+    char* error, std::size_t error_size);

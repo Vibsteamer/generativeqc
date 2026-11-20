@@ -221,3 +221,26 @@ def test_molecular_singles_and_source_response(
             / (2 * step)
         )
         assert analytic == pytest.approx(finite, abs=3e-7, rel=0)
+
+
+def test_ill_conditioned_ao_fock_congruence() -> None:
+    from decimal import Decimal, localcontext
+
+    from generativeqc._f12_cabs_fock import _project
+
+    rng = np.random.default_rng(143)
+    a = rng.normal(size=(24, 24))
+    operator = (a + a.T) * 0.5
+    frame = rng.normal(size=(24, 4)) * 2e4
+    with localcontext() as ctx:
+        ctx.prec = 60
+        decimal_array = np.vectorize(Decimal.from_float, otypes=[object])
+        c = decimal_array(frame)
+        expected = np.asarray(c.T @ decimal_array(operator) @ c, dtype=np.float64)
+    projected = _project(operator, frame, False, None)
+    np.testing.assert_array_max_ulp(projected, expected, maxulp=2)
+    np.testing.assert_allclose(projected, projected.T, rtol=0, atol=2e-8)
+    bad = operator.copy()
+    bad[0, 1] += 1e-6
+    with pytest.raises(ValueError, match="physical AO DF Fock"):
+        _project(bad, frame, False, None)

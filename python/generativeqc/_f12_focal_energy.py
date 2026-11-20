@@ -143,6 +143,7 @@ def molecular_low_order_energy(
 ) -> FocalLowOrderEnergy:
     from generativeqc_compiler.tensor import execute
 
+    from ._f12_cabs_fock import physical_fock
     from ._f12_focal_frame import canonical_pair_frame
     from ._f12_focal_molecular import df_reference, one_electron_sources
     from ._f12_focal_singles import _singles_from_fock
@@ -208,17 +209,22 @@ def molecular_low_order_energy(
         }
 
     fock = spin_fock((oa, ob, ext, len(jk.whitener)), sources(fock_data), run)
+    frames = (ao["coefficients_alpha"], ao["coefficients_beta"])
+    singles_focks, _ = physical_fock(
+        one.hcore, jkfit["ao_coulomb"], jk.whitener, frames, (oa, ob), run,
+        cuda, provider.response_library,
+    )
     indices = ref._pair_spin_indices(request)
     singles = tuple(
         _singles_from_fock(
-            fock["fock_" + s],
+            singles_fock,
             ref.orbital_energies[k],
             ref.occupied[k],
             cuda,
             False,
             provider.response_library,
         )[1]
-        for s, k in zip(("alpha", "beta"), indices, strict=True)
+        for singles_fock, k in zip(singles_focks, indices, strict=True)
     )
     channels = {("alpha", "alpha"): [], ("alpha", "beta"): [], ("beta", "beta"): []}
     increments = []
