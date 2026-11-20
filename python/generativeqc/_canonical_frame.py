@@ -98,9 +98,11 @@ def _frame_seeds(
             "Canonical frame requires square FP64 M and matching FP64 energies"
         )
     n = checked_integer(len(m), "canonical dimension", low=2, high=2**31 - 1)
-    occupied = checked_integer(
-        occupied, "occupied orbitals", low=0 if full else 1, high=n - 1
-    )
+    occupied = checked_integer(occupied, "occupied orbitals", low=0, high=n - 1)
+    # With no occupied orbitals the entire frame is one virtual block. The
+    # full-frame kernel accepts that partition and evaluates all VV torques;
+    # its Fock seed is exactly the requested same-space multiplier.
+    full = full or occupied == 0
     device_id = checked_integer(device_id, "CUDA device")
     budget = checked_integer(
         maximum_bytes, "numeric byte budget", low=1, high=2**63 - 1

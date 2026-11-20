@@ -1,4 +1,5 @@
 import os
+from unittest.mock import Mock
 
 """Canonical cotangents against independently re-diagonalized Fock matrices."""
 
@@ -105,3 +106,41 @@ def test_full_frame_stationary_degeneracy_is_gauge_covariant() -> None:
     m[0, 2] += 8e-10
     with pytest.raises(RuntimeError, match="nonstationary"):
         canonical_full_frame_seeds(m, eps, 3)
+
+
+def test_empty_spin_dispatches_to_the_all_virtual_native_frame() -> None:
+    library = Mock()
+    library.generativeqc_canonical_full_frame_seeds_cuda_v1.side_effect = RuntimeError(
+        "all-virtual invocation"
+    )
+    with pytest.raises(RuntimeError, match="all-virtual invocation"):
+        canonical_frame_seed(np.eye(3), np.arange(3, dtype=float), 0, library=library)
+    assert library.generativeqc_canonical_full_frame_seeds_cuda_v1.call_args.args[
+        :3
+    ] == (0, 3, 0)
+    library.generativeqc_canonical_frame_seed_cuda_v1.assert_not_called()
+
+
+@pytest.mark.skipif(
+    os.getenv("GENERATIVEQC_TEST_CUDA") != "1",
+    reason="requires native canonical CUDA kernels",
+)
+def test_empty_spin_channel_retains_virtual_frame_response() -> None:
+    eps = np.array([-0.8, -0.1, 1.7])
+    frame_bar = np.array([[0.1, 1.0, -0.2], [-0.3, 0.5, 0.4], [0.9, 0.2, -0.6]])
+    direction = np.array([[0.3, 0.7, -0.2], [0.7, 0.1, 1.0], [-0.2, 1.0, -0.4]])
+    seed, device_bytes = canonical_frame_seed(frame_bar, eps, 0)
+    assert device_bytes > 0
+
+    def displaced_value(t: float) -> float:
+        _, frame = np.linalg.eigh(np.diag(eps) + t * direction)
+        frame *= np.sign(np.diag(frame))
+        return float(np.vdot(frame_bar, frame))
+
+    h = 1e-5
+    derivative = (displaced_value(h) - displaced_value(-h)) / (2 * h)
+    assert abs(derivative) > 0.1
+    np.testing.assert_allclose(np.vdot(seed, direction), derivative, rtol=0, atol=1e-8)
+    eps[1] = eps[0]
+    with pytest.raises(RuntimeError, match="nonstationary"):
+        canonical_frame_seed(frame_bar, eps, 0)
