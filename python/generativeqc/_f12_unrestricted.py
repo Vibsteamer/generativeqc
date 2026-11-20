@@ -83,7 +83,7 @@ def unrestricted_mp2_f12_source_pullback(
     physical source tangents including integral, metric, UHF and orbital motion,
     and add the reference gradient. The caller owns that geometry response.
     """
-    weights, _ = _projected_response(
+    weights, _, _ = _projected_response(
         space, data, run, frozen_occupied, singles, auxiliary_batch_size, energies=False
     )
     return weights
@@ -97,6 +97,7 @@ def unrestricted_mp2_f12_ao_response(
     frozen_occupied: tuple[int, int] = (0, 0),
     singles: Callable = cabs_singles,
     auxiliary_batch_size: int | None = None,
+    jkfit: Mapping[str, np.ndarray] | None = None,
 ) -> tuple[UnrestrictedF12Energy, dict[str, np.ndarray]]:
     """Evaluate the correlation and singles energies and their common AO cotangents.
 
@@ -104,14 +105,62 @@ def unrestricted_mp2_f12_ao_response(
     one geometry. Each pair returns both its primal energies and its reverse
     contractions. The AO result includes both spin-coefficient cotangents and
     the physical Coulomb metric derivative. Nuclear and UHF response are
-    applied by the force caller.
+    applied by the force caller. With an independent JKFit panel, pass raw
+    ao_coulomb, metric/coulomb and metric_whitener in that fit. Pair operators
+    use the primary correlation fit. Both fits share the AO rows, spin frames
+    and physical core. JKFit integral weights have the prefix "jkfit/".
     """
-    data, _ = _orbital_sources(space, ao, run, None, projected=None)
-    weights, terms = _projected_response(
-        space, data, run, frozen_occupied, singles, auxiliary_batch_size, energies=True
+    jk_data = None
+    if jkfit is not None:
+        if set(jkfit) != {"ao_coulomb", "metric/coulomb", "metric_whitener"}:
+            raise ValueError(
+                "JKFit requires Coulomb three-center integrals, metric and whitener"
+            )
+        n_ao = len(ao["overlap_ao"])
+        qjk = len(jkfit["metric/coulomb"])
+        if (
+            qjk < 1
+            or jkfit["ao_coulomb"].shape != (qjk, n_ao, n_ao)
+            or jkfit["metric/coulomb"].shape != (qjk, qjk)
+            or jkfit["metric_whitener"].shape != (qjk, qjk)
+        ):
+            raise ValueError("JKFit dimensions disagree with the common AO basis")
+        if any(
+            value.dtype != np.float64 or not np.isfinite(value).all()
+            for value in jkfit.values()
+        ):
+            raise ValueError("JKFit sources must contain finite FP64 values")
+        metric, whiten = jkfit["metric/coulomb"], jkfit["metric_whitener"]
+        if not np.allclose(whiten @ metric @ whiten.T, np.eye(qjk), atol=2e-7, rtol=0):
+            raise ValueError("JKFit whitener does not match its Coulomb metric")
+        jk_space = (*space[:4], qjk)
+        shared = ("overlap_ao", "hcore_ao", "coefficients_alpha", "coefficients_beta")
+        jk_ao = {**{name: ao[name] for name in shared}, **jkfit}
+        jk_data, _ = _orbital_sources(
+            jk_space, jk_ao, run, None, projected=None, role="fock"
+        )
+    pair_role = "shared" if jk_data is None else "pairs"
+    data, _ = _orbital_sources(space, ao, run, None, projected=None, role=pair_role)
+    weights, terms, jk_weights = _projected_response(
+        space,
+        data,
+        run,
+        frozen_occupied,
+        singles,
+        auxiliary_batch_size,
+        energies=True,
+        fock_data=jk_data,
     )
-    _, bars = _orbital_sources(space, ao, run, weights, projected=data)
+    _, bars = _orbital_sources(space, ao, run, weights, projected=data, role=pair_role)
     assert terms is not None and bars is not None
+    if jk_data is not None:
+        _, jk_bars = _orbital_sources(
+            jk_space, jk_ao, run, jk_weights, projected=jk_data, role="fock"
+        )
+        for name in shared:
+            bars[name] += jk_bars[name]
+        for name in ("ao_coulomb", "metric/coulomb"):
+            bars["jkfit/" + name] = jk_bars[name]
     return terms, bars
 
 
@@ -124,15 +173,27 @@ def _projected_response(
     auxiliary_batch_size: int | None,
     *,
     energies: bool,
-) -> tuple[dict[str, np.ndarray], UnrestrictedF12Energy | None]:
-    oa, ob, _, ext, aux = space
+    fock_data: dict[str, np.ndarray] | None = None,
+) -> tuple[
+    dict[str, np.ndarray], UnrestrictedF12Energy | None, dict[str, np.ndarray] | None
+]:
+    oa, ob, _, ext, _ = space
     sources = {
         key.removeprefix("source/"): v
         for key, v in data.items()
         if key.startswith("source/")
     }
-    fock_space = (oa, ob, ext, aux)
-    fock = spin_fock(fock_space, sources, run, auxiliary_batch_size)
+    fock_sources = (
+        sources
+        if fock_data is None
+        else {
+            key.removeprefix("source/"): v
+            for key, v in fock_data.items()
+            if key.startswith("source/")
+        }
+    )
+    fock_space = (oa, ob, ext, fock_sources["raw_coulomb_alpha"].shape[0])
+    fock = spin_fock(fock_space, fock_sources, run, auxiliary_batch_size)
     source_bars = {k: np.zeros_like(v) for k, v in sources.items()}
     raw_bars = {
         k: np.zeros_like(v)
@@ -182,13 +243,13 @@ def _projected_response(
             )
             for key in rev.outputs:
                 buffers[key.removeprefix("bar_")] += result[key]
-    spin_fock_pullback(
+    fock_weights = spin_fock_pullback(
         fock_space,
-        sources,
+        fock_sources,
         fock_bars,
         run,
         auxiliary_batch_size,
-        accumulate=source_bars,
+        accumulate=source_bars if fock_data is None else None,
     )
     raw_bars.update({"source/" + k: v for k, v in source_bars.items()})
     terms = None
@@ -199,4 +260,9 @@ def _projected_response(
         if not all(math.isfinite(value) for value in (mp2, f12, alpha, beta)):
             raise ValueError("Nonfinite unrestricted MP2-F12 or CABS energy")
         terms = UnrestrictedF12Energy(mp2, f12, (alpha, beta), len(mp2_terms))
-    return raw_bars, terms
+    jk_weights = (
+        None
+        if fock_data is None
+        else {"source/" + k: v for k, v in fock_weights.items()}
+    )
+    return raw_bars, terms, jk_weights

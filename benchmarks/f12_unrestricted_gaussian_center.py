@@ -3,6 +3,7 @@
 import ctypes
 import json
 from collections.abc import Callable, Mapping
+from contextlib import ExitStack
 from functools import partial
 from pathlib import Path
 
@@ -22,8 +23,10 @@ from generativeqc_compiler.tensor import (
 
 from benchmarks.f12_cabs_ecp import CabsEcpOneElectron, ResidualEcpPanel
 from benchmarks.f12_cabs_h_batch import CabsHShells
+from benchmarks.f12_molecular_integral_forward import forward_integrals
 from benchmarks.f12_molecular_metric import metric_whitener
 from benchmarks.f12_unrestricted_gaussian import (
+    check_shared_orbital_basis,
     gaussian_orbital_forces,
     gaussian_sources,
 )
@@ -133,6 +136,7 @@ def center_energy_forces(
     cabs_i_one_electron_library: Path | None = None,
     residual_ecp: ResidualEcpPanel | None = None,
     metric_library: Path | None = None,
+    jkfit_layout_path: Path | None = None,
     projector_library: ctypes.CDLL,
     canonical_library: ctypes.CDLL,
     orbital_library: ctypes.CDLL,
@@ -153,7 +157,9 @@ def center_energy_forces(
     For scalar ECPs, supply the joint-basis residual potential and its
     positive nuclear derivatives, an i-shell one-electron library and a
     through-i integral sink. The effective-charge core and the residual
-    enter both spin Focks and their common relaxed AO derivative.
+    enter both spin Focks and their common relaxed AO derivative. A separate
+    JKFit layout supplies the SCF and extended Fock Coulomb source and its
+    nuclear derivative; the primary layout then supplies the correlation fit.
     """
     geometry = json.loads(geometry_path.read_bytes())
     space = tuple(geometry["layout"]["space"])
@@ -186,20 +192,39 @@ def center_energy_forces(
         ),
     }
     fit_diagnostics = {}
+    reference_ao = ao
+    reference_rank = q
+    jkfit = None
+    if jkfit_layout_path is not None:
+        with np.load(layout_path, allow_pickle=False) as layout, np.load(jkfit_layout_path, allow_pickle=False) as jk_layout:
+            check_shared_orbital_basis(layout, jk_layout)
+            jk_values, fit_diagnostics["JKFit_integrals"] = forward_integrals(
+                jk_layout, sink_library, coulomb_only=True, budget_mib=budget_mib,
+            )
+        if metric_library is None:
+            raise ValueError("Independent JKFit and correlation whitening requires the CUDA metric library")
+        ao["metric_whitener"], fit_diagnostics["correlation_metric"] = metric_whitener(
+            ao["metric/coulomb"], metric_library, budget_bytes=budget_mib << 20
+        )
+        jkfit = {"ao_coulomb": jk_values["ao_coulomb"], "metric/coulomb": jk_values["metric"]}
+        reference_ao = {**ao, **jkfit}
+        reference_rank = len(jk_values["metric"])
     if central is None:
         if metric_library is None:
             raise ValueError(
                 "Building the shell DF factors requires the CUDA metric library"
             )
         whiten, fit_diagnostics["metric"] = metric_whitener(
-            ao["metric/coulomb"], metric_library, budget_bytes=budget_mib << 20
+            reference_ao["metric/coulomb"], metric_library, budget_bytes=budget_mib << 20
         )
     else:
         whiten = np.asarray(central["whitener"])
     errors["whitening"] = np.max(
-        abs(whiten @ ao["metric/coulomb"] @ whiten.T - np.eye(q))
+        abs(whiten @ reference_ao["metric/coulomb"] @ whiten.T - np.eye(reference_rank))
     )
-    ao["metric_whitener"] = whiten
+    reference_ao["metric_whitener"] = whiten
+    if jkfit is not None:
+        jkfit["metric_whitener"] = whiten
     energies = {}
     for spin, occ in (("alpha", oa), ("beta", ob)):
         block = snapshot[spin]
@@ -224,19 +249,20 @@ def center_energy_forces(
                 errors["occupation_" + spin] = np.max(
                     abs(energies[spin][:occ] - central["occupied_energies_" + spin])
                 )
-                transformed = (c.T @ ao["ao_coulomb"] @ c).reshape(q, n * n)
+                transformed = (c.T @ reference_ao["ao_coulomb"] @ c).reshape(reference_rank, n * n)
                 errors["df_" + spin] = np.max(
-                    abs((whiten @ transformed).reshape(q, n, n) - central["df_" + spin])
+                    abs((whiten @ transformed).reshape(reference_rank, n, n) - central["df_" + spin])
                 )
         ao["coefficients_" + spin] = frame
+        reference_ao["coefficients_" + spin] = frame
     errors = {k: float(v) for k, v in errors.items()}
     if any(not np.isfinite(v) or v > 2e-7 for v in errors.values()):
         raise ValueError(
             f"UHF state or Coulomb fit differs from the shell geometry: {errors}"
         )
-    if central is None or residual_ecp is not None:
+    if central is None or residual_ecp is not None or jkfit is not None:
         central, fit_diagnostics["canonical_Fock_errors_Eh"] = shell_reference_fit(
-            space, ao, energies, run
+            (*space[:4], reference_rank), reference_ao, energies, run
         )
     terms, direct = unrestricted_mp2_f12_ao_response(
         space,
@@ -244,6 +270,7 @@ def center_energy_forces(
         run,
         frozen_occupied=(oa, ob) if singles_only else (0, 0),
         singles=partial(cabs_singles, library=projector_library),
+        jkfit=jkfit,
     )
     frame_weights = unrestricted_frame_overlap_weights(central, complement, direct, run)
     response = {} if response_output is not None else None
@@ -252,9 +279,11 @@ def center_energy_forces(
         if singles_only
         else np.asarray(snapshot["forces"]).reshape(-1, 3)
     )
-    with np.load(layout_path, allow_pickle=False) as layout:
+    with ExitStack() as inputs:
+        layout = inputs.enter_context(np.load(layout_path, allow_pickle=False))
+        jk_layout = None if jkfit_layout_path is None else inputs.enter_context(np.load(jkfit_layout_path, allow_pickle=False))
         forces, sinks, _ = gaussian_orbital_forces(
-            (oa, ob, n, q),
+            (oa, ob, n, reference_rank),
             central,
             None,
             direct,
@@ -270,6 +299,7 @@ def center_energy_forces(
             budget_mib=budget_mib,
             orbital_response_output=response,
             cabs_h_shells=high,
+            jkfit_layout=jk_layout,
         )
     singles = sum(terms.cabs_singles)
     if singles_only:

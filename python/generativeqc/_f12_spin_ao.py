@@ -1,6 +1,7 @@
 """Unrestricted 3C(FIX) orbital sources and their reverse map to a common AO basis."""
 
 from collections.abc import Callable
+from typing import Literal
 
 import numpy as np
 from generativeqc_compiler.mp2.f12_density_fitting import (
@@ -47,6 +48,7 @@ def _orbital_sources(
     orbital_weights: dict[str, np.ndarray] | None,
     *,
     projected: dict[str, np.ndarray] | None,
+    role: Literal["shared", "pairs", "fock"] = "shared",
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray] | None]:
     # A combined energy/response evaluation owns the forward buffers through
     # the reverse pass. Standalone evaluations build their own projections.
@@ -58,10 +60,9 @@ def _orbital_sources(
     cross = unrestricted_cross_frame_overlap(nc, ext)
     csrc = {k: ao[k] for k in ("overlap_ao", "coefficients_alpha", "coefficients_beta")}
     if projected is None:
-        data = {
-            "space": np.array(space),
-            "cross_overlap": run(cross, csrc).outputs["cross_overlap"],
-        }
+        data = {"space": np.array(space)}
+        if role != "fock":
+            data["cross_overlap"] = run(cross, csrc).outputs["cross_overlap"]
     else:
         data = projected
     bars = None
@@ -69,13 +70,20 @@ def _orbital_sources(
         bars = {
             k: np.zeros_like(v) for k, v in ao.items() if k not in ("metric_whitener",)
         }
-        cross_rev = transpose_program(cross, ("cross_overlap",)).program
-        result = run(
-            cross_rev, {**csrc, "bar_cross_overlap": orbital_weights["cross_overlap"]}
-        ).outputs
-        for name, value in result.items():
-            bars[name.removeprefix("bar_")] += value
-    for op in _OPERATORS:
+        if role != "fock":
+            cross_rev = transpose_program(cross, ("cross_overlap",)).program
+            result = run(
+                cross_rev,
+                {**csrc, "bar_cross_overlap": orbital_weights["cross_overlap"]},
+            ).outputs
+            for name, value in result.items():
+                bars[name.removeprefix("bar_")] += value
+    operators = tuple(_OPERATORS)
+    if role == "fock":
+        operators = ("hcore", "coulomb")
+    elif role == "pairs":
+        operators = tuple(op for op in operators if op != "hcore")
+    for op in operators:
         if op not in ("hcore", "coulomb"):
             name = "metric/" + op
             data[name] = ao[name]
@@ -84,7 +92,8 @@ def _orbital_sources(
     for spin, occ in occupied.items():
         co = "coefficients_" + spin
         frame = molecular_orbital_sources(nc, ext, occ, aux)
-        for op, field in _OPERATORS.items():
+        for op in operators:
+            field = _OPERATORS[op]
             if field not in frame.outputs:
                 continue
             ao_name = (

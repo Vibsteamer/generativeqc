@@ -72,6 +72,45 @@ def _permutation(values: list[int], size: int) -> np.ndarray:
     return order
 
 
+def check_shared_orbital_basis(layout: Mapping, jkfit: Mapping) -> None:
+    """Require identical molecular centers, orbital shells, phases and ordered AO rows."""
+    left, right = (json.loads(str(x["manifest"])) for x in (layout, jkfit))
+    if any(
+        left[key] != right[key]
+        for key in ("case", "elements", "geometry_bohr", "geometry_sha256")
+    ):
+        raise ValueError(
+            "JKFit and correlation layouts describe different molecular centers"
+        )
+    ns = int(layout["orbital_shell_count"])
+    if ns != int(jkfit["orbital_shell_count"]) or int(layout["ao_sizes"][0]) != int(
+        jkfit["ao_sizes"][0]
+    ):
+        raise ValueError("JKFit and correlation orbital dimensions disagree")
+    primitives = int(layout["prim_offsets"][ns])
+    for key, count in (
+        ("angular", ns),
+        ("atom", ns),
+        ("centers", ns),
+        ("prim_offsets", ns + 1),
+        ("exponents", primitives),
+        ("radial", primitives),
+    ):
+        if not np.array_equal(layout[key][:count], jkfit[key][:count]):
+            raise ValueError(f"JKFit and correlation orbital {key} disagree")
+    angular = layout["angular"][:ns]
+    rows, jk_rows = layout["spherical_rows"], jkfit["spherical_rows"]
+    for shell, l in enumerate(angular):
+        n = 2 * int(l) + 1
+        if not np.array_equal(rows[shell, :n], jk_rows[shell, :n]):
+            raise ValueError("JKFit and correlation orbital AO ordering disagrees")
+    for l in np.unique(angular):
+        if not np.array_equal(layout[f"transform_{l}"], jkfit[f"transform_{l}"]):
+            raise ValueError(
+                "JKFit and correlation orbital spherical transforms disagree"
+            )
+
+
 def gaussian_sources(
     space: tuple[int, int, int, int, int],
     *,
@@ -214,6 +253,7 @@ def gaussian_orbital_forces(
     projector_library: ctypes.CDLL | None = None,
     frame_output: dict[str, np.ndarray] | None = None,
     cabs_h_shells: CabsHShells | CabsEcpOneElectron | None = None,
+    jkfit_layout: Mapping[str, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, dict, dict[str, np.ndarray]]:
     """Project central electronic weights through the native Gaussian nuclear gradients.
 
@@ -227,8 +267,11 @@ def gaussian_orbital_forces(
     manifest = json.loads(str(layout["manifest"]))
     basis = geometry["combined_basis"]
     dims = geometry["layout"]["space"]
+    response_rank = dims[4] if jkfit_layout is None else int(jkfit_layout["ao_sizes"][1])
+    if jkfit_layout is not None:
+        check_shared_orbital_basis(layout, jkfit_layout)
     if (
-        tuple(dims[:3]) + tuple(dims[4:]) != space
+        tuple(dims[:3]) + (response_rank,) != space
         or manifest["case"] != geometry["molecule"]
         or manifest["geometry_sha256"] != geometry["geometry"]["geometry_sha256"]
         or manifest["elements"] != basis["elements"]
@@ -288,21 +331,36 @@ def gaussian_orbital_forces(
             frame_output.update(frame_overlap)
         frame_resources = {"one_electron": one_forward, "rank": projector.rank,
                            "cutoff_margin": projector.cutoff_margin}
+    reference_direct = direct
+    if jkfit_layout is not None:
+        reference_direct = {**direct, **{key: direct["jkfit/" + key] for key in ("ao_coulomb", "metric/coulomb")}}
     corrected = unrestricted_nuclear_source_weights(
         space,
         central,
         orbital_adjoint,
         run,
-        direct_weights=direct,
+        direct_weights=reference_direct,
         frame_overlap=frame_overlap,
     )
     operators = {key: direct[key] for key in direct if key.startswith("ao_")}
-    operators["ao_coulomb"] = corrected["ao_coulomb"]
     for key, name in _METRICS.items():
-        operators[name] = corrected[key] if key in corrected else direct[key]
+        operators[name] = direct[key]
+    if jkfit_layout is None:
+        operators["ao_coulomb"] = corrected["ao_coulomb"]
+        operators["metric"] = corrected["metric/coulomb"]
     gauss = contract_live_weights(
         layout, operators, sink_library, budget_mib=budget_mib
     )
+    integral_gradient = np.asarray(gauss["gradient_Eh_per_bohr"])
+    jk_cost = {}
+    if jkfit_layout is not None:
+        jk_cost = contract_live_weights(
+            jkfit_layout, {"ao_coulomb": corrected["ao_coulomb"], "metric": corrected["metric/coulomb"]},
+            sink_library, budget_mib=budget_mib, singles_only=True,
+        )
+        if not jk_cost["passes_contraction_checks"]:
+            raise ValueError("JKFit orbital and Fock response failed its contraction checks")
+        integral_gradient = integral_gradient + jk_cost["gradient_Eh_per_bohr"]
     if cabs_h_shells is None:
         one = native_contraction(
             basis, corrected["overlap_ao"], corrected["hcore_ao"],
@@ -318,13 +376,14 @@ def gaussian_orbital_forces(
         or ref.dtype != np.float64
     ):
         raise ValueError("Expected a FP64 reference force for each nucleus")
-    forces = ref - np.asarray(gauss["gradient_Eh_per_bohr"]) - one.gradient
+    forces = ref - integral_gradient - one.gradient
     if not gauss["passes_contraction_checks"] or not np.isfinite(forces).all():
         raise ValueError("Gaussian response failed contraction checks")
     return (
         forces,
         {
             "Gaussian": gauss,
+            **({"JKFit": jk_cost} if jkfit_layout is not None else {}),
             "canonical_unresolved_torque": gauge,
             "regenerated_frame": frame_resources,
             "one_electron_gradient": one.gradient.tolist(),

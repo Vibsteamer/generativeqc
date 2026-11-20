@@ -27,3 +27,6 @@ give maximum errors below 4e-9 Eh/bohr. A separate spin-singles regression
 checks the two-spin sign and the passage of the selected core through the
 energy and force code. Full-basis, relaxed PP-F12 molecular forces require
 root-matched integral and response measurements on device.
+
+The private driver now also accepts a second shell layout for the independent
+JKFit basis. See [independent fitting spaces](2026-11-20-separate-correlation-and-jkfit.md).
