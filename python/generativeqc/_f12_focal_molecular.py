@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -54,6 +54,19 @@ class FocalUCCStationary:
     primal: UCCSDResult
     dual: UCCSDLambdaResult
     source_cotangents: UCCSDF12Pullback | None
+
+
+@dataclass(frozen=True)
+class FocalUCCSDResult:
+    """Fixed-cusp all-active UCCSD-F12b energy (Eh) and Cartesian forces (Eh/bohr)."""
+
+    energy: float
+    forces: np.ndarray
+    hf_cabs_energy: float
+    hf_cabs_forces: np.ndarray
+    ordinary_cc_forces: np.ndarray
+    fixed_cc_forces: np.ndarray
+    stationary: FocalUCCStationary
 
 
 @dataclass
@@ -110,7 +123,7 @@ class MolecularFocalProvider:
     high_order: Callable[[FocalRequest], FocalEvaluation] | None = None
     relative_cutoff: float = 1e-9
     budget_mib: int = 1536
-    _cuda_cc_target: tuple[str, Path] | None = field(
+    _cuda_cc_target: tuple[str, Path, Callable[[dict], None] | None] | None = field(
         default=None, repr=False, compare=False
     )
 
@@ -157,7 +170,7 @@ class MolecularFocalProvider:
             relative_cutoff=relative_cutoff,
             budget_mib=budget,
             high_order=high_order,
-            _cuda_cc_target=(architecture, cache_directory),
+            _cuda_cc_target=(architecture, cache_directory, record_graph),
         )
 
     def ucc_fixed_sources(self, request: FocalRequest) -> FocalUCCFixedSources:
@@ -194,6 +207,23 @@ class MolecularFocalProvider:
         Set source_cotangents to differentiate the stationary correlation
         energy with respect to the active ordinary and fixed MO inputs.
         """
+        return self._ucc_stationary(
+            request,
+            options,
+            lambda_options,
+            source_cotangents=source_cotangents,
+            reference_forces=False,
+        )
+
+    def _ucc_stationary(
+        self,
+        request: FocalRequest,
+        options: SolverOptions | None,
+        lambda_options: UCCSDLambdaOptions | None,
+        *,
+        source_cotangents: bool,
+        reference_forces: bool,
+    ) -> FocalUCCStationary:
         from ._f12_ucc_solver import (
             CudaCCTensorExecutor,
             NativeCCTensorExecutor,
@@ -219,9 +249,12 @@ class MolecularFocalProvider:
                 )
             from ._f12_focal_runner import focal_cuda_compiler
 
-            arch, cache = self._cuda_cc_target
+            arch, cache, record = self._cuda_cc_target
             executor = CudaCCTensorExecutor(
-                max_bytes=budget, compiler=focal_cuda_compiler(arch), cache=cache
+                max_bytes=budget,
+                compiler=focal_cuda_compiler(arch),
+                cache=cache,
+                record_graph=record,
             )
         elif request.backend == "cpu_reference":
             executor = NativeCCTensorExecutor(max_bytes=budget)
@@ -229,7 +262,9 @@ class MolecularFocalProvider:
             raise ValueError(
                 "A molecular UCC stationary solve requires an explicit backend"
             )
-        sources = self.ucc_equation_sources(request)
+        sources = molecular_ucc_sources(
+            self, request, include_ordinary=True, reference_forces=reference_forces
+        )
         if options is None:
             options = SolverOptions(max_bytes=budget)
         if lambda_options is None:
@@ -264,6 +299,60 @@ class MolecularFocalProvider:
             )
         return ordinary_ucc_source_forces(
             self, request, solution.sources, weights.ordinary_weights
+        )
+
+    def uccsd_f12b(
+        self,
+        request: FocalRequest,
+        *,
+        options: SolverOptions | None = None,
+        lambda_options: UCCSDLambdaOptions | None = None,
+    ) -> FocalUCCSDResult:
+        """Calculate molecular UCCSD-F12b with DF-UHF, CABS singles and analytic forces.
+
+        Supply the all-active UHF pair request for a single cardinal number.
+        One DF-UHF determinant supplies the reference energy and force, CABS
+        singles, ordinary CC Hamiltonian, and fixed-geminal equations.
+        """
+        from ._f12_focal_cc_fixed import fixed_ucc_source_forces
+
+        solution = self._ucc_stationary(
+            request,
+            options,
+            lambda_options,
+            source_cotangents=True,
+            reference_forces=True,
+        )
+        source = solution.sources
+        reference = source.fixed.reference
+        weights = solution.source_cotangents
+        assert weights is not None and solution.primal.correlation_energy is not None
+        ordinary = self.ucc_ordinary_source_forces(request, solution)
+        fixed = fixed_ucc_source_forces(
+            self, request, source, weights.fixed_source_weights
+        )
+        singles_request = replace(request, role="hf_cabs")
+        one = one_electron_sources(
+            singles_request,
+            library=self.one_electron_library or self.shell_library,
+            derivatives=True,
+            budget_mib=self.budget_mib,
+        )
+        hf_cabs, hf_cabs_forces = self._singles(
+            singles_request,
+            reference,
+            one,
+            self._panel(singles_request, "jk_fit"),
+            expected_cabs_rank=source.fixed.cabs_rank,
+        )
+        return FocalUCCSDResult(
+            hf_cabs + solution.primal.correlation_energy,
+            hf_cabs_forces + ordinary + fixed,
+            hf_cabs,
+            hf_cabs_forces,
+            ordinary,
+            fixed,
+            solution,
         )
 
     def _panel(
@@ -405,10 +494,13 @@ class MolecularFocalProvider:
         ref: FocalReference,
         one: FocalOneElectron,
         jk: _Panel,
+        *,
+        expected_cabs_rank: int | None = None,
     ) -> tuple[float, np.ndarray]:
         projector = focal_cabs_projector(
             request,
             one,
+            expected_rank=expected_cabs_rank,
             relative_cutoff=self.relative_cutoff,
             library=self.response_library,
         )

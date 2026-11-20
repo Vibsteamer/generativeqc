@@ -53,6 +53,7 @@ def molecular_ucc_sources(
     request: FocalRequest,
     *,
     include_ordinary: Literal[False],
+    reference_forces: bool = False,
 ) -> FocalUCCFixedSources: ...
 
 
@@ -62,11 +63,16 @@ def molecular_ucc_sources(
     request: FocalRequest,
     *,
     include_ordinary: Literal[True],
+    reference_forces: bool = False,
 ) -> FocalUCCEquationSources: ...
 
 
 def molecular_ucc_sources(
-    provider: MolecularFocalProvider, request: FocalRequest, *, include_ordinary: bool
+    provider: MolecularFocalProvider,
+    request: FocalRequest,
+    *,
+    include_ordinary: bool,
+    reference_forces: bool = False,
 ) -> FocalUCCFixedSources | FocalUCCEquationSources:
     """Calculate fixed-geminal UCC equation inputs on an all-active UHF root."""
     from generativeqc_compiler.tensor import execute
@@ -115,7 +121,7 @@ def molecular_ucc_sources(
             raise RuntimeError("UCC fixed-source graph executed on a different backend")
         return out
 
-    ref = df_reference(request, forces=False, budget_mib=provider.budget_mib)
+    ref = df_reference(request, forces=reference_forces, budget_mib=provider.budget_mib)
     one = one_electron_sources(
         request,
         library=provider.one_electron_library or provider.shell_library,

@@ -33,6 +33,7 @@ class CudaCCTensorExecutor:
         compiler: CudaCompilerAdapter,
         cache: Path,
         device: int = 0,
+        record_graph: typing.Callable[[dict], None] | None = None,
     ) -> None:
         if type(max_bytes) is not int or max_bytes <= 0:
             raise ValueError("CUDA CC tensor max_bytes must be a positive integer")
@@ -46,6 +47,7 @@ class CudaCCTensorExecutor:
         self.compiler = compiler
         self.cache = cache
         self.device = device
+        self._record_graph = record_graph
         self._configuration = (max_bytes, compiler, cache, device, self.backend)
         self._compiled: dict[str, tuple[object, object]] = {}
         self._metrics: dict[str, dict[str, typing.Any]] = {}
@@ -107,6 +109,15 @@ class CudaCCTensorExecutor:
                 )
             identity = program.logical_hash
             self._metrics[identity] = dict(result.metrics)
+            if self._record_graph is not None:
+                self._record_graph(
+                    {
+                        "program": identity,
+                        "backend": result.backend,
+                        "stage": "cc",
+                        "metrics": dict(result.metrics),
+                    }
+                )
             return result
 
     def execute(self, program: object, feeds: object) -> dict[str, object]:

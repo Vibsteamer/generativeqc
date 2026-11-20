@@ -855,6 +855,18 @@ It uses the original stationary spin orbitals, JKFit for the Fock response,
 and MP2Fit for the 32 antisymmetrized Coulomb blocks. The returned array is
 the ordinary-input contribution to the stationary correlation force.
 
+Call `result = provider.uccsd_f12b(pair_request)` to obtain the complete
+single-basis all-active UHF fixed-cusp UCCSD-F12b molecular energy in Eh and
+Cartesian forces in Eh/bohr. This calculation uses one determinant for the
+DF-UHF reference, CABS singles, and both CC Hamiltonian source families.
+`result.hf_cabs_energy` and `result.stationary.primal.correlation_energy`
+sum to `result.energy`. The corresponding force sum is
+`result.hf_cabs_forces + result.ordinary_cc_forces + result.fixed_cc_forces`.
+The stationary record retains the surface and basis identities, spin
+occupations, orbital coefficients, separate fitting identities, amplitudes
+and multipliers. The CBS focal plan selects its post-MP2 and triples
+providers independently.
+
 Use the installed `MolecularFocalProvider` to evaluate a plan step directly
 from its geometry. A single-card CUDA setup looks like this:
 

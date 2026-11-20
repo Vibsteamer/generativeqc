@@ -245,11 +245,14 @@ def test_uhf_equation_sources_against_independent_df_chemist_blocks(
         np.testing.assert_allclose(value, gold, rtol=0, atol=3e-9, err_msg=name)
 
 
-def test_public_uhf_stationary_lagrangian_on_same_molecular_frame() -> None:
+def test_public_uhf_stationary_lagrangian_on_same_molecular_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     shell = os.environ.get("GENERATIVEQC_F12_HOST_SINK")
     if not shell:
         pytest.skip("set GENERATIVEQC_F12_HOST_SINK for the molecular shell library")
-    from generativeqc.experimental.f12_focal import FocalUCCStationary
+    from generativeqc import _f12_focal_reference
+    from generativeqc.experimental.f12_focal import FocalUCCSDResult, FocalUCCStationary
     from generativeqc.experimental.uccsd_f12 import SolverOptions
     from generativeqc_compiler.cc.uccsd_equations import build_f12_program
     from generativeqc_compiler.cc.uccsd_layout import UCCSDLayout
@@ -257,11 +260,44 @@ def test_public_uhf_stationary_lagrangian_on_same_molecular_frame() -> None:
 
     provider = MolecularFocalProvider(shell_library=Path(shell), budget_mib=256)
     q = request(XYZ, (0, 1, 2))
-    solution = provider.ucc_stationary(
-        q,
-        options=SolverOptions(residual_tolerance=3e-12, energy_tolerance=5e-13),
-        source_cotangents=True,
+    solve_reference = _f12_focal_reference.df_reference
+    reference_calls = []
+
+    def counted_reference(
+        request: FocalRequest, *, forces: bool, budget_mib: int
+    ) -> _f12_focal_reference.FocalReference:
+        reference_calls.append((request.surface_id, forces))
+        return solve_reference(request, forces=forces, budget_mib=budget_mib)
+
+    monkeypatch.setattr(_f12_focal_reference, "df_reference", counted_reference)
+    result = provider.uccsd_f12b(
+        q, options=SolverOptions(residual_tolerance=3e-12, energy_tolerance=5e-13)
     )
+    assert reference_calls == [(q.surface_id, True)]
+    assert isinstance(result, FocalUCCSDResult)
+    solution = result.stationary
+    assert solution.sources.fixed.reference.forces is not None
+    assert result.energy == pytest.approx(-1.5204305761129642, rel=0, abs=3e-9)
+    np.testing.assert_allclose(
+        result.energy,
+        result.hf_cabs_energy + solution.primal.correlation_energy,
+        rtol=0,
+        atol=2e-14,
+    )
+    np.testing.assert_allclose(
+        result.forces,
+        result.hf_cabs_forces + result.ordinary_cc_forces + result.fixed_cc_forces,
+        rtol=0,
+        atol=1e-13,
+    )
+    nuclear_direction = np.array([[0.1, 0.4, -0.2], [-0.2, 0.3, 0.5], [0.2, -0.1, 0.3]])
+    nuclear_direction /= np.linalg.norm(nuclear_direction)
+    # Fully reoptimized signed energies from PySCF DF-UHF, Sylvester CABS
+    # singles and an independent dense SciPy root of the 59 CC equations.
+    for signed in (-0.07236072075644806, -0.07236076799699287):
+        assert np.vdot(result.forces, nuclear_direction) == pytest.approx(
+            signed, rel=0, abs=3e-7
+        )
     assert isinstance(solution, FocalUCCStationary)
     sources = solution.sources
     ref = sources.fixed.reference
