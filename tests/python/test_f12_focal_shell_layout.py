@@ -8,12 +8,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 from generativeqc import Atom
+from generativeqc._f12_focal_integrals import (
+    contract_live_weights,
+    focal_shell_layout,
+    forward_integrals,
+)
 from generativeqc.basis import BasisSet, BasisShell
 from generativeqc.experimental.f12_focal import FocalBasis, FocalRequest
-
-from benchmarks.f12_focal_shell_layout import focal_shell_layout
-from benchmarks.f12_molecular_integral_forward import forward_integrals
-from benchmarks.f12_molecular_sink_live import contract_live_weights
 
 
 @pytest.fixture(scope="module")
@@ -176,4 +177,56 @@ def test_raw_cartesian_spherical_projection_through_i(host_sink: Path) -> None:
         expected = angular_scale * gto.cart2sph(l, normalized="sp").T
         np.testing.assert_allclose(
             layout[f"transform_{l}"], expected, atol=1e-14, rtol=0
+        )
+
+
+def test_package_shell_service_runs_without_checkout_modules(
+    host_sink: Path, tmp_path: Path
+) -> None:
+    """An installed client can use both native integral directions with only the package."""
+    import subprocess
+    import sys
+
+    import generativeqc
+
+    req, references = shell_inputs()
+    layout = focal_shell_layout(req, host_sink, host_reference=True, budget_mib=64)
+    topology = tmp_path / "shells.npz"
+    np.savez(topology, **layout)
+    program = """
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import numpy as np
+from generativeqc._f12_focal_integrals import forward_integrals, contract_live_weights
+with np.load(sys.argv[2], allow_pickle=False) as layout:
+    raw, _ = forward_integrals(layout, Path(sys.argv[3]), host_reference=True)
+    weights = {name: np.zeros_like(a) for name,a in raw.items()}
+    weights['metric_f12'][0,1] = 1.0
+    result = contract_live_weights(layout, weights, Path(sys.argv[3]), host_reference=True)
+    assert result['passes_contraction_checks']
+    np.savez(sys.argv[4], value=raw['metric_f12'][0,1], gradient=result['gradient_Eh_per_bohr'])
+"""
+    output = tmp_path / "observed.npz"
+    subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            program,
+            str(Path(generativeqc.__file__).parents[1]),
+            str(topology),
+            str(host_sink),
+            str(output),
+        ],
+        cwd=tmp_path,
+        check=True,
+    )
+    row = references[0]
+    scale = np.prod((2 * np.asarray(row["input"][3:5]) / np.pi) ** 0.75)
+    expected = scale * np.asarray(row["value_and_gradient"])
+    with np.load(output, allow_pickle=False) as raw:
+        assert float(raw["value"]) == pytest.approx(expected[0], abs=3e-12, rel=0)
+        np.testing.assert_allclose(
+            raw["gradient"], expected[1:7].reshape(2, 3), atol=3e-12, rtol=0
         )
