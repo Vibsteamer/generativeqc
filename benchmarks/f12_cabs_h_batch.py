@@ -1,4 +1,4 @@
-"""Assemble OBS+CABS real-spherical one-electron sources with an opt-in h-shell cohort."""
+"""Assemble OBS+CABS real-spherical one-electron sources with a high-shell cohort."""
 
 import ctypes as ct
 import time
@@ -15,7 +15,7 @@ from benchmarks.f12_molecular_one_electron_forward import combined_matrices
 
 
 class CabsHShells:
-    """One high-shell CUDA batch per geometry, with a compact Jacobian reused on the reverse pass."""
+    """One high-shell batch and its reusable compact nuclear Jacobian."""
 
     def __init__(
         self,
@@ -25,7 +25,12 @@ class CabsHShells:
         library: Path,
         *,
         host_reference: bool = False,
+        angular_momentum: int = 5,
+        effective_charges: Sequence[int] | None = None,
     ) -> None:
+        if type(angular_momentum) is not int or angular_momentum not in (5, 6):
+            raise ValueError("the one-electron cohort must be h or i")
+        self.label = "h" if angular_momentum == 5 else "i"
         self.n = len(native_to_source)
         p = np.asarray(native_to_source)
         if (
@@ -35,7 +40,16 @@ class CabsHShells:
         ):
             raise ValueError("expected a bijective orbital AO source mapping")
         z = case["elements"]
-        self.charges = np.asarray([atomic_number(i) for i in z], dtype=np.int32)
+        atomic_charges = np.asarray([atomic_number(i) for i in z], dtype=np.int32)
+        charges = atomic_charges if effective_charges is None else np.asarray(effective_charges)
+        if (
+            charges.dtype.kind not in "iu"
+            or charges.shape != atomic_charges.shape
+            or np.any(charges <= 0)
+            or np.any(charges > atomic_charges)
+        ):
+            raise ValueError("expected one positive effective charge per atom, bounded by its Z")
+        self.charges = np.ascontiguousarray(charges, dtype=np.int32)
         self.xyz = np.asarray(case["coordinates_bohr"], dtype=np.float64, order="C")
         if self.xyz.shape != (len(z), 3) or not np.isfinite(self.xyz).all():
             raise ValueError("invalid geometry")
@@ -48,13 +62,13 @@ class CabsHShells:
             or len(ls) != ns
             or ns == 0
             or min(ls) < 0
-            or max(ls) != 5
+            or max(ls) != angular_momentum
             or not np.array_equal(self.xyz[atoms], topology["centers"][:ns])
             or len(offsets) != ns + 1
             or offsets[0] != 0
             or min(np.diff(offsets)) < 1
         ):
-            raise ValueError("incompatible CABS h shell topology")
+            raise ValueError(f"incompatible CABS {self.label} shell topology")
         self.shells = np.ascontiguousarray(
             np.stack((ls, atoms, offsets[:-1], offsets[1:]), axis=1), dtype=np.int32
         )
@@ -74,7 +88,7 @@ class CabsHShells:
             (i, j, rows[i], rows[j])
             for i in range(ns)
             for j in range(i + 1)
-            if ls[i] == 5 or ls[j] == 5
+            if ls[i] == angular_momentum or ls[j] == angular_momentum
         ]
         self.size = sum(len(a) * len(b) for _, _, a, b in self.blocks)
         # Cross-check ownership by the complete ordered AO tuple, including shell and atom.
@@ -111,16 +125,20 @@ class CabsHShells:
                 raise ValueError(
                     "native and integral-layout radial normalization disagree"
                 )
-            if l != 5:
+            if l != angular_momentum:
                 low_shells.append(shell)
                 low_rows.extend(sub)
         if off != self.n or not low_shells:
-            raise ValueError("a combined CABS h basis requires its orbital subspace")
+            raise ValueError("a combined CABS basis requires its lower-angular subspace")
         self.low_source = np.sort(low_rows).astype(np.intp)
         self.low_permutation = np.searchsorted(self.low_source, low_rows)
         self.low_case = {**case, "shells": low_shells}
+        self.explicit_low = (
+            not np.array_equal(self.charges, atomic_charges)
+            or max(s["angular_momentum"] for s in low_shells) > 4
+        )
         transforms = []
-        for l in range(6):
+        for l in range(angular_momentum + 1):
             dims = (2 * l + 1, (l + 1) * (l + 2) // 2)
             t = topology.get(f"transform_{l}")
             if t is None:
@@ -138,11 +156,12 @@ class CabsHShells:
         i = np.ctypeslib.ndpointer(np.int32, flags="C_CONTIGUOUS")
         size = ct.c_size_t
         ptr = ct.POINTER(size)
-        self.batch = getattr(self.lib, "gqc_f12_cabs_h_one_electron_batch" + suffix)
+        prefix = f"gqc_f12_cabs_{self.label}_one_electron"
+        self.batch = getattr(self.lib, prefix + "_batch" + suffix)
         self.batch.argtypes = [ct.c_int] * 4 + [i, d, d, d, i, d, d, size, size, ptr]
         self.batch.restype = ct.c_int
         self.contract = getattr(
-            self.lib, "gqc_f12_cabs_h_one_electron_weights" + suffix
+            self.lib, prefix + "_weights" + suffix
         )
         self.contract.argtypes = [ct.c_int, size, d, d, d, size, ptr]
         self.contract.restype = ct.c_int
@@ -175,7 +194,7 @@ class CabsHShells:
             ct.byref(used),
         )
         if rc or not np.isfinite(result).all():
-            raise RuntimeError(f"h-shell batch failed (status {rc})")
+            raise RuntimeError(f"{self.label}-shell batch failed (status {rc})")
         self.data = result
         return {
             "backend": self.backend,
@@ -192,6 +211,10 @@ class CabsHShells:
     ) -> tuple[np.ndarray, np.ndarray]:
         if self.data is None:
             raise ValueError("missing high shell integrals")
+        size = len(self.low_source)
+        for matrix in (low_overlap, low_hcore):
+            if matrix.shape != (size, size) or not np.isfinite(matrix).all():
+                raise ValueError("expected complete finite lower-shell matrices in source AO order")
         low = np.ix_(self.low_source, self.low_source)
         out = np.empty((2, self.n, self.n))
         out[0][low] = low_overlap
@@ -243,7 +266,7 @@ class CabsHShells:
             ct.byref(used),
         )
         if rc or not np.isfinite(out).all():
-            raise RuntimeError(f"h-shell weight contraction failed (status {rc})")
+            raise RuntimeError(f"{self.label}-shell weight contraction failed (status {rc})")
         return out, {
             "device_bytes": used.value,
             "native_seconds": time.monotonic() - t,
@@ -253,6 +276,8 @@ class CabsHShells:
     def matrices(
         self, session_library: Path, *, derivatives: bool, max_bytes: int
     ) -> tuple[np.ndarray, np.ndarray, dict]:
+        if self.explicit_low:
+            raise ValueError("assemble the high-shell block with a matched lower-shell provider")
         hip = self.evaluate(derivatives=derivatives, max_bytes=max_bytes)
         s, h, low = combined_matrices(
             self.low_case,
@@ -275,6 +300,8 @@ class CabsHShells:
     def gradient(
         self, ws: np.ndarray, wh: np.ndarray, max_bytes: int
     ) -> IntegralGradient:
+        if self.explicit_low:
+            raise ValueError("combine the high-shell pullback with a matched lower-shell provider")
         high, hi_resources = self.high_gradient(ws, wh, max_bytes)
         low = np.ix_(self.low_source, self.low_source)
         lo = native_contraction(self.low_case, ws[low], wh[low], self.low_permutation)

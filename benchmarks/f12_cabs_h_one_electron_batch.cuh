@@ -80,11 +80,11 @@ struct Allocation {
     if (pointer) cudaFree(pointer);
   }
 };
-#define BATCH_EXPORT gqc_f12_cabs_h_one_electron_batch
-#define WEIGHTS_EXPORT gqc_f12_cabs_h_one_electron_weights
+#define BATCH_EXPORT GQC_F12_CABS_ONE_ELECTRON_SYMBOL(_batch)
+#define WEIGHTS_EXPORT GQC_F12_CABS_ONE_ELECTRON_SYMBOL(_weights)
 #else
-#define BATCH_EXPORT gqc_f12_cabs_h_one_electron_batch_host_reference
-#define WEIGHTS_EXPORT gqc_f12_cabs_h_one_electron_weights_host_reference
+#define BATCH_EXPORT GQC_F12_CABS_ONE_ELECTRON_SYMBOL(_batch_host_reference)
+#define WEIGHTS_EXPORT GQC_F12_CABS_ONE_ELECTRON_SYMBOL(_weights_host_reference)
 #endif
 }  // namespace
 
@@ -206,3 +206,5 @@ extern "C" int WEIGHTS_EXPORT(int nd, Size cols, const double* jac, const double
 #endif
   return 0;
 }
+#undef BATCH_EXPORT
+#undef WEIGHTS_EXPORT

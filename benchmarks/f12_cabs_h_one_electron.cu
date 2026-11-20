@@ -1,4 +1,4 @@
-// Opt-in Q-CABS h-shell qualification. One Cartesian shell block covers all
+// Opt-in CABS high-shell qualification. One Cartesian shell block covers all
 // nuclei, positive matrix derivatives, and real Gaussian radial contractions.
 #include <algorithm>
 #include <cmath>
@@ -14,7 +14,13 @@
 namespace {
 using namespace generativeqc::scf::cuda_execution;
 using Size = std::size_t;
+#ifdef GQC_F12_CABS_I_ONE_ELECTRON
+constexpr int MaxL = 6;
+#define GQC_F12_CABS_ONE_ELECTRON_SYMBOL(suffix) gqc_f12_cabs_i_one_electron##suffix
+#else
 constexpr int MaxL = 5;
+#define GQC_F12_CABS_ONE_ELECTRON_SYMBOL(suffix) gqc_f12_cabs_h_one_electron##suffix
+#endif
 constexpr int MaxPair = 2 * MaxL;
 struct Axis {
   Dual e[MaxPair + 1];  // Partial derivative with respect to A-B.
@@ -141,14 +147,16 @@ __global__ void kernel(Pair pair, int stride, double* out) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
   if (index < stride) element<true>(pair, index, stride, out);
 }
-#define EXPORT gqc_f12_cabs_h_one_electron
+#define EXPORT GQC_F12_CABS_ONE_ELECTRON_SYMBOL()
 #else
-#define EXPORT gqc_f12_cabs_h_one_electron_host_reference
+#define EXPORT GQC_F12_CABS_ONE_ELECTRON_SYMBOL(_host_reference)
 #endif
 }  // namespace
 
 // Output is row-major [S,T,V][value, nuclear Cartesian derivatives][cartA,cartB].
 // Each primitive coefficient is radial-normalized for its ORIGINAL shell.
+// The caller supplies the point charges, including effective charges for ECP atoms.
+// V is the point-charge attraction; the residual local and nonlocal ECP is separate.
 // A bound on staged inputs and outputs is checked before an allocation.
 extern "C" int EXPORT(int la, int lb, int first, int second, int na, int nb, int natom,
                       const double* exps, const double* radial, const double* coords,
@@ -203,3 +211,6 @@ extern "C" int EXPORT(int la, int lb, int first, int second, int na, int nb, int
 }
 
 #include "f12_cabs_h_one_electron_batch.cuh"
+
+#undef EXPORT
+#undef GQC_F12_CABS_ONE_ELECTRON_SYMBOL
