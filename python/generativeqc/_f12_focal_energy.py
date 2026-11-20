@@ -21,16 +21,18 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class FocalLowOrderEnergy:
-    """Single-cardinal energies in Eh. Ordinary spin energies are ordered aa, ab, bb."""
+    """Single-cardinal energies in Eh, with optional CABS singles and aa, ab, bb MP2 channels."""
 
     reference: FocalReference
     cabs_rank: int
-    cabs_spin_energies: tuple[float, float]
+    cabs_spin_energies: tuple[float, float] | None
     ordinary_mp2_spin_energies: tuple[float, float, float]
     f12_increment: float
 
     @property
     def hf_cabs_energy(self) -> float:
+        if self.cabs_spin_energies is None:
+            raise ValueError("HF+CABS was not requested on this basis")
         return self.reference.energy + fsum(self.cabs_spin_energies)
 
     @property
@@ -44,14 +46,16 @@ class FocalLowOrderEnergy:
 
 @dataclass(frozen=True)
 class FocalLowOrderForces:
-    """Component energies and analytic Cartesian forces in Eh/bohr on a single root."""
+    """Component energies and analytic forces in Eh/bohr for the requested terms on one root."""
 
     energies: FocalLowOrderEnergy
-    hf_cabs_forces: np.ndarray
+    hf_cabs_forces: np.ndarray | None
     mp2_f12_correlation_forces: np.ndarray
 
     @property
     def forces(self) -> np.ndarray:
+        if self.hf_cabs_forces is None:
+            raise ValueError("HF+CABS was not requested on this basis")
         return self.hf_cabs_forces + self.mp2_f12_correlation_forces
 
 
@@ -140,6 +144,8 @@ def molecular_low_order_energy(
     provider: MolecularFocalProvider,
     request: FocalRequest,
     expected_cabs_rank: int | None,
+    *,
+    include_hf_cabs: bool = True,
 ) -> FocalLowOrderEnergy:
     from generativeqc_compiler.tensor import execute
 
@@ -209,23 +215,31 @@ def molecular_low_order_energy(
         }
 
     fock = spin_fock((oa, ob, ext, len(jk.whitener)), sources(fock_data), run)
-    frames = (ao["coefficients_alpha"], ao["coefficients_beta"])
-    singles_focks, _ = physical_fock(
-        one.hcore, jkfit["ao_coulomb"], jk.whitener, frames, (oa, ob), run,
-        cuda, provider.response_library,
-    )
     indices = ref._pair_spin_indices(request)
-    singles = tuple(
-        _singles_from_fock(
-            singles_fock,
-            ref.orbital_energies[k],
-            ref.occupied[k],
+    singles = None
+    if include_hf_cabs:
+        frames = (ao["coefficients_alpha"], ao["coefficients_beta"])
+        singles_focks, _ = physical_fock(
+            one.hcore,
+            jkfit["ao_coulomb"],
+            jk.whitener,
+            frames,
+            (oa, ob),
+            run,
             cuda,
-            False,
             provider.response_library,
-        )[1]
-        for singles_fock, k in zip(singles_focks, indices, strict=True)
-    )
+        )
+        singles = tuple(
+            _singles_from_fock(
+                singles_fock,
+                ref.orbital_energies[k],
+                ref.occupied[k],
+                cuda,
+                False,
+                provider.response_library,
+            )[1]
+            for singles_fock, k in zip(singles_focks, indices, strict=True)
+        )
     channels = {("alpha", "alpha"): [], ("alpha", "beta"): [], ("beta", "beta"): []}
     increments = []
     for item in molecular_pair_energies(
@@ -242,6 +256,8 @@ def molecular_low_order_energy(
     result = FocalLowOrderEnergy(
         ref, projector.rank, singles, ordinary, fsum(increments)
     )
-    if not isfinite(result.energy):
+    if not isfinite(result.mp2_f12_correlation_energy) or (
+        include_hf_cabs and not isfinite(result.energy)
+    ):
         raise ArithmeticError("nonfinite molecular low-order energy")
     return result

@@ -838,18 +838,27 @@ def _molecular_f12_plan(
         reference = None
         expected_rank = center.cabs_ranks.get(identity) if center is not None else None
         if roles & {"mp2_f12_correlation", "ccsd_f12b_minus_mp2_f12"}:
+            include_hf_cabs = "hf_cabs" in roles
             if forces:
-                low_forces = provider.low_order_energy_and_forces(pair)
+                low_forces = provider.low_order_energy_and_forces(
+                    pair, include_hf_cabs=include_hf_cabs
+                )
                 low = low_forces.energies
-                gradients[identity, "hf_cabs"] = low_forces.hf_cabs_forces
+                if include_hf_cabs:
+                    gradients[identity, "hf_cabs"] = low_forces.hf_cabs_forces
                 gradients[identity, "mp2_f12_correlation"] = (
                     low_forces.mp2_f12_correlation_forces
                 )
             else:
-                low = provider.low_order_energy(pair, expected_cabs_rank=expected_rank)
+                low = provider.low_order_energy(
+                    pair,
+                    expected_cabs_rank=expected_rank,
+                    include_hf_cabs=include_hf_cabs,
+                )
             reference = low.reference
             ranks[identity] = low.cabs_rank
-            energies[identity, "hf_cabs"] = low.hf_cabs_energy
+            if include_hf_cabs:
+                energies[identity, "hf_cabs"] = low.hf_cabs_energy
             energies[identity, "mp2_f12_correlation"] = low.mp2_f12_correlation_energy
             if "ccsd_f12b_minus_mp2_f12" in roles:
                 key = identity, "ccsd_f12b_minus_mp2_f12"

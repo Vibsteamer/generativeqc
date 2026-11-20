@@ -213,25 +213,38 @@ class MolecularFocalProvider:
         )
 
     def low_order_energy(
-        self, request: FocalRequest, *, expected_cabs_rank: int | None = None
+        self,
+        request: FocalRequest,
+        *,
+        expected_cabs_rank: int | None = None,
+        include_hf_cabs: bool = True,
     ) -> FocalLowOrderEnergy:
         """Return HF+CABS and MP2-F12 energies for one all-active pair request.
 
         A single canonical RHF or UHF determinant supplies both components.
         Only forward integrals and electronic contractions are evaluated.
         Pass the center CABS rank to track its differentiable branch at a displaced point.
+        Set include_hf_cabs=False when only the pair component is required.
         """
-        return molecular_low_order_energy(self, request, expected_cabs_rank)
+        return molecular_low_order_energy(
+            self, request, expected_cabs_rank, include_hf_cabs=include_hf_cabs
+        )
 
-    def low_order_energy_and_forces(self, request: FocalRequest) -> FocalLowOrderForces:
+    def low_order_energy_and_forces(
+        self, request: FocalRequest, *, include_hf_cabs: bool = True
+    ) -> FocalLowOrderForces:
         """Evaluate both low-order analytic forces and energies on one canonical root.
 
         Use low_order_energy with this center's CABS rank for a displaced energy.
         Both center roles share the physical determinant and the AO integral panels.
+        Set include_hf_cabs=False to evaluate just the pair response on this basis.
         """
         budget = _check_request(self, request)
         reference = df_reference(
-            request, forces=True, budget_mib=budget, **self._seed_options(request)
+            request,
+            forces=include_hf_cabs,
+            budget_mib=budget,
+            **self._seed_options(request),
         )
         one = one_electron_sources(
             request,
@@ -243,15 +256,18 @@ class MolecularFocalProvider:
         spin_mp2, increment, rank, correlation_forces = self._pair_components(
             request, reference, one, panels, expected_cabs_rank=None
         )
-        singles, hf_cabs_forces = self._singles_components(
-            replace(request, role="hf_cabs"),
-            reference,
-            one,
-            panels[0],
-            expected_cabs_rank=rank,
-        )
+        singles_energies = hf_cabs_forces = None
+        if include_hf_cabs:
+            singles, hf_cabs_forces = self._singles_components(
+                replace(request, role="hf_cabs"),
+                reference,
+                one,
+                panels[0],
+                expected_cabs_rank=rank,
+            )
+            singles_energies = singles.spin_energies
         energies = FocalLowOrderEnergy(
-            reference, rank, singles.spin_energies, spin_mp2, increment
+            reference, rank, singles_energies, spin_mp2, increment
         )
         return FocalLowOrderForces(energies, hf_cabs_forces, correlation_forces)
 

@@ -536,3 +536,103 @@ def test_rhf_focal_center_and_forward_displacement(
         assert (
             abs((energies[0] - energies[1]) / (2 * step) - center.forces[0, 0]) < 3e-6
         )
+
+
+def test_cc_only_basis_skips_hf_singles_and_reference_gradient() -> None:
+    from unittest.mock import patch
+
+    from generativeqc import _f12_cabs_fock as fock
+    from generativeqc import _f12_focal_molecular as owner
+    from generativeqc.experimental.f12_focal import singlepoint, singlepoint_energy
+
+    shell = os.environ.get("GENERATIVEQC_F12_HOST_SINK")
+    if not shell:
+        pytest.skip("requires the molecular host shell library")
+    xyz = XYZ[:2]
+    low = request(xyz, (0, 1, 1), "rhf").basis
+    high = request(xyz, (0, 2, 2), "rhf").basis
+    provider = MolecularFocalProvider(shell_library=Path(shell), budget_mib=800)
+    args = {
+        "hf_cabs": FocalSeries(low),
+        "correlation": FocalSeries(low),
+        "f12_doubles": FocalSeries(high),
+        "triples": FocalSeries(high),
+        "post_mp2": None,
+        "provider": provider,
+        "root_id": "rhf",
+        "correlation_space_id": "all-active",
+        "backend": "cpu_reference",
+        "protocol_id": "h2-mixed-fits",
+    }
+    atoms = list(zip(("H", "H"), xyz, strict=True))
+    moved = xyz.copy()
+    moved[0, 0] += 2e-4
+    displaced = list(zip(("H", "H"), moved, strict=True))
+    center_method = MolecularFocalProvider.low_order_energy_and_forces
+    energy_method = MolecularFocalProvider.low_order_energy
+    with (
+        patch.object(
+            MolecularFocalProvider,
+            "low_order_energy_and_forces",
+            lambda self, q, **_: center_method(self, q),
+        ),
+        patch.object(
+            MolecularFocalProvider,
+            "low_order_energy",
+            lambda self, q, *, expected_cabs_rank, **_: energy_method(
+                self, q, expected_cabs_rank=expected_cabs_rank
+            ),
+        ),
+    ):
+        full = singlepoint(atoms, **args)
+        full_signed = singlepoint_energy(displaced, center=full, **args)
+    with (
+        patch.object(owner, "df_reference", wraps=owner.df_reference) as scf,
+        patch.object(
+            MolecularFocalProvider,
+            "_singles_components",
+            autospec=True,
+            side_effect=MolecularFocalProvider._singles_components,
+        ) as singles,
+    ):
+        center = singlepoint(atoms, **args)
+    assert [
+        (c.args[0].basis.basis_id, c.kwargs["forces"]) for c in scf.call_args_list
+    ] == [(low.basis_id, True), (high.basis_id, False)]
+    assert (
+        singles.call_count == 1
+        and singles.call_args.args[1].basis.basis_id == low.basis_id
+    )
+    assert center.energy == pytest.approx(full.energy, abs=1e-12, rel=0)
+    np.testing.assert_allclose(center.forces, full.forces, atol=1e-11, rtol=0)
+    for actual, original in zip(center.components, full.components, strict=True):
+        assert actual.term.energy == pytest.approx(
+            original.term.energy, abs=1e-12, rel=0
+        )
+        np.testing.assert_allclose(
+            actual.term.forces, original.term.forces, atol=1e-11, rtol=0
+        )
+    assert center.cabs_ranks == full.cabs_ranks
+    for key, seed in center.references.items():
+        ref = seed.reference
+        previous = full.references[key].reference
+        occupied_overlap = (
+            previous.coefficients[0, :, 0] @ ref.overlap @ ref.coefficients[0, :, 0]
+        )
+        assert abs(occupied_overlap) == pytest.approx(1.0, abs=1e-10, rel=0)
+    with (
+        patch.object(owner, "df_reference", wraps=owner.df_reference) as scf,
+        patch.object(fock, "physical_fock", wraps=fock.physical_fock) as singles_fock,
+    ):
+        signed = singlepoint_energy(displaced, center=center, **args)
+    assert scf.call_count == 2 and all(
+        not c.kwargs["forces"] for c in scf.call_args_list
+    )
+    assert singles_fock.call_count == 1
+    assert signed.cabs_ranks == center.cabs_ranks
+    assert all(
+        min(s.reference.occupied_overlaps) > 0.999 for s in signed.references.values()
+    )
+    assert [p.energy for p in signed.components] == pytest.approx(
+        [p.energy for p in full_signed.components], abs=1e-12, rel=0
+    )
