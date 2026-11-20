@@ -39,3 +39,14 @@ The returned archive SHA-256 was
 The CUDA graphs consumed already formed derivative inputs. The orbital
 response and Coulomb-fit factor tangents were prepared separately on the
 same state. This stage establishes the spin-resolved terminal contractions.
+
+An independent L20 integral-source job `2123759145998876672` generated the
+279-function raw Coulomb auxiliary metric and three-center integrals with all
+nine nuclear derivatives. Its archive SHA-256 is
+`46a749d9e3589a09a1e6629770d261c98f661697db9f540af60cd28c15950d8c`.
+Combining these arrays with the L20 reference and the independently solved
+CPU orbital response reproduced the 27 original L20 spin forces to
+6.15e−14 Eh/Bohr in the forward Cholesky response. Summing the separate
+three-center, metric, coefficient and moving-Fock terms in a CPU reverse
+calculation gave 6.21e−14 Eh/Bohr. These are cross-archive comparisons
+of two device components with CPU molecular response.
