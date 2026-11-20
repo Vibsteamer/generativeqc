@@ -104,6 +104,30 @@ def physical_fock(
     cuda: bool,
     library: ctypes.CDLL | None,
 ) -> tuple[list[np.ndarray], Callable[[Sequence[np.ndarray]], FockBars]]:
+    """Build both extended Fock matrices and their occupied/metric pullback."""
+    values, adjoint = physical_spin_operators(
+        h, raw, whitener, frames, occupied, run, cuda, library, include_exchange=False
+    )
+    names = ("fock_alpha", "fock_beta")
+
+    def pullback(seeds: Sequence[np.ndarray]) -> FockBars:
+        return adjoint(dict(zip(names, seeds, strict=True)))
+
+    return [values[name] for name in names], pullback
+
+
+def physical_spin_operators(
+    h: np.ndarray,
+    raw: np.ndarray,
+    whitener: np.ndarray,
+    frames: Sequence[np.ndarray],
+    occupied: tuple[int, int],
+    run: Runner,
+    cuda: bool,
+    library: ctypes.CDLL | None,
+    *,
+    include_exchange: bool = True,
+) -> tuple[dict[str, np.ndarray], Callable[[Sources], FockBars]]:
     """Build F_AO before projection. Return extended matrices and their pullback.
 
     A_Q is the physical AO three-center panel. For each occupied spin frame O,
@@ -155,33 +179,50 @@ def physical_fock(
     rho = charges[0] if len(charges) == 1 else add(*charges)
     g = add(H, einsum("a,amn->mn", rho, A))
 
+    spins = ("alpha", "beta")
+    slots = [(f"fock_{name}", s) for s, name in enumerate(spins)]
+    if include_exchange:
+        slots.extend((f"exchange_{name}", s) for s, name in enumerate(spins))
+
     def expressions(k: dict[int, Node]) -> dict[str, Node]:
-        return {
-            f"ao{s}": add(g, k[s], coefficients=(1, -1)) if s in k else g
-            for s in range(2)
-        }
+        operators = {}
+        for s, name in enumerate(spins):
+            operators["fock_" + name] = (
+                add(g, k[s], coefficients=(1, -1)) if s in k else g
+            )
+            if include_exchange:
+                operators["exchange_" + name] = (
+                    k[s] if s in k else add(H, coefficients=(0,))
+                )
+        return operators
 
     primal = _run(run, Program(expressions(exchange)), inputs)
-    mo_focks = [
-        _project(primal[f"ao{s}"], c, cuda, library) for s, c in enumerate(frames)
-    ]
+    matrices = {
+        name: _project(primal[name], frames[s], cuda, library) for name, s in slots
+    }
 
-    def pullback(seeds: Sequence[np.ndarray]) -> FockBars:
+    def pullback(seeds: Sources) -> FockBars:
         C, F = _field("coeff", m, p), _field("matrix", m, v)
         transformed = Program(
             {"result": einsum("mp,mq->pq", C, einsum("mn,nq->mq", F, C))}
         )
-        ao_seeds, coeff_bars = {}, []
-        for s, c in enumerate(frames):
-            mat = primal[f"ao{s}"]
+        if not seeds.keys() <= matrices.keys():
+            raise ValueError("Unknown extended spin operator cotangent")
+        ao_seeds = {}
+        coeff_bars = [np.zeros_like(c) for c in frames]
+        for name, s in slots:
+            mat = primal[name]
+            if name not in seeds:
+                ao_seeds[name] = np.zeros_like(mat)
+                continue
             bar = _transpose(
                 run,
                 transformed,
-                {"coeff": c, "matrix": (mat + mat.T) * 0.5},
-                {"result": seeds[s]},
+                {"coeff": frames[s], "matrix": (mat + mat.T) * 0.5},
+                {"result": seeds[name]},
             )
-            ao_seeds[f"ao{s}"] = (bar["bar_matrix"] + bar["bar_matrix"].T) * 0.5
-            coeff_bars.append(bar["bar_coeff"])
+            ao_seeds[name] = (bar["bar_matrix"] + bar["bar_matrix"].T) * 0.5
+            coeff_bars[s] += bar["bar_coeff"]
         bars = _transpose(run, Program(expressions(mixed)), inputs, ao_seeds)
         metric_bar = np.zeros_like(whitener)
         raw_bar = bars["bar_panel"]
@@ -204,7 +245,7 @@ def physical_fock(
             )
         return coeff_bars, bars["bar_core"], raw_bar, metric_bar
 
-    return mo_focks, pullback
+    return matrices, pullback
 
 
 def obs_sources(

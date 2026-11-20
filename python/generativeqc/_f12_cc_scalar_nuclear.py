@@ -10,7 +10,7 @@ from generativeqc_compiler.cc.uccsd_f12_quadratic import (
 from generativeqc_compiler.cc.uccsd_f12_sources import unrestricted_f12_pair_sources
 from generativeqc_compiler.tensor import Program, transpose_program
 
-from generativeqc._f12_cc_fock_pullback import extended_fock_response
+from generativeqc._f12_cc_fock_pullback import FockResponse, extended_fock_response
 from generativeqc._f12_cc_spin_sources import _quadratic_pair_fields
 from generativeqc._f12_spin_ao import _orbital_sources
 from generativeqc._f12_spin_pairs import occupied_pair_blocks
@@ -36,6 +36,7 @@ def unrestricted_cc_scalar_ao_weights(
     *,
     frozen_occupied: tuple[int, int] = (0, 0),
     jkfit: Mapping[str, np.ndarray] | None = None,
+    fock_response: FockResponse | None = None,
 ) -> UnrestrictedCCScalarResponse:
     """Return each unweighted energy and the weighted derivative of their signed sum.
 
@@ -59,7 +60,7 @@ def unrestricted_cc_scalar_ao_weights(
     frozen = dict(zip(("a", "b"), frozen_occupied, strict=True))
     active = {s: slice(frozen[s], no) for s, no in occupied.items()}
     data, _ = _orbital_sources(space, ao, run, None, projected=None, role="pairs")
-    fock, fock_pullback = extended_fock_response(space, ao, jkfit, run)
+    fock, fock_pullback = fock_response or extended_fock_response(space, ao, jkfit, run)
     dbar = {k: np.zeros_like(v) for k, v in data.items() if k != "space"}
     fbar = {k: np.zeros_like(v) for k, v in fock.items()}
     e_v = e_b = e_x = 0.0

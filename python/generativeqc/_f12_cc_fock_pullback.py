@@ -1,11 +1,16 @@
-"""Physical extended spin Fock response with independently attributed JK fitting."""
+"""Physical extended spin Fock and exchange with independently attributed JK fitting."""
 
+import ctypes
 from collections.abc import Callable, Mapping
 
 import numpy as np
 
-from ._f12_spin_ao import _orbital_sources
-from ._f12_spin_fock import spin_fock, spin_fock_pullback
+from ._f12_cabs_fock import physical_spin_operators
+
+FockResponse = tuple[
+    dict[str, np.ndarray],
+    Callable[[dict[str, np.ndarray], dict[str, np.ndarray]], None],
+]
 
 
 def extended_fock_response(
@@ -13,40 +18,38 @@ def extended_fock_response(
     ao: Mapping[str, np.ndarray],
     jkfit: Mapping[str, np.ndarray] | None,
     run: Callable,
-) -> tuple[
-    dict[str, np.ndarray],
-    Callable[[dict[str, np.ndarray], dict[str, np.ndarray]], None],
-]:
-    shared = ("coefficients_alpha", "coefficients_beta", "hcore_ao")
-    fit = ("ao_coulomb", "metric/coulomb", "metric_whitener")
-    panel = {k: ao[k] for k in shared}
-    panel.update({k: (ao if jkfit is None else jkfit)[k] for k in fit})
-    qjk = len(panel["metric/coulomb"])
-    frame = (*space[:4], qjk)
-    fspace = (*space[:2], space[3], qjk)
-    data, _ = _orbital_sources(frame, panel, run, None, projected=None, role="fock")
-    inputs = {
-        k.removeprefix("source/"): v for k, v in data.items() if k.startswith("source/")
-    }
-    fock = spin_fock(fspace, inputs, run)
+    *,
+    cuda: bool = False,
+    library: ctypes.CDLL | None = None,
+) -> FockResponse:
+    panel = ao if jkfit is None else jkfit
+    frames = [ao["coefficients_alpha"], ao["coefficients_beta"]]
+    fock, physical = physical_spin_operators(
+        ao["hcore_ao"],
+        panel["ao_coulomb"],
+        panel["metric_whitener"],
+        frames,
+        (space[0], space[1]),
+        run,
+        cuda,
+        library,
+    )
+    for matrix in fock.values():
+        if not np.isfinite(matrix).all() or not np.allclose(
+            matrix, matrix.T, atol=2e-8, rtol=0
+        ):
+            raise ValueError("Non-Hermitian extended CC Fock or exchange matrix")
 
     def pullback(seed: dict[str, np.ndarray], bars: dict[str, np.ndarray]) -> None:
-        transformed = spin_fock_pullback(fspace, inputs, seed, run)
-        _, physical = _orbital_sources(
-            frame,
-            panel,
-            run,
-            {"source/" + k: v for k, v in transformed.items()},
-            projected=data,
-            role="fock",
-        )
-        assert physical is not None
-        for key in shared:
-            bars[key] += physical[key]
-        for key in ("ao_coulomb", "metric/coulomb"):
-            if jkfit is None:
-                bars[key] += physical[key]
-            else:
-                bars["jkfit/" + key] = physical[key]
+        coefficients, core, raw, metric = physical(seed)
+        bars["coefficients_alpha"] += coefficients[0]
+        bars["coefficients_beta"] += coefficients[1]
+        bars["hcore_ao"] += core
+        if jkfit is None:
+            bars["ao_coulomb"] += raw
+            bars["metric/coulomb"] += metric
+        else:
+            bars["jkfit/ao_coulomb"] = raw
+            bars["jkfit/metric/coulomb"] = metric
 
     return fock, pullback

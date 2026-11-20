@@ -33,6 +33,7 @@ def fixed_ucc_source_forces(
     from generativeqc_compiler.tensor import execute
 
     from ._f12_cc_c_nuclear import unrestricted_cc_c_ao_weights
+    from ._f12_cc_fock_pullback import extended_fock_response
     from ._f12_cc_scalar_nuclear import unrestricted_cc_scalar_ao_weights
     from ._f12_cc_w_nuclear import unrestricted_cc_w_ao_weights
     from ._f12_focal_frame import canonical_pair_frame
@@ -136,8 +137,16 @@ def fixed_ucc_source_forces(
         relative_cutoff=provider.relative_cutoff,
         library=provider.response_library,
     )
+    fock = extended_fock_response(
+        space, ao, panel, checked, cuda=cuda, library=provider.response_library
+    )
     scalar = unrestricted_cc_scalar_ao_weights(
-        space, ao, fixed_weights["fixed_geminal_energy"], checked, jkfit=panel
+        space,
+        ao,
+        fixed_weights["fixed_geminal_energy"],
+        checked,
+        jkfit=panel,
+        fock_response=fock,
     )
     energy = scalar.linear_v + scalar.b_energy - scalar.x_fock_energy
     if abs(energy - float(sources.fixed.feeds["fixed_geminal_energy"])) > 2e-9:
@@ -145,7 +154,11 @@ def fixed_ucc_source_forces(
     bars = scalar.weights
     for prefix, pullback, kwargs in (
         ("w_", unrestricted_cc_w_ao_weights, {}),
-        ("c_f12_", unrestricted_cc_c_ao_weights, {"jkfit": panel}),
+        (
+            "c_f12_",
+            unrestricted_cc_c_ao_weights,
+            {"jkfit": panel, "fock_response": fock},
+        ),
     ):
         selected = {k: v for k, v in fixed_weights.items() if k.startswith(prefix)}
         if selected:

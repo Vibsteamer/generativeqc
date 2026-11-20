@@ -10,7 +10,7 @@ from generativeqc_compiler.mp2.f12_density_fitting import molecular_orbital_sour
 from generativeqc_compiler.mp2.f12_unrestricted import unrestricted_cross_frame_overlap
 from generativeqc_compiler.tensor import Program, transpose_program
 
-from generativeqc._f12_cc_fock_pullback import extended_fock_response
+from generativeqc._f12_cc_fock_pullback import FockResponse, extended_fock_response
 from generativeqc._f12_spin_ao import _orbital_sources
 from generativeqc._f12_spin_pairs import occupied_pair_blocks
 
@@ -26,6 +26,7 @@ def unrestricted_cc_c_ao_weights(
     *,
     frozen_occupied: tuple[int, int] = (0, 0),
     jkfit: Mapping[str, np.ndarray] | None = None,
+    fock_response: FockResponse | None = None,
 ) -> dict[str, np.ndarray]:
     """Transpose ordered active C blocks through the geminal and extended Fock on both spins.
 
@@ -84,7 +85,7 @@ def unrestricted_cc_c_ao_weights(
     fsrc = {
         k.removeprefix("source/"): v for k, v in data.items() if k.startswith("source/")
     }
-    fock, fock_pullback = extended_fock_response(space, ao, jkfit, run)
+    fock, fock_pullback = fock_response or extended_fock_response(space, ao, jkfit, run)
     fseeds = {"fock_" + s: np.zeros((ext, ext)) for s in spins}
     fbar = {k: np.zeros_like(v) for k, v in fsrc.items()}
     cross = unrestricted_cross_frame_overlap(combined, ext)
