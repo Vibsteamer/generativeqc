@@ -393,11 +393,6 @@ generativeqc_status validate_uccsd_system(generativeqc_method method, const core
       detail.replace(position, 4, "unrestricted CC");
     return status;
   }
-  if (std::any_of(system.shells.begin(), system.shells.end(),
-                  [](const auto& shell) { return shell.angular_momentum > 2; })) {
-    detail = "native unrestricted CC is qualified for s/p/d references";
-    return GENERATIVEQC_STATUS_NOT_IMPLEMENTED;
-  }
   return GENERATIVEQC_STATUS_SUCCESS;
 }
 
@@ -456,6 +451,14 @@ std::unique_ptr<PreparedCalculation> prepare_uccsd_with_reference_fit(
   reference_options.export_physical_reference = true;
   reference_options.reference_memory_budget_bytes = options.max_bytes;
   auto fitting = unrestricted_fitting(descriptor, auxiliary, options.max_bytes);
+  if (std::any_of(system.shells.begin(), system.shells.end(),
+                  [](const auto& shell) { return shell.angular_momentum == 3; }) &&
+      (!fitting.full_reference || !system.ecp_terms.empty() ||
+       system.basis_representation != core::kSphericalBasis)) {
+    throw MethodError(GENERATIVEQC_STATUS_NOT_IMPLEMENTED,
+                      "native unrestricted CC f orbitals require an all-electron "
+                      "real-spherical full density-fitted reference");
+  }
   if (reference_auxiliary) {
     if (!fitting.full_reference || !fitting.auxiliary)
       throw std::invalid_argument("independent UCC JKFit requires full density fitting");

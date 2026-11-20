@@ -68,10 +68,16 @@ std::size_t falling(std::size_t count, unsigned selected) {
   return result;
 }
 
+std::size_t factorial(unsigned count) {
+  return count < 2 ? 1 : count == 2 ? 2 : 6;
+}
+
 std::size_t triple_count(const Shape& sizes, unsigned alpha_count) {
-  return graph::checked_product({falling(sizes[0], alpha_count), falling(sizes[1], 3 - alpha_count),
-                                 falling(sizes[2], alpha_count),
-                                 falling(sizes[3], 3 - alpha_count)});
+  const auto beta_count = 3 - alpha_count;
+  return graph::checked_product({falling(sizes[0], alpha_count) / factorial(alpha_count),
+                                 falling(sizes[1], beta_count) / factorial(beta_count),
+                                 falling(sizes[2], alpha_count) / factorial(alpha_count),
+                                 falling(sizes[3], beta_count) / factorial(beta_count)});
 }
 
 std::size_t triples_required(const Shape& sizes) {
@@ -227,29 +233,13 @@ double triples_channel(const std::array<unsigned, 3>& spins, const Bindings& bin
                        std::vector<double>& arena, UnrestrictedSolve& result) {
   const unsigned alpha_count = static_cast<unsigned>(std::count(spins.begin(), spins.end(), 0));
   if (!triple_count(sizes, alpha_count)) return 0.0;
-  std::array<std::size_t, 6> shape{};
-  std::size_t count = 1;
-  for (unsigned axis = 0; axis < 6; ++axis) {
+  std::array<std::size_t, 6> shape{}, selected{};
+  for (unsigned axis = 0; axis < shape.size(); ++axis)
     shape[axis] = sizes[spins[axis % 3] + (axis < 3 ? 0 : 2)];
-    count = posthf::checked_mul(count, shape[axis]);
-  }
   std::vector<std::vector<double>> buffers(bindings.size());
   Inputs inputs;
   double energy = 0.0;
-  for (std::size_t flat = 0; flat < count; ++flat) {
-    auto remainder = flat;
-    std::array<std::size_t, 6> selected{};
-    for (unsigned axis = 6; axis > 0; --axis) {
-      selected[axis - 1] = remainder % shape[axis - 1];
-      remainder /= shape[axis - 1];
-    }
-    bool repeated = false;
-    for (unsigned first = 0; first < 3; ++first)
-      for (unsigned second = first + 1; second < 3; ++second)
-        if (spins[first] == spins[second] &&
-            (selected[first] == selected[second] || selected[first + 3] == selected[second + 3]))
-          repeated = true;
-    if (repeated) continue;
+  const auto accumulate = [&] {
     double denominator = 0.0;
     for (unsigned axis = 0; axis < 3; ++axis) {
       const auto spin = spins[axis];
@@ -295,8 +285,26 @@ double triples_channel(const std::array<unsigned, 3>& spins, const Bindings& bin
     energy += *tile.triples_energy;
     if (!std::isfinite(energy)) throw std::runtime_error("nonfinite unrestricted triples energy");
     ++result.triples_tiles;
-  }
-  return energy;
+  };
+  // The generated scalar includes all spin-position multiplicities. Within
+  // one spin channel an equal-spin exchange changes the sign of both
+  // numerators and leaves their product and denominator invariant. Enumerate
+  // just increasing occupied and virtual tuples within each spin group.
+  const auto visit = [&](auto& self, unsigned axis) -> void {
+    if (axis == shape.size()) {
+      accumulate();
+      return;
+    }
+    const unsigned position = axis % 3;
+    const auto first = position && spins[position] == spins[position - 1] ? selected[axis - 1] + 1 : 0;
+    for (selected[axis] = first; selected[axis] < shape[axis]; ++selected[axis])
+      self(self, axis + 1);
+  };
+  visit(visit, 0);
+  const auto permutations = factorial(alpha_count) * factorial(3 - alpha_count);
+  const auto full_energy = energy * static_cast<double>(permutations * permutations);
+  if (!std::isfinite(full_energy)) throw std::runtime_error("nonfinite unrestricted triples energy");
+  return full_energy;
 }
 
 }  // namespace
