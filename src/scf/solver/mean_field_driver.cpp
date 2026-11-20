@@ -11,6 +11,7 @@
 #include "runtime/host_component_trace.hpp"
 #include "runtime/resource_usage.hpp"
 #include "scf/fock_prepared.hpp"
+#include "scf/fock_symmetry.hpp"
 #include "scf/gradient/hf_gradient.hpp"
 #include "scf/initial_guess/density.hpp"
 #include "scf/reference/mean_field.hpp"
@@ -143,14 +144,29 @@ class ExactIncrementalDirectJk {
   DirectJkMatrices anchor_jk_;
 };
 
+FockMatrices assemble_host_fock(const PreparedFockPlan& plan, const Matrix& hcore,
+                                const DirectJkMatrices& jk) {
+  const auto& strategy = plan.strategy();
+  auto fock = assemble_fock(strategy, hcore, jk);
+  if (strategy.backend == FockBackend::Cuda &&
+      strategy.spec.coulomb.approximation == FockApproximation::DensityFitted &&
+      strategy.spec.exchange.approximation == FockApproximation::DensityFitted) {
+    // Keep independently accumulated CUDA J/K roundoff out of Pulay history
+    // and use the same physical matrix convention for finalization.
+    preserve_fock_symmetry(fock.alpha, jk.nbf);
+    if (!fock.beta.empty()) preserve_fock_symmetry(fock.beta, jk.nbf);
+  }
+  return fock;
+}
+
 std::pair<Matrix, Matrix> build_uhf_focks(const PreparedFockPlan& plan, const Matrix& hcore,
                                           const Matrix& alpha_density, const Matrix& beta_density) {
-  auto fock = assemble_fock(plan.strategy(), hcore, plan.build(alpha_density, beta_density));
+  auto fock = assemble_host_fock(plan, hcore, plan.build(alpha_density, beta_density));
   return {std::move(fock.alpha), std::move(fock.beta)};
 }
 
 Matrix build_fock(const PreparedFockPlan& plan, const Matrix& hcore, const Matrix& density) {
-  return assemble_fock(plan.strategy(), hcore, plan.build(density)).alpha;
+  return assemble_host_fock(plan, hcore, plan.build(density)).alpha;
 }
 
 /** Substitute only the provider of this actual matrix. Iterative matrices may
@@ -343,7 +359,7 @@ ScfResult run_rhf_host_plan(const core::System& system, const ScfOptions& option
       [&](const Matrix& current_density, unsigned) {
         ++result.fock_builds;
         Matrix fock =
-            assemble_fock(plan.strategy(), ints.hcore, incremental_jk.build(current_density)).alpha;
+            assemble_host_fock(plan, ints.hcore, incremental_jk.build(current_density)).alpha;
         const runtime::CpuRetainedCapacity anchor_capacity(incremental_jk.numeric_capacity());
         const double energy =
             electronic_energy(current_density, ints.hcore, fock) + ints.nuclear_repulsion;
@@ -459,8 +475,7 @@ ScfResult run_uhf_host_plan(const core::System& system, const ScfOptions& option
   auto outcome = ::generativeqc::solver::run_self_consistent(
       UhfState{std::move(alpha_density), std::move(beta_density)}, policy,
       [&](const UhfState& state, unsigned) {
-        auto fock = assemble_fock(plan.strategy(), ints.hcore,
-                                  incremental_jk.build(state.alpha, state.beta));
+        auto fock = assemble_host_fock(plan, ints.hcore, incremental_jk.build(state.alpha, state.beta));
         const runtime::CpuRetainedCapacity anchor_capacity(incremental_jk.numeric_capacity());
         auto alpha_fock = std::move(fock.alpha);
         auto beta_fock = std::move(fock.beta);
