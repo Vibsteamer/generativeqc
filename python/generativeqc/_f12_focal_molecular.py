@@ -301,8 +301,7 @@ class MolecularFocalProvider:
             {"metric": w["metric"], "ao_coulomb": w["three_center"]},
             coulomb_only=True,
         )
-        grad += np.einsum("axij,ij->ax", one.d_overlap, w["overlap"])
-        grad += np.einsum("axij,ij->ax", one.d_hcore, w["hcore"])
+        grad += one.nuclear_gradient(w["overlap"], w["hcore"], run=self.run)
         return singles.hf_cabs_energy, ref.forces - grad
 
     def _pair(
@@ -361,8 +360,11 @@ class MolecularFocalProvider:
         if mp2 is not jk and mp2 is not f12:
             grad += self._gradient(request, mp2, mp_weights, coulomb_only=True)
         assert one.d_overlap is not None and one.d_hcore is not None
-        for derivative, key in ((one.d_overlap, "overlap"), (one.d_hcore, "hcore")):
-            bar = explicit.one_electron_weights[key]
-            bar[:n, :n] += w[key]
-            grad += np.einsum("axij,ij->ax", derivative, bar)
+        for key in ("overlap", "hcore"):
+            explicit.one_electron_weights[key][:n, :n] += w[key]
+        grad += one.nuclear_gradient(
+            explicit.one_electron_weights["overlap"],
+            explicit.one_electron_weights["hcore"],
+            run=self.run,
+        )
         return float(sum(ordinary.spin_energies) + explicit.energy), -grad

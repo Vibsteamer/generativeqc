@@ -105,6 +105,10 @@ def hydroxyl() -> tuple[FocalRequest, dict, dict]:
 
 
 def test_oh_physical_d_f12_obs_optri(molecular_library: Path, hydroxyl: tuple) -> None:
+    from generativeqc_compiler.method.nuclear_integral_response import (
+        overlap_hcore_gradient,
+    )
+    from generativeqc_compiler.tensor import execute
     from pyscf import gto, scf
 
     req, obs, opt = hydroxyl
@@ -140,6 +144,22 @@ def test_oh_physical_d_f12_obs_optri(molecular_library: Path, hydroxyl: tuple) -
     ip = -mol.intor("int1e_ipovlp", comp=3)
     gen_h = scf.RHF(mol).nuc_grad_method().hcore_generator(mol)
     assert out.d_overlap is not None and out.d_hcore is not None
+    rng = np.random.default_rng(614)
+    weights = rng.normal(size=(2, *out.overlap.shape)) / len(out.overlap)
+    weighted = out.nuclear_gradient(*weights, run=None)
+    graph = overlap_hcore_gradient(2, len(out.overlap))
+    inputs = {
+        "d_overlap": out.d_overlap,
+        "d_hcore": out.d_hcore,
+        "overlap": weights[0],
+        "hcore": weights[1],
+    }
+    generated = execute(graph, inputs).outputs["gradient"]
+    np.testing.assert_allclose(generated, weighted, atol=1e-12, rtol=0)
+    with pytest.raises(ValueError, match="runner"):
+        replace(out, executed_backend="cuda").nuclear_gradient(*weights, run=None)
+    with pytest.raises(RuntimeError, match="backend"):
+        replace(out, executed_backend="cuda").nuclear_gradient(*weights, run=execute)
     for atom in range(2):
         ds = np.zeros_like(ip)
         for first, last in (aos[atom], aos[atom + 2]):
@@ -160,6 +180,9 @@ def test_oh_physical_d_f12_obs_optri(molecular_library: Path, hydroxyl: tuple) -
                         - independent(xyz - 2 * shift)[1]
                     )
                 ) / (12 * h)
+                assert weighted[atom, axis] == pytest.approx(
+                    float(np.vdot(weights, fd)), abs=2e-8, rel=0
+                )
                 np.testing.assert_allclose(
                     (out.d_overlap[atom, axis], out.d_hcore[atom, axis]),
                     fd,

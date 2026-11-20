@@ -13,6 +13,7 @@ from ._f12_focal_shells import pack_shells, spherical_projections
 from .elements import checked_integer
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from os import PathLike
 
     from .experimental.f12_focal import Backend, FocalRequest
@@ -31,6 +32,49 @@ class FocalOneElectron:
     basis_id: str
     executed_backend: Backend
     native_workspace_bytes: int
+
+    def nuclear_gradient(
+        self,
+        overlap_weight: np.ndarray,
+        hcore_weight: np.ndarray,
+        *,
+        run: Callable | None,
+    ) -> np.ndarray:
+        """Positive derivative of the two weighted one-electron operators on this backend."""
+        from generativeqc_compiler.method.nuclear_integral_response import (
+            overlap_hcore_gradient,
+        )
+
+        if self.d_overlap is None or self.d_hcore is None:
+            raise ValueError("Nuclear contraction requires both one-electron Jacobians")
+        for weight in (overlap_weight, hcore_weight):
+            if weight.shape != self.overlap.shape or weight.dtype != np.float64:
+                raise ValueError(
+                    "One-electron weights must be full FP64 matrices in the source AO order"
+                )
+        if self.executed_backend == "cpu_reference":
+            return np.einsum("axij,ij->ax", self.d_overlap, overlap_weight) + np.einsum(
+                "axij,ij->ax", self.d_hcore, hcore_weight
+            )
+        if self.executed_backend != "cuda" or run is None:
+            raise ValueError(
+                "CUDA one-electron nuclear contraction requires its graph runner"
+            )
+        graph = overlap_hcore_gradient(len(self.d_overlap), len(self.overlap))
+        result = run(
+            graph,
+            {
+                "d_overlap": self.d_overlap,
+                "d_hcore": self.d_hcore,
+                "overlap": overlap_weight,
+                "hcore": hcore_weight,
+            },
+        )
+        if result.backend != "cuda-fp64-ordinary-stream":
+            raise RuntimeError(
+                "One-electron nuclear contraction returned the wrong backend"
+            )
+        return result.outputs["gradient"]
 
 
 def one_electron_sources(

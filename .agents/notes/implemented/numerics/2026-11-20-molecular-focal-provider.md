@@ -15,3 +15,10 @@ and forces and by two displacement sizes. The HF+CABS regression uses an
 independent SCF and finite differences along each Cartesian coordinate. For
 physical qualification use a request with the desired spin root, a matching
 backend and a separately identified high-order provider.
+
+For a CUDA request, the final contractions of the overlap and core-Hamiltonian
+Jacobian with their relaxed AO weights run as two FP64 TensorIR contractions
+on the assigned card. The sign convention of the returned contraction is the
+positive nuclear energy derivative. The caller applies the force sign along
+with the Coulomb and geminal derivatives. The independent host full-matrix
+contractions and both signed displacement sizes exercise AO order and sign.
