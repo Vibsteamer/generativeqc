@@ -152,14 +152,12 @@ def test_molecular_singles_and_source_response(
         relax=True,
     ).weights
     if shell_library := os.environ.get("GENERATIVEQC_F12_HOST_SINK"):
-        from benchmarks.f12_focal_hf_cabs import molecular_hf_cabs
+        from generativeqc.experimental.f12_focal import MolecularFocalProvider
 
-        endpoint = molecular_hf_cabs(
-            req,
+        endpoint = MolecularFocalProvider(
             shell_library=Path(shell_library),
             one_electron_library=molecular_library,
-            expected_cabs_rank=projector.rank,
-        )
+        )(req)
         assert endpoint.term.energy == pytest.approx(
             result.hf_cabs_energy, abs=4e-9, rel=0
         )

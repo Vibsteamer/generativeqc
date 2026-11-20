@@ -16,6 +16,7 @@ import numpy as np
 
 from .. import (
     _f12_focal_increment,
+    _f12_focal_molecular,
     _f12_focal_one_electron,
     _f12_focal_projector,
     _f12_focal_reference,
@@ -41,6 +42,7 @@ Role = Literal[
     "hf_cabs", "mp2_f12_correlation", "post_mp2", "ccsd_minus_mp2", "triples"
 ]
 Backend = Literal["cuda", "cpu_reference"]
+MolecularFocalProvider = _f12_focal_molecular.MolecularFocalProvider
 FocalOneElectron = _f12_focal_one_electron.FocalOneElectron
 one_electron_sources = _f12_focal_one_electron.one_electron_sources
 FocalReference = _f12_focal_reference.FocalReference

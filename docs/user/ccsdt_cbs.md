@@ -818,14 +818,32 @@ weight, `einsum("ij,axij->ax", result.overlap_bar, one.d_overlap)` gives
 the positive nuclear derivative of the weighted kernel.
 
 
-To evaluate the HF+CABS component from the geometry in a source checkout,
-use `benchmarks.f12_focal_hf_cabs.molecular_hf_cabs(request, ...)`. Supply
-the F12 shell and one-electron libraries by path. CUDA also requires the
-CUDA metric library and the FP64 TensorIR runner. The provider uses the same
-canonical DF-HF state for singles and orbital relaxation, contracts the
-JKFit two- and three-center derivatives, and returns a `FocalEvaluation`
-with total energy and Cartesian forces. This full-rank JKFit path covers
-all-electron canonical RHF/UHF references with OBS virtual orbitals.
+Use the installed `MolecularFocalProvider` to evaluate a plan step directly
+from its geometry. A single-card CUDA setup looks like this:
+
+```python
+from generativeqc.experimental.f12_focal import MolecularFocalProvider
+
+provider = MolecularFocalProvider.cuda(
+    shell_library=shell_library,
+    response_library=response_library,
+    architecture="sm_89",
+    cache_directory=cache_directory,
+)
+hf = provider(next(req for req, _ in plan.steps if req.role == "hf_cabs"))
+pair = provider(next(req for req, _ in plan.steps if req.role == "mp2_f12_correlation"))
+```
+
+Pass filesystem paths as `pathlib.Path` objects. The HF+CABS term returns the
+DF-HF energy and forces plus the relaxed spin singles contribution for an
+all-electron RHF or UHF reference. The pair term supports all-active UHF and
+returns ordinary DF-UMP2 correlation plus the explicit 3C(FIX) increment.
+Both contributions within that term share one physical determinant. The JK,
+ordinary correlation and explicit correlation fits follow their respective
+basis records. Matching identities share the fitted integrals and their
+nuclear derivatives. The returned forces are Cartesian and in Eh/bohr.
+Supply the `high_order` callable when dispatching a complete plan containing
+post-MP2 or triples terms.
 
 For an existing reference and OBS-first integral set, call
 `reference_cabs_singles(request, reference, one, complement=frame,
