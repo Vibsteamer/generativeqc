@@ -3,6 +3,7 @@
 import argparse
 import importlib.util
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -11,11 +12,21 @@ from pathlib import Path
 def run(
     data: Path, main: Path, shell: Path, response: Path, out: Path, backend: str
 ) -> None:
+    os.environ["GENERATIVEQC_LIBRARY"] = str(main.resolve())
     sys.path.insert(0, str(data))
     from tensor_cache import export_cache, observe_compilation, restore_cache, sha
 
     task = json.loads((data / "task.json").read_bytes())
     context = json.loads((data / "jit_context.json").read_bytes())
+    configuration = json.loads(Path(__file__).with_name("cases.json").read_bytes())
+    if (
+        context["main_library_sha256"] != configuration["df_reference_library_sha256"]
+        or context["wheel_sha256"] != configuration["files"]["generativeqc.whl"]
+        or context["shell_library_sha256"] != configuration["files"][shell.name]
+        or context["response_library_sha256"] != configuration["files"][response.name]
+        or configuration["source_commit"] != task["source_commit"]
+    ):
+        raise ValueError("Qualified JIT bundle and stage runtime identities differ")
     if (
         backend != "cuda"
         or context["architecture"] != "sm_89"

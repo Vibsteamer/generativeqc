@@ -10,13 +10,14 @@ import re
 import shutil
 import tarfile
 import tempfile
-from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from generativeqc_compiler.common.cuda_adapter import CudaCompilerAdapter
     from generativeqc_compiler.common.cuda_runtime import CudaArtifact
     from generativeqc_compiler.tensor.cuda_plan import TensorPlan
