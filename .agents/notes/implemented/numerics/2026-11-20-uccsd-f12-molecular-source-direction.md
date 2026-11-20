@@ -155,3 +155,23 @@ spherical AOs and the 198-function common fit. The coefficient derivatives,
 the two previously verified Hcore terms and the other source, UHF and CABS
 actions remain inputs. The validation directory is
 `molecular_cartesian_nh2/l20_ordinary_fock_jk/` in the area described above.
+
+For the six ordinary Fock inputs, Hcore contributes 2 H C W to each spin's
+coefficient cotangent, where W is the symmetric CC Fock weight in that MO
+frame. The measured DF Coulomb/exchange coefficient cotangent adds to it.
+The resulting two weights include the norm-changing part of the AO overlap
+and all canonical rotations. The same DF-UHF root supplies the metric
+whitener, MO fitting factors and energy gaps to one transposed coupled-spin
+orbital solve. Its output is a set of orbital-response weights on S, Hcore,
+the Coulomb three-center tensor and the fitting metric. Their negative
+nuclear contractions add to the explicit Fock force. The source no longer
+takes Cartesian MO coefficient derivatives.
+
+For the NH2/D six-weight observable the dense CPU CPHF control used 391
+occupied/virtual rotations with residual 1.74e-17 and recovered the nine
+original moving-orbital forces within 9.03e-13 Eh/bohr. The pure orbital
+force on H1-z was −0.006832263983 Eh/bohr. The center reproduced both
+retained canonical spin Fock matrices within 2.35e-10 Eh. Native CUDA
+and independent centered controls for this route live in
+`molecular_cartesian_nh2/l20_ordinary_fock_orbital_response/` in the
+validation area above.
