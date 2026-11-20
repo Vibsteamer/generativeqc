@@ -68,6 +68,22 @@ class UccsdPrepared final : public PreparedCalculation {
   }
 
   Result execute_components_impl(bool compute_forces, unsigned components) override {
+    return evaluate(compute_forces, components, {});
+  }
+
+  Result triples_on_reference(const std::shared_ptr<const hf::UnrestrictedPhysicalReference>& ref,
+                              const molecule::ScalarHamiltonianIdentity& jk, bool forces) {
+    if (!ref || !ref->source_identity || !ref->source_identity->matches(system_) ||
+        !fitting_.full_reference || !jk.matches(*fitting_.reference_auxiliary()) ||
+        capabilities_.method != GENERATIVEQC_METHOD_UCCSD_T)
+      throw std::invalid_argument(
+          "focal triples requires the same molecular determinant and JKFit");
+    return evaluate(forces, 0, ref);
+  }
+
+ private:
+  Result evaluate(bool compute_forces, unsigned components,
+                  const std::shared_ptr<const hf::UnrestrictedPhysicalReference>& focal) {
     std::lock_guard<std::mutex> lock(mutex_);
     last_.reset();
     performance_.reset();
@@ -104,12 +120,17 @@ class UccsdPrepared final : public PreparedCalculation {
           (cuda_ || fitting_.full_reference) && compute_forces && (components & kHfComponent);
       reference_options.density_fitting_relative_threshold = fitting_.threshold;
       reference_options.resolved_fock_build = reference_plan.strategy();
-      auto reference_result = warm_reference::solve_reference(
-          nullptr, scf::FockSpin::Unrestricted, nullptr,
-          [&](const std::vector<double>* seed) {
-            return scf::run_prepared_fock_strategy(reference_plan, reference_options, seed);
-          },
-          "UHF did not produce a converged physical unrestricted CC reference");
+      scf::ScfResult reference_result;
+      if (focal) {
+        reference_result.unrestricted_reference = focal;
+      } else {
+        reference_result = warm_reference::solve_reference(
+            nullptr, scf::FockSpin::Unrestricted, nullptr,
+            [&](const std::vector<double>* seed) {
+              return scf::run_prepared_fock_strategy(reference_plan, reference_options, seed);
+            },
+            "UHF did not produce a converged physical unrestricted CC reference");
+      }
       const auto reference_seconds =
           std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
       const auto& reference = *reference_result.unrestricted_reference;
@@ -275,6 +296,19 @@ class UccsdPrepared final : public PreparedCalculation {
         diagnostic.response_workspace_allocation_count = force.orbital.workspace_allocation_count;
         diagnostic.force_provenance_flags = fitted && cuda_ ? 0x1 : 0x7;
       }
+      if (focal) {
+        result.energy = solved.triples_energy;
+        if (compute_forces) {
+          const auto parent = cc::unrestricted_force(
+              reference, source, solved, options_, false, charged_reference_capacity,
+              orbital_problem ? &*orbital_problem : nullptr, cuda_, device_,
+              fitted ? &*fitted : nullptr, independent_reference, unrestricted_integral_backend());
+          if (parent.forces.size() != result.forces.size())
+            throw std::runtime_error("inconsistent focal triples force dimensions");
+          for (std::size_t k = 0; k < result.forces.size(); ++k)
+            result.forces[k] -= parent.forces[k];
+        }
+      }
       if (result.mp2_component)
         diagnostic.numeric_capacity_bytes =
             std::max(diagnostic.numeric_capacity_bytes,
@@ -344,6 +378,14 @@ class UccsdPrepared final : public PreparedCalculation {
 };
 
 }  // namespace
+
+Result focal_ucc_triples(PreparedCalculation& plan,
+                         const std::shared_ptr<const hf::UnrestrictedPhysicalReference>& reference,
+                         const molecule::ScalarHamiltonianIdentity& jk, bool forces) {
+  auto* cc = dynamic_cast<UccsdPrepared*>(&plan);
+  if (!cc) throw std::invalid_argument("focal triples requires a native UCCSD(T) plan");
+  return cc->triples_on_reference(reference, jk, forces);
+}
 
 generativeqc_status validate_uccsd_system(generativeqc_method method, const core::System& system,
                                           std::string& detail) {

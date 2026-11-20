@@ -7,18 +7,29 @@
 
 #include "api/error.hpp"
 #include "api/handles.hpp"
+#include "generativeqc/ucc_fitting.h"
 #include "methods/hf_ecp_df.hpp"
+#include "methods/uccsd_method.hpp"
 #include "molecule/basis.hpp"
 #include "posthf/capacity.hpp"
 #include "runtime/bounded_workspace.hpp"
 #include "runtime/execution_context.hpp"
 #include "scf/mean_field.hpp"
 
+struct generativeqc_focal_reference {
+  std::shared_ptr<const generativeqc::hf::UnrestrictedPhysicalReference> uhf;
+  generativeqc::molecule::ScalarHamiltonianIdentity jk;
+  generativeqc_backend backend;
+  int device;
+};
+
 namespace {
-generativeqc_status focal_df_reference(
-    generativeqc_context* context, const generativeqc_system* orbital,
-    const generativeqc_system* auxiliary, int spins, int forces, std::size_t budget,
-    const double* initial_density, std::size_t initial_count, double* output, std::size_t count) {
+generativeqc_status focal_df_reference(generativeqc_context* context,
+                                       const generativeqc_system* orbital,
+                                       const generativeqc_system* auxiliary, int spins, int forces,
+                                       std::size_t budget, const double* initial_density,
+                                       std::size_t initial_count, double* output, std::size_t count,
+                                       generativeqc_focal_reference** owner = nullptr) {
   using namespace generativeqc;
   if (!context || !orbital || !auxiliary || !output || !budget || (spins != 1 && spins != 2) ||
       (forces != 0 && forces != 1))
@@ -144,6 +155,37 @@ generativeqc_status focal_df_reference(
       copy(channel.orbital_energies);
     }
     if (forces) copy(state.forces);
+    if (owner) {
+      auto ref = state.unrestricted_reference;
+      if (spins == 1) {
+        if (posthf::uhf_reference_capacity(sys, options.diis_history, false) > budget)
+          throw std::length_error("closed-shell spin expansion exceeds focal capacity");
+        const auto& rhf = *state.reference;
+        auto expanded = std::make_shared<hf::UnrestrictedPhysicalReference>();
+        expanded->nbf = n;
+        expanded->nocc.fill(rhf.nocc);
+        expanded->overlap = rhf.overlap;
+        expanded->hcore = rhf.hcore;
+        expanded->coefficients.fill(rhf.coefficients);
+        expanded->fock.fill(rhf.fock);
+        expanded->orbital_energies.fill(rhf.orbital_energies);
+        auto density = rhf.density;
+        for (auto& x : density) x *= 0.5;
+        expanded->density.fill(density);
+        expanded->energy = rhf.energy;
+        expanded->commutator_residual = rhf.commutator_residual;
+        expanded->canonical_density_drift = rhf.canonical_density_drift;
+        expanded->canonical_error = rhf.eigen_residual;
+        expanded->source_identity.emplace(physical);
+        expanded->source_charge = physical.charge;
+        expanded->source_electrons = physical.electron_count;
+        expanded->source_multiplicity = physical.multiplicity;
+        ref = std::move(expanded);
+      }
+      *owner = new generativeqc_focal_reference{
+          std::move(ref), molecule::ScalarHamiltonianIdentity(aux),
+          static_cast<generativeqc_backend>(backend), context->state.device_id};
+    }
     return GENERATIVEQC_STATUS_SUCCESS;
   } catch (...) {
     return api::map_exception(&context->last_detail);
@@ -167,4 +209,45 @@ extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_df_reference_
   if (!initial_density || !initial_count) return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
   return focal_df_reference(context, orbital, auxiliary, spins, forces, budget,
                             initial_density, initial_count, output, count);
+}
+
+extern "C" generativeqc_status generativeqc_focal_df_reference_owned_v1(
+    generativeqc_context* context, const generativeqc_system* orbital,
+    const generativeqc_system* auxiliary, int spins, int forces, std::size_t budget,
+    const double* initial_density, std::size_t initial_count, double* output, std::size_t count,
+    generativeqc_focal_reference** owner) {
+  if (!owner) return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
+  *owner = nullptr;
+  return focal_df_reference(context, orbital, auxiliary, spins, forces, budget, initial_density,
+                            initial_count, output, count, owner);
+}
+
+extern "C" void generativeqc_focal_reference_destroy_v1(generativeqc_focal_reference* owner) {
+  delete owner;
+}
+
+extern "C" generativeqc_status generativeqc_focal_ucc_triples_v1(
+    generativeqc_calculation* calculation, const generativeqc_focal_reference* owner, int forces,
+    double* output, std::size_t count) {
+  if (!calculation || !calculation->context || !owner || !output || (forces != 0 && forces != 1))
+    return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
+  auto* context = calculation->context;
+  std::lock_guard lock(context->mutex);
+  try {
+    if (owner->backend != context->state.executed_backend ||
+        owner->device != context->state.device_id ||
+        count != 1 + (forces ? 3 * calculation->plan->atom_count() : 0))
+      throw std::invalid_argument("inconsistent focal triples output or backend");
+    const auto result = generativeqc::methods::detail::focal_ucc_triples(
+        *calculation->plan, owner->uhf, owner->jk, forces);
+    if (!std::isfinite(result.energy) || result.forces.size() + 1 != count ||
+        !std::all_of(result.forces.begin(), result.forces.end(),
+                     [](double x) { return std::isfinite(x); }))
+      throw std::runtime_error("invalid focal triples result");
+    output[0] = result.energy;
+    std::copy(result.forces.begin(), result.forces.end(), output + 1);
+    return GENERATIVEQC_STATUS_SUCCESS;
+  } catch (...) {
+    return generativeqc::api::map_exception(&context->last_detail);
+  }
 }

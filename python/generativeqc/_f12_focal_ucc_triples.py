@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 if TYPE_CHECKING:
+    from ._f12_focal_reference import FocalReference
     from .experimental.f12_focal import FocalEvaluation, FocalRequest
 
 
@@ -113,3 +114,99 @@ def conventional_df_ucc_triples(
         corrected_forces - parent_forces,
     )
     return FocalEvaluation(term, request.backend, converged=True)
+
+
+def molecular_triples_on_reference(
+    request: FocalRequest,
+    reference: FocalReference,
+    *,
+    budget_mib: int,
+    forces: bool,
+) -> tuple[float, np.ndarray | None]:
+    """Use the native conventional CCSD and triples owner on a retained determinant."""
+    import ctypes as ct
+    from contextlib import ExitStack
+
+    from . import _native
+    from .calculator import Calculator
+
+    basis = request.basis
+    if (
+        request.role != "triples"
+        or request.correlation_space_id != "all-active"
+        or reference.surface_id != request.surface_id
+        or reference.executed_backend != request.backend
+        or reference.orbital_id != basis.orbital.identity
+        or reference.jk_fit_id != basis.jk_fit.identity
+        or basis.mp2_fit is None
+    ):
+        raise ValueError(
+            "Triples requires the matching molecular reference, JKFit and correlation fit"
+        )
+    spins = reference._pair_spin_indices(request)
+    oa, ob = (reference.occupied[k] for k in spins)
+    n = len(reference.overlap)
+    # A spin-conserving triple needs enough holes and particles in each spin.
+    if not any(
+        oa >= a and ob >= 3 - a and n - oa >= a and n - ob >= 3 - a for a in range(4)
+    ):
+        return 0.0, np.zeros((len(request.atoms), 3)) if forces else None
+    owner = reference._native_owner
+    if owner is None:
+        raise RuntimeError(
+            "Nonempty focal triples requires the native retained DF reference ABI"
+        )
+    calc = Calculator(
+        method="uccsd(t)",
+        device="cuda" if request.backend == "cuda" else "cpu",
+        basis=basis.orbital,
+        auxiliary_basis=basis.mp2_fit,
+        density_fitting="full_cuda",
+        initial_guess=None,
+        correlation_memory_budget_bytes=budget_mib << 20,
+    )
+    with ExitStack() as stack:
+        stack.callback(calc.clear_cache)
+        lib = calc._library
+        if lib._handle != owner.library._handle:
+            raise RuntimeError("The triples library must own the supplied reference")
+        ctx, plan = ct.c_void_p(), ct.c_void_p()
+        _native.check(
+            lib,
+            lib.generativeqc_context_create(
+                ct.byref(calc._context_descriptor()), ct.byref(ctx)
+            ),
+        )
+        stack.callback(lib.generativeqc_context_destroy, ctx)
+        geometry = (ctx, request.atoms, request.charge, request.multiplicity)
+        system = calc._create_native_system(*geometry)
+        stack.callback(lib.generativeqc_system_destroy, system)
+        correlation_fit = calc._create_native_system(*geometry, basis.mp2_fit)
+        stack.callback(lib.generativeqc_system_destroy, correlation_fit)
+        descriptor = calc._method_descriptor(correlation_fit, systems=(request.atoms,))
+        if basis.jk_fit.identity != basis.mp2_fit.identity:
+            jk = calc._create_native_system(*geometry, basis.jk_fit)
+            stack.callback(lib.generativeqc_system_destroy, jk)
+            status = lib.generativeqc_calculation_prepare_ucc_df_fits_v1(
+                ctx, system, ct.byref(descriptor), jk, ct.byref(plan)
+            )
+        else:
+            status = lib.generativeqc_calculation_prepare(
+                ctx, system, ct.byref(descriptor), ct.byref(plan)
+            )
+        _native.check(lib, status, context=ctx)
+        stack.callback(lib.generativeqc_calculation_destroy, plan)
+        native = lib.generativeqc_focal_ucc_triples_v1
+        native.argtypes = [
+            ct.c_void_p,
+            ct.c_void_p,
+            ct.c_int,
+            np.ctypeslib.ndpointer(np.float64, ndim=1, flags="C_CONTIGUOUS"),
+            ct.c_size_t,
+        ]
+        native.restype = ct.c_int
+        output = np.empty(1 + (3 * len(request.atoms) if forces else 0))
+        _native.check(
+            lib, native(plan, owner.handle, forces, output, output.size), context=ctx
+        )
+    return float(output[0]), output[1:].reshape(-1, 3) if forces else None

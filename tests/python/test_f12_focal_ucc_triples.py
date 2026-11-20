@@ -133,3 +133,58 @@ def test_native_triples_preserves_declared_root_and_fits() -> None:
     missing = FocalBasis(2, "missing", "sto-3g", jk_fit="def2-svp")
     with pytest.raises(ValueError, match="requires a correlation fitting basis"):
         conventional_df_ucc_triples(replace(req, basis=missing))
+
+
+def test_triples_from_retained_uhf_and_rhf_references() -> None:
+    from generativeqc._f12_focal_ucc_triples import molecular_triples_on_reference
+    from generativeqc.experimental.f12_focal import df_reference
+
+    req = triples_request()
+    ref = df_reference(req, forces=False)
+    analytic = molecular_triples_on_reference(req, ref, budget_mib=1024, forces=True)
+    energy, forces = molecular_triples_on_reference(
+        req, ref, budget_mib=1024, forces=False
+    )
+    assert forces is None and energy == pytest.approx(analytic[0], abs=2e-13)
+    independent = conventional_df_ucc_triples(req).term
+    assert energy == pytest.approx(independent.energy, abs=3e-11)
+    np.testing.assert_allclose(analytic[1], independent.forces, rtol=0, atol=2e-9)
+    with pytest.raises(ValueError, match="matching molecular reference"):
+        molecular_triples_on_reference(
+            replace(req, surface_id="other"), ref, budget_mib=1024, forces=False
+        )
+
+    # Independent PySCF DF-RCCSD(T) on LiH/STO-3G with def2-SVP fitting.
+    # The force uses the +/- 0.0004-bohr signed energies on the hydrogen z axis.
+    b = req.basis
+    low = FocalBasis(
+        2,
+        "calibration",
+        b.orbital,
+        jk_fit=b.jk_fit,
+        mp2_fit=b.mp2_fit,
+        f12_fit=b.mp2_fit,
+        cabs=b.jk_fit,
+        beta=1.0,
+    )
+    atoms = [("Li", (0.0, 0.0, 0.0)), ("H", (0.1, 0.2, 3.0))]
+    rhf = next(
+        q
+        for q, _ in plan_singlepoint(
+            atoms,
+            FocalSeries(low),
+            FocalSeries(low),
+            None,
+            f12_doubles=low,
+            triples=b,
+            root_id="rhf",
+            correlation_space_id="all-active",
+            backend="cpu_reference",
+        ).steps
+        if q.role == "triples"
+    )
+    r = df_reference(rhf, forces=False)
+    assert len(r.occupied) == 1
+    e, f = molecular_triples_on_reference(rhf, r, budget_mib=1024, forces=True)
+    assert e == pytest.approx(-7.4691686931e-6, abs=8e-12)
+    assert f[1, 2] == pytest.approx(5.63559527e-6, abs=1e-11)

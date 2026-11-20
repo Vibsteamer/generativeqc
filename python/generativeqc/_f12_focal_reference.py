@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import ctypes as ct
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
+from weakref import finalize
 
 import numpy as np
 
@@ -15,6 +16,18 @@ from .elements import checked_integer
 if TYPE_CHECKING:
     from .calculator import Calculator
     from .experimental.f12_focal import Backend, FocalRequest
+
+
+class _NativeFocalReference:
+    """Own an immutable native determinant independently of its original context."""
+
+    def __init__(self, library: ct.CDLL, handle: ct.c_void_p) -> None:
+        self.library = library
+        self.handle = handle
+        release = library.generativeqc_focal_reference_destroy_v1
+        release.argtypes = [ct.c_void_p]
+        release.restype = None
+        finalize(self, release, handle)
 
 
 @dataclass(frozen=True)
@@ -42,6 +55,9 @@ class FocalReference:
     orbital_id: str
     jk_fit_id: str
     occupied_overlaps: tuple[float, ...] | None = None
+    _native_owner: _NativeFocalReference | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def _pair_spin_indices(self, request: FocalRequest) -> tuple[int, int]:
         """Map physical alpha/beta lines to the canonical orbital variables."""
@@ -240,20 +256,20 @@ def df_reference(
             if seed is None
             else "generativeqc_focal_df_reference_seeded_v1"
         )
-        native = getattr(lib, name, None)
+        owned = getattr(lib, "generativeqc_focal_df_reference_owned_v1", None)
+        native = owned if owned is not None else getattr(lib, name, None)
         if native is None:
             raise RuntimeError(f"the native library lacks {name}")
         array = np.ctypeslib.ndpointer(np.float64, ndim=1, flags="C_CONTIGUOUS")
-        native.argtypes = (
-            [ct.c_void_p] * 3
-            + [
-                ct.c_int,
-                ct.c_int,
-                ct.c_size_t,
-            ]
-            + ([array, ct.c_size_t] if seed is not None else [])
-            + [array, ct.c_size_t]
-        )
+        signature = [ct.c_void_p] * 3 + [ct.c_int, ct.c_int, ct.c_size_t]
+        if owned is not None:
+            signature.extend([ct.c_void_p, ct.c_size_t])
+        elif seed is not None:
+            signature.extend([array, ct.c_size_t])
+        signature.extend([array, ct.c_size_t])
+        if owned is not None:
+            signature.append(ct.POINTER(ct.c_void_p))
+        native.argtypes = signature
         native.restype = ct.c_int
         calc._preflight_hf_basis(request.atoms, compute_forces=forces)
         ctx = ct.c_void_p()
@@ -269,18 +285,36 @@ def df_reference(
         owners.callback(lib.generativeqc_system_destroy, system)
         auxiliary = calc._create_native_system(*geometry, jk)
         owners.callback(lib.generativeqc_system_destroy, auxiliary)
-        arguments = ()
+        handle = ct.c_void_p()
+        native_owner = None
+        arguments = (None, 0) if owned is not None else ()
         if seed is not None:
             density, cross = seed._project(request, calc, budget)
-            arguments = (density, density.size)
+            arguments = (
+                density.ctypes.data if owned is not None else density,
+                density.size,
+            )
         raw = np.empty(count)
         _native.check(
             lib,
             native(
-                ctx, system, auxiliary, spin, forces, budget, *arguments, raw, count
+                ctx,
+                system,
+                auxiliary,
+                spin,
+                forces,
+                budget,
+                *arguments,
+                raw,
+                count,
+                *((ct.byref(handle),) if owned is not None else ()),
             ),
             context=ctx,
         )
+        if owned is not None:
+            if not handle.value:
+                raise RuntimeError("The focal DF solve returned no native reference")
+            native_owner = _NativeFocalReference(lib, handle)
     if not np.isfinite(raw).all() or raw[2] != (
         _native.BACKEND_CUDA if cuda else _native.BACKEND_CPU_REFERENCE
     ):
@@ -315,4 +349,5 @@ def df_reference(
         orb.identity,
         jk.identity,
         seed._checked_overlaps(cross, coeff, occupied) if seed is not None else None,
+        native_owner,
     )

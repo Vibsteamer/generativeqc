@@ -1,5 +1,6 @@
 #pragma once
 
+#include "hf/reference.hpp"
 #include "methods/method.hpp"
 
 namespace generativeqc::methods::detail {
@@ -20,6 +21,11 @@ std::unique_ptr<PreparedCalculation> prepare_uccsd_with_reference_fit(
     const Capabilities& capabilities, core::ContextState& context, const core::System& system,
     const generativeqc_method_descriptor& descriptor, const core::System* correlation_auxiliary,
     const core::System* reference_auxiliary);
+
+/** Conventional triples on an already qualified molecular determinant and fitting model. */
+Result focal_ucc_triples(PreparedCalculation& plan,
+                         const std::shared_ptr<const hf::UnrestrictedPhysicalReference>& reference,
+                         const molecule::ScalarHamiltonianIdentity& jk, bool forces);
 
 }  // namespace generativeqc::methods::detail
 

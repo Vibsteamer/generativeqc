@@ -39,6 +39,8 @@ if TYPE_CHECKING:
 
     from ._f12_cc_stationary import UCCSDF12Pullback
     from ._f12_ucc_solver import (
+        CudaCCTensorExecutor,
+        NativeCCTensorExecutor,
         SolverOptions,
         UCCSDLambdaOptions,
         UCCSDLambdaResult,
@@ -295,23 +297,10 @@ class MolecularFocalProvider:
             reference_forces=False,
         )
 
-    def _ucc_stationary(
-        self,
-        request: FocalRequest,
-        options: SolverOptions | None,
-        lambda_options: UCCSDLambdaOptions | None,
-        *,
-        source_cotangents: bool,
-        reference_forces: bool,
-    ) -> FocalUCCStationary:
-        from ._f12_ucc_solver import (
-            CudaCCTensorExecutor,
-            NativeCCTensorExecutor,
-            SolverOptions,
-            UCCSDLambdaOptions,
-            solve_focal_uccsd_f12b,
-            solve_focal_uccsd_f12b_with_cotangents,
-        )
+    def _cc_executor(
+        self, request: FocalRequest
+    ) -> tuple[NativeCCTensorExecutor | CudaCCTensorExecutor, int]:
+        from ._f12_ucc_solver import CudaCCTensorExecutor, NativeCCTensorExecutor
 
         budget = (
             checked_integer(
@@ -342,8 +331,34 @@ class MolecularFocalProvider:
             raise ValueError(
                 "A molecular UCC stationary solve requires an explicit backend"
             )
+        return executor, budget
+
+    def _ucc_stationary(
+        self,
+        request: FocalRequest,
+        options: SolverOptions | None,
+        lambda_options: UCCSDLambdaOptions | None,
+        *,
+        source_cotangents: bool,
+        reference_forces: bool,
+        reference: FocalReference | None = None,
+        expected_cabs_rank: int | None = None,
+    ) -> FocalUCCStationary:
+        from ._f12_ucc_solver import (
+            SolverOptions,
+            UCCSDLambdaOptions,
+            solve_focal_uccsd_f12b,
+            solve_focal_uccsd_f12b_with_cotangents,
+        )
+
+        executor, budget = self._cc_executor(request)
         sources = molecular_ucc_sources(
-            self, request, include_ordinary=True, reference_forces=reference_forces
+            self,
+            request,
+            include_ordinary=True,
+            reference_forces=reference_forces,
+            reference=reference,
+            expected_cabs_rank=expected_cabs_rank,
         )
         if options is None:
             options = SolverOptions(max_bytes=budget)
@@ -369,6 +384,88 @@ class MolecularFocalProvider:
             )
             weights = None
         return FocalUCCStationary(sources, primal, dual, weights)
+
+    def f12_doubles_energy(
+        self,
+        pair_request: FocalRequest,
+        *,
+        low_order: FocalLowOrderEnergy,
+        expected_cabs_rank: int | None = None,
+    ) -> float:
+        """CCSD-F12b minus MP2-F12 on the supplied determinant and CABS rank."""
+        from ._f12_ucc_solver import SolverOptions, solve_focal_uccsd_f12b_energy
+
+        if expected_cabs_rank is not None and expected_cabs_rank != low_order.cabs_rank:
+            raise ValueError("The displaced and low-order CABS ranks disagree")
+        sources = molecular_ucc_sources(
+            self,
+            pair_request,
+            include_ordinary=True,
+            reference=low_order.reference,
+            expected_cabs_rank=low_order.cabs_rank,
+        )
+        executor, budget = self._cc_executor(pair_request)
+        correlation = solve_focal_uccsd_f12b_energy(
+            sources,
+            options=SolverOptions(max_bytes=budget),
+            executor=executor,
+        )
+        return correlation - low_order.mp2_f12_correlation_energy
+
+    def f12_doubles_energy_and_forces(
+        self,
+        pair_request: FocalRequest,
+        *,
+        low_order: FocalLowOrderForces,
+    ) -> tuple[float, np.ndarray]:
+        """Differentiate CCSD-F12b minus the supplied matched MP2-F12 energy."""
+        low = low_order.energies
+        solution = self._ucc_stationary(
+            pair_request,
+            None,
+            None,
+            source_cotangents=True,
+            reference_forces=False,
+            reference=low.reference,
+            expected_cabs_rank=low.cabs_rank,
+        )
+        ordinary, fixed = self._ucc_correlation_forces(pair_request, solution)
+        assert solution.primal.correlation_energy is not None
+        return (
+            solution.primal.correlation_energy - low.mp2_f12_correlation_energy,
+            ordinary + fixed - low_order.mp2_f12_correlation_forces,
+        )
+
+    def triples_energy(
+        self, request: FocalRequest, *, reference: FocalReference
+    ) -> float:
+        """Conventional triples on the supplied canonical determinant in Eh."""
+        from ._f12_focal_ucc_triples import molecular_triples_on_reference
+
+        return molecular_triples_on_reference(
+            request,
+            reference,
+            budget_mib=self.budget_mib,
+            forces=False,
+        )[0]
+
+    def triples_energy_and_forces(
+        self,
+        request: FocalRequest,
+        *,
+        reference: FocalReference,
+    ) -> tuple[float, np.ndarray]:
+        """Conventional triples and its analytic Cartesian forces on a shared root."""
+        from ._f12_focal_ucc_triples import molecular_triples_on_reference
+
+        energy, forces = molecular_triples_on_reference(
+            request,
+            reference,
+            budget_mib=self.budget_mib,
+            forces=True,
+        )
+        assert forces is not None
+        return energy, forces
 
     def ucc_ordinary_source_forces(
         self, request: FocalRequest, solution: FocalUCCStationary

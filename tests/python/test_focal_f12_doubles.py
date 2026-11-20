@@ -128,3 +128,21 @@ def test_singlet_rhf_doubles_share_the_spatial_orbital_response() -> None:
     np.testing.assert_allclose(
         result.term.forces, [expected, -expected], rtol=0, atol=3e-9
     )
+
+
+def test_forward_doubles_on_same_low_order_determinant() -> None:
+    shell = os.environ.get("GENERATIVEQC_F12_HOST_SINK")
+    if not shell:
+        pytest.skip("requires native molecular integrals")
+    req = request(XYZ, (0, 1, 2))
+    provider = MolecularFocalProvider(shell_library=Path(shell))
+    low = provider.low_order_energy(req)
+    delta = provider.f12_doubles_energy(req, low_order=low)
+    # Correlation from the independent dense H3 fixed-cusp amplitude solve.
+    assert delta + low.mp2_f12_correlation_energy == pytest.approx(
+        -0.06269423582838254, abs=2e-9
+    )
+    with pytest.raises(ValueError, match="CABS ranks"):
+        provider.f12_doubles_energy(
+            req, low_order=low, expected_cabs_rank=low.cabs_rank + 1
+        )
