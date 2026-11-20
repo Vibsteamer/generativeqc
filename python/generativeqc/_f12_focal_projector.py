@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
-import ctypes
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 from ._f12_cabs import CABSProjector, cabs_projector
-from ._f12_focal_one_electron import FocalOneElectron
 from .elements import checked_integer
 
 if TYPE_CHECKING:
+    import ctypes
+
+    from ._f12_focal_one_electron import FocalOneElectron
     from .experimental.f12_focal import FocalRequest
 
 
@@ -60,11 +61,18 @@ def _reference(
     if seed is not None:
         u = 0.5 * (seed + seed.T)
         if full:
-            bar = -(kernel @ u @ kernel)
+            # A small U K may result from cancellation between large elements
+            # of K. Its leading digits also determine the subsequent K U K.
+            # The OBS lift term uses the same product.
+            wide_kernel = kernel.astype(np.longdouble)
+            uk = u.astype(np.longdouble) @ wide_kernel
+            bar = np.asarray(-(wide_kernel @ uk), dtype=np.float64)
+            rhs = np.asarray(uk[:obs], dtype=np.float64)
         else:
             # The fixed-rank derivative includes rotations across the cutoff.
             bar = lift @ state.vjp(lift.T @ u @ lift) @ lift.T
-        cross_bar = cho_solve(chol, u[:obs] @ kernel)
+            rhs = u[:obs] @ kernel
+        cross_bar = cho_solve(chol, rhs)
         bar[:obs] -= cross_bar
         bar[:, :obs] -= cross_bar.T
         bar = 0.5 * (bar + bar.T)

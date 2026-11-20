@@ -8,7 +8,7 @@ import pytest
 from generativeqc.experimental.f12_focal import FocalOneElectron, focal_cabs_projector
 
 
-def independent_kernel(s, obs, cutoff):
+def independent_kernel(s: np.ndarray, obs: int, cutoff: float) -> np.ndarray:
     features = np.linalg.cholesky(s).T
     q, _ = np.linalg.qr(features[:, :obs])
     aux = features[:, obs:]
@@ -18,7 +18,7 @@ def independent_kernel(s, obs, cutoff):
 
 
 @pytest.mark.parametrize("small, rank", [(0.45, 3), (0.017, 2)])
-def test_focal_cabs_fixed_rank_direction(small, rank):
+def test_focal_cabs_fixed_rank_direction(small: float, rank: int) -> None:
     rng = np.random.default_rng(907)
     a = np.array([[1.0, 0.1], [0.1, 0.86]])
     b = rng.normal(size=(2, 3)) * 0.1
@@ -55,3 +55,32 @@ def test_focal_cabs_fixed_rank_direction(small, rank):
         focal_cabs_projector(request, one, expected_rank=5 - rank, relative_cutoff=0.1)
     with pytest.raises(ValueError, match="surfaces"):
         focal_cabs_projector(request, replace(one, surface_id="displaced"))
+
+
+def test_diffuse_metric_response_preserves_cancellation() -> None:
+    rng = np.random.default_rng(901)
+    n, obs = 48, 23
+    vectors, _ = np.linalg.qr(rng.normal(size=(n, n)))
+    features = np.sqrt(np.geomspace(1e-7, 2.0, n))[:, None] * vectors.T
+    s = features.T @ features
+    q = rng.normal(size=n)
+    q /= np.linalg.norm(q)
+    b = s @ q
+    motion = features.T @ (0.03 * rng.normal(size=(n, n)))
+    ds = motion + motion.T
+    one = FocalOneElectron(
+        s, s, None, None, obs, "geometry", "basis", "cpu_reference", 0
+    )
+    request = SimpleNamespace(
+        role="hf_cabs",
+        backend="cpu_reference",
+        surface_id="geometry",
+        basis=SimpleNamespace(basis_id="basis", cabs=object()),
+    )
+    result = focal_cabs_projector(
+        request, one, expected_rank=n - obs, cotangent=np.outer(b, b)
+    )
+    residual = q.copy()
+    residual[:obs] -= np.linalg.solve(s[:obs, :obs], b[:obs])
+    response = np.vdot(result.overlap_bar, ds) + 2 * q @ ds @ (result.kernel @ b)
+    assert response == pytest.approx(residual @ ds @ residual, abs=2e-8)

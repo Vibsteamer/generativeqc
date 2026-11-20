@@ -81,6 +81,19 @@ __global__ void newton_normalizer(const double* c, const Extended* sc, size_t n,
   }
 }
 
+// A diffuse full-rank complement can have large inverse-metric elements.
+// Preserve cancellation in the two contractions of its kernel cotangent.
+__global__ void compensated_square_product(const double* left, const double* right, size_t n,
+                                           double scale, double* product) {
+  for (size_t pos = blockIdx.x * blockDim.x + threadIdx.x; pos < n * n;
+       pos += size_t(blockDim.x) * gridDim.x) {
+    const size_t row = pos % n, col = pos / n;
+    Extended sum{};
+    for (size_t j = 0; j < n; ++j) sum.add_product(left[row + j * n], right[j + col * n]);
+    product[pos] = scale * (sum.hi + sum.lo);
+  }
+}
+
 __global__ void pack_frame(const double* column_major, std::size_t rows, std::size_t cols,
                            double* row_major, int* bad) {
   for (std::size_t k = blockIdx.x * blockDim.x + threadIdx.x; k < rows * cols;
@@ -92,12 +105,12 @@ __global__ void pack_frame(const double* column_major, std::size_t rows, std::si
 }
 
 __global__ void assemble_response(const double* from_metric, const double* from_lift, std::size_t n,
-                                  std::size_t o, double* out) {
+                                  std::size_t o, std::size_t lift_stride, double* out) {
   for (std::size_t k = blockIdx.x * blockDim.x + threadIdx.x; k < n * n;
        k += std::size_t(blockDim.x) * gridDim.x) {
     const auto i = k % n, j = k / n;
     out[k] = .5 * from_metric[k] + .5 * from_metric[j + i * n] -
-             (i < o ? from_lift[i + o * j] : 0.) - (j < o ? from_lift[j + o * i] : 0.);
+             (i < o ? from_lift[i + lift_stride * j] : 0.) - (j < o ? from_lift[j + lift_stride * i] : 0.);
   }
 }
 
@@ -264,8 +277,8 @@ void evaluate(int device, int n, int o, double cutoff, double guard, int expecte
     if (full_rank) {
       // K = S^-1 - O, O=embed(A^-1). Its full-rank derivative uses the same
       // realized K as the forward evaluation. The two cross terms follow below.
-      gemm(false, false, n, n, n, k, n, s, n, tmp, n);
-      gemm(false, false, n, n, n, tmp, n, k, n, tmp2, n, -1.);
+      compensated_square_product<<<blocks(nn), 256, 0, stream.get()>>>(s, k, n, 1., tmp);
+      compensated_square_product<<<blocks(nn), 256, 0, stream.get()>>>(k, tmp, n, -1., tmp2);
     } else {
       // G=frechet(T^+)[J^T U J]. Include retained/discarded rotations.
       gemm(false, false, n, x, n, s, n, j, n, tmp, n);
@@ -276,9 +289,10 @@ void evaluate(int device, int n, int o, double cutoff, double guard, int expecte
       gemm(false, true, n, n, x, tmp, n, j, n, tmp2, n);
     }
     // bar_S = J G J^T - O U K - K U O, O contains A^-1 in the OBS block.
-    gemm(false, false, o, n, n, s, n, k, n, tmp, o);
-    solve_obs(tmp, n, o, 1.);
-    assemble_response<<<blocks(nn), 256, 0, stream.get()>>>(tmp2, tmp, n, o, s);
+    const int lift_stride = full_rank ? n : o;
+    if (!full_rank) gemm(false, false, o, n, n, s, n, k, n, tmp, o);
+    solve_obs(tmp, n, lift_stride, 1.);
+    assemble_response<<<blocks(nn), 256, 0, stream.get()>>>(tmp2, tmp, n, o, lift_stride, s);
     symmetrize<<<blocks(nn), 256, 0, stream.get()>>>(s, n, false, info.get());
   }
   check_flags(stream, info.get(), 1, "nonfinite CABS projector or overlap response");
