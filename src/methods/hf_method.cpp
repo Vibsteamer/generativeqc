@@ -13,7 +13,7 @@
 #include "methods/batch_capabilities.hpp"
 #include "methods/scf_common_options.hpp"
 #include "runtime/execution_context.hpp"
-#include "scf/cuda/df_spin_domain.hpp"
+#include "methods/hf_ecp_df.hpp"
 #include "scf/fleet.hpp"
 #include "scf/fock_prepared.hpp"
 #include "scf/hf_fock_work.hpp"
@@ -439,38 +439,6 @@ generativeqc_status validate_hf_system(generativeqc_method method, const core::S
   return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
 }
 
-// Admit the tested scalar small-core halogen hydride domain. The native source
-// and spin solver independently validate the actual fitting and orbital shells.
-static void prepare_ecp_df_uhf(core::System& system, const scf::ScfOptions& options,
-                               generativeqc_method method, const runtime::ExecutionContext& execution,
-                               const std::optional<core::System>& auxiliary) {
-  if (system.ecp_terms.empty() || options.density_fitting_mode == GENERATIVEQC_DENSITY_FITTING_NONE)
-    return;
-  bool supported = method == GENERATIVEQC_METHOD_UHF && execution.cuda_requested() &&
-                   options.density_fitting_mode == GENERATIVEQC_DENSITY_FITTING_CUDA &&
-                   options.precision_mode == GENERATIVEQC_PRECISION_FP64 && auxiliary &&
-                   system.charge == 0 && system.multiplicity == 2 &&
-                   system.basis_representation == core::kSphericalBasis;
-  unsigned halogens = 0;
-  bool bromine = false;
-  for (const auto& atom : system.atoms) {
-    if (atom.atomic_number == 1 && atom.ecp_core == 0) continue;
-    ++halogens;
-    bool br = atom.atomic_number == 35 && atom.ecp_core == 10;
-    supported &= br || (atom.atomic_number == 53 && atom.ecp_core == 28);
-    bromine |= br;
-  }
-  const unsigned limit = scf::cuda_execution::fitted_halogen_dihydride_doublet(system) ? 4U : 3U;
-  if (!supported || halogens != 1 ||
-      std::any_of(system.shells.begin(), system.shells.end(),
-                  [limit](const auto& s) { return s.angular_momentum > limit; }) ||
-      std::any_of(auxiliary->shells.begin(), auxiliary->shells.end(),
-                  [](const auto& s) { return s.angular_momentum > 5; }))
-    throw MethodError(GENERATIVEQC_STATUS_NOT_IMPLEMENTED,
-                      "ECP density-fitting execution is not yet validated for this reference domain");
-  system.refine_ecp_quadrature = bromine;
-}
-
 std::unique_ptr<PreparedCalculation> prepare_hf_calculation(
     const Capabilities& capabilities, core::ContextState& context, const core::System& system,
     const generativeqc_method_descriptor& descriptor, const core::System* auxiliary_basis) {
@@ -485,7 +453,8 @@ std::unique_ptr<PreparedCalculation> prepare_hf_calculation(
   resolve_hf_options(options, capabilities.method, execution);
   core::System prepared_system = system;
   if (options.density_fitting_mode != GENERATIVEQC_DENSITY_FITTING_NONE) {
-    prepare_ecp_df_uhf(prepared_system, options, capabilities.method, execution, auxiliary);
+    prepare_ecp_df_uhf(prepared_system, options, capabilities.method, execution,
+                       auxiliary ? &*auxiliary : nullptr);
     validate_density_fitting_auxiliary(system, auxiliary);
   }
   return std::make_unique<HfPreparedCalculation>(capabilities, std::move(execution), std::move(prepared_system),
@@ -516,7 +485,8 @@ std::unique_ptr<PreparedBatch> prepare_hf_batch(const Capabilities& capabilities
   resolve_hf_options(options, capabilities.method, execution);
   if (options.density_fitting_mode != GENERATIVEQC_DENSITY_FITTING_NONE)
     for (auto& system : systems)
-      prepare_ecp_df_uhf(system, options, capabilities.method, execution, auxiliary);
+      prepare_ecp_df_uhf(system, options, capabilities.method, execution,
+                       auxiliary ? &*auxiliary : nullptr);
   if (options.density_fitting_mode != GENERATIVEQC_DENSITY_FITTING_NONE && auxiliary.has_value()) {
     if (auxiliary->atoms.size() != systems.front().atoms.size()) {
       throw MethodError(GENERATIVEQC_STATUS_INVALID_ARGUMENT,

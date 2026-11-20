@@ -1,13 +1,16 @@
 // Private Python bridge to the native canonical DF-HF owner, on one cold geometry.
 #include <algorithm>
 #include <cmath>
+#include <optional>
 #include <span>
 
 #include "api/error.hpp"
 #include "api/handles.hpp"
+#include "methods/hf_ecp_df.hpp"
 #include "molecule/basis.hpp"
 #include "posthf/capacity.hpp"
 #include "runtime/bounded_workspace.hpp"
+#include "runtime/execution_context.hpp"
 #include "scf/mean_field.hpp"
 
 extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_df_reference_v1(
@@ -30,16 +33,15 @@ extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_df_reference_
         aux.basis_representation != core::kSphericalBasis)
       throw std::invalid_argument(
           "focal reference requires real-spherical orbital and JKFit representations");
-    if (!sys.ecp_terms.empty() || !aux.ecp_terms.empty())
-      throw std::invalid_argument("focal reference requires an all-electron Hamiltonian");
+    if (!aux.ecp_terms.empty())
+      throw std::invalid_argument("the focal JKFit describes Coulomb fitting functions only");
     if (sys.atoms.size() != aux.atoms.size() || sys.charge != aux.charge ||
-        sys.multiplicity != aux.multiplicity || sys.electron_count != aux.electron_count)
+        sys.multiplicity != aux.multiplicity)
       throw std::invalid_argument(
           "focal reference systems differ in geometry, charge or multiplicity");
     for (std::size_t i = 0; i < sys.atoms.size(); ++i)
       if (sys.atoms[i].atomic_number != aux.atoms[i].atomic_number ||
-          sys.atoms[i].position != aux.atoms[i].position || sys.atoms[i].ecp_core ||
-          aux.atoms[i].ecp_core)
+          sys.atoms[i].position != aux.atoms[i].position || aux.atoms[i].ecp_core)
         throw std::invalid_argument("focal reference nuclei or effective charges differ");
     const auto n = molecule::ao_count(sys), nn = runtime::size_mul(n, n);
     const auto nforce = forces ? runtime::size_mul(3, sys.atoms.size()) : 0;
@@ -82,9 +84,21 @@ extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_df_reference_
     options.resolved_fock_build = scf::resolve_fock_build(
         spec, cuda ? scf::FockBackend::Cuda : scf::FockBackend::Cpu, options.screening_tolerance,
         options.density_fitting_relative_threshold);
-    const auto state =
-        cuda ? scf::run_cuda_independent_fock_strategy(sys, &aux, options, context->state.device_id)
-             : scf::run_cpu_fock_strategy(sys, &aux, options);
+    // Only the orbital system defines occupations and the scalar Hamiltonian.
+    // Keep the JKFit as supplied, with its own Gaussian shells on the same nuclei.
+    std::optional<core::System> prepared_ecp;
+    if (!sys.ecp_terms.empty()) {
+      prepared_ecp = sys;
+      options.density_fitting_mode = cuda ? GENERATIVEQC_DENSITY_FITTING_CUDA
+                                          : GENERATIVEQC_DENSITY_FITTING_CPU_REFERENCE;
+      methods::detail::prepare_ecp_df_uhf(*prepared_ecp, options,
+          spins == 1 ? GENERATIVEQC_METHOD_RHF : GENERATIVEQC_METHOD_UHF,
+          runtime::ExecutionContext(context->state), &aux);
+    }
+    const auto& physical = prepared_ecp ? *prepared_ecp : sys;
+    const auto state = cuda ? scf::run_cuda_independent_fock_strategy(
+                                  physical, &aux, options, context->state.device_id)
+                            : scf::run_cpu_fock_strategy(physical, &aux, options);
     if (!state.converged) {
       context->last_detail = "canonical DF-HF did not converge";
       return GENERATIVEQC_STATUS_SCF_NOT_CONVERGED;

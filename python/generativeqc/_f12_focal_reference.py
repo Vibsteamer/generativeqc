@@ -45,10 +45,12 @@ class FocalReference:
 def df_reference(
     request: FocalRequest, *, forces: bool = True, budget_mib: int = 512
 ) -> FocalReference:
-    """Solve canonical all-electron DF-RHF/DF-UHF using the declared OBS and JKFit.
+    """Solve canonical DF-RHF/DF-UHF using the declared OBS and JKFit.
 
     Use root_id="rhf" or "uhf" for the respective cold solver. Both J and K
-    use the same Coulomb metric with relative cutoff 1e-10. With forces=True
+    use the same Coulomb metric with relative cutoff 1e-10. A scalar ECP on
+    the OBS uses the native CUDA FP64 fitted halogen-hydride UHF domain. The
+    JKFit supplies only Coulomb fitting functions. With forces=True
     the same solve also evaluates the reference's analytic nuclear forces.
     The CUDA path uses the native CUDA DF operator and derivative providers
     with host SCF control. The budget limits detached output and native reference
@@ -76,12 +78,26 @@ def df_reference(
         if record.representation != "spherical":
             raise ValueError("DF focal reference requires real-spherical OBS and JKFit")
         if any(
-            record.by_element[a.atomic_number].ecp_core_electrons
-            or record.by_element[a.atomic_number].nuclear_charge != a.atomic_number
+            record.by_element[a.atomic_number].nuclear_charge != a.atomic_number
             for a in request.atoms
         ):
             raise NotImplementedError(
-                "DF focal reference currently admits all-electron systems"
+                "DF focal reference requires physical nuclear charges"
+            )
+    if any(jk.by_element[a.atomic_number].ecp_core_electrons for a in request.atoms):
+        raise ValueError("the focal JKFit describes Coulomb fitting functions only")
+    if any(orb.by_element[a.atomic_number].ecp_core_electrons for a in request.atoms):
+        from .ecp import fitted_uhf_hydride_domain
+
+        if (
+            request.root_id != "uhf"
+            or request.backend != "cuda"
+            or not fitted_uhf_hydride_domain(
+                orb, request.atoms, request.charge, request.multiplicity
+            )
+        ):
+            raise NotImplementedError(
+                "focal scalar ECP requires the native CUDA DF-UHF hydride domain"
             )
 
     from .calculator import Calculator

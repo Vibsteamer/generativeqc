@@ -172,3 +172,19 @@ def test_cuda_geometry_projectors_against_three_center_oracle(symbol: str) -> No
         req, library=Path(library), derivatives=False, budget_mib=160
     )
     np.testing.assert_allclose(only.hcore, h, atol=2e-9, rtol=0)
+
+
+def test_focal_reference_keeps_ecp_on_orbital_system_only() -> None:
+    from generativeqc.experimental.f12_focal import df_reference
+
+    xyz = np.array([[0, 0, 0], [0, 0, 3.25], [2.7625, 0.21, -1.04]])
+    req, _ = _request("I", xyz)
+    with pytest.raises(ValueError, match="JKFit describes Coulomb fitting"):
+        df_reference(req)
+    bare_fit = replace(req.basis, jk_fit=req.basis.cabs)
+    with pytest.raises(NotImplementedError, match="native CUDA DF-UHF"):
+        df_reference(replace(req, basis=bare_fit))
+    with pytest.raises(NotImplementedError, match="native CUDA DF-UHF"):
+        df_reference(
+            replace(req, basis=bare_fit, root_id="rhf", multiplicity=1, backend="cuda")
+        )
