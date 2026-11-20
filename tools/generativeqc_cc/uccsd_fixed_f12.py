@@ -20,13 +20,15 @@ from generativeqc_compiler.common.resources import checked_bytes
 from generativeqc_compiler.tensor.cpu import emit_cpu
 from generativeqc_compiler.tensor.cuda_plan import plan_cuda
 
-from tools.generativeqc_response.implicit import ResponseGMRES
+from tools.generativeqc_response.implicit import ImplicitSolveError, ResponseGMRES
 
 from .native_tensor_cpu import NativeCCTensorExecutor
 from .native_tensor_cuda import CudaCCTensorExecutor
 from .solver import SolverOptions
 from .uccsd_lambda import UCCSDLambdaOptions, _PackedUCCSDLambda
 from .uccsd_solver import (
+    UCCSDIteration,
+    UCCSDResult,
     _denominator_minimum,
     _denominators,
     _iteration_bytes,
@@ -37,7 +39,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from typing import Any
 
-    from .uccsd_solver import UCCSDResult
+    from .uccsd_lambda import UCCSDParameterCotangent
 
 
 def _digest(values: np.ndarray) -> str:
@@ -215,6 +217,60 @@ class _PreparedFixedSourceUCCSD(_PackedUCCSD):
         self._closed = False
         self.preparation_seconds = time.perf_counter() - started
 
+    def _replay_fixed_source_amplitudes(
+        self, packed_amplitudes: np.ndarray, correlation_energy: float
+    ) -> UCCSDResult:
+        """Bind the exact supplied amplitudes after native energy/residual replay."""
+        if isinstance(correlation_energy, bool) or not math.isfinite(
+            correlation_energy
+        ):
+            raise ValueError("archived UCCSD correlation energy must be finite")
+        packed = _checked_array(
+            "packed UCCSD amplitudes", packed_amplitudes, (self.layout.packed_size,)
+        )
+        outputs = self.evaluate(packed)
+        energy = float(outputs["correlation_energy"])
+        drift = abs(energy - correlation_energy)
+        maxima = tuple(
+            (name, float(np.max(np.abs(residual), initial=0)))
+            for name, residual in outputs.items()
+            if name != "correlation_energy"
+        )
+        residual = max(value for _, value in maxima)
+        if (
+            drift > self.options.energy_tolerance
+            or residual > self.options.residual_tolerance
+        ):
+            raise ImplicitSolveError(
+                "archived UCCSD amplitudes failed fresh physical replay"
+            )
+        return UCCSDResult(
+            "converged",
+            "archived energy and all freshly evaluated physical residuals passed",
+            energy,
+            self.reference.reference_energy + energy,
+            MappingProxyType(
+                {
+                    name: immutable(value)
+                    for name, value in self.layout.unpack(packed).items()
+                }
+            ),
+            packed,
+            (UCCSDIteration(0, energy, float(drift), residual, maxima),),
+            MappingProxyType(
+                {
+                    "reference_id": self.reference.identity,
+                    "hamiltonian_id": self.reference.hamiltonian_id,
+                    "integral_hash": self.integral_hash,
+                    "equation_hash": self.program.logical_hash,
+                    "tensor_backend": self.executor.backend,
+                    "iteration_backend": "archived-state-physical-replay",
+                    "physical_evaluations": 1,
+                    "solver_numeric_bound_bytes": self.logical_required_bytes,
+                }
+            ),
+        )
+
 
 def _gap_workspace_bytes(dimension: int) -> int:
     # Reserve the frozen gaps, the diagonal/inverse snapshots, and two
@@ -313,3 +369,19 @@ class _PreparedFixedSourceUCCSDLambda(_PackedUCCSDLambda):
                     dimension=dimension, options=options.gmres, gaps=gaps
                 )
         super().__init__(prepared, state, options=options, solver=solver)
+
+    def _replay_fixed_source_parameter_cotangent(
+        self, packed_multipliers: np.ndarray, parameter: str
+    ) -> UCCSDParameterCotangent:
+        """Check a supplied packed dual against this native center and take its VJP."""
+        self._check_open()
+        started = time.perf_counter()
+        packed = _checked_array(
+            "packed Lambda multipliers", packed_multipliers, (self.layout.packed_size,)
+        )
+        return self._parameter_cotangent_from_packed(
+            packed,
+            parameter,
+            lambda_identity=self._lambda_identity(packed),
+            started=started,
+        )

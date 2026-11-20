@@ -25,6 +25,7 @@ from tools.generativeqc_cc.uccsd_fixed_f12 import (
     _PreparedFixedSourceUCCSDLambda,
 )
 from tools.generativeqc_cc.uccsd_lambda import UCCSDLambdaOptions
+from tools.generativeqc_response.implicit import ImplicitSolveError
 
 _LAYOUT = UCCSDLayout(2, 2, 2, 2)
 _ENERGY_ALPHA = np.repeat((-0.8, 0.7), 2)
@@ -160,8 +161,24 @@ def test_fixed_source_stationarity_and_cotangent_against_independent_root(
         np.testing.assert_allclose(
             state.packed_amplitudes, expected, rtol=0, atol=2e-11
         )
+        archived_t = state.packed_amplitudes.copy()
+        replayed_t = owner._replay_fixed_source_amplitudes(
+            archived_t, state.correlation_energy
+        )
+        assert replayed_t.converged
+        assert replayed_t.correlation_energy == state.correlation_energy
+        archived_t[0] += 0.01
+        np.testing.assert_array_equal(
+            replayed_t.packed_amplitudes, state.packed_amplitudes
+        )
+        with pytest.raises(ImplicitSolveError, match="fresh physical replay"):
+            owner._replay_fixed_source_amplitudes(archived_t, state.correlation_energy)
+        with pytest.raises(ImplicitSolveError, match="fresh physical replay"):
+            owner._replay_fixed_source_amplitudes(
+                state.packed_amplitudes, state.correlation_energy + 1e-5
+            )
         with _PreparedFixedSourceUCCSDLambda(
-            owner, state, orbital_gap_preconditioner=preconditioned
+            owner, replayed_t, orbital_gap_preconditioner=preconditioned
         ) as response:
             result = response.solve()
             assert result.converged
@@ -175,11 +192,44 @@ def test_fixed_source_stationarity_and_cotangent_against_independent_root(
             np.testing.assert_allclose(
                 result.packed_multipliers, expected_lambda, rtol=0, atol=3e-11
             )
+            alpha_direction = direction[:2, :2, :2, :2].copy()
             cotangent = response.parameter_cotangent(result, "c_f12_aaaa")
-            actual_derivative = cotangent.contract(direction[:2, :2, :2, :2].copy())
+            actual_derivative = cotangent.contract(alpha_direction)
             assert actual_derivative == pytest.approx(
                 expected_derivative, rel=0, abs=2e-10
             )
+            archived = result.packed_multipliers.copy()
+            replay = response._replay_fixed_source_parameter_cotangent(
+                archived, "c_f12_aaaa"
+            )
+            np.testing.assert_array_equal(replay.values, cotangent.values)
+            assert replay.lambda_identity == result.lambda_identity
+            assert (
+                replay.provenance["primal_residual_max"]
+                <= response.options.cc_tolerance
+            )
+            assert (
+                replay.provenance["stationarity_max"]
+                <= response.options.lambda_tolerance
+            )
+            archived[0] += 0.01
+            with pytest.raises(
+                ImplicitSolveError, match="fresh Lagrangian stationarity"
+            ):
+                response._replay_fixed_source_parameter_cotangent(
+                    archived, "c_f12_aaaa"
+                )
+            assert replay.contract(alpha_direction) == actual_derivative
+            for wrong in (archived[:-1], archived.astype(np.float32)):
+                with pytest.raises(ValueError, match="native FP64"):
+                    response._replay_fixed_source_parameter_cotangent(
+                        wrong, "c_f12_aaaa"
+                    )
+            archived[0] = np.nan
+            with pytest.raises(ValueError, match="finite"):
+                response._replay_fixed_source_parameter_cotangent(
+                    archived, "c_f12_aaaa"
+                )
 
 
 def test_fixed_source_binding_and_numeric_admission(

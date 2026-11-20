@@ -37,7 +37,7 @@ from tools.generativeqc_response.implicit import (
 )
 
 from .native_tensor_cuda import CudaCCTensorExecutor
-from .uccsd_solver import _PackedUCCSD, PreparedUCCSD, UCCSDResult
+from .uccsd_solver import PreparedUCCSD, UCCSDResult, _PackedUCCSD
 
 if TYPE_CHECKING:
     from typing_extensions import Self
@@ -742,6 +742,19 @@ class _PackedUCCSDLambda:
         self._check_open()
         started = time.perf_counter()
         packed = self._packed_result(result)
+        return self._parameter_cotangent_from_packed(
+            packed, parameter, lambda_identity=result.lambda_identity, started=started
+        )
+
+    def _parameter_cotangent_from_packed(
+        self,
+        packed: np.ndarray,
+        parameter: str,
+        *,
+        lambda_identity: str,
+        started: float,
+    ) -> UCCSDParameterCotangent:
+        """Evaluate a detached physical dual under the common response budget."""
         action = self._parameter_programs.get(parameter)
         if action is None:
             action = build_parameter_vjp(
@@ -771,9 +784,8 @@ class _PackedUCCSDLambda:
             raise MemoryError(
                 "UCCSD parameter response numeric/semantic-work budget exceeded"
             )
-        packed = immutable(packed)
         counter = _Counter()
-        self._qualify_parent(counter)
+        primal_residual, energy_drift = self._qualify_parent(counter)
         stationary_norm, stationary_max = self._stationarity(packed, counter)
         outputs = self._execute(
             action.program,
@@ -785,13 +797,15 @@ class _PackedUCCSDLambda:
             parameter,
             immutable(outputs[f"bar_{parameter}"]),
             self.state_identity,
-            result.lambda_identity,
+            lambda_identity,
             action.derivative_hash,
             MappingProxyType(
                 {
                     "tensor_backend": self.prepared.executor.backend,
                     "numeric_bound_bytes": peak,
                     "executed_semantic_scalar_work": counter.scalar_work,
+                    "primal_residual_max": primal_residual,
+                    "energy_drift": energy_drift,
                     "stationarity_norm": stationary_norm,
                     "stationarity_max": stationary_max,
                     "scope": "one independent fixed-orbital correlation-Lagrangian input; not a relaxed RDM or force",
