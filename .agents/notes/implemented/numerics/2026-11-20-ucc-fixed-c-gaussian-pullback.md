@@ -18,3 +18,14 @@ contracted AO derivatives agree with the stationary C-source force to
 sources use 36 signed nuclear displacements with ordinary UHF orbital
 phases referred to the central root. Maximum errors over the 54 individual
 force components are 2.60e−8 and 6.52e−9 Eh/Bohr at 0.0002 and 0.0001 Bohr.
+
+L20 job `2123770743018749952` evaluated 20 distinct electronic CUDA graphs
+in 92 calls. Two Coulomb and two geminal Gaussian derivative contractions
+were evaluated on the physical geometry. The same spin frames consumed
+the archived orbital response, overlap derivatives and the complete
+158-by-158 core-Hamiltonian derivatives of the previously qualified L20 root.
+Recontracting the returned weights independently with each source and
+coordinate reproduced the separate forces to 3.16e−15 Eh/Bohr. The
+nine-coordinate C contribution agreed with the six original stationary
+source actions to 2.94e−14 Eh/Bohr. The original L20 archive SHA-256 is
+`6f43f2501ac84a3a99db4b31f2e564dacedf2defce924c069cb1bdb2280e55af`.
