@@ -1013,6 +1013,26 @@ def singlepoint_energy(
         protocol_id=protocol_id,
     )
     if center is not None:
+        cabs_requests = {
+            q.basis.basis_id: q
+            for q, _ in plan.steps
+            if q.role in ("hf_cabs", "mp2_f12_correlation", "ccsd_f12b_minus_mp2_f12")
+        }
+        if set(center.cabs_ranks) != set(cabs_requests):
+            raise ValueError(
+                "center CABS ranks must identify every requested complementary basis"
+            )
+        for identity, q in cabs_requests.items():
+            assert q.basis.cabs is not None
+            elements = q.basis.cabs.by_element
+            dimension = sum(
+                (2 * shell.angular_momentum + 1) * len(shell.coefficients)
+                for atom in q.atoms
+                for shell in elements[atom.atomic_number].shells
+            )
+            checked_integer(
+                center.cabs_ranks[identity], "center CABS rank", low=1, high=dimension
+            )
         weights = tuple(
             (q.role, q.basis.basis_id, q.basis.cardinal, w) for q, w in plan.steps
         )

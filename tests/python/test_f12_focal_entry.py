@@ -406,3 +406,31 @@ def test_explicit_mp2_f12_series_dispatch_and_composition() -> None:
         assert value.weights == result.weights
     with pytest.raises(ValueError, match="triples require a ccsd_minus_mp2 increment"):
         plan_singlepoint(atoms, hf, pair, post_mp2=None, triples=low, **options)
+
+
+@pytest.mark.parametrize("rank", [None, 0, -1, True, 1.5, 3])
+def test_forward_displacement_rejects_incomplete_center_rank_before_scf(
+    rank: float | None, tmp_path: Path
+) -> None:
+    from generativeqc.experimental.f12_focal import (
+        FocalMolecularResult,
+        MolecularFocalProvider,
+        singlepoint_energy,
+    )
+
+    b = basis(2)
+    series = FocalSeries(b)
+    ranks = {} if rank is None else {b.basis_id: rank}
+    center = FocalMolecularResult(0.0, np.zeros((2, 3)), (), (), {}, ranks)
+    provider = MolecularFocalProvider(shell_library=tmp_path / "not-opened.so")
+    with pytest.raises(ValueError, match="center CABS rank"):
+        singlepoint_energy(
+            [("H", (0.0, 0.0, 0.0)), ("H", (0.0, 0.0, 1.4))],
+            series,
+            series,
+            center=center,
+            provider=provider,
+            root_id="rhf",
+            correlation_space_id="all-active",
+            backend="cpu_reference",
+        )
