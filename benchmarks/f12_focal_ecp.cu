@@ -34,6 +34,13 @@ struct Arena {
     for (auto* b : buffers) cudaFree(b);
     cublasDestroy(blas);
   }
+  void rewind(size_t count, size_t consumed) {
+    while (buffers.size() > count) {
+      check(cudaFree(buffers.back()));
+      buffers.pop_back();
+    }
+    used = consumed;
+  }
   template <class T>
   T* allocate(size_t count, const T* src = nullptr) {
     if (count > (limit - used) / sizeof(T)) throw AllocationError{};
@@ -150,13 +157,30 @@ extern "C" int gqc_f12_focal_ecp_projectors(int derivative, int na, int n, int n
     check(cudaMemset(out, 0, dims * sizeof(double)));
     const size_t per =
         sizeof(double) * n * (static_cast<size_t>(jets) * nq + (2 * jets + 1) * channels);
-    const int tile = static_cast<int>(std::min<size_t>(nr, (budget - d.used) / per));
-    if (tile < 1) return 2;
-    const size_t layer = static_cast<size_t>(tile) * n;
-    auto vals = d.allocate<double>(jets * layer * nq),
-         proj = d.allocate<double>(jets * layer * channels);
-    auto panel = d.allocate<double>(jets * layer * channels),
-         weighted = d.allocate<double>(layer * channels);
+    size_t free_bytes = 0, total_bytes = 0;
+    check(cudaMemGetInfo(&free_bytes, &total_bytes));
+    // The supplied numeric allowance can exceed device memory. Plan the tile
+    // after allocating the persistent matrices, then retry if free memory changed
+    // or the allocator cannot fit the largest individual buffer.
+    int tile = static_cast<int>(std::min<size_t>(nr, std::min(budget - d.used, free_bytes) / per));
+    const size_t persistent_buffers = d.buffers.size(), persistent_bytes = d.used;
+    double *vals = nullptr, *proj = nullptr, *panel = nullptr, *weighted = nullptr;
+    while (tile > 0) {
+      try {
+        const size_t layer = static_cast<size_t>(tile) * n;
+        vals = d.allocate<double>(jets * layer * nq);
+        proj = d.allocate<double>(jets * layer * channels);
+        panel = d.allocate<double>(jets * layer * channels);
+        weighted = d.allocate<double>(layer * channels);
+        break;
+      } catch (const AllocationError&) {
+        // The persistent inputs and zeroed output survive a scratch retry.
+        (void)cudaGetLastError();
+        d.rewind(persistent_buffers, persistent_bytes);
+        tile /= 2;
+      }
+    }
+    if (tile == 0) return 2;
     double one = 1., zero = 0.;
     for (auto active : centers) {
       channel_weights<<<blocks(4ul * nr), threads>>>(active, nr, nt, it, pp, rr, rd, weights);
