@@ -111,7 +111,9 @@ class MolecularFocalProvider:
     canonical-response ABI of the main native library. Each call solves one
     physical determinant on the backend in the request. Pass this callable as
     the provider of singlepoint(), or evaluate individual plan steps. Select a
-    high-order evaluator explicitly for post-MP2 and triples steps.
+    high-order evaluator explicitly for conventional post-MP2 and triples steps.
+    On all-active UHF the provider also evaluates the same-reference difference
+    between CCSD-F12b and MP2-F12 correlation energies and forces.
     """
 
     shell_library: Path
@@ -301,6 +303,19 @@ class MolecularFocalProvider:
             self, request, solution.sources, weights.ordinary_weights
         )
 
+    def _ucc_correlation_forces(
+        self, request: FocalRequest, solution: FocalUCCStationary
+    ) -> tuple[np.ndarray, np.ndarray]:
+        from ._f12_focal_cc_fixed import fixed_ucc_source_forces
+
+        weights = solution.source_cotangents
+        assert weights is not None
+        ordinary = self.ucc_ordinary_source_forces(request, solution)
+        fixed = fixed_ucc_source_forces(
+            self, request, solution.sources, weights.fixed_source_weights
+        )
+        return ordinary, fixed
+
     def uccsd_f12b(
         self,
         request: FocalRequest,
@@ -314,8 +329,6 @@ class MolecularFocalProvider:
         One DF-UHF determinant supplies the reference energy and force, CABS
         singles, ordinary CC Hamiltonian, and fixed-geminal equations.
         """
-        from ._f12_focal_cc_fixed import fixed_ucc_source_forces
-
         solution = self._ucc_stationary(
             request,
             options,
@@ -325,12 +338,8 @@ class MolecularFocalProvider:
         )
         source = solution.sources
         reference = source.fixed.reference
-        weights = solution.source_cotangents
-        assert weights is not None and solution.primal.correlation_energy is not None
-        ordinary = self.ucc_ordinary_source_forces(request, solution)
-        fixed = fixed_ucc_source_forces(
-            self, request, source, weights.fixed_source_weights
-        )
+        assert solution.primal.correlation_energy is not None
+        ordinary, fixed = self._ucc_correlation_forces(request, solution)
         singles_request = replace(request, role="hf_cabs")
         one = one_electron_sources(
             singles_request,
@@ -417,7 +426,11 @@ class MolecularFocalProvider:
     def __call__(self, request: FocalRequest) -> FocalEvaluation:
         from .experimental.f12_focal import FocalEvaluation, FocalTerm
 
-        if request.role not in ("hf_cabs", "mp2_f12_correlation"):
+        if request.role not in (
+            "hf_cabs",
+            "mp2_f12_correlation",
+            "ccsd_f12b_minus_mp2_f12",
+        ):
             if self.high_order is None:
                 raise ValueError(f"Supply the high-order evaluator for {request.role}")
             return self.high_order(request)
@@ -435,7 +448,7 @@ class MolecularFocalProvider:
             raise ValueError(
                 "CUDA molecular focal evaluation requires a device metric library and FP64 graph runner"
             )
-        pair = request.role == "mp2_f12_correlation"
+        pair = request.role != "hf_cabs"
         if (
             request.basis.cabs is None
             or not np.isfinite(self.relative_cutoff)
@@ -455,9 +468,22 @@ class MolecularFocalProvider:
             raise ValueError(
                 "The pair term requires all-active UHF or singlet RHF, MP2Fit, F12Fit and beta"
             )
-        ref = df_reference(request, forces=not pair, budget_mib=self.budget_mib)
+        solution = None
+        calculation = request
+        if request.role == "ccsd_f12b_minus_mp2_f12":
+            if request.root_id != "uhf":
+                raise ValueError(
+                    "the native CCSD-F12b minus MP2-F12 increment requires an all-active UHF root"
+                )
+            calculation = replace(request, role="mp2_f12_correlation")
+            solution = self._ucc_stationary(
+                calculation, None, None, source_cotangents=True, reference_forces=False
+            )
+            ref = solution.sources.fixed.reference
+        else:
+            ref = df_reference(request, forces=not pair, budget_mib=self.budget_mib)
         one = one_electron_sources(
-            request,
+            calculation,
             library=self.one_electron_library or self.shell_library,
             budget_mib=self.budget_mib,
         )
@@ -469,7 +495,13 @@ class MolecularFocalProvider:
                 "The canonical and combined one-electron OBS matrices disagree"
             )
         if pair:
-            energy, forces = self._pair(request, ref, one)
+            rank = solution.sources.fixed.cabs_rank if solution is not None else None
+            energy, forces = self._pair(calculation, ref, one, expected_cabs_rank=rank)
+            if solution is not None:
+                ordinary, fixed = self._ucc_correlation_forces(calculation, solution)
+                assert solution.primal.correlation_energy is not None
+                energy = solution.primal.correlation_energy - energy
+                forces = ordinary + fixed - forces
         else:
             energy, forces = self._singles(
                 request, ref, one, self._panel(request, "jk_fit")
@@ -531,7 +563,12 @@ class MolecularFocalProvider:
         return singles.hf_cabs_energy, ref.forces - grad
 
     def _pair(
-        self, request: FocalRequest, ref: FocalReference, one: FocalOneElectron
+        self,
+        request: FocalRequest,
+        ref: FocalReference,
+        one: FocalOneElectron,
+        *,
+        expected_cabs_rank: int | None = None,
     ) -> tuple[float, np.ndarray]:
         basis, n = request.basis, one.obs_ao_count
         assert basis.mp2_fit is not None and basis.f12_fit is not None
@@ -559,6 +596,7 @@ class MolecularFocalProvider:
             one,
             jk.joint(request, explicit=False),
             f12.joint(request, explicit=True),
+            expected_cabs_rank=expected_cabs_rank,
             relative_cutoff=self.relative_cutoff,
             budget_mib=self.budget_mib,
             run=self.run,

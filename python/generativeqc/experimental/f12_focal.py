@@ -40,7 +40,12 @@ if typing.TYPE_CHECKING:
 BasisRecordInput = BasisSet | str | PathLike[str]
 BasisInput = BasisRecordInput | Mapping[str | int, BasisRecordInput]
 Role = Literal[
-    "hf_cabs", "mp2_f12_correlation", "post_mp2", "ccsd_minus_mp2", "triples"
+    "hf_cabs",
+    "mp2_f12_correlation",
+    "post_mp2",
+    "ccsd_minus_mp2",
+    "ccsd_f12b_minus_mp2_f12",
+    "triples",
 ]
 Backend = Literal["cuda", "cpu_reference"]
 MolecularFocalProvider = _f12_focal_molecular.MolecularFocalProvider
@@ -372,18 +377,30 @@ def _weighted_terms(
     post_mp2: _Endpoint | FocalSeries[_Endpoint] | None,
     triples: _Endpoint | FocalSeries[_Endpoint] | None,
     *,
+    f12_doubles: _Endpoint | FocalSeries[_Endpoint] | None = None,
     nuclei: set[int] | None = None,
 ) -> list[tuple[Role, _Endpoint, float]]:
     roles: list[tuple[FocalSeries[_Endpoint], Role]] = [
         (hf_cabs, "hf_cabs"),
         (correlation, "mp2_f12_correlation"),
     ]
+    if f12_doubles is not None:
+        if post_mp2 is not None:
+            raise ValueError("choose either a conventional or an F12 doubles increment")
+        series = (
+            f12_doubles
+            if isinstance(f12_doubles, FocalSeries)
+            else FocalSeries(f12_doubles)
+        )
+        roles.append((series, "ccsd_f12b_minus_mp2_f12"))
     if post_mp2 is not None:
         high = post_mp2 if isinstance(post_mp2, FocalSeries) else FocalSeries(post_mp2)
         roles.append((high, "post_mp2" if triples is None else "ccsd_minus_mp2"))
     if triples is not None:
-        if post_mp2 is None:
-            raise ValueError("separate triples require a ccsd_minus_mp2 increment")
+        if post_mp2 is None and f12_doubles is None:
+            raise ValueError(
+                "separate triples require a ccsd_minus_mp2 increment or F12 doubles"
+            )
         triple_series = (
             triples if isinstance(triples, FocalSeries) else FocalSeries(triples)
         )
@@ -495,11 +512,13 @@ def combine(
     post_mp2: FocalTerm | FocalSeries[FocalTerm] | None,
     *,
     triples: FocalTerm | FocalSeries[FocalTerm] | None = None,
+    f12_doubles: FocalTerm | FocalSeries[FocalTerm] | None = None,
 ) -> FocalResult:
     """Apply fixed coefficients to both E and -dE/dR after the electronic solves.
 
     Correlation includes ordinary MP2 correlation plus the explicit F12 pair term.
-    Pass post_mp2=None for HF+CABS plus MP2-F12 correlation alone.
+    Set post_mp2=None for HF+CABS plus MP2-F12. Supply f12_doubles to add
+    CCSD-F12b minus MP2-F12, optionally followed by conventional triples.
     Supply a combined post_mp2 increment, or supply a ccsd_minus_mp2
     increment together with separate conventional triples. Each increment can
     have its own basis series. CCSD and MP2 must be differenced at matching
@@ -507,7 +526,9 @@ def combine(
     Exponential extrapolation is available for the HF plus CABS series.
     All energy and force terms must describe the same ordered geometry.
     """
-    return _assemble(_weighted_terms(hf_cabs, correlation, post_mp2, triples))
+    return _assemble(
+        _weighted_terms(hf_cabs, correlation, post_mp2, triples, f12_doubles=f12_doubles)
+    )
 
 
 def _hamiltonian(
@@ -521,14 +542,15 @@ def _hamiltonian(
     for role, basis, _ in weighted:
         if not isinstance(basis, FocalBasis):
             raise TypeError("singlepoint requires FocalBasis inputs")
-        if role == "mp2_f12_correlation" and basis.beta is None:
+        f12_pair = role in ("mp2_f12_correlation", "ccsd_f12b_minus_mp2_f12")
+        if f12_pair and basis.beta is None:
             raise ValueError("F12 pair correlation requires an explicit beta")
         for name, record, required in (
             ("orbital", basis.orbital, True),
             ("JKFit", basis.jk_fit, True),
             ("MP2Fit", basis.mp2_fit, role != "hf_cabs"),
-            ("F12 fit", basis.f12_fit, role == "mp2_f12_correlation"),
-            ("CABS", basis.cabs, role in ("hf_cabs", "mp2_f12_correlation")),
+            ("F12 fit", basis.f12_fit, f12_pair),
+            ("CABS", basis.cabs, role == "hf_cabs" or f12_pair),
         ):
             if required and record is None:
                 raise ValueError(f"{role} requires an explicit {name} basis")
@@ -570,6 +592,7 @@ def plan_singlepoint(
     multiplicity: int = 1,
     backend: Backend = "cuda",
     triples: FocalBasis | FocalSeries[FocalBasis] | None = None,
+    f12_doubles: FocalBasis | FocalSeries[FocalBasis] | None = None,
     protocol_id: str | None = None,
 ) -> FocalPlan:
     """Resolve one geometry and basis recipe into independently evaluable requests.
@@ -597,6 +620,7 @@ def plan_singlepoint(
         raise ValueError("protocol_id must be a nonempty string when supplied")
     weighted = _weighted_terms(
         hf_cabs, correlation, post_mp2, triples,
+        f12_doubles=f12_doubles,
         nuclei={atom.atomic_number for atom in geometry},
     )
     hamiltonian = _hamiltonian(weighted, geometry, charge, multiplicity)
@@ -712,6 +736,7 @@ def singlepoint(
     multiplicity: int = 1,
     backend: Backend = "cuda",
     triples: FocalBasis | FocalSeries[FocalBasis] | None = None,
+    f12_doubles: FocalBasis | FocalSeries[FocalBasis] | None = None,
     protocol_id: str | None = None,
 ) -> FocalRunResult:
     """Evaluate a geometry (Bohr) and compose energies (Eh) and forces (Eh/Bohr).
@@ -732,6 +757,7 @@ def singlepoint(
         multiplicity=multiplicity,
         backend=backend,
         triples=triples,
+        f12_doubles=f12_doubles,
         protocol_id=protocol_id,
     )
     evaluations = tuple(

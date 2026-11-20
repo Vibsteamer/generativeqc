@@ -703,6 +703,13 @@ energy and Cartesian force contributions from a single geometry. Pass a
 correlation plus the explicit F12 pair correction, and a high-level correction.
 For an MP2-F12 energy and force, explicitly pass `post_mp2=None` to `combine`,
 `plan_singlepoint`, or `singlepoint`. This evaluates just the first two series.
+To add the explicitly correlated doubles increment, pass `post_mp2=None` and
+`f12_doubles=FocalSeries(upper, lower, power)` with the desired bases or terms.
+The `ccsd_f12b_minus_mp2_f12` step takes the difference of CCSD-F12b and MP2-F12
+correlation energies and forces at each cardinal, using the same determinant,
+orbital basis, three fitting roles, CABS and geminal exponent. The molecular
+provider implements this step for all-active UHF. A separate `triples` term
+can add the conventional perturbative triples contribution.
 Use the role `post_mp2` for a combined correction. To treat conventional
 (T) separately, use `ccsd_minus_mp2` for the matched CCSD minus MP2 increment
 and pass the `triples` term or series by keyword. Each correction accepts
