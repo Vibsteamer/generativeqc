@@ -367,6 +367,7 @@ std::vector<double> derivative(const hf::UnrestrictedPhysicalReference& referenc
                                int device, std::size_t budget,
                                const posthf::DensityFittedInteractionSource* fitted,
                                bool separate_reference,
+                               const posthf::DensityFittedInteractionSource* reference_fit,
                                const integrals::CorrelationIntegralBackend& backend) {
   const auto nbf = reference.nbf, n2 = mul(nbf, nbf), n4 = mul(n2, n2);
   std::vector<double> one(n2), overlap(n2), temporary(n2), scratch(n2);
@@ -392,30 +393,35 @@ std::vector<double> derivative(const hf::UnrestrictedPhysicalReference& referenc
   } else
     gradient = integrals::contract_weighted_one_electron_derivative(system, overlap, one, true);
   if (fitted) {
-    fitted->validate_frame(reference.electronic_reference());
-    const auto factor_count = fitted->spin_factors(0).size();
-    std::array<std::vector<double>, 2> seeds{std::vector<double>(factor_count),
-                                             std::vector<double>(factor_count)};
-    for (const auto& pair : std::array<std::string, 3>{"aa", "ab", "bb"}) {
-      const auto left = pair[0] == 'a' ? 0U : 1U, right = pair[1] == 'a' ? 0U : 1U;
-      const auto& cotangent = weights.at("g_" + pair);
-      for (std::size_t flat = 0; flat < cotangent.size(); ++flat)
-        if (cotangent[flat] != 0)
-          fitted->add_pair_cotangent(seeds, left, right, coordinates(flat, {nbf, nbf, nbf, nbf}, 4),
-                                     cotangent[flat]);
-    }
-    std::vector<double> raw(factor_count), root(mul(fitted->naux(), fitted->naux()));
-    for (unsigned spin = 0; spin < 2; ++spin) {
-      const auto bars = fitted->pullback_factors(spin, seeds[spin]);
-      for (std::size_t index = 0; index < raw.size(); ++index)
-        raw[index] += bars.three_center[index];
-      for (std::size_t index = 0; index < root.size(); ++index)
-        root[index] += bars.inverse_root[index];
-    }
-    const auto fitted_gradient = fitted->nuclear_derivative(raw, root);
-    for (std::size_t coordinate = 0; coordinate < gradient.size(); ++coordinate)
-      gradient[coordinate] += fitted_gradient.at(coordinate);
-    if (!separate_reference) {
+    const auto add_fitted = [&](const posthf::DensityFittedInteractionSource& fit,
+                                       const std::string& prefix) {
+      fit.validate_frame(reference.electronic_reference());
+      const auto factor_count = fit.spin_factors(0).size();
+      std::array<std::vector<double>, 2> seeds{std::vector<double>(factor_count),
+                                               std::vector<double>(factor_count)};
+      for (const auto& pair : std::array<std::string, 3>{"aa", "ab", "bb"}) {
+        const auto left = pair[0] == 'a' ? 0U : 1U, right = pair[1] == 'a' ? 0U : 1U;
+        const auto& cotangent = weights.at(prefix + pair);
+        for (std::size_t flat = 0; flat < cotangent.size(); ++flat)
+          if (cotangent[flat] != 0)
+            fit.add_pair_cotangent(seeds, left, right, coordinates(flat, {nbf, nbf, nbf, nbf}, 4),
+                                       cotangent[flat]);
+      }
+      std::vector<double> raw(factor_count), root(mul(fit.naux(), fit.naux()));
+      for (unsigned spin = 0; spin < 2; ++spin) {
+        const auto bars = fit.pullback_factors(spin, seeds[spin]);
+        for (std::size_t index = 0; index < raw.size(); ++index)
+          raw[index] += bars.three_center[index];
+        for (std::size_t index = 0; index < root.size(); ++index)
+          root[index] += bars.inverse_root[index];
+      }
+      const auto contribution = fit.nuclear_derivative(raw, root);
+      for (std::size_t axis = 0; axis < gradient.size(); ++axis)
+        gradient[axis] += contribution.at(axis);
+    };
+    add_fitted(*fitted, "g_");
+    if (reference_fit) add_fitted(*reference_fit, "reference_g_");
+    if (!separate_reference || reference_fit) {
       if (!finite(gradient)) throw std::runtime_error("nonfinite unrestricted fitted force");
       for (auto& value : gradient) value = -value;
       return gradient;
@@ -700,10 +706,13 @@ UnrestrictedForce unrestricted_force(
       result.stationarity_residual = std::max(result.stationarity_residual, std::abs(value));
   if (!std::isfinite(result.stationarity_residual) || result.stationarity_residual > 1e-7)
     throw std::runtime_error("fresh unrestricted full orbital stationarity failed");
-  if (fitted) {
+  const auto* reference_fit =
+      dynamic_cast<const posthf::DensityFittedInteractionSource*>(independent_reference);
+  const auto admit_seeds = [&](const posthf::DensityFittedInteractionSource& fit,
+                               const std::string& prefix) {
     std::size_t nonzero_seeds = 0;
-    for (const auto* name : {"g_aa", "g_ab", "g_bb"}) {
-      const auto& values = weights.at(name);
+    for (const auto* name : {"aa", "ab", "bb"}) {
+      const auto& values = weights.at(prefix + name);
       nonzero_seeds =
           add(nonzero_seeds,
               static_cast<std::size_t>(std::count_if(values.begin(), values.end(),
@@ -711,15 +720,17 @@ UnrestrictedForce unrestricted_force(
     }
     // Each Gram seed updates both factor legs with one FMA per auxiliary.
     // Admit cumulatively before derivative() can start traversing the seeds.
-    runtime.executed_work = add(runtime.executed_work, mul(mul(2, fitted->naux()), nonzero_seeds));
+    runtime.executed_work = add(runtime.executed_work, mul(mul(2, fit.naux()), nonzero_seeds));
     core::admit_correlation_work("uccsd_response/df_pair_cotangent", runtime.executed_work,
                                  result.numeric_capacity_bytes, reference.nbf, reference.nocc[0],
                                  reference.nocc[1], options.max_iterations);
-  }
+  };
+  if (fitted) admit_seeds(*fitted, "g_");
+  if (reference_fit) admit_seeds(*reference_fit, "reference_g_");
   runtime::df_progress::Scope derivative_trace("uccsd_nuclear_response", cuda ? "cuda" : "host");
   result.forces =
       derivative(reference, source.orbital(), weights, cuda, device, derivative_capacity, fitted,
-                 independent_reference != nullptr, backend);
+                 independent_reference != nullptr, reference_fit, backend);
   return result;
 }
 

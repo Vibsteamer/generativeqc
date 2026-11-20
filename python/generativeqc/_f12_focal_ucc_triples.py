@@ -17,7 +17,7 @@ def conventional_df_ucc_triples(
     """Compute conventional UCCSD(T) minus UCCSD energy and analytic forces.
 
     Both native full-DF calculations cold-start on the declared all-active UHF
-    surface. They use one auxiliary record for JK and correlation. Each solves
+    surface. Each uses the declared JK and correlation fits and solves
     its own relaxed force equations. The native (T) diagnostic gives the energy
     directly, including when the triples space is empty.
     """
@@ -33,10 +33,11 @@ def conventional_df_ucc_triples(
     if request.backend not in ("cpu_reference", "cuda"):
         raise ValueError("conventional UCC triples requires an explicit focal backend")
     basis = request.basis
-    if basis.mp2_fit is None or basis.mp2_fit.identity != basis.jk_fit.identity:
+    if basis.mp2_fit is None:
         raise ValueError(
-            "native full-DF UCC triples requires the same JKFit and MP2Fit"
+            "native full-DF UCC triples requires a correlation fitting basis"
         )
+    split = basis.mp2_fit.identity != basis.jk_fit.identity
 
     components = {}
     for method in ("uccsd(t)", "uccsd"):
@@ -55,6 +56,7 @@ def conventional_df_ucc_triples(
                 charge=request.charge,
                 multiplicity=request.multiplicity,
                 properties=("energy", "forces"),
+                reference_auxiliary_basis=basis.jk_fit if split else None,
             )
         finally:
             calculator.clear_cache()
@@ -76,6 +78,14 @@ def conventional_df_ucc_triples(
                 != expected.identity
             ):
                 raise RuntimeError(f"{method} used a different {role} basis")
+        if (
+            split
+            and result.basis_metadata.get("reference_auxiliary", {}).get(
+                "basis_identity"
+            )
+            != basis.jk_fit.identity
+        ):
+            raise RuntimeError(f"{method} did not use the declared JK fitting basis")
         components[method] = result.energy, result.correlation, result.forces
 
     corrected_energy, corrected, corrected_forces = components["uccsd(t)"]

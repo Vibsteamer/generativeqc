@@ -3583,6 +3583,7 @@ class Calculator:
         charge: int = 0,
         multiplicity: int = 1,
         properties: Iterable[str] | None = None,
+        reference_auxiliary_basis: BasisSet | None = None,
     ) -> Result:
         """Compute energy, optional analytic forces and mean-field electronic properties.
 
@@ -3611,12 +3612,19 @@ class Calculator:
         Invalid inputs raise TypeError/ValueError; unsupported combinations,
         native failures or nonconvergence raise without publishing a partial
         Result. Resource-aware failures can carry allocation diagnostics.
+        Full-DF UCCSD and UCCSD(T) accept a separate JK fitting
+        record through ``reference_auxiliary_basis``. The calculator's
+        ``auxiliary_basis`` remains the correlation fit.
         Returned force storage outlives the synchronous call.
         See :ref:`python-calculation-errors` and :ref:`python-calculation-ownership`."""
         owner = self._singlepoint_context
         with owner.lock if owner is not None else nullcontext():
             return self._singlepoint(
-                atoms, charge=charge, multiplicity=multiplicity, properties=properties
+                atoms,
+                charge=charge,
+                multiplicity=multiplicity,
+                properties=properties,
+                reference_auxiliary_basis=reference_auxiliary_basis,
             )
 
     def singlepoint_components(
@@ -3700,6 +3708,7 @@ class Calculator:
         properties: Iterable[str] | None = None,
         component_methods: tuple[str, ...] = (),
         component_outputs: dict[str, Result] | None = None,
+        reference_auxiliary_basis: BasisSet | None = None,
     ) -> Result:
         """Execute under the retained context's transaction lock, when present."""
         intent = getattr(self, "_provider_initialization_intent", None)
@@ -3707,6 +3716,30 @@ class Calculator:
             from ._provider_initialization_lifetime import require_no_pending_owner
 
             require_no_pending_owner()
+        if reference_auxiliary_basis is not None:
+            if not isinstance(reference_auxiliary_basis, BasisSet):
+                raise TypeError(
+                    "reference_auxiliary_basis requires a canonical basis record"
+                )
+            if (
+                self._method_name not in ("uccsd", "uccsd(t)")
+                or self._density_fitting_mode != _native.DENSITY_FITTING_FULL_CUDA
+                or self._auxiliary_basis is None
+                or component_methods
+            ):
+                raise ValueError(
+                    "independent JK fitting requires a full-DF UCCSD or UCCSD(T) singlepoint"
+                )
+            if intent is not None or self._resource_budget is not None:
+                raise NotImplementedError(
+                    "independent UCC fitting requires the ordinary native prepare path"
+                )
+            if not hasattr(
+                self._library, "generativeqc_calculation_prepare_ucc_df_fits_v1"
+            ):
+                raise NotImplementedError(
+                    "native library lacks independent UCC JK and correlation fits"
+                )
         default_properties = properties is None
         if default_properties:
             properties = self._default_properties()
@@ -3850,6 +3883,7 @@ class Calculator:
             )
         system = ctypes.c_void_p()
         auxiliary_system = ctypes.c_void_p()
+        jk_system = ctypes.c_void_p()
         calculation = ctypes.c_void_p()
         ledger = None
         resource_prepare = None
@@ -3888,6 +3922,14 @@ class Calculator:
                 )
                 if provider_transaction is not None:
                     provider_transaction.auxiliary_system = auxiliary_system
+            if reference_auxiliary_basis is not None:
+                jk_system = self._create_native_system(
+                    context,
+                    native_atoms,
+                    charge,
+                    multiplicity,
+                    reference_auxiliary_basis,
+                )
             method_descriptor = self._method_descriptor(
                 auxiliary_system if auxiliary_system.value else None,
                 resource_plan=resource_plan,
@@ -3909,6 +3951,16 @@ class Calculator:
                         ctypes.byref(method_descriptor),
                         ctypes.byref(calculation),
                         intent,
+                    )
+                if jk_system.value:
+                    return (
+                        self._library.generativeqc_calculation_prepare_ucc_df_fits_v1(
+                            context,
+                            system,
+                            ctypes.byref(method_descriptor),
+                            jk_system,
+                            ctypes.byref(calculation),
+                        )
                     )
                 if resource_prepare is not None:
                     return resource_prepare(
@@ -4073,6 +4125,25 @@ class Calculator:
                 ks_transport_diagnostic = read_ks_transport_diagnostic(
                     self._library, calculation
                 )
+            metadata = self.basis_metadata(
+                native_atoms, charge=charge, multiplicity=multiplicity
+            )
+            if reference_auxiliary_basis is not None:
+                metadata["reference_auxiliary"] = resolved_basis_metadata(
+                    reference_auxiliary_basis,
+                    self._shells_for_atoms(native_atoms, reference_auxiliary_basis),
+                    native_atoms,
+                    representation=reference_auxiliary_basis.representation,
+                    charge=charge,
+                    multiplicity=multiplicity,
+                    role="reference_auxiliary",
+                )
+                metadata["model_identity"] = canonical_hash(
+                    {
+                        "correlation_model": metadata["model_identity"],
+                        "reference_auxiliary": metadata["reference_auxiliary"],
+                    }
+                )
             native_result = Result(
                 **(
                     density_capture.analyze(context, system)
@@ -4091,9 +4162,7 @@ class Calculator:
                 incremental_direct_jk=self._incremental_direct_jk_diagnostic(
                     calculation
                 ),
-                basis_metadata=self.basis_metadata(
-                    native_atoms, charge=charge, multiplicity=multiplicity
-                ),
+                basis_metadata=metadata,
                 accuracy=self._accuracy_assessment(
                     native_atoms,
                     charge,
@@ -4146,6 +4215,8 @@ class Calculator:
                     self._library.generativeqc_calculation_destroy(calculation)
                 if system.value:
                     self._library.generativeqc_system_destroy(system)
+                if jk_system.value:
+                    self._library.generativeqc_system_destroy(jk_system)
                 if auxiliary_system.value:
                     self._library.generativeqc_system_destroy(auxiliary_system)
                 if self._singlepoint_context is None:

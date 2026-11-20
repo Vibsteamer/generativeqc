@@ -15,7 +15,14 @@ namespace generativeqc::methods::detail {
  * the UHF stationary problem; full fitting uses the same metric branch in both. */
 struct UnrestrictedFitting {
   std::optional<core::System> auxiliary;
+  std::optional<core::System> separate_reference_auxiliary;
   bool full_reference{};
+
+  const core::System* reference_auxiliary() const {
+    if (separate_reference_auxiliary) return &*separate_reference_auxiliary;
+    return full_reference ? &*auxiliary : nullptr;
+  }
+
   double threshold{1e-10};
   std::size_t budget{};
 
@@ -26,14 +33,14 @@ struct UnrestrictedFitting {
     auto result = posthf::uhf_reference_capacity(system, history, !full_reference);
     if (!full_reference) return result;
     const auto orbital = molecule::cartesian_ao_count(system);
-    const auto auxiliary_count = molecule::cartesian_ao_count(*auxiliary);
+    const auto auxiliary_count = molecule::cartesian_ao_count(*reference_auxiliary());
     const auto metric = posthf::checked_mul(auxiliary_count, auxiliary_count);
     const auto raw = posthf::checked_mul(posthf::checked_mul(orbital, orbital), auxiliary_count);
     const auto coordinates = posthf::checked_add(1, posthf::checked_mul(3, system.atoms.size()));
     auto fitted = posthf::checked_mul(
         16 * sizeof(double), posthf::checked_mul(coordinates, posthf::checked_add(raw, metric)));
     fitted = posthf::checked_add(fitted, posthf::checked_mul(2, posthf::source_scratch_bytes));
-    fitted = posthf::checked_add(fitted, posthf::source_capacity(*auxiliary));
+    fitted = posthf::checked_add(fitted, posthf::source_capacity(*reference_auxiliary()));
     if (fitted > budget)
       throw std::length_error("unrestricted DF reference exceeds fitting memory budget");
     const auto nbf = molecule::ao_count(system);

@@ -47,8 +47,14 @@ def triples_request() -> FocalRequest:
     return next(req for req, _ in plan.steps if req.role == "triples")
 
 
-def test_native_triples_energy_and_signed_force() -> None:
+@pytest.mark.parametrize("separate", [False, True])
+def test_native_triples_energy_and_signed_force(separate: bool) -> None:
     req = triples_request()
+    if separate:
+        basis = FocalBasis(
+            2, "independent", "sto-3g", jk_fit="def2-svp", mp2_fit="sto-3g"
+        )
+        req = replace(req, basis=basis)
     out = conventional_df_ucc_triples(req)
     assert out.converged and out.executed_backend == "cpu_reference"
     assert out.term.role == "triples" and out.term.basis_id == req.basis.basis_id
@@ -63,14 +69,48 @@ def test_native_triples_energy_and_signed_force() -> None:
         device="cpu",
         initial_guess=None,
     )
+    reference_energy = None
+    if separate:
+        reference = Calculator(
+            method="uhf",
+            basis=req.basis.orbital,
+            auxiliary_basis=req.basis.jk_fit,
+            density_fitting="cpu",
+            device="cpu",
+            initial_guess=None,
+        )
+        try:
+            reference_energy = reference.singlepoint(
+                req.atoms, multiplicity=2, properties=("energy",)
+            ).energy
+        finally:
+            reference.clear_cache()
     try:
 
         def energy(dz: float) -> float:
             atoms = list(req.atoms)
             x, y, z = atoms[1].position
             atoms[1] = replace(atoms[1], position=(x, y, z + dz))
-            state = q.singlepoint(atoms, multiplicity=2, properties=("energy",))
+            state = q.singlepoint(
+                atoms,
+                multiplicity=2,
+                properties=("energy",),
+                reference_auxiliary_basis=req.basis.jk_fit if separate else None,
+            )
+            if separate:
+                assert (
+                    state.basis_metadata["reference_auxiliary"]["basis_identity"]
+                    == req.basis.jk_fit.identity
+                )
+                assert (
+                    state.basis_metadata["auxiliary"]["basis_identity"]
+                    == req.basis.mp2_fit.identity
+                )
             assert state.correlation is not None
+            if dz == 0 and reference_energy is not None:
+                assert state.correlation.reference_energy == pytest.approx(
+                    reference_energy, abs=1e-9, rel=0
+                )
             return state.correlation.ccsd_t_triples_energy
 
         assert energy(0) == pytest.approx(out.term.energy, abs=2e-12, rel=0)
@@ -90,6 +130,6 @@ def test_native_triples_preserves_declared_root_and_fits() -> None:
         conventional_df_ucc_triples(replace(req, root_id="rhf"))
     with pytest.raises(ValueError, match="all-active"):
         conventional_df_ucc_triples(replace(req, correlation_space_id="frozen-core"))
-    separate = FocalBasis(2, "different", "sto-3g", jk_fit="def2-svp", mp2_fit="sto-3g")
-    with pytest.raises(ValueError, match="same JKFit and MP2Fit"):
-        conventional_df_ucc_triples(replace(req, basis=separate))
+    missing = FocalBasis(2, "missing", "sto-3g", jk_fit="def2-svp")
+    with pytest.raises(ValueError, match="requires a correlation fitting basis"):
+        conventional_df_ucc_triples(replace(req, basis=missing))

@@ -71,7 +71,8 @@ class UccsdPrepared final : public PreparedCalculation {
     std::lock_guard<std::mutex> lock(mutex_);
     last_.reset();
     performance_.reset();
-    if ((components & ~(kHfComponent | kMp2Component)) ||
+    if ((fitting_.separate_reference_auxiliary && components) ||
+        (components & ~(kHfComponent | kMp2Component)) ||
         (components && capabilities_.method != GENERATIVEQC_METHOD_UCCSD_T))
       throw MethodError(GENERATIVEQC_STATUS_NOT_IMPLEMENTED,
                         "unrestricted companions require UCCSD(T)");
@@ -86,14 +87,14 @@ class UccsdPrepared final : public PreparedCalculation {
             static_cast<std::size_t>((system_.electron_count + system_.multiplicity - 1) / 2);
         cc::unrestricted_force_capacity(
             nbf, alpha, system_.electron_count - alpha, options_, triples, reference_capacity_,
-            fitting_.auxiliary && !fitting_.full_reference, derivative_capacity);
+            fitting_.auxiliary && (!fitting_.full_reference || fitting_.separate_reference_auxiliary), derivative_capacity);
       }
       const auto started = std::chrono::steady_clock::now();
       const auto strategy = scf::resolve_fock_build(
           fitting_.reference_spec(compute_forces),
           cuda_ ? scf::FockBackend::Cuda : scf::FockBackend::Cpu, 0, fitting_.threshold);
       scf::PreparedFockPlan reference_plan(
-          system_, fitting_.full_reference ? &*fitting_.auxiliary : nullptr, strategy,
+          system_, fitting_.reference_auxiliary(), strategy,
           cuda_ ? device_ : -1, cuda_ ? options_.max_bytes : 0,
           cuda_ && !fitting_.full_reference && compute_forces && (components & kHfComponent) ? 1
                                                                                              : 0,
@@ -127,6 +128,17 @@ class UccsdPrepared final : public PreparedCalculation {
         retained_reference_capacity =
             posthf::checked_add(retained_reference_capacity, fitted->numeric_capacity_bytes());
       }
+      std::optional<posthf::DensityFittedInteractionSource> reference_fit;
+      if (compute_forces && fitting_.separate_reference_auxiliary) {
+        if (retained_reference_capacity >= options_.max_bytes)
+          throw std::length_error("independent JKFit exceeds unrestricted CC endpoint budget");
+        reference_fit.emplace(reference_source, reference, *fitting_.separate_reference_auxiliary,
+                              fitting_.threshold,
+                              std::min(fitting_.budget, options_.max_bytes - retained_reference_capacity),
+                              cuda_, device_, true, unrestricted_integral_backend());
+        retained_reference_capacity = posthf::checked_add(retained_reference_capacity,
+                                                           reference_fit->numeric_capacity_bytes());
+      }
       // MP2 providers own the retained fitted source on both backends. CC's
       // provider includes it only on CUDA; preserve the CPU CC reservation.
       auto mp2_reference_capacity = retained_reference_capacity;
@@ -141,8 +153,9 @@ class UccsdPrepared final : public PreparedCalculation {
       const integrals::ElectronInteractionSource& source =
           fitted ? static_cast<const integrals::ElectronInteractionSource&>(*fitted)
                  : reference_source;
-      const auto* independent_reference =
-          fitted && !fitting_.full_reference ? &reference_source : nullptr;
+      const integrals::ElectronInteractionSource* independent_reference = nullptr;
+      if (reference_fit) independent_reference = &*reference_fit;
+      else if (fitted && !fitting_.full_reference) independent_reference = &reference_source;
       if (compute_forces)
         cc::unrestricted_force_capacity(reference.nbf, reference.nocc[0], reference.nocc[1],
                                         options_, triples, retained_reference_capacity,
@@ -351,6 +364,13 @@ generativeqc_status validate_uccsd_system(generativeqc_method method, const core
 std::unique_ptr<PreparedCalculation> prepare_uccsd_calculation(
     const Capabilities& capabilities, core::ContextState& context, const core::System& system,
     const generativeqc_method_descriptor& descriptor, const core::System* auxiliary) {
+  return prepare_uccsd_with_reference_fit(capabilities, context, system, descriptor, auxiliary, nullptr);
+}
+
+std::unique_ptr<PreparedCalculation> prepare_uccsd_with_reference_fit(
+    const Capabilities& capabilities, core::ContextState& context, const core::System& system,
+    const generativeqc_method_descriptor& descriptor, const core::System* auxiliary,
+    const core::System* reference_auxiliary) {
   if (context.requested_backend != GENERATIVEQC_BACKEND_CPU_REFERENCE &&
       context.requested_backend != GENERATIVEQC_BACKEND_CUDA)
     throw MethodError(GENERATIVEQC_STATUS_NOT_IMPLEMENTED,
@@ -396,6 +416,11 @@ std::unique_ptr<PreparedCalculation> prepare_uccsd_calculation(
   reference_options.export_physical_reference = true;
   reference_options.reference_memory_budget_bytes = options.max_bytes;
   auto fitting = unrestricted_fitting(descriptor, auxiliary, options.max_bytes);
+  if (reference_auxiliary) {
+    if (!fitting.full_reference || !fitting.auxiliary)
+      throw std::invalid_argument("independent UCC JKFit requires full density fitting");
+    fitting.separate_reference_auxiliary = *reference_auxiliary;
+  }
   const auto reference_capacity =
       fitting.reference_capacity(system, reference_options.diis_history);
   const auto nbf = molecule::ao_count(system);

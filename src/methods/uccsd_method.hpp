@@ -16,4 +16,16 @@ std::unique_ptr<PreparedCalculation> prepare_uccsd_calculation(
     const generativeqc_method_descriptor& descriptor,
     const core::System* auxiliary_basis = nullptr);
 
+std::unique_ptr<PreparedCalculation> prepare_uccsd_with_reference_fit(
+    const Capabilities& capabilities, core::ContextState& context, const core::System& system,
+    const generativeqc_method_descriptor& descriptor, const core::System* correlation_auxiliary,
+    const core::System* reference_auxiliary);
+
 }  // namespace generativeqc::methods::detail
+
+namespace generativeqc::methods {
+std::unique_ptr<PreparedCalculation> prepare_split_uccsd_calculation(
+    core::ContextState& context, const core::System& system,
+    const generativeqc_method_descriptor& descriptor, const core::System* correlation_auxiliary,
+    const core::System& reference_auxiliary);
+}  // namespace generativeqc::methods
