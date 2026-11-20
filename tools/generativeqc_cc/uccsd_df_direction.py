@@ -35,6 +35,36 @@ def unrestricted_cc_df_hamiltonian_tangent(
     from the output occupied legs. Each Coulomb tile contracts one solved
     density and one raw density, including both derivatives and the metric.
     """
+    return _hamiltonian_blocks(
+        space, data, whitener, run, fock_tangent, frozen_occupied,
+        direction=(data_tangent, coulomb_metric_tangent),
+    )
+
+
+def unrestricted_cc_df_hamiltonian(
+    space: tuple[int, int, int, int, int],
+    data: Mapping[str, np.ndarray],
+    fock: Mapping[str, np.ndarray],
+    whitener: np.ndarray,
+    run: Callable,
+    *,
+    frozen_occupied: tuple[int, int] = (0, 0),
+) -> dict[str, np.ndarray]:
+    """Build the normal-ordered Fock and antisymmetrized DF Coulomb blocks."""
+    return _hamiltonian_blocks(
+        space, data, whitener, run, fock, frozen_occupied, direction=None
+    )
+
+
+def _hamiltonian_blocks(
+    space: tuple[int, int, int, int, int],
+    data: Mapping[str, np.ndarray],
+    whitener: np.ndarray,
+    run: Callable,
+    spin_fock: Mapping[str, np.ndarray],
+    frozen_occupied: tuple[int, int],
+    direction: tuple[Mapping[str, np.ndarray], np.ndarray] | None,
+) -> dict[str, np.ndarray]:
     oa, ob, obs, ext, aux = space
     fa, fb = frozen_occupied
     if not (0 <= fa <= oa < obs and 0 <= fb <= ob < obs <= ext and aux > 0):
@@ -55,30 +85,28 @@ def unrestricted_cc_df_hamiltonian_tangent(
     dfit_graph = unrestricted_cc_obs_fit_direction(aux, obs)
     factors = {}
     for spin in spins.values():
-        fock = fock_tangent["fock_" + spin]
+        fock = spin_fock["fock_" + spin]
         if fock.shape != (ext, ext) or fock.dtype != np.float64 or not np.isfinite(fock).all():
-            raise ValueError("Expected a finite FP64 extended spin Fock tangent")
+            raise ValueError("Expected a finite FP64 extended spin Fock matrix")
         name = "source/raw_coulomb_" + spin
         raw = np.ascontiguousarray(data[name][:, :obs, :obs]).reshape(aux, -1)
-        draw = np.ascontiguousarray(data_tangent[name][:, :obs, :obs]).reshape(aux, -1)
         fit = run(
             fit_graph, {"metric_whitener": whitener, "three_center": raw}
         ).outputs["fit"]
-        dfit = run(
-            dfit_graph,
-            {
-                "metric_whitener": whitener,
-                "d_metric": coulomb_metric_tangent,
-                "fit": fit,
-                "d_three_center": draw,
-            },
-        ).outputs["d_fit"]
-        fields = {
-            "fit_left": fit,
-            "raw_right": raw,
-            "d_fit_left": dfit,
-            "d_raw_right": draw,
-        }
+        fields = {"fit_left": fit, "raw_right": raw}
+        if direction is not None:
+            data_tangent, metric_tangent = direction
+            draw = np.ascontiguousarray(data_tangent[name][:, :obs, :obs]).reshape(aux, -1)
+            dfit = run(
+                dfit_graph,
+                {
+                    "metric_whitener": whitener,
+                    "d_metric": metric_tangent,
+                    "fit": fit,
+                    "d_three_center": draw,
+                },
+            ).outputs["d_fit"]
+            fields.update(d_fit_left=dfit, d_raw_right=draw)
         factors[spin] = {k: v.reshape(aux, obs, obs) for k, v in fields.items()}
 
     kernels = {}
@@ -87,7 +115,7 @@ def unrestricted_cc_df_hamiltonian_tangent(
         sections, labels = name[1:].split("_")
         slices = tuple(domains[s, d] for s, d in zip(labels, sections, strict=True))
         if name.startswith("f"):
-            result[name] = np.ascontiguousarray(fock_tangent["fock_" + spins[labels[0]]][slices])
+            result[name] = np.ascontiguousarray(spin_fock["fock_" + spins[labels[0]]][slices])
             continue
         value = np.zeros(shape, dtype=np.float64)
         if value.size:
@@ -97,16 +125,17 @@ def unrestricted_cc_df_hamiltonian_tangent(
                 nl, nr = prod(request.shape[:2]), prod(request.shape[2:])
                 if (nl, nr) not in kernels:
                     graph = fitted_integral_block(aux, nl, nr, coulomb=True)
-                    kernels[nl, nr] = linearize(graph, None).program
+                    kernels[nl, nr] = graph if direction is None else linearize(graph, None).program
                 rows = tuple(slice(s[0], s[-1] + 1) for s in request.slots)
                 fields = {}
                 for key, side in (("fit_left", 0), ("raw_right", 2)):
-                    for prefix in ("", "d_"):
+                    for prefix in (("",) if direction is None else ("", "d_")):
                         field = prefix + key
                         arr = factors[request.spins[side]][field]
                         tile = arr[:, rows[side], rows[side + 1]]
                         fields[field] = np.ascontiguousarray(tile).reshape(aux, -1)
-                chemists = run(kernels[nl, nr], fields).outputs["d_block"]
+                output = "block" if direction is None else "d_block"
+                chemists = run(kernels[nl, nr], fields).outputs[output]
                 value += sign * chemists.reshape(request.shape).transpose(axes)
         result[name] = value
     return result
