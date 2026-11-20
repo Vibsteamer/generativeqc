@@ -73,6 +73,13 @@ def _integral_requests(name: str, snapshot: UHFReferenceSnapshot) -> tuple:
         else tuple(range(snapshot.nocc(spin), snapshot.nmo))
         for domain, spin in zip(domains, spins, strict=True)
     )
+    return _antisymmetrized_integral_requests(slots, spins)
+
+
+def _antisymmetrized_integral_requests(
+    slots: tuple[tuple[int, ...], ...], spins: tuple[str, ...]
+) -> tuple:
+    """Bind direct and exchange legs to their canonical chemists' blocks."""
     contributions = []
     for coefficient, axes, output_axes in (
         (1, (0, 2, 1, 3), (0, 2, 1, 3)),

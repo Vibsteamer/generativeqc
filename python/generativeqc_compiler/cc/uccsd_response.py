@@ -84,18 +84,26 @@ def fixed_source_lagrangian_direction(layout: UCCSDLayout) -> Program:
     Supply the same packed-dual lift as the ordinary residual transpose.
     Differentiating just the F12 additions holds ordinary MO inputs fixed.
     """
-    correction = build_f12_correction_program(layout)
-    terms = [correction.outputs["correlation_energy"]]
+    return _parameter_direction(build_f12_correction_program(layout), "fixed_source_lagrangian")
+
+
+def molecular_lagrangian_direction(layout: UCCSDLayout) -> Program:
+    """Differentiate the ordinary and fixed-source correlation Lagrangian jointly."""
+    return _parameter_direction(build_f12_program(layout), "correlation_lagrangian")
+
+
+def _parameter_direction(primal: Program, output: str) -> Program:
+    terms = [primal.outputs["correlation_energy"]]
     for name in RESIDUALS:
-        residual = correction.outputs[name]
+        residual = primal.outputs[name]
         seed = input_tensor(
             "bar_" + name, replace(residual.spec, role="input", differentiable=False)
         )
         axes = "ia" if name.startswith("r1") else "ijab"
         terms.append(einsum(f"{axes},{axes}->", seed, residual))
-    lagrangian = Program({"fixed_source_lagrangian": add(*terms)})
+    lagrangian = Program({output: add(*terms)})
     sources = tuple(
-        node.attrs["name"] for node in correction.live_nodes
+        node.attrs["name"] for node in primal.live_nodes
         if node.op == "input" and node.attrs["name"] not in BLOCK_NAMES
     )
     return linearize(lagrangian, sources).program

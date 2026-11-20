@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from types import MappingProxyType
@@ -16,6 +17,7 @@ from generativeqc_compiler.cc.uccsd_layout import BLOCK_NAMES, UCCSDLayout
 from generativeqc_compiler.cc.uccsd_response import (
     build_f12_response_programs,
     fixed_source_lagrangian_direction,
+    molecular_lagrangian_direction,
 )
 from generativeqc_compiler.common.arrays import immutable
 from generativeqc_compiler.common.evidence import canonical_hash
@@ -39,7 +41,6 @@ from .uccsd_solver import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
     from typing import Any
 
     from .uccsd_lambda import UCCSDLambdaResult, UCCSDParameterCotangent
@@ -382,29 +383,74 @@ class _PreparedFixedSourceUCCSDLambda(_PackedUCCSDLambda):
         to the energy gradient. The ordinary Hamiltonian and reference terms
         have their own derivatives.
         """
+        return self._correlation_direction(result, direction, ordinary=None)
+
+    def molecular_directional_derivative(
+        self,
+        result: UCCSDLambdaResult,
+        *,
+        ordinary_direction: Mapping[str, np.ndarray],
+        fixed_source_direction: Mapping[str, np.ndarray],
+        reference_derivative: float,
+    ) -> float:
+        """Derivative of the reference plus stationary CCSD-F12b correlation.
+
+        Both mappings must describe the same coordinate of the same moving
+        spin-MO frame. The ordinary mapping carries dF and antisymmetrized dERI.
+        Supply the full reference derivative, including nuclear repulsion.
+        A separately defined CABS singles correction contributes independently.
+        """
+        if not isinstance(ordinary_direction, Mapping):
+            raise TypeError("Expected a complete ordinary Hamiltonian direction")
+        if isinstance(reference_derivative, bool) or not math.isfinite(
+            reference_derivative
+        ):
+            raise ValueError("Expected a finite UHF reference derivative")
+        derivative = self._correlation_direction(
+            result, fixed_source_direction, ordinary=ordinary_direction
+        )
+        return math.fsum((reference_derivative, derivative))
+
+    def _correlation_direction(
+        self,
+        result: UCCSDLambdaResult,
+        fixed: Mapping[str, np.ndarray],
+        *,
+        ordinary: Mapping[str, np.ndarray] | None,
+    ) -> float:
         self._check_open()
         expected = {k: v for k, v in self.prepared.feeds.items() if _source_key(k)}
-        if not expected.keys() <= direction.keys() or any(
-            not isinstance(k, str) or not _source_key(k) for k in direction
+        if not expected.keys() <= fixed.keys() or any(
+            not isinstance(k, str) or not _source_key(k) for k in fixed
         ):
             raise ValueError("Incomplete or unknown fixed-source direction")
-        program = fixed_source_lagrangian_direction(self.layout)
+        direction = dict(fixed)
+        if ordinary is None:
+            program = fixed_source_lagrangian_direction(self.layout)
+        else:
+            all_feeds = self.prepared.feeds
+            if ordinary.keys() != all_feeds.keys() - expected.keys():
+                raise ValueError("Incomplete or unknown ordinary Hamiltonian direction")
+            direction.update(ordinary)
+            expected = all_feeds
+            program = molecular_lagrangian_direction(self.layout)
         resource = self._resource(program)
         direction_bytes = sum(v.nbytes for v in expected.values())
         peak = checked_bytes(
             self.base_bytes + 2 * direction_bytes + resource.native_bytes,
-            "fixed-source direction numeric storage",
+            "CC Lagrangian direction numeric storage",
         )
         work = self.qualification_scalar_work + resource.scalar_work
         if peak > self.options.max_bytes or work > self.options.max_total_work:
-            raise MemoryError("Fixed-source direction exceeds numeric/semantic-work budget")
+            raise MemoryError("CC Lagrangian direction exceeds numeric/semantic-work budget")
         self._resources[program.logical_hash] = resource
         packed, _ = self.qualify(result)
         fields = {
             "d_" + k: _checked_array(k, direction[k], v.shape) for k, v in expected.items()
         }
         output = self._execute(program, {**fields, **self._seeds(packed)}, _Counter())
-        return float(output["d_fixed_source_lagrangian"])
+        (derivative,) = output.values()
+        return float(derivative)
 
     def _replay_fixed_source_parameter_cotangent(
         self, packed_multipliers: np.ndarray, parameter: str

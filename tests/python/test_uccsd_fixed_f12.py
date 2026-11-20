@@ -8,7 +8,7 @@ from generativeqc.response_solver import GMRESOptions
 from generativeqc_compiler.cc.uccsd_equations import build_program
 from generativeqc_compiler.cc.uccsd_layout import UCCSDLayout
 from generativeqc_compiler.tensor import execute
-from test_uccsd_equations import _feeds, _random_hamiltonian
+from test_uccsd_equations import _determinant_oracle, _feeds, _random_hamiltonian
 from test_uccsd_f12 import (
     _dense_correction,
     _pack_residual,
@@ -210,6 +210,33 @@ def test_fixed_source_stationarity_and_cotangent_against_independent_root(
                 assert derivative == pytest.approx((ep - em) / (2 * h), rel=0, abs=3e-10)
             with pytest.raises(ValueError, match="fixed-source direction"):
                 response.fixed_source_directional_derivative(result, {})
+            # The ordinary Hamiltonian is linear at fixed amplitudes. Direct
+            # determinant-space projection gives its independent directional
+            # energy and residual contributions, including off-diagonal Fock.
+            dfock, deri = _random_hamiltonian(layout)
+            blocks = layout.unpack(expected)
+            ordinary = _feeds(layout, dfock, deri, blocks)
+            ordinary = {k: v for k, v in ordinary.items() if k not in blocks}
+            det = _determinant_oracle(layout, dfock, deri, blocks)
+            ordinary_bar = float(det["correlation_energy"]) + np.dot(
+                expected_lambda, _pack_residual(layout, det)
+            )
+            ref = -0.031
+            combined = response.molecular_directional_derivative(
+                result, ordinary_direction=ordinary,
+                fixed_source_direction=changes, reference_derivative=ref,
+            )
+            assert combined == pytest.approx(ref + ordinary_bar + derivative, abs=3e-10, rel=0)
+            with pytest.raises(ValueError, match="ordinary Hamiltonian"):
+                response.molecular_directional_derivative(
+                    result, ordinary_direction={}, fixed_source_direction=changes,
+                    reference_derivative=ref,
+                )
+            with pytest.raises(TypeError, match="ordinary Hamiltonian"):
+                response.molecular_directional_derivative(
+                    result, ordinary_direction=None, fixed_source_direction=changes,
+                    reference_derivative=ref,
+                )
             alpha_direction = direction[:2, :2, :2, :2].copy()
             cotangent = response.parameter_cotangent(result, "c_f12_aaaa")
             actual_derivative = cotangent.contract(alpha_direction)
