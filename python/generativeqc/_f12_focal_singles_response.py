@@ -219,6 +219,13 @@ def relaxed_reference_weights(
             raise RuntimeError(
                 f"DF-HF coupled orbital response did not converge ({status})"
             )
+    if len(reference.occupied) == 1:
+        # A spin-independent perturbation of a restricted orbital changes
+        # both spin channels together. Project the doubled solution onto the
+        # singlet block, then verify the full coupled equations on that block.
+        za, zb = np.split(z, 2)
+        shared = (za + zb) * 0.5
+        z = np.concatenate((shared, shared))
     if np.linalg.norm(matvec(z) - driver) > 1e-9 * max(1.0, np.linalg.norm(driver)):
         raise ValueError("DF-HF orbital response residual exceeds its tolerance")
     # With the direct occupied/virtual torque as driver the electronic observable

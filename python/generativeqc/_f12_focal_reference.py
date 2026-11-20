@@ -41,6 +41,18 @@ class FocalReference:
     orbital_id: str
     jk_fit_id: str
 
+    def _pair_spin_indices(self, request: FocalRequest) -> tuple[int, int]:
+        """Map physical alpha/beta lines to the canonical orbital variables."""
+        if (
+            request.root_id == "rhf"
+            and request.multiplicity == 1
+            and len(self.occupied) == 1
+        ):
+            return (0, 0)
+        if request.root_id == "uhf" and len(self.occupied) == 2:
+            return (0, 1)
+        raise ValueError("Pair request and canonical reference spin channels disagree")
+
 
 def df_reference(
     request: FocalRequest, *, forces: bool = True, budget_mib: int = 512

@@ -836,8 +836,11 @@ pair = provider(next(req for req, _ in plan.steps if req.role == "mp2_f12_correl
 
 Pass filesystem paths as `pathlib.Path` objects. The HF+CABS term returns the
 DF-HF energy and forces plus the relaxed spin singles contribution for an
-all-electron RHF or UHF reference. The pair term supports all-active UHF and
-returns ordinary DF-UMP2 correlation plus the explicit 3C(FIX) increment.
+all-electron RHF or UHF reference. The pair term supports all-active singlet RHF and UHF and
+returns ordinary DF-MP2 correlation plus the explicit 3C(FIX) increment.
+For a singlet RHF request, both spin channels use the same restricted
+spatial orbitals. Their coefficient derivatives add before the restricted
+orbital response.
 Both contributions within that term share one physical determinant. The JK,
 ordinary correlation and explicit correlation fits follow their respective
 basis records. Matching identities share the fitted integrals and their
@@ -853,7 +856,7 @@ energy, both spin corrections and the four relaxed weights for S, Hcore,
 B and M. With `relax=False`, the returned coefficient and complementary
 kernel weights expose the separate electronic and overlap derivatives.
 
-For the ordinary MP2 part of an all-active UHF pair request, use
+For the ordinary MP2 part of an all-active singlet RHF or UHF pair request, use
 `benchmarks.f12_focal_ump2.molecular_df_ump2(request, ...)` from a source
 checkout. The shell and one-electron libraries take the same path arguments
 as the HF+CABS provider. On CUDA supply the CUDA metric and response
@@ -874,12 +877,12 @@ their corresponding nuclear integral derivatives and negate the sum.
 
 For the explicit 3C(FIX) contribution from retained spin pairs, call
 `benchmarks.f12_focal_increment.molecular_f12_increment(request, ...)`.
-This source-checkout provider takes an all-active UHF pair request and the
+This source-checkout provider takes an all-active singlet RHF or UHF pair request and the
 same native library and runner arguments as the ordinary provider. It uses
 the full joint OBS/OptRI basis in both the JKFit Fock and the independently
 fitted Gaussian operators. Its result contains the explicit F12 increment,
 its relaxed force, the active-pair count and the fixed CABS rank. Add the
-ordinary UMP2 correlation once to assemble the `mp2_f12_correlation` term.
+ordinary DF-MP2 correlation once to assemble the `mp2_f12_correlation` term.
 Supply `expected_cabs_rank` for consistent displaced-geometry checks.
 
 For already computed sources, the public experimental function

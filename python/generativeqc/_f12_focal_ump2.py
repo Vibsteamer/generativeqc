@@ -1,4 +1,4 @@
-"""Ordinary all-active DF-UMP2 on one canonical focal UHF determinant."""
+"""Ordinary all-active DF-MP2 on one canonical focal RHF or UHF determinant."""
 
 from __future__ import annotations
 
@@ -49,7 +49,7 @@ def reference_df_ump2(
     library: ctypes.CDLL | None = None,
     budget_mib: int = 512,
 ) -> FocalUMP2Weights:
-    """Calculate ordinary MP2 and relax its integral weights using the same unrestricted root.
+    """Calculate ordinary MP2 and relax its integral weights using the same canonical root.
 
     Independently declared JKFit and MP2Fit may have different dimensions.
     Return derivatives with respect to overlap, core, JKFit and MP2Fit raw
@@ -72,11 +72,11 @@ def reference_df_ump2(
         )
     if (
         request.role != "mp2_f12_correlation"
-        or request.root_id != "uhf"
+        or request.root_id not in ("rhf", "uhf")
         or request.correlation_space_id != "all-active"
     ):
         raise ValueError(
-            "ordinary focal DF-UMP2 requires an all-active UHF pair request"
+            "ordinary focal DF-UMP2 requires an all-active RHF or UHF pair request"
         )
     if (
         reference.executed_backend,
@@ -92,12 +92,13 @@ def reference_df_ump2(
         request.basis.jk_fit.identity,
     ):
         raise ValueError(
-            "UHF reference and pair request describe different surfaces or bases"
+            "HF reference and pair request describe different surfaces or bases"
         )
     n = len(reference.hcore)
-    occs = reference.occupied
+    spin_indices = reference._pair_spin_indices(request)
+    occs = tuple(reference.occupied[k] for k in spin_indices)
     if len(occs) != 2 or any(not 0 <= o < n for o in occs) or not any(occs):
-        raise ValueError("invalid UHF occupations")
+        raise ValueError("invalid HF occupations")
     for source, fit in ((jk, request.basis.jk_fit), (mp2, request.basis.mp2_fit)):
         if fit is None or (
             source.executed_backend,
@@ -149,14 +150,14 @@ def reference_df_ump2(
             continue
         graph = ordinary_df_factors(n, o, q)
         inputs = {
-            "coefficients": reference.coefficients[k],
+            "coefficients": reference.coefficients[spin_indices[k]],
             "ao_coulomb": mp2.three_center,
             "whitener": mp2.whitener,
         }
         forward = Program({"B": graph.outputs["B"]})
         graphs[spin] = (forward, graph, inputs)
         b = checked(forward, inputs).outputs["B"]
-        eps = reference.orbital_energies[k]
+        eps = reference.orbital_energies[spin_indices[k]]
         controls[spin] = {"B_" + spin: b, "eo_" + spin: eps[:o], "ev_" + spin: eps[o:]}
         seeds[spin] = np.zeros_like(b)
     fock_seeds = {"fock_" + spin: np.zeros((n, n)) for spin in spins}
@@ -189,7 +190,7 @@ def reference_df_ump2(
         fwd, graph, inputs = graphs[spin]
         reverse = transpose_program(fwd, ("B",)).program
         result = checked(reverse, {**inputs, "bar_B": seeds[spin]}).outputs
-        cbar[k] += result["bar_coefficients"]
+        cbar[spin_indices[k]] += result["bar_coefficients"]
         mp2_raw_bar += result["bar_ao_coulomb"]
         mg = Program({"metric_bar": graph.outputs["metric_bar"]})
         mp2_metric_bar += checked(mg, {**inputs, "factor_bar": seeds[spin]}).outputs[
@@ -199,7 +200,7 @@ def reference_df_ump2(
     space = (*occs, n, n, len(jk.metric))
     ao = {
         "coefficients_alpha": reference.coefficients[0],
-        "coefficients_beta": reference.coefficients[1],
+        "coefficients_beta": reference.coefficients[spin_indices[1]],
         "hcore_ao": reference.hcore,
         "ao_coulomb": jk.three_center,
         "metric/coulomb": jk.metric,
@@ -218,11 +219,11 @@ def reference_df_ump2(
     for k, spin in enumerate(spins):
         if not np.allclose(
             focks["fock_" + spin],
-            np.diag(reference.orbital_energies[k]),
+            np.diag(reference.orbital_energies[spin_indices[k]]),
             rtol=0,
             atol=2e-8,
         ):
-            raise ValueError("JKFit does not reproduce the canonical physical UHF Fock")
+            raise ValueError("JKFit does not reproduce the canonical physical HF Fock")
     fseed = spin_fock_pullback(fspace, values, fock_seeds, checked)
     _, bars = _orbital_sources(
         space,
@@ -234,7 +235,7 @@ def reference_df_ump2(
     )
     assert bars is not None
     for k, spin in enumerate(spins):
-        cbar[k] += bars["coefficients_" + spin]
+        cbar[spin_indices[k]] += bars["coefficients_" + spin]
     direct = {
         "hcore": bars["hcore_ao"],
         "three_center": bars["ao_coulomb"],

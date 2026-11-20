@@ -1,4 +1,4 @@
-"""Selected retained 3C(FIX) F12 increment on a canonical all-active UHF focal root."""
+"""Selected retained 3C(FIX) F12 increment on a canonical all-active RHF or UHF focal root."""
 
 from __future__ import annotations
 
@@ -76,7 +76,7 @@ def reference_f12_increment(
     The JK panel contains raw Coulomb operators. The F12 panel also contains
     f12, f12_squared, f12_over_coulomb and double_commutator, with their metrics
     and 3-center tensors. All weights are positive energy cotangents. The
-    energy excludes HF, ordinary UMP2 and CABS singles.
+    energy excludes HF, ordinary MP2 and CABS singles.
     """
     from generativeqc_compiler.method.canonical_frame_response import (
         orbital_rotation_cotangent,
@@ -95,14 +95,13 @@ def reference_f12_increment(
     cuda = request.backend == "cuda"
     if (
         request.role != "mp2_f12_correlation"
-        or request.root_id != "uhf"
+        or request.root_id not in ("rhf", "uhf")
         or request.correlation_space_id != "all-active"
         or request.backend not in ("cuda", "cpu_reference")
-        or (cuda
-        and run is None)
+        or (cuda and run is None)
     ):
         raise ValueError(
-            "selected F12 requires a canonical all-active UHF pair request with its backend runner"
+            "selected F12 requires a canonical all-active RHF or UHF pair request with its backend runner"
         )
     budget = checked_integer(
         budget_mib, "F12 increment budget in MiB", low=1, high=(2**63 - 1) >> 20
@@ -139,7 +138,8 @@ def reference_f12_increment(
         raise ValueError("F12 reference uses different orbital or JKFit bases")
     n = one.obs_ao_count
     atomic = len(one.overlap)
-    occs = reference.occupied
+    spin_indices = reference._pair_spin_indices(request)
+    occs = tuple(reference.occupied[k] for k in spin_indices)
     if (
         len(occs) != 2
         or any(not 0 <= o < n for o in occs)
@@ -147,7 +147,7 @@ def reference_f12_increment(
         or not np.allclose(one.overlap[:n, :n], reference.overlap, atol=2e-8, rtol=0)
         or not np.allclose(one.hcore[:n, :n], reference.hcore, atol=2e-8, rtol=0)
     ):
-        raise ValueError("incompatible F12/UHF orbital spaces")
+        raise ValueError("incompatible F12/HF orbital spaces")
     metrics = {
         "metric/coulomb": "metric",
         "metric/geminal": "metric_f12",
@@ -206,7 +206,7 @@ def reference_f12_increment(
     spins = ("alpha", "beta")
     for k, spin in enumerate(spins):
         frame = np.zeros((atomic, ext))
-        frame[:n, :n] = reference.coefficients[k]
+        frame[:n, :n] = reference.coefficients[spin_indices[k]]
         frame[:, n:] = complement
         ao["coefficients_" + spin] = frame
     panel = {
@@ -218,14 +218,17 @@ def reference_f12_increment(
         space, ao, checked, jkfit=panel, component="f12"
     )
     # Apply the same-space canonical multipliers to the physical OBS Fock,
-    # then relax the remaining occupied/virtual torque through coupled UHF.
+    # then relax the remaining occupied/virtual torque through coupled HF.
     jkspace = (*occs, n, n, len(jk.whitener))
     fspace = (*occs, n, len(jk.whitener))
     obsao = {
         **panel,
         "ao_coulomb": panel["ao_coulomb"][:, :n, :n],
         "hcore_ao": reference.hcore,
-        **{"coefficients_" + s: reference.coefficients[k] for k, s in enumerate(spins)},
+        **{
+            "coefficients_" + s: reference.coefficients[spin_indices[k]]
+            for k, s in enumerate(spins)
+        },
     }
     projected, _ = _orbital_sources(
         jkspace, obsao, checked, None, projected=None, role="ordinary_fock"
@@ -238,13 +241,13 @@ def reference_f12_increment(
     focks = spin_fock(fspace, values, checked)
     seeds = {}
     for k, spin in enumerate(spins):
-        eps = reference.orbital_energies[k]
+        eps = reference.orbital_energies[spin_indices[k]]
         if not np.allclose(focks["fock_" + spin], np.diag(eps), atol=2e-8, rtol=0):
-            raise ValueError("F12 Fock mismatch with its native UHF reference")
+            raise ValueError("F12 Fock mismatch with its native HF reference")
         rotation = checked(
             orbital_rotation_cotangent(n, n),
             {
-                "coefficients": reference.coefficients[k],
+                "coefficients": reference.coefficients[spin_indices[k]],
                 "frame_bar": bars["coefficients_" + spin][:n, :n],
             },
         ).outputs["rotation_gradient"]
@@ -274,9 +277,11 @@ def reference_f12_increment(
     h[:n, :n] += extra["hcore_ao"]
     three = bars["jkfit/ao_coulomb"]
     three[:, :n, :n] += extra["ao_coulomb"]
-    cbar = np.stack(
-        [bars["coefficients_" + s][:n, :n] + extra["coefficients_" + s] for s in spins]
-    )
+    cbar = np.zeros_like(reference.coefficients)
+    for spin, index in zip(spins, spin_indices, strict=True):
+        cbar[index] += (
+            bars["coefficients_" + spin][:n, :n] + extra["coefficients_" + spin]
+        )
     cg = sum(bars["coefficients_" + s][:, n:] for s in spins)
     transfer = checked(
         frame_kernel_cotangent(atomic, proj.rank),

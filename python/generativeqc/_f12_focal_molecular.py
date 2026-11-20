@@ -63,7 +63,7 @@ class _Panel:
 
 @dataclass(frozen=True, kw_only=True)
 class MolecularFocalProvider:
-    """Evaluate geometric HF+CABS and all-active UHF MP2-F12/3C(FIX) focal terms.
+    """Evaluate geometric HF+CABS and all-active RHF/UHF MP2-F12/3C(FIX) focal terms.
 
     Supply native F12 shell and optional separate one-electron libraries. CUDA
     uses an FP64 TensorIR runner, the device metric/response library, and the
@@ -213,14 +213,15 @@ class MolecularFocalProvider:
                 "The molecular focal term requires an OptRI basis and positive relative cutoff"
             )
         if pair and (
-            request.root_id != "uhf"
+            request.root_id not in ("rhf", "uhf")
+            or (request.root_id == "rhf" and request.multiplicity != 1)
             or request.correlation_space_id != "all-active"
             or request.basis.mp2_fit is None
             or request.basis.f12_fit is None
             or request.basis.beta is None
         ):
             raise ValueError(
-                "The pair term requires all-active UHF, MP2Fit, F12Fit and beta"
+                "The pair term requires all-active UHF or singlet RHF, MP2Fit, F12Fit and beta"
             )
         ref = df_reference(request, forces=not pair, budget_mib=self.budget_mib)
         one = one_electron_sources(

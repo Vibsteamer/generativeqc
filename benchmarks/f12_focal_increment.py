@@ -1,4 +1,4 @@
-"""Molecular retained 3C(FIX) pair increment with separately fitted canonical UHF."""
+"""Molecular retained 3C(FIX) pair increment with separately fitted canonical HF."""
 
 from __future__ import annotations
 
@@ -53,7 +53,7 @@ def molecular_f12_increment(
     relative_cutoff: float = 1e-9,
     budget_mib: int = 1536,
 ) -> MolecularF12Increment:
-    """Solve the physical UHF reference and contract its explicit F12 pair response.
+    """Solve the physical HF reference and contract its explicit F12 pair response.
 
     The two integral layouts use the same full joint OBS/OptRI basis. The
     extended Fock uses JKFit and every Gaussian pair operator uses F12Fit.
@@ -62,13 +62,12 @@ def molecular_f12_increment(
     if (
         request.role != "mp2_f12_correlation"
         or request.correlation_space_id != "all-active"
-        or request.root_id != "uhf"
+        or request.root_id not in ("rhf", "uhf")
         or request.backend not in ("cuda", "cpu_reference")
-        or (not host
-        and (metric_library is None or run is None))
+        or (not host and (metric_library is None or run is None))
     ):
         raise ValueError(
-            "selected F12 increment needs its all-active UHF pair request and explicit backend"
+            "selected F12 increment needs its all-active RHF or UHF pair request and explicit backend"
         )
     reference = df_reference(request, forces=False, budget_mib=budget_mib)
     one = one_electron_sources(

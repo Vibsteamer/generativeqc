@@ -1,4 +1,4 @@
-"""Geometry-driven ordinary UMP2 part of an unrestricted focal pair request."""
+"""Geometry-driven ordinary MP2 part of a canonical focal pair request."""
 
 from __future__ import annotations
 
@@ -50,21 +50,21 @@ def molecular_df_ump2(
     run: Callable | None = None,
     budget_mib: int = 512,
 ) -> MolecularUMP2:
-    """Evaluate the all-active UHF ordinary correlation energy and its full relaxed force.
+    """Evaluate the all-active RHF or UHF ordinary correlation energy and its full relaxed force.
 
     The geometry defines both independently fitted Coulomb operators. SCF, each
     shell derivative contraction and the electronic response use the requested
-    backend. The measured sum of the three spin classes is ordinary DF-UMP2.
+    backend. The measured sum of the three spin classes is the ordinary DF-MP2 energy.
     """
     host = request.backend == "cpu_reference"
     if (
         request.role != "mp2_f12_correlation"
-        or request.root_id != "uhf"
+        or request.root_id not in ("rhf", "uhf")
         or request.correlation_space_id != "all-active"
         or request.backend not in ("cuda", "cpu_reference")
     ):
         raise ValueError(
-            "ordinary molecular DF-UMP2 requires an all-active UHF pair request and explicit backend"
+            "ordinary molecular DF-UMP2 requires an all-active RHF or UHF pair request and explicit backend"
         )
     if not host and (metric_library is None or run is None):
         raise ValueError(

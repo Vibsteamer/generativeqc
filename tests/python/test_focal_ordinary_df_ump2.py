@@ -87,12 +87,14 @@ def test_energy_source_weights_match_full_moving_frame_force(channel: str) -> No
     assert source["energy"] == pytest.approx(expected["energy"])
 
 
+@pytest.mark.parametrize("root", ["rhf", "uhf"])
 def test_molecular_ordinary_mp2_against_two_independent_fits(
     hydrogen_bases: tuple,
+    root: str,
 ) -> None:
     from generativeqc.experimental.f12_focal import FocalSeries, plan_singlepoint
     from pyscf import df, gto, scf
-    from pyscf.mp import dfump2
+    from pyscf.mp import dfmp2, dfump2
 
     from benchmarks.f12_focal_ump2 import molecular_df_ump2
 
@@ -103,15 +105,19 @@ def test_molecular_ordinary_mp2_against_two_independent_fits(
         )
     basis, obs, jk = hydrogen_bases
     xyz = np.array([(0.10, -0.23, 0.20), (1.38, 0.27, -0.10), (0.67, 1.45, 0.31)])
-    atoms = list(zip(["H"] * 3, xyz, strict=True))
+    if root == "rhf":
+        xyz = xyz[:2]
+    symbols = ["H"] * len(xyz)
+    mult = 1 if root == "rhf" else 2
+    atoms = list(zip(symbols, xyz, strict=True))
     plan = plan_singlepoint(
         atoms,
         FocalSeries(basis),
         FocalSeries(basis),
         basis,
-        root_id="uhf",
+        root_id=root,
         correlation_space_id="all-active",
-        multiplicity=2,
+        multiplicity=mult,
         backend="cpu_reference",
     )
     req = next(r for r, _ in plan.steps if r.role == "mp2_f12_correlation")
@@ -121,17 +127,17 @@ def test_molecular_ordinary_mp2_against_two_independent_fits(
 
     def oracle(positions: np.ndarray) -> float:
         mol = gto.M(
-            atom=list(zip(["H"] * 3, positions, strict=True)),
+            atom=list(zip(symbols, positions, strict=True)),
             basis=obs,
             unit="Bohr",
-            spin=1,
+            spin=mult - 1,
             verbose=0,
         )
-        mf = scf.UHF(mol).density_fit(auxbasis=jk)
+        mf = (scf.RHF(mol) if root == "rhf" else scf.UHF(mol)).density_fit(auxbasis=jk)
         mf.conv_tol, mf.conv_tol_grad, mf.max_cycle = 1e-13, 1e-9, 150
         mf.kernel()
         assert mf.converged
-        mp = dfump2.DFUMP2(mf)
+        mp = dfmp2.DFMP2(mf) if root == "rhf" else dfump2.DFUMP2(mf)
         mp.with_df = df.DF(mol, auxbasis="aug-cc-pvtz-ri")
         energy, _ = mp.kernel(with_t2=False)
         return float(energy)
@@ -140,8 +146,63 @@ def test_molecular_ordinary_mp2_against_two_independent_fits(
     assert result.spin_energies[-1] == 0.0
     assert sum(result.spin_energies) == pytest.approx(oracle(xyz), abs=2e-9)
     delta = np.array([[0.1, -0.2, 0.3], [-0.2, 0.4, -0.1], [0.1, -0.2, -0.2]])
+    delta = delta[: len(xyz)]
     for step in (4e-4, 2e-4):
         force = (oracle(xyz - step * delta) - oracle(xyz + step * delta)) / (2 * step)
         assert np.vdot(result.correlation_forces, delta) == pytest.approx(
             force, abs=2e-7
         )
+
+
+def test_restricted_water_orbital_response_matches_pyscf_cphf() -> None:
+    """Equal-spin response to each Cartesian electric field on a bent RHF root."""
+    from generativeqc_compiler.mp2.f12_unrestricted_reference import (
+        unrestricted_df_orbital_action,
+    )
+    from pyscf import gto, lib, scf
+
+    mol = gto.M(
+        atom="O .11 -.16 .21; H 1.46 .91 -.31; H -1.09 1.28 .37",
+        unit="Bohr",
+        basis="6-31g",
+        verbose=0,
+    )
+    mf = scf.RHF(mol).density_fit(auxbasis="weigend")
+    mf.conv_tol = 1e-13
+    mf.kernel()
+    assert mf.converged
+    coeff = mf.mo_coeff
+    occ = mol.nelectron // 2
+    co, cv = coeff[:, :occ], coeff[:, occ:]
+    b = np.concatenate([lib.unpack_tril(chunk) for chunk in mf.with_df.loop()])
+    b = np.einsum("Ppq,pi,qj->Pij", b, coeff, coeff, optimize=True)
+    gap = mf.mo_energy[occ:, None] - mf.mo_energy[:occ]
+    raw = {
+        "vo": b[:, occ:, :occ],
+        "oo": b[:, :occ, :occ],
+        "vv": b[:, occ:, occ:],
+        "gap": gap,
+    }
+    factors = {
+        f"{k}_{s}": np.ascontiguousarray(v)
+        for k, v in raw.items()
+        for s in ("alpha", "beta")
+    }
+    action = unrestricted_df_orbital_action(occ, occ, mol.nao, len(b))
+    field = cv.T @ mol.intor("int1e_r", comp=3) @ co
+    response = mf.gen_response(hermi=1)
+
+    def fock_response(vector: np.ndarray) -> np.ndarray:
+        density = 2 * cv @ vector.reshape(-1, *gap.shape) @ co.T
+        v = response(density + density.transpose(0, 2, 1))
+        return (cv.T @ v @ co).reshape(vector.shape)
+
+    # Build the independent restricted CPHF matrix by perturbing each
+    # spatial rotation in PySCF; solve all three field directions together.
+    hessian = np.diag(gap.ravel()) + fock_response(np.eye(gap.size)).T
+    solution = np.linalg.solve(hessian, -field.reshape(3, -1).T).T.reshape(field.shape)
+    for trial, rhs in zip(solution, field, strict=True):
+        x = np.ascontiguousarray(trial)
+        value = execute(action, {**factors, "trial_alpha": x, "trial_beta": x}).outputs
+        for spin in ("alpha", "beta"):
+            np.testing.assert_allclose(value[spin], -rhs, rtol=0, atol=1e-9)
