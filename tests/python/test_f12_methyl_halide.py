@@ -59,3 +59,50 @@ def test_displaced_organic_geometry() -> None:
     assert shifted.atoms[1].position[2] == coords[1][2]
     assert fixed.surface_id != shifted.surface_id
     assert fixed.basis.basis_id == shifted.basis.basis_id
+
+
+@pytest.mark.parametrize("element", ("Br", "I"))
+@pytest.mark.parametrize("cardinal", (2, 3))
+@pytest.mark.parametrize("root,charge,multiplicity", (("rhf", 0, 1), ("uhf", 1, 2)))
+def test_methyl_halide_fitted_ecp_template(
+    element: str, cardinal: int, root: str, charge: int, multiplicity: int
+) -> None:
+    import ctypes
+
+    from generativeqc import Calculator, _native
+    from generativeqc.ecp import fitted_hf_ecp_domain, resolve_ecp
+
+    q = methyl_halide_plan(element, cardinal, root=root).steps[0][0]
+    basis, atoms = q.basis.orbital, q.atoms
+    assert fitted_hf_ecp_domain(root, basis, atoms, charge, multiplicity)
+    assert not fitted_hf_ecp_domain(root, basis, atoms, charge + 2, multiplicity)
+    assert not fitted_hf_ecp_domain(root, basis, atoms[:-1], charge, multiplicity)
+    cores, terms = resolve_ecp(basis, atoms)
+    assert cores == (0, 10 if element == "Br" else 28, 0, 0, 0)
+    assert all(term[0] == 1 for term in terms)
+    calc = Calculator(
+        method=root,
+        basis=basis,
+        auxiliary_basis=q.basis.jk_fit,
+        density_fitting="cuda",
+        device="cuda",
+        precision="fp64",
+    )
+    assert calc._fitted_ecp_hf(basis, atoms, charge, multiplicity)
+    assert calc._full_df_basis_consumer("df_three_center", 1, atoms=atoms) == "full_df"
+    assert calc.basis_capability_report(atoms, compute_forces=True)["eligible"]
+    # Template expansion owns no electronic solve and is identical on host and device.
+    ctx = ctypes.c_void_p()
+    cpu = Calculator(basis=basis, device="cpu")
+    lib = calc._library
+    _native.check(
+        lib,
+        lib.generativeqc_context_create(
+            ctypes.byref(cpu._context_descriptor()), ctypes.byref(ctx)
+        ),
+    )
+    try:
+        handle = calc._create_native_system(ctx, atoms, charge, multiplicity)
+        lib.generativeqc_system_destroy(handle)
+    finally:
+        lib.generativeqc_context_destroy(ctx)

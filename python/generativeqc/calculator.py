@@ -2024,13 +2024,16 @@ class Calculator:
         self, operator: str, derivative_order: int = 0, *, atoms=None
     ) -> str | None:
         """Select value and gradient operators provided by the CUDA fitted Fock source."""
-        if atoms is not None and self._fitted_ecp_hf(
-            self._basis, atoms, 0, 1 if self._method == _native.METHOD_RHF else 2
-        ):
-            from .ecp import g_shell_halogen_hydride
+        if atoms is not None:
+            from .ecp import g_shell_halogen_hydride, g_shell_methyl_halide
 
+            methyl = g_shell_methyl_halide(self._basis, atoms)
+            unrestricted = self._method == _native.METHOD_UHF
             if (
-                g_shell_halogen_hydride(self._basis, atoms)
+                (methyl or g_shell_halogen_hydride(self._basis, atoms))
+                and self._fitted_ecp_hf(
+                    self._basis, atoms, int(methyl and unrestricted), 2 if unrestricted else 1
+                )
                 and derivative_order in (0, 1)
                 and operator
                 in ("overlap", "kinetic", "nuclear_attraction", "df_three_center")
@@ -2458,7 +2461,7 @@ class Calculator:
             raise NotImplementedError("; ".join(report["reasons"]))
 
     def _fitted_ecp_hf(self, basis, atoms, charge, multiplicity):
-        from .ecp import fitted_hf_hydride_domain
+        from .ecp import fitted_hf_ecp_domain
 
         return (
             self._method in (_native.METHOD_RHF, _native.METHOD_UHF)
@@ -2466,7 +2469,7 @@ class Calculator:
             and self._density_fitting_mode == _native.DENSITY_FITTING_CUDA
             and self._precision_mode == _native.PRECISION_FP64
             and self._auxiliary_basis is not None
-            and fitted_hf_hydride_domain(
+            and fitted_hf_ecp_domain(
                 self._method_name, basis, atoms, charge, multiplicity
             )
         )

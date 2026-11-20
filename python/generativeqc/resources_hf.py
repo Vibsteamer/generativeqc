@@ -784,15 +784,15 @@ def hf_resource_request(
         )
         if method == "rhf" and multiplicity != 1:
             raise ValueError("RHF requires a closed-shell singlet")
-        from .ecp import fitted_hf_hydride_domain
+        from .ecp import fitted_hf_ecp_domain
 
-        fitted_hydride = (
+        fitted_ecp = (
             fitted
             and backend == "cuda"
             and density_fitting == "cuda"
             and precision == "fp64"
             and auxiliary_basis is not None
-            and fitted_hf_hydride_domain(
+            and fitted_hf_ecp_domain(
                 method, selected_basis, atoms, charge, multiplicity
             )
         )
@@ -805,7 +805,7 @@ def hf_resource_request(
             multiplicity,
             "orbital",
             library=library,
-            fitted_consumer="full_df" if fitted_hydride else None,
+            fitted_consumer="full_df" if fitted_ecp else None,
         )
         if max(electrons.nalpha, electrons.nbeta) > orbital["nbf"]:
             raise ValueError(
@@ -813,7 +813,7 @@ def hf_resource_request(
             )
         auxiliary = None
         if fitted:
-            if orbital.get("ecp_terms") and not fitted_hydride:
+            if orbital.get("ecp_terms") and not fitted_ecp:
                 raise NotImplementedError(
                     "ECP density-fitting execution is not yet validated"
                 )
@@ -835,7 +835,7 @@ def hf_resource_request(
                     multiplicity,
                     "auxiliary",
                     library=library,
-                    fitted_consumer="scf_df" if fitted_hydride else None,
+                    fitted_consumer="scf_df" if fitted_ecp else None,
                 )
             )
         items.append(

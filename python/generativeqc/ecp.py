@@ -22,6 +22,11 @@ from generativeqc_compiler.integral.ecp_policy import (
 from .basis import BasisSet, validate_ecp_data
 from .elements import checked_integer
 
+if typing.TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from .calculator import Atom
+
 
 def g_shell_halogen_hydride(basis, atoms):
     """Return whether orbital g quadrature was qualified for this atom/core topology."""
@@ -37,6 +42,20 @@ def g_shell_halogen_hydride(basis, atoms):
         and hydrogen.ecp_core_electrons == 0
         and heavy is not None
         and heavy.ecp_core_electrons == {35: 10, 53: 28}[elements[-1]]
+    )
+
+
+def g_shell_methyl_halide(basis: object, atoms: Sequence[Atom]) -> bool:
+    """C/H carry their full charges and only Br or I carries a small-core ECP."""
+    if not isinstance(basis, BasisSet) or basis.representation != "spherical":
+        return False
+    numbers = sorted(a.atomic_number for a in atoms)
+    if numbers not in ([1, 1, 1, 6, 35], [1, 1, 1, 6, 53]):
+        return False
+    cores = {1: 0, 6: 0, numbers[-1]: 10 if numbers[-1] == 35 else 28}
+    return all(
+        z in basis.by_element and basis.by_element[z].ecp_core_electrons == core
+        for z, core in cores.items()
     )
 
 
@@ -82,9 +101,28 @@ def fitted_hf_hydride_domain(method, basis, atoms, charge, multiplicity):
     )
 
 
+def fitted_hf_ecp_domain(
+    method: str, basis: BasisSet, atoms: Sequence[Atom], charge: int, multiplicity: int
+) -> bool:
+    if fitted_hf_hydride_domain(method, basis, atoms, charge, multiplicity):
+        return True
+    return (
+        (method, charge, multiplicity) in (("rhf", 0, 1), ("uhf", 1, 2))
+        and g_shell_methyl_halide(basis, atoms)
+        and all(
+            shell.angular_momentum <= 4
+            for z in {atom.atomic_number for atom in atoms}
+            for shell in basis.by_element[z].shells
+        )
+    )
+
+
 def resolve_ecp(basis: typing.Any, atoms: typing.Any) -> typing.Any:
     """Resolve immutable source records to atom-mapped scalar residual terms."""
-    shell_limit = 4 if g_shell_halogen_hydride(basis, atoms) else 3
+    orbital_g = g_shell_halogen_hydride(basis, atoms) or g_shell_methyl_halide(
+        basis, atoms
+    )
+    shell_limit = 4 if orbital_g else 3
     cores, terms = [], []
     metadata = basis.by_element if isinstance(basis, BasisSet) else {}
     for atom_index, atom in enumerate(atoms):
@@ -111,7 +149,7 @@ def resolve_ecp(basis: typing.Any, atoms: typing.Any) -> typing.Any:
             raise NotImplementedError(
                 "ECP execution supports orbital s/p/d/f shells"
                 if shell_limit == 3
-                else "scalar-ECP hydride orbital shells extend through g"
+                else "scalar-ECP orbital shells in this domain extend through g"
             )
         for potential in potentials:
             if set(potential) - {
@@ -158,7 +196,7 @@ def resolve_ecp(basis: typing.Any, atoms: typing.Any) -> typing.Any:
                 raise NotImplementedError(
                     "ECP execution supports orbital s/p/d/f shells"
                     if shell_limit == 3
-                    else "scalar-ECP hydride orbital shells extend through g"
+                    else "scalar-ECP orbital shells in this domain extend through g"
                 )
     return tuple(cores), tuple(terms)
 
