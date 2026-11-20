@@ -708,7 +708,9 @@ To add the explicitly correlated doubles increment, pass `post_mp2=None` and
 The `ccsd_f12b_minus_mp2_f12` step takes the difference of CCSD-F12b and MP2-F12
 correlation energies and forces at each cardinal, using the same determinant,
 orbital basis, three fitting roles, CABS and geminal exponent. The molecular
-provider implements this step for all-active UHF. A separate `triples` term
+provider solves the spin-orbital equations on an all-active UHF or singlet RHF
+determinant. Both spin lines use the same spatial orbitals on RHF, and their
+derivatives add to the single RHF orbital response. A separate `triples` term
 can add the conventional perturbative triples contribution.
 Use the role `post_mp2` for a combined correction. To treat conventional
 (T) separately, use `ccsd_minus_mp2` for the matched CCSD minus MP2 increment

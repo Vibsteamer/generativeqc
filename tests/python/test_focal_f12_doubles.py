@@ -110,3 +110,21 @@ def test_uhf_f12_doubles_share_one_reference_and_three_distinct_fits(
     np.testing.assert_allclose(
         result.term.forces + mp2.forces, expected, rtol=0, atol=2e-7
     )
+
+
+def test_singlet_rhf_doubles_share_the_spatial_orbital_response() -> None:
+    shell = os.environ.get("GENERATIVEQC_F12_HOST_SINK")
+    if not shell:
+        pytest.skip("requires the compiled native molecular integral library")
+    req = request(XYZ[:2], (0, 1, 2), root="rhf")
+    provider = MolecularFocalProvider(shell_library=Path(shell))
+    result = provider(replace(req, role="ccsd_f12b_minus_mp2_f12"))
+    assert result.executed_backend == "cpu_reference" and result.converged
+    # Independent dense CC root, and the two radial five-point energy stencils
+    # for an oriented H2 with three distinct fits and one occupied spatial MO.
+    cc_energy, mp2_energy = -0.04507740159251933, -0.03721938216813194
+    assert result.term.energy == pytest.approx(cc_energy - mp2_energy, abs=2e-10, rel=0)
+    expected = np.array([-0.0096192187573, -0.0019238437515, 0.0022444843767])
+    np.testing.assert_allclose(
+        result.term.forces, [expected, -expected], rtol=0, atol=3e-9
+    )

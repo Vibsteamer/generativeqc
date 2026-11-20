@@ -112,7 +112,7 @@ class MolecularFocalProvider:
     physical determinant on the backend in the request. Pass this callable as
     the provider of singlepoint(), or evaluate individual plan steps. Select a
     high-order evaluator explicitly for conventional post-MP2 and triples steps.
-    On all-active UHF the provider also evaluates the same-reference difference
+    On all-active RHF singlet and UHF roots the provider also evaluates the same-reference difference
     between CCSD-F12b and MP2-F12 correlation energies and forces.
     """
 
@@ -178,13 +178,13 @@ class MolecularFocalProvider:
     def ucc_fixed_sources(self, request: FocalRequest) -> FocalUCCFixedSources:
         """Generate W_vo, W_vv, C and the V+B-X scalar for fixed-cusp UCC.
 
-        Supply the all-active UHF pair step with its declared JKFit, F12Fit,
+        Supply the all-active singlet RHF or UHF pair step with its declared JKFit, F12Fit,
         OptRI and exponent. Returned MO tensors and the reference share a frame.
         """
         return molecular_ucc_sources(self, request, include_ordinary=False)
 
     def ucc_equation_sources(self, request: FocalRequest) -> FocalUCCEquationSources:
-        """Generate all ordinary and fixed-geminal inputs for one all-active UHF pair step.
+        """Generate all ordinary and fixed-geminal inputs for one all-active singlet RHF or UHF pair step.
 
         The normal-ordered Fock blocks use JKFit and the antisymmetrized
         two-electron Hamiltonian blocks use MP2Fit. The fixed sources use
@@ -200,9 +200,9 @@ class MolecularFocalProvider:
         lambda_options: UCCSDLambdaOptions | None = None,
         source_cotangents: bool = False,
     ) -> FocalUCCStationary:
-        """Solve T and Lambda for an all-active UHF molecular pair request.
+        """Solve T and Lambda for an all-active singlet RHF or UHF molecular pair request.
 
-        The returned primal total is the DF-UHF energy plus fixed-cusp
+        The returned primal total is the DF-HF energy plus fixed-cusp
         UCCSD-F12b correlation. Obtain CABS singles separately. The CPU
         reference uses compiled FP64 CC equations. The CUDA provider runs
         those equations on device zero with its configured target and cache.
@@ -323,10 +323,10 @@ class MolecularFocalProvider:
         options: SolverOptions | None = None,
         lambda_options: UCCSDLambdaOptions | None = None,
     ) -> FocalUCCSDResult:
-        """Calculate molecular UCCSD-F12b with DF-UHF, CABS singles and analytic forces.
+        """Calculate molecular UCCSD-F12b with DF-HF, CABS singles and analytic forces.
 
-        Supply the all-active UHF pair request for a single cardinal number.
-        One DF-UHF determinant supplies the reference energy and force, CABS
+        Supply the all-active singlet RHF or UHF pair request for one cardinal.
+        One DF-HF determinant supplies the reference energy and force, CABS
         singles, ordinary CC Hamiltonian, and fixed-geminal equations.
         """
         solution = self._ucc_stationary(
@@ -471,10 +471,6 @@ class MolecularFocalProvider:
         solution = None
         calculation = request
         if request.role == "ccsd_f12b_minus_mp2_f12":
-            if request.root_id != "uhf":
-                raise ValueError(
-                    "the native CCSD-F12b minus MP2-F12 increment requires an all-active UHF root"
-                )
             calculation = replace(request, role="mp2_f12_correlation")
             solution = self._ucc_stationary(
                 calculation, None, None, source_cotangents=True, reference_forces=False

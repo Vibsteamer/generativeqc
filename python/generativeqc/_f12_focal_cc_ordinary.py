@@ -41,13 +41,13 @@ def ordinary_ucc_source_forces(
     ref = sources.fixed.reference
     basis = request.basis
     if (
-        (request.role, request.root_id, request.correlation_space_id)
-        != ("mp2_f12_correlation", "uhf", "all-active")
+        request.role != "mp2_f12_correlation"
+        or request.correlation_space_id != "all-active"
         or basis.mp2_fit is None
         or basis.f12_fit is None
     ):
         raise ValueError(
-            "Ordinary UCC source forces require an all-active UHF molecular pair request"
+            "Ordinary CC source forces require an all-active molecular pair request"
         )
     if (
         request.surface_id,
@@ -116,9 +116,12 @@ def ordinary_ucc_source_forces(
         else provider._panel(request, "mp2_fit")
     )
     spins = ("alpha", "beta")
-    c = dict(zip(spins, ref.coefficients, strict=True))
+    spin_indices = ref._pair_spin_indices(request)
+    occupied = tuple(ref.occupied[i] for i in spin_indices)
+    energies = tuple(ref.orbital_energies[i] for i in spin_indices)
+    c = {s: ref.coefficients[i] for s, i in zip(spins, spin_indices, strict=True)}
     eri = unrestricted_cc_eri_pullback(
-        ref.occupied,
+        occupied,
         {k: v for k, v in weights.items() if k.startswith("g")},
         c,
         mp.data["ao_coulomb"],
@@ -135,8 +138,8 @@ def ordinary_ucc_source_forces(
         metric_whitener=jk.whitener,
     )
     ao["metric/coulomb"] = jk.data["metric"]
-    space = (*ref.occupied, n, n, len(jk.whitener))
-    fspace = (*ref.occupied, n, len(jk.whitener))
+    space = (*occupied, n, n, len(jk.whitener))
+    fspace = (*occupied, n, len(jk.whitener))
     projected, _ = _orbital_sources(
         space, ao, run, None, projected=None, role="ordinary_fock"
     )
@@ -146,7 +149,7 @@ def ordinary_ucc_source_forces(
         if k.startswith("source/")
     }
     focks = spin_fock(fspace, values, run)
-    for s, eps in zip(spins, ref.orbital_energies, strict=True):
+    for s, eps in zip(spins, energies, strict=True):
         if not np.allclose(focks["fock_" + s], np.diag(eps), atol=2e-8, rtol=0):
             raise ValueError(
                 "Ordinary JKFit Fock differs from the stationary canonical frame"
@@ -168,14 +171,14 @@ def ordinary_ucc_source_forces(
     direct = fock_pullback(
         {
             "fock_" + s: _spin_fock_weight(weights, s, n, o, 0)
-            for s, o in zip(spins, ref.occupied, strict=True)
+            for s, o in zip(spins, occupied, strict=True)
         }
     )
     # The ordinary part alone can carry a same-spin, same-occupation torque.
     # Enforce the canonical oo/vv constraint before the coupled ov relaxation.
     seeds = {}
     rotation = orbital_rotation_cotangent(n, n)
-    for spin, eps, o in zip(spins, ref.orbital_energies, ref.occupied, strict=True):
+    for spin, eps, o in zip(spins, energies, occupied, strict=True):
         key = "coefficients_" + spin
         direct[key] += eri[key]
         rot = run(
@@ -195,6 +198,9 @@ def ordinary_ucc_source_forces(
     canonical = fock_pullback(seeds)
     for key in direct:
         direct[key] += canonical[key]
+    coefficient_bar = np.zeros_like(ref.coefficients)
+    for spin, i in zip(spins, spin_indices, strict=True):
+        coefficient_bar[i] += direct["coefficients_" + spin]
     relaxed = relaxed_reference_weights(
         ref,
         values,
@@ -203,7 +209,7 @@ def ordinary_ucc_source_forces(
             "hcore": direct["hcore_ao"],
             "three_center": direct["ao_coulomb"],
             "metric": direct["metric/coulomb"],
-            "obs_coefficients": np.stack([direct["coefficients_" + s] for s in spins]),
+            "obs_coefficients": coefficient_bar,
         },
         np.zeros_like(ref.overlap),
         run,

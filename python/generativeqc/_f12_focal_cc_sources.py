@@ -40,7 +40,7 @@ class FocalUCCFixedSources:
 
 @dataclass(frozen=True)
 class FocalUCCEquationSources:
-    """Ordinary and fixed-geminal CC inputs for the same canonical UHF determinant."""
+    """Ordinary and fixed-geminal CC inputs for the same canonical DF-HF determinant."""
 
     fixed: FocalUCCFixedSources
     mp2_fit_id: str
@@ -74,7 +74,7 @@ def molecular_ucc_sources(
     include_ordinary: bool,
     reference_forces: bool = False,
 ) -> FocalUCCFixedSources | FocalUCCEquationSources:
-    """Calculate fixed-geminal UCC equation inputs on an all-active UHF root."""
+    """Calculate fixed-geminal UCC equation inputs on an all-active singlet RHF or UHF root."""
     from generativeqc_compiler.tensor import execute
 
     from ._f12_focal_one_electron import one_electron_sources
@@ -82,11 +82,12 @@ def molecular_ucc_sources(
 
     if (
         request.role != "mp2_f12_correlation"
-        or request.root_id != "uhf"
+        or request.root_id not in ("rhf", "uhf")
+        or (request.root_id == "rhf" and request.multiplicity != 1)
         or request.correlation_space_id != "all-active"
     ):
         raise ValueError(
-            "fixed-cusp UCC sources require an all-active UHF molecular pair request"
+            "fixed-cusp UCC sources require an all-active UHF or singlet RHF molecular pair request"
         )
     if (
         request.basis.f12_fit is None
@@ -158,7 +159,8 @@ def molecular_ucc_sources(
     }
     oa, ob, obs, ext, _ = space
     fock = spin_fock((oa, ob, ext, len(jk.whitener)), sources, checked)
-    for k, spin in enumerate(("alpha", "beta")):
+    spin_indices = ref._pair_spin_indices(request)
+    for spin, k in zip(("alpha", "beta"), spin_indices, strict=True):
         if not np.allclose(
             fock["fock_" + spin][:obs, :obs],
             np.diag(ref.orbital_energies[k]),
@@ -191,8 +193,8 @@ def molecular_ucc_sources(
             "ao_coulomb": mp.data["ao_coulomb"],
             "metric_whitener": whitener,
             **{
-                "coefficients_" + spin: c
-                for spin, c in zip(("alpha", "beta"), ref.coefficients, strict=True)
+                "coefficients_" + spin: ref.coefficients[k]
+                for spin, k in zip(("alpha", "beta"), spin_indices, strict=True)
             },
         }
         raw, _ = _orbital_sources(

@@ -42,13 +42,13 @@ def fixed_ucc_source_forces(
     ref = sources.fixed.reference
     basis = request.basis
     if (
-        (request.role, request.root_id, request.correlation_space_id)
-        != ("mp2_f12_correlation", "uhf", "all-active")
+        request.role != "mp2_f12_correlation"
+        or request.correlation_space_id != "all-active"
         or basis.f12_fit is None
         or basis.mp2_fit is None
     ):
         raise ValueError(
-            "Fixed UCC forces require all-active UHF molecular equation sources"
+            "Fixed CC forces require all-active molecular equation sources"
         )
     if (
         request.surface_id,
@@ -66,9 +66,9 @@ def fixed_ucc_source_forces(
         sources.mp2_fit_id,
     ):
         raise ValueError(
-            "Fixed UCC weights and molecular request must share the UHF surface and all fitting roles"
+            "Fixed UCC weights and molecular request must share the reference surface and all fitting roles"
         )
-    oa, ob = ref.occupied
+    oa, ob = (ref.occupied[i] for i in ref._pair_spin_indices(request))
     n = ref.coefficients.shape[-1]
     cc = build_f12_program(UCCSDLayout(oa, ob, n - oa, n - ob))
     required = {

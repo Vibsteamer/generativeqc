@@ -33,8 +33,13 @@ def _prepare_focal_ucc(
         raise ValueError(
             "UCC equation sources and stationary solver must share a backend"
         )
-    oa, ob = ref.occupied
-    ea, eb = ref.orbital_energies
+    if len(ref.occupied) == 1:
+        # RHF has one independent spatial orbital variable for both spin lines.
+        oa = ob = ref.occupied[0]
+        ea = eb = ref.orbital_energies[0]
+    else:
+        oa, ob = ref.occupied
+        ea, eb = ref.orbital_energies
     layout = UCCSDLayout(oa, ob, len(ea) - oa, len(eb) - ob)
     hamiltonian_id = canonical_hash(
         {
