@@ -368,7 +368,8 @@ std::vector<double> derivative(const hf::UnrestrictedPhysicalReference& referenc
                                const posthf::DensityFittedInteractionSource* fitted,
                                bool separate_reference,
                                const posthf::DensityFittedInteractionSource* reference_fit,
-                               const integrals::CorrelationIntegralBackend& backend) {
+                               const integrals::CorrelationIntegralBackend& backend,
+                               bool include_nuclear_repulsion) {
   const auto nbf = reference.nbf, n2 = mul(nbf, nbf), n4 = mul(n2, n2);
   std::vector<double> one(n2), overlap(n2), temporary(n2), scratch(n2);
   for (unsigned spin = 0; spin < 2; ++spin) {
@@ -386,12 +387,13 @@ std::vector<double> derivative(const hf::UnrestrictedPhysicalReference& referenc
     if (!backend.one_electron_gradient)
       throw std::invalid_argument("unrestricted CUDA forces require an explicit integral backend");
     gradient = backend.one_electron_gradient(device, system, overlap, one, budget);
-    molecule::add_nuclear_repulsion_gradient(system, gradient);
+    if (include_nuclear_repulsion) molecule::add_nuclear_repulsion_gradient(system, gradient);
 #else
     throw std::invalid_argument("unrestricted CUDA force requires a CUDA build");
 #endif
   } else
-    gradient = integrals::contract_weighted_one_electron_derivative(system, overlap, one, true);
+    gradient = integrals::contract_weighted_one_electron_derivative(system, overlap, one,
+                                                                    include_nuclear_repulsion);
   if (fitted) {
     const auto add_fitted = [&](const posthf::DensityFittedInteractionSource& fit,
                                        const std::string& prefix) {
@@ -555,7 +557,11 @@ UnrestrictedForce unrestricted_force(
     const response::LinearResponseProblem* orbital_problem, bool cuda, int device,
     const posthf::DensityFittedInteractionSource* fitted,
     const integrals::ElectronInteractionSource* independent_reference,
-    const integrals::CorrelationIntegralBackend& backend) {
+    const integrals::CorrelationIntegralBackend& backend, UnrestrictedForceTarget target) {
+  const bool total = target == UnrestrictedForceTarget::Total;
+  if (!total && !triples)
+    throw std::invalid_argument("the unrestricted triples force requires triples amplitudes");
+  const double parent_energy_seed = total ? 1.0 : 0.0;
   const std::string suffix = independent_reference ? "_separate" : "";
   const auto derivative_capacity = cuda ? posthf::one_electron_response_capacity(source.orbital())
                                         : posthf::source_scratch_bytes;
@@ -613,7 +619,7 @@ UnrestrictedForce unrestricted_force(
   auto lambda_inputs = runtime.zero_inputs("lambda");
   for (auto& [name, values] : lambda_inputs)
     if (const auto found = fields.find(name); found != fields.end()) values = found->second;
-  lambda_inputs.at("bar_correlation_energy")[0] = 1.0;
+  lambda_inputs.at("bar_correlation_energy")[0] = parent_energy_seed;
   auto parameter_seeds = runtime.zero_inputs("correction" + suffix);
   for (auto& [name, values] : parameter_seeds)
     if (const auto found = raw.find(name); found != raw.end()) values = found->second;
@@ -659,7 +665,7 @@ UnrestrictedForce unrestricted_force(
     if (!result.lambda.converged())
       throw std::runtime_error("unrestricted corrected Lambda did not converge");
   }
-  lambda_inputs.at("bar_correlation_energy")[0] = 1.0;
+  lambda_inputs.at("bar_correlation_energy")[0] = parent_energy_seed;
   lift(lambda_inputs, result.lambda.solution, entries);
   bars = runtime.run("lambda", lambda_inputs, controls.max_iterations);
   accumulate(bars, amplitude_bars);
@@ -695,7 +701,7 @@ UnrestrictedForce unrestricted_force(
     if (!result.orbital.converged())
       throw std::runtime_error("unrestricted UHF adjoint did not converge");
   }
-  physical.at("bar_reference_electronic_energy")[0] = 1.0;
+  physical.at("bar_reference_electronic_energy")[0] = parent_energy_seed;
   std::size_t position = 0;
   for (const auto* name : {"bar_fov_aa", "bar_fov_bb"})
     for (auto& value : physical.at(name)) value = result.orbital.solution[position++];
@@ -730,7 +736,7 @@ UnrestrictedForce unrestricted_force(
   runtime::df_progress::Scope derivative_trace("uccsd_nuclear_response", cuda ? "cuda" : "host");
   result.forces =
       derivative(reference, source.orbital(), weights, cuda, device, derivative_capacity, fitted,
-                 independent_reference != nullptr, reference_fit, backend);
+                 independent_reference != nullptr, reference_fit, backend, total);
   return result;
 }
 

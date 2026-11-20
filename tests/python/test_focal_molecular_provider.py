@@ -538,6 +538,68 @@ def test_rhf_focal_center_and_forward_displacement(
         )
 
 
+def test_rhf_forward_displacement_with_nonzero_triples(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from generativeqc import _f12_focal_ucc_triples
+    from generativeqc.experimental.f12_focal import singlepoint, singlepoint_energy
+
+    shell = os.environ.get("GENERATIVEQC_F12_HOST_SINK")
+    if not shell:
+        pytest.skip("set GENERATIVEQC_F12_HOST_SINK for molecular host integrals")
+    atoms = [("Li", (0.0, 0.0, 0.0)), ("H", (0.1, 0.2, 3.0))]
+    b = FocalBasis(
+        2, "test", "sto-3g", jk_fit="def2-svp", mp2_fit="def2-svp",
+        f12_fit="def2-svp", cabs="def2-svp", beta=1.0,
+    )
+    series = FocalSeries(b)
+    args = dict(
+        hf_cabs=series,
+        correlation=series,
+        f12_doubles=b,
+        triples=b,
+        root_id="rhf",
+        correlation_space_id="all-active",
+        provider=MolecularFocalProvider(shell_library=Path(shell), budget_mib=1024),
+        backend="cpu_reference",
+        protocol_id="lih-retained-triples",
+    )
+    center = singlepoint(atoms, post_mp2=None, **args)
+    triples = next(c.term for c in center.components if c.term.role == "triples")
+    # Independent DF-RCCSD(T) with the same STO-3G and def2-SVP fitting bases.
+    assert triples.energy == pytest.approx(-7.4691686931e-6, abs=8e-12, rel=0)
+
+    def forbidden_response(*args: object, **kwargs: object) -> None:
+        pytest.fail("a displaced energy evaluated the stationary force response")
+
+    for name in ("_gradient", "_ucc_stationary", "low_order_energy_and_forces"):
+        monkeypatch.setattr(MolecularFocalProvider, name, forbidden_response)
+    native_triples = _f12_focal_ucc_triples.molecular_triples_on_reference
+
+    def forward_triples(request, reference, *, budget_mib, forces):
+        assert not forces and reference.forces is None
+        return native_triples(request, reference, budget_mib=budget_mib, forces=forces)
+
+    monkeypatch.setattr(
+        _f12_focal_ucc_triples, "molecular_triples_on_reference", forward_triples
+    )
+    for step in (4e-4, 2e-4):
+        pair = []
+        for delta in (-step, step):
+            displaced = [atoms[0], ("H", (0.1, 0.2, 3.0 + delta))]
+            result = singlepoint_energy(displaced, center=center, **args)
+            assert result.cabs_ranks == center.cabs_ranks
+            assert min(result.references[b.basis_id].reference.occupied_overlaps) > 0.999
+            pair.append({part.request.role: part.energy for part in result.components})
+        assert all(abs(point["ccsd_f12b_minus_mp2_f12"]) > 1e-6 for point in pair)
+        for component in center.components:
+            role = component.term.role
+            fd = (pair[0][role] - pair[1][role]) / (2 * step)
+            assert fd == pytest.approx(
+                component.term.forces[1, 2], abs=3e-8 if role == "triples" else 3e-6, rel=0
+            )
+
+
 def test_cc_only_basis_skips_hf_singles_and_reference_gradient() -> None:
     from unittest.mock import patch
 

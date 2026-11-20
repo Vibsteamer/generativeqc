@@ -258,8 +258,9 @@ class UccsdPrepared final : public PreparedCalculation {
       if (!solved.converged)
         throw MethodError(GENERATIVEQC_STATUS_NOT_CONVERGED,
                           "UCCSD physical residual/replay convergence gates did not pass");
-      // UHF owns the nuclear repulsion; do not add it a second time here.
-      result.energy = reference.energy + solved.correlation_energy + solved.triples_energy;
+      // UHF owns the nuclear repulsion in the total energy.
+      result.energy = focal ? solved.triples_energy
+                            : reference.energy + solved.correlation_energy + solved.triples_energy;
       if (!std::isfinite(result.energy))
         throw MethodError(GENERATIVEQC_STATUS_NUMERICAL_FAILURE,
                           "nonfinite unrestricted CC total energy");
@@ -282,7 +283,9 @@ class UccsdPrepared final : public PreparedCalculation {
         auto force = cc::unrestricted_force(
             reference, source, solved, options_, triples, charged_reference_capacity,
             orbital_problem ? &*orbital_problem : nullptr, cuda_, device_,
-            fitted ? &*fitted : nullptr, independent_reference, unrestricted_integral_backend());
+            fitted ? &*fitted : nullptr, independent_reference, unrestricted_integral_backend(),
+            focal ? cc::UnrestrictedForceTarget::TriplesIncrement
+                  : cc::UnrestrictedForceTarget::Total);
         result.forces = std::move(force.forces);
         diagnostic.numeric_capacity_bytes = force.numeric_capacity_bytes;
         diagnostic.planned_endpoint_peak_bytes = force.numeric_capacity_bytes;
@@ -295,19 +298,6 @@ class UccsdPrepared final : public PreparedCalculation {
             force.orbital.measured_workspace_peak_bytes;
         diagnostic.response_workspace_allocation_count = force.orbital.workspace_allocation_count;
         diagnostic.force_provenance_flags = fitted && cuda_ ? 0x1 : 0x7;
-      }
-      if (focal) {
-        result.energy = solved.triples_energy;
-        if (compute_forces) {
-          const auto parent = cc::unrestricted_force(
-              reference, source, solved, options_, false, charged_reference_capacity,
-              orbital_problem ? &*orbital_problem : nullptr, cuda_, device_,
-              fitted ? &*fitted : nullptr, independent_reference, unrestricted_integral_backend());
-          if (parent.forces.size() != result.forces.size())
-            throw std::runtime_error("inconsistent focal triples force dimensions");
-          for (std::size_t k = 0; k < result.forces.size(); ++k)
-            result.forces[k] -= parent.forces[k];
-        }
       }
       if (result.mp2_component)
         diagnostic.numeric_capacity_bytes =

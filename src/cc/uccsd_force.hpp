@@ -34,8 +34,12 @@ struct UnrestrictedForce {
   double stationarity_residual{};
 };
 
+enum class UnrestrictedForceTarget { Total, TriplesIncrement };
+
 /** Analytic derivative of a freshly qualified physical UCCSD/(T) endpoint.
  * The borrowed orbital problem must come from the identical UHF Fock owner.
+ * The triples increment differentiates only (T) while imposing the same
+ * conventional CCSD amplitude and orbital constraints.
  * No iterative/shifted denominator, finite difference or reference oracle is
  * differentiated. Any failed stationarity check prevents force publication. */
 UnrestrictedForce unrestricted_force(
@@ -45,6 +49,7 @@ UnrestrictedForce unrestricted_force(
     const response::LinearResponseProblem* orbital_problem, bool cuda = false, int device = 0,
     const posthf::DensityFittedInteractionSource* fitted = nullptr,
     const integrals::ElectronInteractionSource* independent_reference = nullptr,
-    const integrals::CorrelationIntegralBackend& backend = {});
+    const integrals::CorrelationIntegralBackend& backend = {},
+    UnrestrictedForceTarget target = UnrestrictedForceTarget::Total);
 
 }  // namespace generativeqc::cc
