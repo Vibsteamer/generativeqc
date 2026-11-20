@@ -13,7 +13,10 @@ import numpy as np
 from generativeqc.response_solver import DiagonalPreconditioner, solve
 from generativeqc_compiler.cc.uccsd_equations import build_f12_program
 from generativeqc_compiler.cc.uccsd_layout import BLOCK_NAMES, UCCSDLayout
-from generativeqc_compiler.cc.uccsd_response import build_f12_response_programs
+from generativeqc_compiler.cc.uccsd_response import (
+    build_f12_response_programs,
+    fixed_source_lagrangian_direction,
+)
 from generativeqc_compiler.common.arrays import immutable
 from generativeqc_compiler.common.evidence import canonical_hash
 from generativeqc_compiler.common.resources import checked_bytes
@@ -25,7 +28,7 @@ from tools.generativeqc_response.implicit import ImplicitSolveError, ResponseGMR
 from .native_tensor_cpu import NativeCCTensorExecutor
 from .native_tensor_cuda import CudaCCTensorExecutor
 from .solver import SolverOptions
-from .uccsd_lambda import UCCSDLambdaOptions, _PackedUCCSDLambda
+from .uccsd_lambda import UCCSDLambdaOptions, _Counter, _PackedUCCSDLambda
 from .uccsd_solver import (
     UCCSDIteration,
     UCCSDResult,
@@ -39,7 +42,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from typing import Any
 
-    from .uccsd_lambda import UCCSDParameterCotangent
+    from .uccsd_lambda import UCCSDLambdaResult, UCCSDParameterCotangent
 
 
 def _digest(values: np.ndarray) -> str:
@@ -369,6 +372,39 @@ class _PreparedFixedSourceUCCSDLambda(_PackedUCCSDLambda):
                     dimension=dimension, options=options.gmres, gaps=gaps
                 )
         super().__init__(prepared, state, options=options, solver=solver)
+
+    def fixed_source_directional_derivative(
+        self, result: UCCSDLambdaResult, direction: Mapping[str, np.ndarray]
+    ) -> float:
+        """Requalify the center and contract a complete W/C/V+B-X direction.
+
+        For nuclear input tangents the scalar is the F12-source contribution
+        to the energy gradient. The ordinary Hamiltonian and reference terms
+        have their own derivatives.
+        """
+        self._check_open()
+        expected = {k: v for k, v in self.prepared.feeds.items() if _source_key(k)}
+        if not expected.keys() <= direction.keys() or any(
+            not isinstance(k, str) or not _source_key(k) for k in direction
+        ):
+            raise ValueError("Incomplete or unknown fixed-source direction")
+        program = fixed_source_lagrangian_direction(self.layout)
+        resource = self._resource(program)
+        direction_bytes = sum(v.nbytes for v in expected.values())
+        peak = checked_bytes(
+            self.base_bytes + 2 * direction_bytes + resource.native_bytes,
+            "fixed-source direction numeric storage",
+        )
+        work = self.qualification_scalar_work + resource.scalar_work
+        if peak > self.options.max_bytes or work > self.options.max_total_work:
+            raise MemoryError("Fixed-source direction exceeds numeric/semantic-work budget")
+        self._resources[program.logical_hash] = resource
+        packed, _ = self.qualify(result)
+        fields = {
+            "d_" + k: _checked_array(k, direction[k], v.shape) for k, v in expected.items()
+        }
+        output = self._execute(program, {**fields, **self._seeds(packed)}, _Counter())
+        return float(output["d_fixed_source_lagrangian"])
 
     def _replay_fixed_source_parameter_cotangent(
         self, packed_multipliers: np.ndarray, parameter: str

@@ -10,6 +10,28 @@ from ..tensor.types import Index, IndexSpace, TensorSpec
 from .f12_residual import _projected_v
 
 
+def unrestricted_cc_obs_fit_direction(auxiliaries: int, obs: int) -> Program:
+    """Differentiate the full OBS Coulomb fit J D = G in one spin frame.
+
+    The supplied inverse Cholesky factor W satisfies W.T W = J^-1.
+    Both the central fit and its tangent use this same metric inverse.
+    """
+    if any(type(n) is not int or n < 1 for n in (auxiliaries, obs)):
+        raise ValueError("Positive Coulomb-fit and OBS dimensions are required")
+    aux = IndexSpace("fitting_basis", "auxiliary", auxiliaries)
+    a, b = Index("a", aux), Index("b", aux)
+    p = Index("p", IndexSpace("orbital_pairs", "pair", obs * obs))
+    metric = TensorSpec((a, b), role="input")
+    columns = TensorSpec((b, p), role="input")
+    whitener = input_tensor("metric_whitener", metric)
+    dj = input_tensor("d_metric", metric)
+    dg = input_tensor("d_three_center", columns)
+    fit = input_tensor("fit", columns)
+    rhs = add(dg, einsum("ab,bp->ap", dj, fit), coefficients=(1, -1))
+    whitened = einsum("ab,bp->ap", whitener, rhs)
+    return Program({"d_fit": einsum("ab,ap->bp", whitener, whitened)})
+
+
 def unrestricted_f12_pair_sources(
     left: tuple[int, int, int],
     right: tuple[int, int, int],

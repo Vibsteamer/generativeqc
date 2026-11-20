@@ -16,6 +16,7 @@ from generativeqc.f12_orbital_response import (
     unrestricted_source_orbital_adjoint,
 )
 
+from benchmarks.f12_cabs_ecp import CabsEcpOneElectron
 from benchmarks.f12_cabs_h_batch import CabsHShells
 from benchmarks.f12_molecular_integral_forward import forward_integrals
 from benchmarks.f12_molecular_one_electron import native_contraction
@@ -82,7 +83,7 @@ def gaussian_sources(
     component_library: ctypes.CDLL,
     budget_mib: int,
     frame_output: dict[str, np.ndarray] | None = None,
-    cabs_h_shells: CabsHShells | None = None,
+    cabs_h_shells: CabsHShells | CabsEcpOneElectron | None = None,
 ) -> tuple:
     """Build ten operators, S/H, and an OBS-orthogonal geometric CABS on CUDA."""
     start = time.monotonic()
@@ -212,7 +213,7 @@ def gaussian_orbital_forces(
     one_electron_forward_library: Path | None = None,
     projector_library: ctypes.CDLL | None = None,
     frame_output: dict[str, np.ndarray] | None = None,
-    cabs_h_shells: CabsHShells | None = None,
+    cabs_h_shells: CabsHShells | CabsEcpOneElectron | None = None,
 ) -> tuple[np.ndarray, dict, dict[str, np.ndarray]]:
     """Project central electronic weights through the native Gaussian nuclear gradients.
 

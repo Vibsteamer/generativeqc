@@ -724,6 +724,17 @@ basis records. Give the F12 exponent in inverse Bohr for pair correlation.
 The caller also supplies charge, multiplicity, root and correlated-space
 identities. All orbital records must describe the same scalar Hamiltonian.
 
+Each of the five basis roles also accepts an element mapping. For example,
+`orbital={"H": "sto-3g", "He": "def2-svp"}` selects only the H record from
+STO-3G and the He record from def2-SVP. Use an element symbol or its atomic
+number as the key. Each value can be a bundled name, a `BasisSet`, or a local
+canonical basis file. Provide every element in the geometry for each required
+role. A role has one AO representation across all its elements. Selections
+preserve the source shells, scalar ECPs and provenance, and use the same
+resolved basis identity for equivalent symbol and atomic-number mappings.
+A cardinal pair must change the orbital basis on at least one element in the
+geometry.
+
 For each requested role and cardinal, the provider receives the resolved basis
 and geometry and returns a converged `FocalEvaluation`. The result must echo
 the request's surface and basis identity and report its executed backend.
@@ -731,6 +742,13 @@ The requested backend is CUDA by default. Set `backend="cpu_reference"` to
 request that backend explicitly. A backend mismatch raises before numerical
 assembly. The completed components are returned alongside the combined energy,
 forces and weights.
+
+For independent component jobs, call `plan_singlepoint` with the same geometry
+and basis arguments, execute the requests in `plan.steps`, then pass the
+outputs in any completion order to `plan.collect`. It matches each role and
+cardinal against the planned surface and basis. When archiving components for
+later collection, supply a fixed `protocol_id` that identifies the method
+and implementation version across all jobs.
 
 The provider controls electronic execution and is responsible for the
 same-reference CCSD and MP2 differences, convergence and analytic gradients.

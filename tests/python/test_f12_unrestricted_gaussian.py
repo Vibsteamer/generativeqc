@@ -7,7 +7,7 @@ from benchmarks.f12_unrestricted_gaussian import spin_ao_inputs
 
 @pytest.mark.parametrize(
     ("angular_momentum", "message"),
-    [(5, "h-shell basis requires"), (6, "at most h shells")],
+    [(5, "h-shell basis requires"), (6, "i-shell ECP center requires"), (7, "at most i shells")],
 )
 def test_unrestricted_center_requires_a_matching_angular_provider(
     tmp_path, angular_momentum, message

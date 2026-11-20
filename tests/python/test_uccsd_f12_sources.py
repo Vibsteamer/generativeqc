@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from generativeqc._f12_cc_spin_sources import (
     unrestricted_cc_f12_fixed_source_feeds,
+    unrestricted_cc_f12_fixed_source_tangent,
     unrestricted_cc_f12_residual_sources,
 )
 from generativeqc_compiler.cc.f12_residual import standard_v_tile
@@ -384,3 +385,76 @@ def test_quadratic_pair_uses_full_active_occupied_fock_and_transpose(
     for step in (4e-4,2e-4):
         plus,minus = (oracle({**feeds,**{k:feeds[k]+sign*step*x for k,x in dirs.items()}}) for sign in (1,-1))
         np.testing.assert_allclose(tangent,np.dot(seeds,plus-minus)/(2*step),rtol=0,atol=1e-8)
+
+
+@pytest.mark.parametrize(
+    "occupied,frozen",
+    [((3, 2), (1, 0)), ((0, 2), (0, 0)), ((1, 1), (1, 0))],
+)
+def test_fixed_source_molecular_direction(
+    occupied: tuple[int, int], frozen: tuple[int, int]
+) -> None:
+    rng = np.random.default_rng(5472)
+    obs, ext, aux = 4, 6, 3
+    space = (*occupied, obs, ext, aux)
+    operators = ("geminal", "geminal_coulomb", "squared_geminal", "double_commutator")
+
+    def symmetric(shape: tuple[int, ...]) -> np.ndarray:
+        x = rng.normal(scale=0.2, size=shape)
+        return (x + x.swapaxes(-1, -2)) / 2
+
+    q = rng.normal(size=(aux, aux))
+    metric = np.eye(aux) + q @ q.T
+    dm = symmetric((aux, aux))
+    data = {"cross_overlap": np.linalg.qr(rng.normal(size=(ext, ext)))[0]}
+    fock = {}
+    for op in operators:
+        data["metric/" + op] = symmetric((aux, aux))
+    for spin, n in zip(("alpha", "beta"), occupied, strict=True):
+        data["source/raw_coulomb_" + spin] = symmetric((aux, ext, ext))
+        fock["fock_" + spin] = symmetric((ext, ext))
+        fock["exchange_" + spin] = symmetric((ext, ext))
+        for op in operators:
+            data[f"raw/{op}/{spin}"] = rng.normal(scale=0.3, size=(aux, n, ext))
+    ddata = {k: rng.normal(scale=0.2, size=v.shape) for k, v in data.items()}
+    for k, v in data.items():
+        if k.startswith(("metric/", "source/raw_coulomb_")):
+            ddata[k] = symmetric(v.shape)
+    dfock = {k: symmetric(v.shape) for k, v in fock.items()}
+
+    def displaced(h: float) -> tuple[dict, dict, np.ndarray]:
+        displaced_metric = metric + h * dm
+        fields = {k: v + h * ddata[k] for k, v in data.items()}
+        for spin, n in zip(("alpha", "beta"), occupied, strict=True):
+            raw = fields["source/raw_coulomb_" + spin][:, :n]
+            fields["source/fit_" + spin] = np.linalg.solve(
+                displaced_metric, raw.reshape(aux, n * ext)
+            ).reshape(aux, n, ext)
+        return fields, {k: v + h * dfock[k] for k, v in fock.items()}, np.linalg.inv(
+            np.linalg.cholesky(displaced_metric)
+        )
+
+    center, central_fock, whitener = displaced(0.0)
+    for spin, n in zip(("alpha", "beta"), occupied, strict=True):
+        fit = center["source/fit_" + spin].reshape(aux, n * ext)
+        draw = ddata["source/raw_coulomb_" + spin][:, :n].reshape(aux, n * ext)
+        ddata["source/fit_" + spin] = np.linalg.solve(metric, draw - dm @ fit).reshape(
+            aux, n, ext
+        )
+    derivative = unrestricted_cc_f12_fixed_source_tangent(
+        space, center, central_fock, whitener, execute, data_tangent=ddata,
+        fock_tangent=dfock, coulomb_metric_tangent=dm, frozen_occupied=frozen,
+    )
+    for step in (2e-4, 1e-4):
+        plus, minus = (
+            unrestricted_cc_f12_fixed_source_feeds(
+                space, *displaced(h), execute, frozen_occupied=frozen
+            )
+            for h in (step, -step)
+        )
+        assert derivative.keys() == plus.keys() == minus.keys()
+        for key, value in derivative.items():
+            np.testing.assert_allclose(
+                value, (plus[key] - minus[key]) / (2 * step),
+                atol=2e-8, rtol=0, err_msg=key,
+            )

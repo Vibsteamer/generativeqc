@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import math
 import typing
-from dataclasses import dataclass, replace
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, replace
 from functools import cached_property
 from os import PathLike
+from pathlib import Path
 from typing import Generic, Literal, TypeVar
 
 import numpy as np
@@ -16,14 +18,15 @@ from .. import _native
 from .._api_types import Atom
 from .._cbs_plan import native_cbs_plan
 from .._model_resolution import snapshot_basis
-from ..basis import BasisSet
-from ..elements import checked_integer, electron_state
+from ..basis import BasisProvenance, BasisSet
+from ..elements import SYMBOLS, atomic_number, checked_integer, electron_state
 from ..profiles import canonical_hash
 
 if typing.TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
 
-BasisInput = BasisSet | str | PathLike[str]
+BasisRecordInput = BasisSet | str | PathLike[str]
+BasisInput = BasisRecordInput | Mapping[str | int, BasisRecordInput]
 Role = Literal[
     "hf_cabs", "mp2_f12_correlation", "post_mp2", "ccsd_minus_mp2", "triples"
 ]
@@ -49,11 +52,64 @@ class FocalTerm:
     forces: np.ndarray
 
 
+def _role_basis(role: str, value: BasisInput, files: dict[Path, BasisSet]) -> BasisSet:
+    def record(source: BasisRecordInput) -> BasisSet:
+        if isinstance(source, BasisSet):
+            return source
+        if isinstance(source, str) and not source.endswith(".json"):
+            return snapshot_basis(source, "spherical")
+        if isinstance(source, (str, PathLike)):
+            path = Path(source).resolve()
+            if path not in files:
+                files[path] = snapshot_basis(path)
+            return files[path]
+        raise TypeError(f"{role} requires a bundled name or a canonical basis record")
+
+    if not isinstance(value, Mapping):
+        return record(value)
+    if not value:
+        raise ValueError(f"{role} requires at least one element assignment")
+    sources: dict[int, BasisSet] = {}
+    for key, source in value.items():
+        z = atomic_number(key)
+        if z in sources:
+            raise ValueError(f"{role} has duplicate assignments for {SYMBOLS[z - 1]}")
+        basis = record(source)
+        if z not in basis.by_element:
+            raise ValueError(f"{role} basis {basis.name!r} lacks {SYMBOLS[z - 1]}")
+        sources[z] = basis
+    representations = {basis.representation for basis in sources.values()}
+    if len(representations) != 1:
+        raise ValueError(f"{role} element assignments must have one AO representation")
+    selections = sorted(sources.items())
+    manifest = [
+        {"element": z, "name": b.name, "basis_id": b.identity, **asdict(b.provenance)}
+        for z, b in selections
+    ]
+    return BasisSet(
+        name=", ".join(f"{SYMBOLS[z - 1]}={b.name}" for z, b in selections),
+        elements=tuple(b.by_element[z] for z, b in selections),
+        provenance=BasisProvenance(
+            source=json.dumps(manifest, sort_keys=True, separators=(",", ":")),
+            version="element-selection-v1",
+            license=", ".join(
+                f"{SYMBOLS[z - 1]}={b.provenance.license}" for z, b in selections
+            ),
+            checksum=canonical_hash(manifest),
+        ),
+        representation=representations.pop(),
+    )
+
+
 @dataclass(frozen=True, init=False)
 class FocalBasis:
     """Owned canonical basis records for the separate fitted operator roles.
 
-    Canonical files are loaded once. Bundled names use real spherical shells.
+    Give each role a bundled name, canonical record/file, or a mapping from
+    element symbol or atomic number to those inputs. Each selection keeps the
+    source's shells and ECP. All selections for one role share an AO
+    representation. Canonical files are loaded once per FocalBasis and
+    bundled names use real spherical shells.
     Declare the correlation and F12 fitting records separately, even when
     they are the same record. For F12 pair correlation, declare beta in
     inverse Bohr at each cardinal.
@@ -91,6 +147,7 @@ class FocalBasis:
         ):
             raise ValueError("F12 beta must be finite and positive")
         object.__setattr__(self, "beta", float(beta) if beta is not None else None)
+        files: dict[Path, BasisSet] = {}
         for name, value in (
             ("orbital", orbital),
             ("jk_fit", jk_fit),
@@ -98,22 +155,14 @@ class FocalBasis:
             ("f12_fit", f12_fit),
             ("cabs", cabs),
         ):
-            if value is None and name not in ("orbital", "jk_fit"):
+            if value is None:
+                if name in ("orbital", "jk_fit"):
+                    raise TypeError(
+                        f"{name} requires a bundled name or a canonical basis record"
+                    )
                 object.__setattr__(self, name, None)
-                continue
-            if not isinstance(value, (BasisSet, str, PathLike)):
-                raise TypeError(
-                    f"{name} requires a bundled name or a canonical basis record"
-                )
-            representation = (
-                "spherical"
-                if isinstance(value, str) and not value.endswith(".json")
-                else None
-            )
-            record = snapshot_basis(value, representation)
-            if not isinstance(record, BasisSet):
-                raise TypeError(f"{name} requires a canonical basis record")
-            object.__setattr__(self, name, record)
+            else:
+                object.__setattr__(self, name, _role_basis(name, value, files))
 
     @cached_property
     def basis_id(self) -> str:
@@ -280,6 +329,8 @@ def _weighted_terms(
     correlation: FocalSeries[_Endpoint],
     post_mp2: _Endpoint | FocalSeries[_Endpoint],
     triples: _Endpoint | FocalSeries[_Endpoint] | None,
+    *,
+    nuclei: set[int] | None = None,
 ) -> list[tuple[Role, _Endpoint, float]]:
     high = post_mp2 if isinstance(post_mp2, FocalSeries) else FocalSeries(post_mp2)
     roles: list[tuple[FocalSeries[_Endpoint], Role]] = [
@@ -319,12 +370,19 @@ def _weighted_terms(
             raise ValueError(
                 "a cardinal pair requires distinct bases from the same series"
             )
-        if (
-            isinstance(lower, FocalBasis)
-            and isinstance(upper, FocalBasis)
-            and lower.orbital.identity == upper.orbital.identity
-        ):
-            raise ValueError("a cardinal pair requires distinct orbital bases")
+        if isinstance(lower, FocalBasis) and isinstance(upper, FocalBasis):
+            lower_elements = lower.orbital.by_element
+            upper_elements = upper.orbital.by_element
+            selected = (
+                nuclei
+                if nuclei is not None
+                else lower_elements.keys() | upper_elements.keys()
+            )
+            if lower.orbital.representation == upper.orbital.representation and all(
+                z in lower_elements and lower_elements[z] == upper_elements.get(z)
+                for z in selected
+            ):
+                raise ValueError("a cardinal pair requires distinct orbital bases")
         lo = checked_integer(lower.cardinal, "lower cardinal", low=2, high=100)
         hi = checked_integer(upper.cardinal, "upper cardinal", low=2, high=100)
         if lo >= hi:
@@ -454,28 +512,25 @@ def _hamiltonian(
     return reference
 
 
-def singlepoint(
+def plan_singlepoint(
     atoms: Iterable[Atom | tuple[str | int, Sequence[float]]],
     hf_cabs: FocalSeries[FocalBasis],
     correlation: FocalSeries[FocalBasis],
     post_mp2: FocalBasis | FocalSeries[FocalBasis],
     *,
-    provider: Callable[[FocalRequest], FocalEvaluation],
     root_id: str,
     correlation_space_id: str,
     charge: int = 0,
     multiplicity: int = 1,
     backend: Backend = "cuda",
     triples: FocalBasis | FocalSeries[FocalBasis] | None = None,
-) -> FocalRunResult:
-    """Evaluate a geometry with an explicit electronic component provider.
+    protocol_id: str | None = None,
+) -> FocalPlan:
+    """Resolve one geometry and basis recipe into independently evaluable requests.
 
-    Positions are in Bohr. The provider evaluates each requested role and
-    returns matched, converged energy (Eh) and analytic forces (Eh/Bohr).
-    It must echo the request identities and report the executed backend.
-    The caller declares the root and correlated space shared by all roles.
-    Providers own electronic execution and method support. The dispatcher
-    raises on a mismatched result or backend and never retries on another backend.
+    Positions are in Bohr. Each request specifies its basis records, electronic
+    surface, component role and backend. For independently archived returns,
+    pass the campaign's immutable method and implementation ID as protocol_id.
     """
     geometry = tuple(Atom.from_value(atom) for atom in atoms)
     if not geometry:
@@ -490,10 +545,14 @@ def singlepoint(
         )
     if backend not in ("cuda", "cpu_reference"):
         raise ValueError("focal backend must be cuda or cpu_reference")
-    if not callable(provider):
-        raise TypeError("a focal component provider is required")
-
-    weighted = _weighted_terms(hf_cabs, correlation, post_mp2, triples)
+    if protocol_id is not None and (
+        not isinstance(protocol_id, str) or not protocol_id.strip()
+    ):
+        raise ValueError("protocol_id must be a nonempty string when supplied")
+    weighted = _weighted_terms(
+        hf_cabs, correlation, post_mp2, triples,
+        nuclei={atom.atomic_number for atom in geometry},
+    )
     hamiltonian = _hamiltonian(weighted, geometry, charge, multiplicity)
     surface_id = canonical_hash(
         {
@@ -509,10 +568,10 @@ def singlepoint(
             "hamiltonian": hamiltonian,
             "electronic_root": root_id,
             "correlation_space": correlation_space_id,
+            **({"protocol_id": protocol_id} if protocol_id is not None else {}),
         }
     )
-    components = []
-    computed = []
+    steps = []
     for role, basis, weight in weighted:
         request = FocalRequest(
             geometry,
@@ -525,32 +584,110 @@ def singlepoint(
             role,
             backend,
         )
-        evaluation = provider(request)
-        if not isinstance(evaluation, FocalEvaluation) or not isinstance(
-            evaluation.term, FocalTerm
-        ):
-            raise TypeError("provider must return a FocalEvaluation with a FocalTerm")
-        if evaluation.executed_backend != backend:
-            raise RuntimeError(f"{role} returned a different execution backend")
-        if evaluation.converged is not True:
-            raise RuntimeError(f"{role} did not converge")
-        term = evaluation.term
-        if (
-            term.surface_id != surface_id
-            or term.basis_id != basis.basis_id
-            or term.series_id != basis.series_id
-            or term.role != role
-            or term.cardinal != basis.cardinal
-        ):
-            raise ValueError(
-                "component result does not match its requested surface, role and basis"
+        steps.append((request, weight))
+    return FocalPlan(tuple(steps))
+
+
+def _accepted(request: FocalRequest, evaluation: FocalEvaluation) -> FocalEvaluation:
+    if not isinstance(evaluation, FocalEvaluation) or not isinstance(
+        evaluation.term, FocalTerm
+    ):
+        raise TypeError("provider must return a FocalEvaluation with a FocalTerm")
+    if evaluation.executed_backend != request.backend:
+        raise RuntimeError(f"{request.role} returned a different execution backend")
+    if evaluation.converged is not True:
+        raise RuntimeError(f"{request.role} did not converge")
+    term = evaluation.term
+    if (
+        term.surface_id != request.surface_id
+        or term.basis_id != request.basis.basis_id
+        or term.series_id != request.basis.series_id
+        or term.role != request.role
+        or term.cardinal != request.basis.cardinal
+    ):
+        raise ValueError(
+            "component result does not match its requested surface, role and basis"
+        )
+    value, forces = _values(term, (len(request.atoms), 3))
+    return replace(evaluation, term=replace(term, energy=value, forces=forces.copy()))
+
+
+@dataclass(frozen=True)
+class FocalPlan:
+    """Ordered (request, weight) pairs produced by plan_singlepoint()."""
+
+    steps: tuple[tuple[FocalRequest, float], ...]
+
+    def _finish(self, evaluations: tuple[FocalEvaluation, ...]) -> FocalRunResult:
+        weighted = [
+            (request.role, evaluation.term, weight)
+            for (request, weight), evaluation in zip(
+                self.steps, evaluations, strict=True
             )
-        value, forces = _values(term, (len(geometry), 3))
-        # Snapshot provider storage before the next call can reuse its workspace.
-        term = replace(term, energy=value, forces=forces.copy())
-        components.append(replace(evaluation, term=term))
-        computed.append((role, term, weight))
-    result = _assemble(computed)
-    return FocalRunResult(
-        result.energy, result.forces, result.weights, tuple(components)
+        ]
+        result = _assemble(weighted)
+        return FocalRunResult(result.energy, result.forces, result.weights, evaluations)
+
+    def collect(self, evaluations: Iterable[FocalEvaluation]) -> FocalRunResult:
+        """Validate independently returned components and combine them in recipe order.
+
+        Supply one converged result per role and cardinal from the same method
+        and implementation used to plan the campaign.
+        """
+        requests = {(r.role, r.basis.cardinal): r for r, _ in self.steps}
+        received = {}
+        for evaluation in evaluations:
+            if not isinstance(evaluation, FocalEvaluation) or not isinstance(
+                evaluation.term, FocalTerm
+            ):
+                raise TypeError("expected a FocalEvaluation with a FocalTerm")
+            key = evaluation.term.role, evaluation.term.cardinal
+            if key not in requests:
+                raise ValueError(f"unexpected focal component {key}")
+            if key in received:
+                raise ValueError(f"duplicate focal component {key}")
+            received[key] = _accepted(requests[key], evaluation)
+        missing = requests.keys() - received.keys()
+        if missing:
+            raise ValueError(f"missing focal components: {sorted(missing)}")
+        return self._finish(tuple(received[key] for key in requests))
+
+
+def singlepoint(
+    atoms: Iterable[Atom | tuple[str | int, Sequence[float]]],
+    hf_cabs: FocalSeries[FocalBasis],
+    correlation: FocalSeries[FocalBasis],
+    post_mp2: FocalBasis | FocalSeries[FocalBasis],
+    *,
+    provider: Callable[[FocalRequest], FocalEvaluation],
+    root_id: str,
+    correlation_space_id: str,
+    charge: int = 0,
+    multiplicity: int = 1,
+    backend: Backend = "cuda",
+    triples: FocalBasis | FocalSeries[FocalBasis] | None = None,
+    protocol_id: str | None = None,
+) -> FocalRunResult:
+    """Evaluate a geometry (Bohr) and compose energies (Eh) and forces (Eh/Bohr).
+
+    Each provider result is checked and copied before the next provider call.
+    """
+    if not callable(provider):
+        raise TypeError("a focal component provider is required")
+    plan = plan_singlepoint(
+        atoms,
+        hf_cabs,
+        correlation,
+        post_mp2,
+        root_id=root_id,
+        correlation_space_id=correlation_space_id,
+        charge=charge,
+        multiplicity=multiplicity,
+        backend=backend,
+        triples=triples,
+        protocol_id=protocol_id,
     )
+    evaluations = tuple(
+        _accepted(request, provider(request)) for request, _ in plan.steps
+    )
+    return plan._finish(evaluations)

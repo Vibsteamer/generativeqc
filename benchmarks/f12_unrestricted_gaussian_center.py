@@ -1,4 +1,4 @@
-"""Evaluate one all-electron open-shell MP2-F12 center from Gaussian shells and a matched UHF state."""
+"""Evaluate an open-shell MP2-F12 center from Gaussian shells and a matched UHF state."""
 
 import ctypes
 import json
@@ -20,6 +20,7 @@ from generativeqc_compiler.tensor import (
     input_tensor,
 )
 
+from benchmarks.f12_cabs_ecp import CabsEcpOneElectron, ResidualEcpPanel
 from benchmarks.f12_cabs_h_batch import CabsHShells
 from benchmarks.f12_molecular_metric import metric_whitener
 from benchmarks.f12_unrestricted_gaussian import (
@@ -72,6 +73,52 @@ def shell_reference_fit(
     return central, errors
 
 
+def _center_one_electron(
+    basis: dict,
+    mapping: dict,
+    layout_path: Path,
+    occupations: tuple[int, int],
+    cabs_h_one_electron_library: Path | None,
+    cabs_i_one_electron_library: Path | None,
+    residual_ecp: ResidualEcpPanel | None,
+) -> CabsHShells | CabsEcpOneElectron | None:
+    """Bind the one-electron Hamiltonian and nuclear derivative to the same root."""
+    maximum_l = max(shell["angular_momentum"] for shell in basis["shells"])
+    if maximum_l > 6:
+        raise ValueError("The combined one-electron basis supports at most i shells")
+    if residual_ecp is not None and maximum_l != 6:
+        raise ValueError("The scalar ECP center requires a combined basis with i shells")
+    if maximum_l == 6:
+        if cabs_i_one_electron_library is None or residual_ecp is None:
+            raise ValueError("The i-shell ECP center requires its CUDA library and residual ECP panel")
+        if residual_ecp.derivative is None:
+            raise ValueError("The ECP center requires the residual nuclear derivatives")
+        if (
+            int(residual_ecp.effective_charges.sum()) - basis["charge"] != sum(occupations)
+            or occupations[0] - occupations[1] + 1 != basis["multiplicity"]
+        ):
+            raise ValueError("The effective ECP electron count and spin occupations disagree")
+        with np.load(layout_path, allow_pickle=False) as layout:
+            bare = CabsHShells(
+                basis, mapping["native_to_source"], layout, cabs_i_one_electron_library,
+                angular_momentum=6, effective_charges=residual_ecp.effective_charges, full_basis=True,
+            )
+        return CabsEcpOneElectron(bare, residual_ecp)
+    if maximum_l == 5:
+        if cabs_h_one_electron_library is None:
+            raise ValueError(
+                "The combined h-shell basis requires its one-electron CUDA library"
+            )
+        with np.load(layout_path, allow_pickle=False) as layout:
+            return CabsHShells(
+                basis,
+                mapping["native_to_source"],
+                layout,
+                cabs_h_one_electron_library,
+            )
+    return None
+
+
 def center_energy_forces(
     geometry_path: Path,
     layout_path: Path,
@@ -83,6 +130,8 @@ def center_energy_forces(
     sink_library: Path,
     forward_library: Path,
     cabs_h_one_electron_library: Path | None = None,
+    cabs_i_one_electron_library: Path | None = None,
+    residual_ecp: ResidualEcpPanel | None = None,
     metric_library: Path | None = None,
     projector_library: ctypes.CDLL,
     canonical_library: ctypes.CDLL,
@@ -101,29 +150,21 @@ def center_energy_forces(
     With singles_only=True the CABS singles energy and its relaxed force
     are returned separately. All occupied orbitals still enter the Fock
     and orbital response, while the MP2 and explicit pair terms are omitted.
+    For scalar ECPs, supply the joint-basis residual potential and its
+    positive nuclear derivatives, an i-shell one-electron library and a
+    through-i integral sink. The effective-charge core and the residual
+    enter both spin Focks and their common relaxed AO derivative.
     """
     geometry = json.loads(geometry_path.read_bytes())
     space = tuple(geometry["layout"]["space"])
     oa, ob, n, ext, q = space
     if tuple(snapshot["occupations"]) != (oa, ob) or snapshot["nbf"] != n:
         raise ValueError("The snapshot and geometry have different spin spaces")
-    high = None
     basis = geometry["combined_basis"]
-    maximum_l = max(shell["angular_momentum"] for shell in basis["shells"])
-    if maximum_l > 5:
-        raise ValueError("The combined one-electron basis supports at most h shells")
-    if maximum_l == 5:
-        if cabs_h_one_electron_library is None:
-            raise ValueError(
-                "The combined h-shell basis requires its one-electron CUDA library"
-            )
-        with np.load(layout_path, allow_pickle=False) as layout:
-            high = CabsHShells(
-                basis,
-                geometry["layout"]["native_to_source"],
-                layout,
-                cabs_h_one_electron_library,
-            )
+    high = _center_one_electron(
+        basis, geometry["layout"], layout_path, (oa, ob),
+        cabs_h_one_electron_library, cabs_i_one_electron_library, residual_ecp,
+    )
     ao, embedding, complement, order, so, hcore, forward = gaussian_sources(
         space,
         science_path=geometry_path,
@@ -193,7 +234,7 @@ def center_energy_forces(
         raise ValueError(
             f"UHF state or Coulomb fit differs from the shell geometry: {errors}"
         )
-    if central is None:
+    if central is None or residual_ecp is not None:
         central, fit_diagnostics["canonical_Fock_errors_Eh"] = shell_reference_fit(
             space, ao, energies, run
         )

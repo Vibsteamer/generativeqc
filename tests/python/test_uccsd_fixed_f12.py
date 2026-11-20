@@ -192,6 +192,24 @@ def test_fixed_source_stationarity_and_cotangent_against_independent_root(
             np.testing.assert_allclose(
                 result.packed_multipliers, expected_lambda, rtol=0, atol=3e-11
             )
+            # Perturb all physical sources together and solve both displaced
+            # dense spin-orbital problems, including their amplitude response.
+            all_direction = _pair_sources(layout, 54722)
+            changes = _source_feeds(layout, all_direction)
+            derivative = response.fixed_source_directional_derivative(result, changes)
+            for h in (2e-4, 1e-4):
+                sources = [
+                    _PairSources(
+                        source.w + sign * h * all_direction.w,
+                        source.c + sign * h * all_direction.c,
+                        source.scalar + sign * h * all_direction.scalar,
+                    )
+                    for sign in (1, -1)
+                ]
+                ep, em = (reference(root(s), s)[0] for s in sources)
+                assert derivative == pytest.approx((ep - em) / (2 * h), rel=0, abs=3e-10)
+            with pytest.raises(ValueError, match="fixed-source direction"):
+                response.fixed_source_directional_derivative(result, {})
             alpha_direction = direction[:2, :2, :2, :2].copy()
             cotangent = response.parameter_cotangent(result, "c_f12_aaaa")
             actual_derivative = cotangent.contract(alpha_direction)

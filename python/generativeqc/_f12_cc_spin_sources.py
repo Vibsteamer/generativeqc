@@ -2,14 +2,18 @@
 
 from collections.abc import Callable
 from itertools import product
+from typing import NamedTuple
 
 import numpy as np
 from generativeqc_compiler.cc.uccsd_f12_quadratic import (
     unrestricted_fixed_geminal_quadratic_pair,
 )
-from generativeqc_compiler.cc.uccsd_f12_sources import unrestricted_f12_pair_sources
+from generativeqc_compiler.cc.uccsd_f12_sources import (
+    unrestricted_cc_obs_fit_direction,
+    unrestricted_f12_pair_sources,
+)
 from generativeqc_compiler.mp2.f12_density_fitting import coulomb_fit_response
-from generativeqc_compiler.tensor import Program
+from generativeqc_compiler.tensor import Program, linearize
 
 from ._f12_spin_pairs import occupied_pair_blocks
 
@@ -63,6 +67,83 @@ def unrestricted_cc_f12_fixed_source_feeds(
     return feeds
 
 
+class _SourceDirection(NamedTuple):
+    data: dict[str, np.ndarray]
+    fock: dict[str, np.ndarray]
+    coulomb_metric: np.ndarray
+
+
+def unrestricted_cc_f12_fixed_source_tangent(
+    space: tuple[int, int, int, int, int],
+    data: dict[str, np.ndarray],
+    fock: dict[str, np.ndarray],
+    whitener: np.ndarray,
+    run: Callable,
+    *,
+    data_tangent: dict[str, np.ndarray],
+    fock_tangent: dict[str, np.ndarray],
+    coulomb_metric_tangent: np.ndarray,
+    frozen_occupied: tuple[int, int] = (0, 0),
+) -> dict[str, np.ndarray]:
+    """Return dW_vo, dW_vv, dC and d(V+B-X) in the CC equation feed layout.
+
+    Supply the total derivatives of the projected molecular inputs (including
+    occupied fits, cross-frame overlap, extended Fock and positive exchange)
+    along one coordinate of the same UHF root. The full OBS fit additionally
+    needs the symmetric physical Coulomb metric tangent. Selectors of the
+    active occupied indices stay fixed as both orbital frames move.
+
+    A dot with the matching stationary CC source cotangents gives the fixed-
+    source contribution to the energy derivative in this direction.
+    """
+    direction = _SourceDirection(data_tangent, fock_tangent, coulomb_metric_tangent)
+    feeds, scalar = _fixed_source_terms(
+        space, data, fock, whitener, run, frozen_occupied,
+        quadratic=True, direction=direction,
+    )
+    if not np.isfinite(scalar):
+        raise ValueError("Nonfinite fixed-geminal energy tangent")
+    feeds["fixed_geminal_energy"] = np.asarray(scalar, dtype=np.float64)
+    return feeds
+
+
+def _pair_kernel(graph: Program, tangent: bool) -> Program:
+    if not tangent:
+        return graph
+    derivative = linearize(graph, None).program
+    # Preserve the field names so the same spin permutations apply to values
+    # and tangents, including the transposed mixed-spin occupied-virtual tile.
+    return Program({name: derivative.outputs["d_" + name] for name in graph.outputs})
+
+
+def _linear_pair_fields(
+    data: dict[str, np.ndarray],
+    fock: dict[str, np.ndarray],
+    fit_obs: dict[str, np.ndarray],
+    raw_obs: dict[str, np.ndarray],
+    sl: str,
+    sr: str,
+    i: int,
+    j: int,
+) -> dict[str, np.ndarray]:
+    fields = {
+        "fit_obs_left": fit_obs[sl],
+        "raw_coulomb_obs_right": raw_obs[sr],
+        "fock_left": fock["fock_" + sl],
+        "fit_left": data["source/fit_" + sl][:, i],
+        "fit_right": data["source/fit_" + sr][:, j],
+        "raw_coulomb_right": data["source/raw_coulomb_" + sr][:, j],
+    }
+    if sl != sr:
+        fields["cross_overlap"] = data["cross_overlap"]
+        fields["fock_right"] = fock["fock_" + sr]
+    for op in ("geminal", "geminal_coulomb"):
+        fields["metric_" + op] = data["metric/" + op]
+        fields["raw_" + op + "_left"] = data[f"raw/{op}/{sl}"][:, i]
+        fields["raw_" + op + "_right"] = data[f"raw/{op}/{sr}"][:, j]
+    return fields
+
+
 def _quadratic_pair_fields(
     data: dict[str, np.ndarray],
     fock: dict[str, np.ndarray],
@@ -94,6 +175,7 @@ def _fixed_source_terms(
     frozen_occupied: tuple[int, int],
     *,
     quadratic: bool,
+    direction: _SourceDirection | None = None,
 ) -> tuple[dict[str, np.ndarray], float]:
     oa, ob, obs, extended, auxiliary = space
     pairs = list(occupied_pair_blocks(space, frozen_occupied=frozen_occupied))
@@ -128,6 +210,24 @@ def _fixed_source_terms(
         for spin in {block.left for block in pairs}
     }
 
+    if direction is not None:
+        d_raw_obs = {
+            spin: np.ascontiguousarray(
+                direction.data["source/raw_coulomb_" + spin][:, :obs, :obs]
+            )
+            for spin in raw_obs
+        }
+        d_fit_graph = unrestricted_cc_obs_fit_direction(auxiliary, obs)
+        d_fit_obs = {
+            spin: run(d_fit_graph, {
+                "fit": fit.reshape(auxiliary, -1),
+                "metric_whitener": whitener,
+                "d_three_center": d_raw_obs[spin].reshape(auxiliary, -1),
+                "d_metric": direction.coulomb_metric,
+            }).outputs["d_fit"].reshape(auxiliary, obs, obs)
+            for spin, fit in fit_obs.items()
+        }
+
     selectors = np.eye(extended)
     linear_v = 0.
     quadratic_energy = 0.
@@ -136,8 +236,9 @@ def _fixed_source_terms(
         left = (nl, obs - nl, extended - obs)
         right = (nr, obs - nr, extended - obs)
         channel = sl + "_" + sr
-        graph = unrestricted_f12_pair_sources(
-            left, right, auxiliary, channel=channel
+        graph = _pair_kernel(
+            unrestricted_f12_pair_sources(left, right, auxiliary, channel=channel),
+            direction is not None,
         )
         if quadratic:
             quadratic_graph = unrestricted_fixed_geminal_quadratic_pair(
@@ -145,25 +246,20 @@ def _fixed_source_terms(
                 frozen_occupied=(frozen[i_spin], frozen[j_spin]),
             )
             quadratic_fields = _quadratic_pair_fields(data, fock, sl, sr, occ_slice)
-        shared = {
-            "fit_obs_left": fit_obs[sl],
-            "raw_coulomb_obs_right": raw_obs[sr],
-            "fock_left": fock["fock_" + sl],
-            **{f"metric_{operator}": data[f"metric/{operator}"]
-               for operator in ("geminal", "geminal_coulomb")},
-        }
-        if sl != sr:
-            shared["cross_overlap"] = data["cross_overlap"]
-            shared["fock_right"] = fock["fock_" + sr]
+            if direction is not None:
+                quadratic_graph = _pair_kernel(quadratic_graph, True)
+                tangent_fields = _quadratic_pair_fields(
+                    direction.data, direction.fock, sl, sr, occ_slice
+                )
+                quadratic_fields.update({"d_" + k: v for k, v in tangent_fields.items()})
         for i, j in pair_indices:
-            rows = {**shared,
-                    "select_i": selectors[i], "select_j": selectors[j],
-                    "fit_left": data["source/fit_" + sl][:, i],
-                    "fit_right": data["source/fit_" + sr][:, j],
-                    "raw_coulomb_right": data["source/raw_coulomb_" + sr][:, j]}
-            for operator in ("geminal", "geminal_coulomb"):
-                rows[f"raw_{operator}_left"] = data[f"raw/{operator}/{sl}"][:, i]
-                rows[f"raw_{operator}_right"] = data[f"raw/{operator}/{sr}"][:, j]
+            rows = _linear_pair_fields(data, fock, fit_obs, raw_obs, sl, sr, i, j)
+            if direction is not None:
+                tangent_rows = _linear_pair_fields(
+                    direction.data, direction.fock, d_fit_obs, d_raw_obs, sl, sr, i, j
+                )
+                rows.update({"d_" + k: v for k, v in tangent_rows.items()})
+            rows.update(select_i=selectors[i], select_j=selectors[j])
             result = run(graph, {k: np.ascontiguousarray(x) for k, x in rows.items()}).outputs
             linear_v += float(result["linear_v_energy"])
             if quadratic:

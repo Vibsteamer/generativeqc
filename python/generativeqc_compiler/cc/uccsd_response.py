@@ -7,14 +7,21 @@ supplies the physical packed primal/dual maps and qualifies stationary states.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from generativeqc_compiler.cc.uccsd_equations import build_f12_program, build_program
+from generativeqc_compiler.cc.uccsd_equations import (
+    build_f12_correction_program,
+    build_f12_program,
+    build_program,
+)
 from generativeqc_compiler.cc.uccsd_layout import BLOCK_NAMES, UCCSDLayout
 from generativeqc_compiler.tensor import (
     JVPProgram,
     Program,
     VJPProgram,
+    add,
+    einsum,
+    input_tensor,
     linearize,
     transpose_program,
 )
@@ -69,6 +76,29 @@ def build_f12_response_programs(
 ) -> UCCSDResponsePrograms:
     """Build fixed-source amplitude and Lambda actions for CCSD-F12b."""
     return _response_programs(build_f12_program(layout), max_elements)
+
+
+def fixed_source_lagrangian_direction(layout: UCCSDLayout) -> Program:
+    """Contract all molecular F12 feed tangents with the CC Lagrangian.
+
+    Supply the same packed-dual lift as the ordinary residual transpose.
+    Differentiating just the F12 additions holds ordinary MO inputs fixed.
+    """
+    correction = build_f12_correction_program(layout)
+    terms = [correction.outputs["correlation_energy"]]
+    for name in RESIDUALS:
+        residual = correction.outputs[name]
+        seed = input_tensor(
+            "bar_" + name, replace(residual.spec, role="input", differentiable=False)
+        )
+        axes = "ia" if name.startswith("r1") else "ijab"
+        terms.append(einsum(f"{axes},{axes}->", seed, residual))
+    lagrangian = Program({"fixed_source_lagrangian": add(*terms)})
+    sources = tuple(
+        node.attrs["name"] for node in correction.live_nodes
+        if node.op == "input" and node.attrs["name"] not in BLOCK_NAMES
+    )
+    return linearize(lagrangian, sources).program
 
 
 def _response_programs(primal: Program, max_elements: int) -> UCCSDResponsePrograms:

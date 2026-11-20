@@ -17,6 +17,7 @@ from generativeqc.experimental.f12_focal import (
     FocalSeries,
     FocalTerm,
     conventional_df_post_mp2,
+    plan_singlepoint,
     singlepoint,
 )
 
@@ -49,6 +50,46 @@ def term(request: FocalRequest, energy: float, forces: np.ndarray) -> FocalTerm:
         energy,
         forces,
     )
+
+
+def test_independent_components_match_serial_and_reject_incomplete_or_stale_results() -> None:
+    atoms = [("H", (0, 0, 0)), ("H", (0, 0, 1.4))]
+    low, high = basis(2, "def2-svp"), basis(3, "def2-tzvp")
+    series = FocalSeries(high, low, 3.0)
+    options = dict(root_id="rhf", correlation_space_id="all", backend="cpu_reference")
+    plan = plan_singlepoint(atoms, series, series, low, **options)
+
+    def evaluate(request: FocalRequest) -> FocalEvaluation:
+        offsets = {"hf_cabs": -1.0, "mp2_f12_correlation": -0.02, "post_mp2": -0.001}
+        energy = offsets[request.role] + request.basis.cardinal ** -3
+        forces = np.outer([1.0, -1.0], [0.0, 0.0, energy])
+        return FocalEvaluation(term(request, energy, forces), request.backend, True)
+
+    returns = [evaluate(request) for request, _ in reversed(plan.steps)]
+    result = plan.collect(returns)
+    serial = singlepoint(atoms, series, series, low, provider=evaluate, **options)
+    assert result.weights == serial.weights
+    assert result.energy == serial.energy
+    np.testing.assert_array_equal(result.forces, serial.forces)
+    assert [e.term.basis_id for e in result.components] == [
+        e.term.basis_id for e in serial.components
+    ]
+    with pytest.raises(ValueError, match="missing.*post_mp2"):
+        plan.collect(returns[1:])
+    with pytest.raises(ValueError, match="duplicate"):
+        plan.collect([*returns, returns[0]])
+    changed = plan_singlepoint(
+        [atoms[0], ("H", (0, 0, 1.4001))], series, series, low, **options
+    )
+    with pytest.raises(ValueError, match="surface"):
+        changed.collect(returns)
+    new_protocol = plan_singlepoint(
+        atoms, series, series, low, protocol_id="method-v2-build-b", **options
+    )
+    with pytest.raises(ValueError, match="surface"):
+        new_protocol.collect(returns)
+    with pytest.raises(RuntimeError, match="backend"):
+        plan.collect([replace(returns[0], executed_backend="cuda"), *returns[1:]])
 
 
 def test_focal_dispatch_uses_ordered_nuclei_per_role_and_cardinal() -> None:

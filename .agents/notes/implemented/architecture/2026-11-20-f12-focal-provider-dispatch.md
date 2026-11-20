@@ -40,3 +40,14 @@ through native CPU `Calculator.singlepoint_components` and checks the
 CCSD(T) minus MP2 force against a scalar energy difference. The same test case
 supports an explicit CUDA allocation opt-in. CUDA molecular F12 endpoint
 evidence remains with the corresponding provider tests.
+
+## Independently returned components
+
+`plan_singlepoint` resolves the same ordered requests as the synchronous
+dispatcher. Each geometry has its own plan. Workers can evaluate independent
+roles and cardinal numbers on separate devices and return results in any
+order. `FocalPlan.collect` checks each return against its request, rejects
+duplicates and missing components, and uses the original summation order.
+An explicit `protocol_id` binds the campaign's method and implementation
+revision to the archived surface identity. Physical execution and electronic
+root tracking require evidence from the component provider.
