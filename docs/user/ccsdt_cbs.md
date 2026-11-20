@@ -808,3 +808,11 @@ For a finite-difference control, plan each displaced geometry and pass its
 same native group with energy as the sole requested property. Keep the
 request identity alongside the scalar result. At the central geometry use
 `conventional_df_post_mp2` to obtain the analytic forces.
+
+For the complementary orbital space, pass the returned one-electron result
+to `focal_cabs_projector(request, one)`. Its `frame` columns are orthogonal
+to the full orbital basis in the combined overlap metric. Record its `rank`
+and pass `expected_rank` when evaluating displacements. A matrix supplied as
+`cotangent` weights the invariant kernel `frame @ frame.T`. For a fixed
+weight, `einsum("ij,axij->ax", result.overlap_bar, one.d_overlap)` gives
+the positive nuclear derivative of the weighted kernel.

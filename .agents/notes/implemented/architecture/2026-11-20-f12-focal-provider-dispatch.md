@@ -65,3 +65,14 @@ The OH regression places OptRI functions on additional zero-charge centers
 in its independent libcint calculation. Moving each zero-charge center with
 its physical nucleus preserves the public AO order and checks the separate
 basis-center contributions and their sum.
+
+## Complement on the shared molecular overlap
+
+The public CABS projector consumes the OBS-first overlap produced by the
+one-electron provider. The providers must agree on geometry, basis and backend.
+A fixed-rank kernel weight propagates through the projected OptRI overlap, its
+retained subspace, and the removal of OBS components. The CPU reference uses
+the existing symmetric pseudoinverse response for a truncated subspace and
+the inverse-metric identity when all complementary directions survive.
+Contract the returned overlap weight once with the one-electron nuclear
+Jacobian. Contributions from a nuclear-dependent observable seed enter separately.
