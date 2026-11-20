@@ -1,8 +1,9 @@
-// Private Python bridge to the native canonical DF-HF owner, on one cold geometry.
+// Python bridge to the native canonical DF-HF owner at one geometry.
 #include <algorithm>
 #include <cmath>
 #include <optional>
 #include <span>
+#include <vector>
 
 #include "api/error.hpp"
 #include "api/handles.hpp"
@@ -13,10 +14,11 @@
 #include "runtime/execution_context.hpp"
 #include "scf/mean_field.hpp"
 
-extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_df_reference_v1(
+namespace {
+generativeqc_status focal_df_reference(
     generativeqc_context* context, const generativeqc_system* orbital,
-    const generativeqc_system* auxiliary, int spins, int forces, std::size_t budget, double* output,
-    std::size_t count) {
+    const generativeqc_system* auxiliary, int spins, int forces, std::size_t budget,
+    const double* initial_density, std::size_t initial_count, double* output, std::size_t count) {
   using namespace generativeqc;
   if (!context || !orbital || !auxiliary || !output || !budget || (spins != 1 && spins != 2) ||
       (forces != 0 && forces != 1))
@@ -51,7 +53,10 @@ extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_df_reference_
         runtime::size_add(runtime::size_add(matrices, vectors), runtime::size_add(3, nforce)))
       throw std::invalid_argument(
           "focal reference output shape differs from the normalized native OBS");
-    if (runtime::size_mul(count, sizeof(double)) > budget)
+    if ((initial_density && initial_count != runtime::size_mul(spins, nn)) ||
+        (!initial_density && initial_count))
+      throw std::invalid_argument("initial DF-HF density has the wrong spin or AO dimensions");
+    if (runtime::size_mul(runtime::size_add(count, initial_count), sizeof(double)) > budget)
       throw std::length_error("focal reference export exceeds the numeric budget");
 
     const auto backend = context->state.executed_backend;
@@ -96,9 +101,17 @@ extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_df_reference_
           runtime::ExecutionContext(context->state), &aux);
     }
     const auto& physical = prepared_ecp ? *prepared_ecp : sys;
+    std::vector<double> seed;
+    if (initial_density) {
+      seed.assign(initial_density, initial_density + initial_count);
+      options.strict_initial_density = true;
+    }
+    const auto* start = initial_density ? &seed : nullptr;
     const auto state = cuda ? scf::run_cuda_independent_fock_strategy(
-                                  physical, &aux, options, context->state.device_id)
-                            : scf::run_cpu_fock_strategy(physical, &aux, options);
+                                  physical, &aux, options, context->state.device_id, start)
+                            : scf::run_cpu_fock_strategy(physical, &aux, options, start);
+    if (start && !state.initial_density_used)
+      throw std::runtime_error("DF-HF did not use the requested initial density");
     if (!state.converged) {
       context->last_detail = "canonical DF-HF did not converge";
       return GENERATIVEQC_STATUS_SCF_NOT_CONVERGED;
@@ -135,4 +148,23 @@ extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_df_reference_
   } catch (...) {
     return api::map_exception(&context->last_detail);
   }
+}
+
+}  // namespace
+
+extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_df_reference_v1(
+    generativeqc_context* context, const generativeqc_system* orbital,
+    const generativeqc_system* auxiliary, int spins, int forces, std::size_t budget,
+    double* output, std::size_t count) {
+  return focal_df_reference(context, orbital, auxiliary, spins, forces, budget, nullptr, 0,
+                            output, count);
+}
+
+extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_df_reference_seeded_v1(
+    generativeqc_context* context, const generativeqc_system* orbital,
+    const generativeqc_system* auxiliary, int spins, int forces, std::size_t budget,
+    const double* initial_density, std::size_t initial_count, double* output, std::size_t count) {
+  if (!initial_density || !initial_count) return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
+  return focal_df_reference(context, orbital, auxiliary, spins, forces, budget,
+                            initial_density, initial_count, output, count);
 }

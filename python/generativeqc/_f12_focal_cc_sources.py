@@ -122,7 +122,10 @@ def molecular_ucc_sources(
             raise RuntimeError("UCC fixed-source graph executed on a different backend")
         return out
 
-    ref = df_reference(request, forces=reference_forces, budget_mib=provider.budget_mib)
+    ref = df_reference(
+        request, forces=reference_forces, budget_mib=provider.budget_mib,
+        **provider._seed_options(request),
+    )
     one = one_electron_sources(
         request,
         library=provider.one_electron_library or provider.shell_library,

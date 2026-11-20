@@ -13,12 +13,13 @@ from . import _native
 from .elements import checked_integer
 
 if TYPE_CHECKING:
+    from .calculator import Calculator
     from .experimental.f12_focal import Backend, FocalRequest
 
 
 @dataclass(frozen=True)
 class FocalReference:
-    """One cold DF-HF solution in the orbital basis declared by the request.
+    """One converged DF-HF solution in the orbital basis declared by the request.
 
     Spin-major coefficients[:, AO, MO], Fock and density have one RHF or two UHF
     channels. The RHF density includes both electrons per occupied orbital.
@@ -40,6 +41,7 @@ class FocalReference:
     basis_id: str
     orbital_id: str
     jk_fit_id: str
+    occupied_overlaps: tuple[float, ...] | None = None
 
     def _pair_spin_indices(self, request: FocalRequest) -> tuple[int, int]:
         """Map physical alpha/beta lines to the canonical orbital variables."""
@@ -54,12 +56,109 @@ class FocalReference:
         raise ValueError("Pair request and canonical reference spin channels disagree")
 
 
+@dataclass(frozen=True)
+class FocalReferenceSeed:
+    """Transport a converged determinant between geometries of one ordered molecule.
+
+    The projected occupied orbitals initialize an independent target SCF. The
+    smallest singular value of the source/target occupied overlap in every
+    populated spin channel must meet minimum_overlap after convergence.
+    """
+
+    request: FocalRequest
+    reference: FocalReference
+    minimum_overlap: float = 0.99
+
+    def __post_init__(self) -> None:
+        req, ref = self.request, self.reference
+        if (
+            ref.surface_id != req.surface_id
+            or ref.basis_id != req.basis.basis_id
+            or ref.orbital_id != req.basis.orbital.identity
+            or ref.jk_fit_id != req.basis.jk_fit.identity
+        ):
+            raise ValueError("Seed determinant and reference request identities differ")
+        if isinstance(self.minimum_overlap, bool) or not 0 < self.minimum_overlap <= 1:
+            raise ValueError("minimum_overlap must be in (0, 1]")
+
+    def _project(
+        self, request: FocalRequest, calculator: Calculator, budget: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        from .overlap import cross_overlap
+        from .projection import project_occupied
+
+        source, ref = self.request, self.reference
+        if (
+            source.root_id,
+            source.charge,
+            source.multiplicity,
+            tuple(a.atomic_number for a in source.atoms),
+        ) != (
+            request.root_id,
+            request.charge,
+            request.multiplicity,
+            tuple(a.atomic_number for a in request.atoms),
+        ):
+            raise ValueError(
+                "Seed and target must have the same ordered nuclei, charge and spin reference"
+            )
+        if (ref.orbital_id, ref.jk_fit_id) != (
+            request.basis.orbital.identity,
+            request.basis.jk_fit.identity,
+        ):
+            raise ValueError("Seed and target require identical OBS and JKFit")
+        options = {
+            "charge": request.charge,
+            "multiplicity": request.multiplicity,
+            "maximum_bytes": budget,
+        }
+        cross = cross_overlap(
+            calculator, calculator, request.atoms, source_atoms=source.atoms, **options
+        )
+        target = cross_overlap(calculator, calculator, request.atoms, **options)
+        occupancy = 2 if request.root_id == "rhf" else 1
+        spin_density = []
+        for coeff, nocc in zip(ref.coefficients, ref.occupied, strict=True):
+            if nocc:
+                projected = project_occupied(
+                    ref.overlap, target, cross, coeff[:, :nocc], occupation=occupancy
+                )
+                spin_density.append(projected.density)
+            else:
+                spin_density.append(np.zeros_like(target))
+        return np.ascontiguousarray(spin_density).reshape(-1), cross
+
+    def _checked_overlaps(
+        self, cross: np.ndarray, coefficients: np.ndarray, occupied: tuple[int, ...]
+    ) -> tuple[float, ...]:
+        if occupied != self.reference.occupied:
+            raise ValueError("Target SCF changed the seed spin occupations")
+        overlaps = []
+        for source, target, nocc in zip(
+            self.reference.coefficients, coefficients, occupied, strict=True
+        ):
+            m = target[:, :nocc].T @ cross @ source[:, :nocc]
+            overlaps.append(
+                float(np.linalg.svd(m, compute_uv=False)[-1]) if nocc else 1.0
+            )
+        if not np.isfinite(overlaps).all() or min(overlaps) < self.minimum_overlap:
+            raise ValueError(
+                f"Target SCF changed occupied subspace: overlaps {overlaps}"
+            )
+        return tuple(overlaps)
+
+
 def df_reference(
-    request: FocalRequest, *, forces: bool = True, budget_mib: int = 512
+    request: FocalRequest,
+    *,
+    forces: bool = True,
+    budget_mib: int = 512,
+    seed: FocalReferenceSeed | None = None,
 ) -> FocalReference:
     """Solve canonical DF-RHF/DF-UHF using the declared OBS and JKFit.
 
-    Use root_id="rhf" or "uhf" for the respective cold solver. Both J and K
+    Use root_id="rhf" or "uhf" and optionally transport an occupied seed.
+    Seed projection and the cross-geometry overlap check use host setup. Both J and K
     use the same Coulomb metric with relative cutoff 1e-10. A scalar ECP on
     the OBS uses native CUDA FP64 fitted UHF hydrides and singlet RHF HBr or HI. The
     JKFit supplies only Coulomb fitting functions. With forces=True
@@ -69,6 +168,8 @@ def df_reference(
     capacity separately and sets the CUDA DF provider workspace allowance.
     CPU DF integral scratch is additional. Results use public AO order.
     """
+    if seed is not None and not isinstance(seed, FocalReferenceSeed):
+        raise TypeError("seed must be a FocalReferenceSeed")
     if request.backend not in ("cpu_reference", "cuda"):
         raise ValueError("DF focal reference requires an explicit CPU or CUDA backend")
     if request.root_id not in ("rhf", "uhf") or (
@@ -134,16 +235,25 @@ def df_reference(
     with ExitStack() as owners:
         owners.callback(calc.clear_cache)
         lib = calc._library
-        native = getattr(lib, "generativeqc_focal_df_reference_v1", None)
+        name = (
+            "generativeqc_focal_df_reference_v1"
+            if seed is None
+            else "generativeqc_focal_df_reference_seeded_v1"
+        )
+        native = getattr(lib, name, None)
         if native is None:
-            raise RuntimeError("the native library lacks the focal DF reference export")
-        native.argtypes = [ct.c_void_p] * 3 + [
-            ct.c_int,
-            ct.c_int,
-            ct.c_size_t,
-            np.ctypeslib.ndpointer(np.float64, ndim=1, flags="C_CONTIGUOUS"),
-            ct.c_size_t,
-        ]
+            raise RuntimeError(f"the native library lacks {name}")
+        array = np.ctypeslib.ndpointer(np.float64, ndim=1, flags="C_CONTIGUOUS")
+        native.argtypes = (
+            [ct.c_void_p] * 3
+            + [
+                ct.c_int,
+                ct.c_int,
+                ct.c_size_t,
+            ]
+            + ([array, ct.c_size_t] if seed is not None else [])
+            + [array, ct.c_size_t]
+        )
         native.restype = ct.c_int
         calc._preflight_hf_basis(request.atoms, compute_forces=forces)
         ctx = ct.c_void_p()
@@ -159,10 +269,16 @@ def df_reference(
         owners.callback(lib.generativeqc_system_destroy, system)
         auxiliary = calc._create_native_system(*geometry, jk)
         owners.callback(lib.generativeqc_system_destroy, auxiliary)
+        arguments = ()
+        if seed is not None:
+            density, cross = seed._project(request, calc, budget)
+            arguments = (density, density.size)
         raw = np.empty(count)
         _native.check(
             lib,
-            native(ctx, system, auxiliary, spin, forces, budget, raw, count),
+            native(
+                ctx, system, auxiliary, spin, forces, budget, *arguments, raw, count
+            ),
             context=ctx,
         )
     if not np.isfinite(raw).all() or raw[2] != (
@@ -198,4 +314,5 @@ def df_reference(
         request.basis.basis_id,
         orb.identity,
         jk.identity,
+        seed._checked_overlaps(cross, coeff, occupied) if seed is not None else None,
     )

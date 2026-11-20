@@ -57,6 +57,7 @@ conventional_df_ucc_triples = _f12_focal_ucc_triples.conventional_df_ucc_triples
 FocalOneElectron = _f12_focal_one_electron.FocalOneElectron
 one_electron_sources = _f12_focal_one_electron.one_electron_sources
 FocalReference = _f12_focal_reference.FocalReference
+FocalReferenceSeed = _f12_focal_reference.FocalReferenceSeed
 df_reference = _f12_focal_reference.df_reference
 FocalF12Increment = _f12_focal_increment.FocalF12Increment
 FocalF12Sources = _f12_focal_increment.FocalF12Sources

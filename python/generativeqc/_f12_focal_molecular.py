@@ -21,7 +21,7 @@ from ._f12_focal_integrals import (
 )
 from ._f12_focal_one_electron import FocalOneElectron, one_electron_sources
 from ._f12_focal_projector import focal_cabs_projector
-from ._f12_focal_reference import FocalReference, df_reference
+from ._f12_focal_reference import FocalReference, FocalReferenceSeed, df_reference
 from ._f12_focal_singles import reference_cabs_singles
 from ._f12_focal_ump2 import FocalCoulombSource, reference_df_ump2
 from .elements import checked_integer
@@ -116,6 +116,8 @@ class MolecularFocalProvider:
     between CCSD-F12b and MP2-F12 correlation energies and forces.
     lambda_options controls the stationary multiplier solve of each CC role.
     Its workspace is bounded by budget_mib.
+    Supply reference_seed to transport a converged determinant between geometries
+    in internally evaluated molecular roles. A callable can select each basis seed.
     """
 
     shell_library: Path
@@ -132,6 +134,24 @@ class MolecularFocalProvider:
     )
     lambda_options: UCCSDLambdaOptions | None = None
 
+    reference_seed: (
+        FocalReferenceSeed | Callable[[FocalRequest], FocalReferenceSeed] | None
+    ) = None
+
+    def _seed_options(self, request: FocalRequest) -> dict[str, FocalReferenceSeed]:
+        if self.reference_seed is None:
+            return {}
+        value = (
+            self.reference_seed(request)
+            if callable(self.reference_seed)
+            else self.reference_seed
+        )
+        if not isinstance(value, FocalReferenceSeed):
+            raise TypeError(
+                "reference_seed must supply a FocalReferenceSeed for each molecular role"
+            )
+        return {"seed": value}
+
     @classmethod
     def cuda(
         cls,
@@ -146,6 +166,9 @@ class MolecularFocalProvider:
         high_order: Callable[[FocalRequest], FocalEvaluation] | None = None,
         record_graph: Callable[[dict], None] | None = None,
         lambda_options: UCCSDLambdaOptions | None = None,
+        reference_seed: (
+            FocalReferenceSeed | Callable[[FocalRequest], FocalReferenceSeed] | None
+        ) = None,
     ) -> MolecularFocalProvider:
         """Use the installed CUDA backend with compiled shell and metric/response libraries.
 
@@ -177,6 +200,7 @@ class MolecularFocalProvider:
             budget_mib=budget,
             high_order=high_order,
             lambda_options=lambda_options,
+            reference_seed=reference_seed,
             _cuda_cc_target=(architecture, cache_directory, record_graph),
         )
 
@@ -486,7 +510,10 @@ class MolecularFocalProvider:
             )
             ref = solution.sources.fixed.reference
         else:
-            ref = df_reference(request, forces=not pair, budget_mib=self.budget_mib)
+            ref = df_reference(
+                request, forces=not pair, budget_mib=self.budget_mib,
+                **self._seed_options(request),
+            )
         one = one_electron_sources(
             calculation,
             library=self.one_electron_library or self.shell_library,

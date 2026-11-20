@@ -8,6 +8,7 @@ import pytest
 from generativeqc.basis import BasisProvenance, BasisSet, BasisShell, ElementBasis
 from generativeqc.experimental.f12_focal import (
     FocalBasis,
+    FocalRequest,
     FocalSeries,
     df_reference,
     plan_singlepoint,
@@ -165,3 +166,56 @@ def test_physical_df_frame_and_nuclear_forces(
         )
         with pytest.raises(ValueError, match="canonical uhf root"):
             df_reference(replace(req, root_id="uhf:excited"))
+
+
+@pytest.mark.parametrize("root,charge,multiplicity", [("rhf", 1, 1), ("uhf", 0, 2)])
+def test_displaced_reference_seed_retains_occupied_space(
+    hydrogen_bases: tuple[FocalBasis, dict, dict],
+    root: str,
+    charge: int,
+    multiplicity: int,
+) -> None:
+    from generativeqc.experimental.f12_focal import FocalReferenceSeed
+    from pyscf import gto, scf
+
+    basis, obs, jk = hydrogen_bases
+    xyz = np.array([[0.10, -0.23, 0.2], [1.38, 0.27, -0.1], [0.67, 1.45, 0.31]])
+
+    def request(coords: np.ndarray) -> FocalRequest:
+        return plan_singlepoint(
+            list(zip(("H",) * 3, coords, strict=True)),
+            FocalSeries(basis),
+            FocalSeries(basis),
+            post_mp2=None,
+            root_id=root,
+            correlation_space_id="all-active",
+            charge=charge,
+            multiplicity=multiplicity,
+            backend="cpu_reference",
+        ).steps[0][0]
+
+    base = request(xyz)
+    initial = df_reference(base, forces=False)
+    seed = FocalReferenceSeed(base, initial)
+    xyz[1, 0] -= 4e-4
+    moved = request(xyz)
+    final = df_reference(moved, seed=seed)
+    mol = gto.M(
+        atom=list(zip(("H",) * 3, xyz, strict=True)),
+        basis=obs,
+        charge=charge,
+        spin=multiplicity - 1,
+        unit="Bohr",
+        verbose=0,
+    )
+    mf = (scf.RHF(mol) if root == "rhf" else scf.UHF(mol)).density_fit(auxbasis=jk)
+    mf.conv_tol = 1e-13
+    mf.kernel()
+    assert mf.converged and final.occupied_overlaps is not None
+    assert min(final.occupied_overlaps) > 0.99999
+    assert abs(final.energy - mf.e_tot) < 3e-9
+    np.testing.assert_allclose(
+        final.forces, -mf.nuc_grad_method().kernel(), rtol=0, atol=3e-7
+    )
+    with pytest.raises(ValueError, match="identities differ"):
+        FocalReferenceSeed(moved, initial)
