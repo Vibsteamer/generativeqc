@@ -75,3 +75,25 @@ doubles elimination accounted for explicitly. The next layers still need
 to join this common scalar to the molecular UCCSD-F12b amplitude solver
 and propagate its weights through the AO integrals, orbital relaxation,
 and nuclear derivatives.
+
+## Assembly of the fixed-source equation feeds
+
+The molecular adapter now supplies all W/C blocks and the common
+`fixed_geminal_energy` in one traversal of the active occupied pairs.
+It reuses the W/C/V projection and the quadratic B/X graphs with the
+same fitted columns, extended Fock, and cross-spin overlap. The B/X
+graphs also consume the positive exchange from that spin Fock source.
+Their occupied columns and selectors use the active slice of each spin
+while the strong projector retains every occupied orbital in the parent
+reference.
+
+The adapter stores the sum V+B−X in a zero-dimensional float64 array for
+the residual and energy program. A rank-one array would fail the native
+tensor input contract. The component interface still exposes the linear V
+term separately for W/C/V validation.
+
+The assembly test compares the common scalar to an independently summed
+dense B/X oracle and evaluates the F12 correction graph at zero amplitudes.
+It covers all three spin channels, frozen occupied spaces, fully polarized
+occupation, and the absence of occupied pairs. Converged molecular
+amplitudes, Lambda, and nuclear derivatives require their own validation.

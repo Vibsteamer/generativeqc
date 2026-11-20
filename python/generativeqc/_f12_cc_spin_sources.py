@@ -4,6 +4,9 @@ from collections.abc import Callable
 from itertools import product
 
 import numpy as np
+from generativeqc_compiler.cc.uccsd_f12_quadratic import (
+    unrestricted_fixed_geminal_quadratic_pair,
+)
 from generativeqc_compiler.cc.uccsd_f12_sources import unrestricted_f12_pair_sources
 from generativeqc_compiler.mp2.f12_density_fitting import coulomb_fit_response
 from generativeqc_compiler.tensor import Program
@@ -30,6 +33,68 @@ def unrestricted_cc_f12_residual_sources(
     scalar is solely the linear V contribution and still needs the common
     B and occupied-Fock/X terms before solving the full CC equations.
     """
+    return _fixed_source_terms(
+        space, data, fock, whitener, run, frozen_occupied, quadratic=False
+    )
+
+
+def unrestricted_cc_f12_fixed_source_feeds(
+    space: tuple[int, int, int, int, int],
+    data: dict[str, np.ndarray],
+    fock: dict[str, np.ndarray],
+    whitener: np.ndarray,
+    run: Callable,
+    *,
+    frozen_occupied: tuple[int, int] = (0, 0),
+) -> dict[str, np.ndarray]:
+    """Build W/C and the scalar V+B-X feeds from a single molecular DF frame.
+
+    The extended Fock and positive exchange follow the spin Fock source
+    convention. The frame supplies all raw and fitted operators from the same
+    reference and auxiliary space. Frozen occupied orbitals are excluded from
+    the CC amplitudes and the occupied Fock contraction of X.
+    """
+    feeds, energy = _fixed_source_terms(
+        space, data, fock, whitener, run, frozen_occupied, quadratic=True
+    )
+    if not np.isfinite(energy):
+        raise ValueError("Nonfinite fixed-geminal energy")
+    feeds["fixed_geminal_energy"] = np.asarray(energy, dtype=np.float64)
+    return feeds
+
+
+def _quadratic_pair_fields(
+    data: dict[str, np.ndarray],
+    fock: dict[str, np.ndarray],
+    left: str,
+    right: str,
+    occupied: dict[str, slice],
+) -> dict[str, np.ndarray]:
+    operators = ("geminal", "squared_geminal", "double_commutator")
+    fields = {f"metric_{op}": data[f"metric/{op}"] for op in operators}
+    if left != right:
+        fields["cross_overlap"] = data["cross_overlap"]
+    legs = ((left, "left"),) if left == right else ((left, "left"), (right, "right"))
+    for spin, side in legs:
+        active = occupied[spin[0]]
+        fields[f"fock_{side}"] = fock[f"fock_{spin}"]
+        fields[f"exchange_{side}"] = fock[f"exchange_{spin}"]
+        fields[f"fit_{side}"] = data[f"source/fit_{spin}"][:, active]
+        for op in operators:
+            fields[f"raw_{op}_{side}"] = data[f"raw/{op}/{spin}"][:, active]
+    return {name: np.ascontiguousarray(value) for name, value in fields.items()}
+
+
+def _fixed_source_terms(
+    space: tuple[int, int, int, int, int],
+    data: dict[str, np.ndarray],
+    fock: dict[str, np.ndarray],
+    whitener: np.ndarray,
+    run: Callable,
+    frozen_occupied: tuple[int, int],
+    *,
+    quadratic: bool,
+) -> tuple[dict[str, np.ndarray], float]:
     oa, ob, obs, extended, auxiliary = space
     pairs = list(occupied_pair_blocks(space, frozen_occupied=frozen_occupied))
     occupied = dict(zip(("a", "b"), (oa, ob), strict=True))
@@ -65,14 +130,21 @@ def unrestricted_cc_f12_residual_sources(
 
     selectors = np.eye(extended)
     linear_v = 0.
+    quadratic_energy = 0.
     for sl, sr, nl, nr, _, pair_indices in pairs:
         i_spin, j_spin = sl[0], sr[0]
+        left = (nl, obs - nl, extended - obs)
+        right = (nr, obs - nr, extended - obs)
+        channel = sl + "_" + sr
         graph = unrestricted_f12_pair_sources(
-            (nl, obs - nl, extended - obs),
-            (nr, obs - nr, extended - obs),
-            auxiliary,
-            channel=sl + "_" + sr,
+            left, right, auxiliary, channel=channel
         )
+        if quadratic:
+            quadratic_graph = unrestricted_fixed_geminal_quadratic_pair(
+                left, right, auxiliary, channel=channel,
+                frozen_occupied=(frozen[i_spin], frozen[j_spin]),
+            )
+            quadratic_fields = _quadratic_pair_fields(data, fock, sl, sr, occ_slice)
         shared = {
             "fit_obs_left": fit_obs[sl],
             "raw_coulomb_obs_right": raw_obs[sr],
@@ -94,6 +166,13 @@ def unrestricted_cc_f12_residual_sources(
                 rows[f"raw_{operator}_right"] = data[f"raw/{operator}/{sr}"][:, j]
             result = run(graph, {k: np.ascontiguousarray(x) for k, x in rows.items()}).outputs
             linear_v += float(result["linear_v_energy"])
+            if quadratic:
+                values = run(quadratic_graph, {
+                    **quadratic_fields,
+                    "select_i": selectors[i, occ_slice[i_spin]],
+                    "select_j": selectors[j, occ_slice[j_spin]],
+                }).outputs
+                quadratic_energy += float(values["b_energy"]) - float(values["x_fock_energy"])
             w, c = result["w_obs"], result["c_vv"]
             target_orders = [(i_spin, j_spin, w, c)]
             if sl != sr:
@@ -107,4 +186,4 @@ def unrestricted_cc_f12_residual_sources(
                     ii, jj = i - frozen[i_spin], j - frozen[j_spin]
                     sources[name + i_spin + j_spin + p + q][ii, jj] = tile
                     sources[name + j_spin + i_spin + p + q][jj, ii] = -tile
-    return sources, linear_v
+    return sources, linear_v + quadratic_energy if quadratic else linear_v

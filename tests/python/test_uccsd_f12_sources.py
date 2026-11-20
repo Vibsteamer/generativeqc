@@ -1,8 +1,13 @@
 """Independent checks of the fixed-geminal external spin projection."""
 
+from itertools import combinations, product
+
 import numpy as np
 import pytest
-from generativeqc._f12_cc_spin_sources import unrestricted_cc_f12_residual_sources
+from generativeqc._f12_cc_spin_sources import (
+    unrestricted_cc_f12_fixed_source_feeds,
+    unrestricted_cc_f12_residual_sources,
+)
 from generativeqc_compiler.cc.f12_residual import standard_v_tile
 from generativeqc_compiler.cc.uccsd_equations import build_f12_correction_program
 from generativeqc_compiler.cc.uccsd_f12_quadratic import (
@@ -197,7 +202,15 @@ def test_cusp_dressed_df_pair_sources_and_molecular_input_adjoint(
         np.testing.assert_allclose(adjoint, (objective(step) - objective(-step)) / (2 * step), atol=2e-9, rtol=0)
 
 
-@pytest.mark.parametrize("occupied,frozen", [((3, 2), (1, 1)), ((2, 0), (0, 0)), ((1, 0), (0, 0))])
+@pytest.mark.parametrize(
+    "occupied,frozen",
+    [
+        ((3, 2), (0, 0)),
+        ((3, 2), (1, 1)),
+        ((2, 0), (0, 0)),
+        ((1, 0), (0, 0)),
+    ],
+)
 def test_molecular_adapter_canonical_spin_permutations(
     occupied: tuple[int, int], frozen: tuple[int, int]
 ) -> None:
@@ -233,6 +246,57 @@ def test_molecular_adapter_canonical_spin_permutations(
     np.testing.assert_equal(accepted["correlation_energy"], v)
     if sum(occupied) < 2:
         assert v == 0 and all(not x.any() for x in blocks.values())
+
+    quadratic_operators = ("geminal", "squared_geminal", "double_commutator")
+    for spin, n in zip(("alpha", "beta"), occupied, strict=True):
+        fock["exchange_" + spin] = rng.normal(scale=0.2, size=(ext, ext))
+        for op in quadratic_operators[1:]:
+            data[f"raw/{op}/{spin}"] = rng.normal(scale=0.2, size=(aux, n, ext))
+            data[f"metric/{op}"] = np.eye(aux)
+    feeds = unrestricted_cc_f12_fixed_source_feeds(
+        (*occupied, obs, ext, aux),
+        data,
+        fock,
+        np.eye(aux),
+        execute,
+        frozen_occupied=frozen,
+    )
+    assert set(feeds) == {*blocks, "fixed_geminal_energy"}
+    for name, block in blocks.items():
+        np.testing.assert_array_equal(feeds[name], block)
+
+    quadratic = np.zeros(2)
+    for left, right, nl, nr, fl, fr in (
+        ("alpha", "alpha", oa, oa, frozen[0], frozen[0]),
+        ("alpha", "beta", oa, ob, *frozen),
+        ("beta", "beta", ob, ob, frozen[1], frozen[1]),
+    ):
+        il, ir = range(nl - fl), range(nr - fr)
+        same = left == right
+        pairs = combinations(il, 2) if same else product(il, ir)
+        for i, j in pairs:
+            reference = {f"metric_{op}": data[f"metric/{op}"] for op in quadratic_operators}
+            reference.update(select_i=np.eye(len(il))[i], select_j=np.eye(len(ir))[j])
+            if not same:
+                reference["cross_overlap"] = data["cross_overlap"]
+            for side, spin, first, stop in (
+                ("left", left, fl, nl),
+                ("right", right, fr, nr),
+            ):
+                if side == "right" and same:
+                    continue
+                active = slice(first, stop)
+                reference[f"fock_{side}"] = fock[f"fock_{spin}"]
+                reference[f"exchange_{side}"] = fock[f"exchange_{spin}"]
+                reference[f"fit_{side}"] = data[f"source/fit_{spin}"][:, active]
+                for op in quadratic_operators:
+                    reference[f"raw_{op}_{side}"] = data[f"raw/{op}/{spin}"][:, active]
+            quadratic += _dense_quadratic_pair(reference, nl, nr, obs, (fl, fr))
+    scalar = feeds["fixed_geminal_energy"]
+    assert scalar.shape == () and scalar.dtype == np.float64
+    np.testing.assert_allclose(scalar, v + quadratic[0] - quadratic[1], rtol=0, atol=2e-14)
+    complete = execute(program, {**amplitudes, **feeds}).outputs
+    np.testing.assert_equal(complete["correlation_energy"], scalar)
 
 
 def _dense_quadratic_pair(
