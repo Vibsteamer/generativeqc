@@ -716,6 +716,32 @@ surface identity for all terms, including ordered coordinates, electronic root,
 ECP and frozen-core convention, and distinct basis identities for different
 cardinals. Returned weights apply to both energy (Eh) and force (Eh/bohr).
 
-This function assembles components after their native calculations. Availability
-of electronic methods, elements and their molecular responses is established by
-the corresponding solver and independent endpoint tests.
+Use `generativeqc.experimental.f12_focal.singlepoint` to dispatch components
+from one ordered geometry in Bohr. Supply `FocalBasis` records (or series of
+records) and an explicit component provider. Each basis snapshots its orbital,
+JKFit, and applicable MP2Fit, F12 fitting and CABS data from canonical local
+basis records. Give the F12 exponent in inverse Bohr for pair correlation.
+The caller also supplies charge, multiplicity, root and correlated-space
+identities. All orbital records must describe the same scalar Hamiltonian.
+
+For each requested role and cardinal, the provider receives the resolved basis
+and geometry and returns a converged `FocalEvaluation`. The result must echo
+the request's surface and basis identity and report its executed backend.
+The requested backend is CUDA by default. Set `backend="cpu_reference"` to
+request that backend explicitly. A backend mismatch raises before numerical
+assembly. The completed components are returned alongside the combined energy,
+forces and weights.
+
+The provider controls electronic execution and is responsible for the
+same-reference CCSD and MP2 differences, convergence and analytic gradients.
+The experimental dispatcher requires a provider for electronic work.
+Availability of electronic methods, elements and their molecular responses is
+established through independent endpoint tests of the provider.
+
+The explicit `conventional_df_post_mp2` provider supplies the combined
+DF-CCSD(T) minus DF-MP2 energy and analytic force from one native group. Route
+`post_mp2` to this provider and supply your F12 provider for the other roles.
+Use root identity `rhf` or `uhf`, correlation space `all-active` and an identical
+JKFit and MP2Fit record for the conventional increment. The restricted
+DF-CCSD(T) provider requires CUDA. The caller must match the selected cold
+reference with the rest of the focal calculation.

@@ -1,0 +1,42 @@
+# Decision for geometry-first F12 focal dispatch
+
+Status: implemented
+
+Date: 2026-11-20
+
+## Problem
+
+The focal assembler combines precomputed energy and force terms using
+caller-defined identifiers. Every caller validates geometry and basis identity.
+The molecular provider for each electronic role can be qualified independently.
+
+## Decision
+
+The experimental geometry-first entry hands explicitly requested electronic
+roles to a caller-selected provider. It resolves immutable orbital, JKFit,
+MP2Fit, F12 fit and CABS records before work. The surface key incorporates the
+ordered geometry, charge, multiplicity, scalar ECP data, root and correlated
+space identifiers. The basis key includes the fitting roles and F12 exponent.
+The dispatcher rejects any detected mismatch in a returned key or executed
+backend. Both entry points use the same native-owned extrapolation coefficients
+and force convention.
+
+Electronic root continuity and response convergence are provider obligations.
+The numerical composition remains an orchestration layer. Configured roles or
+compiled integral kernels alone establish no new method capability.
+
+The combined conventional correction uses the existing same-reference native
+component group. Its single auxiliary record must describe both fitting roles.
+The grouped result exposes a complete CCSD(T) force, so this provider owns the
+combined CCSD(T) minus MP2 role. Split correction providers require separate
+analytic force outputs.
+
+## Evidence
+
+The entry tests exercise same-geometry dispatch, stale result and backend
+rejection, owned result storage, ECP changes and force differences for a known
+analytic surface. The conventional provider test sends the high-order role
+through native CPU `Calculator.singlepoint_components` and checks the
+CCSD(T) minus MP2 force against a scalar energy difference. The same test case
+supports an explicit CUDA allocation opt-in. CUDA molecular F12 endpoint
+evidence remains with the corresponding provider tests.
