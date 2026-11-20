@@ -83,7 +83,8 @@ def reference_cabs_singles(
     Supply the real-spherical combined-space three-center tensor [JKFit,AO,AO],
     its Coulomb metric, a full-rank W satisfying W.T W = metric^-1, and the
     OBS-orthogonal CABS columns returned by focal_cabs_projector. CPU reference
-    uses FP64 TensorIR and NumPy LAPACK. CUDA requires a configured ordinary
+    uses FP64 TensorIR, a wider congruence accumulator and NumPy LAPACK. CUDA
+    uses two-word FP64 for the congruence and requires a configured ordinary
     FP64 CUDA TensorIR runner and the native CUDA singles library. Each spin's
     extended physical Fock must reproduce the canonical reference in its OBS.
     Set relax=True to solve the coupled occupied/virtual response and return
@@ -97,8 +98,7 @@ def reference_cabs_singles(
     from generativeqc_compiler.tensor import execute
 
     from ._f12_cabs import cabs_singles
-    from ._f12_spin_ao import _orbital_sources
-    from ._f12_spin_fock import spin_fock, spin_fock_pullback
+    from ._f12_cabs_fock import obs_sources, physical_fock
 
     if (
         request.role != "hf_cabs"
@@ -188,37 +188,27 @@ def reference_cabs_singles(
         )
     spins = (0, 0) if expected == 1 else (0, 1)
     oa, ob = (reference.occupied[k] for k in spins)
-    space = (oa, ob, obs, obs + rank, q)
-    ao = {
-        "overlap_ao": s,
-        "hcore_ao": h,
-        "ao_coulomb": three_center,
-        "metric/coulomb": metric,
-        "metric_whitener": whitener,
-    }
-    for name, k in zip(("alpha", "beta"), spins, strict=True):
+    frames = []
+    for k in spins:
         frame = np.zeros((atomic, obs + rank))
         frame[:obs, :obs] = reference.coefficients[k]
         frame[:, obs:] = complement
-        ao["coefficients_" + name] = frame
-    projected, _ = _orbital_sources(
-        space, ao, checked_run, None, projected=None, role="fock"
+        frames.append(frame)
+    focks, fock_pullback = physical_fock(
+        h, three_center, whitener, frames, (oa, ob), checked_run, cuda, library
     )
-    values = {
-        k.removeprefix("source/"): v
-        for k, v in projected.items()
-        if k.startswith("source/")
-    }
-    fock_space = (oa, ob, obs + rank, q)
-    focks = spin_fock(fock_space, values, checked_run)
     matrices = []
     energies = []
     errors = []
-    seeds = {}
-    for name, k, occ in zip(("alpha", "beta"), spins, (oa, ob), strict=True):
-        f = focks["fock_" + name]
-        if not np.allclose(f, f.T, atol=2e-8, rtol=0):
-            raise ValueError("physical extended DF Fock is asymmetric")
+    seeds = []
+    for name, k, occ, raw_fock in zip(
+        ("alpha", "beta"), spins, (oa, ob), focks, strict=True
+    ):
+        f = raw_fock
+        if not np.isfinite(f).all() or not np.allclose(f, f.T, atol=2e-8, rtol=0):
+            raise ValueError(
+                f"physical extended DF Fock is asymmetric: {name}, max skew {np.max(np.abs(f - f.T))} Eh"
+            )
         f = (f + f.T) * 0.5
         err = float(
             np.max(np.abs(f[:obs, :obs] - np.diag(reference.orbital_energies[k])))
@@ -236,20 +226,10 @@ def reference_cabs_singles(
         energies.append(energy)
         errors.append(err)
         if pullback:
-            seeds["fock_" + name] = bar
+            seeds.append(bar)
     weights = None
     if pullback:
-        seed = spin_fock_pullback(fock_space, values, seeds, checked_run)
-        _, bars = _orbital_sources(
-            space,
-            ao,
-            checked_run,
-            {"source/" + k: v for k, v in seed.items()},
-            projected=projected,
-            role="fock",
-        )
-        assert bars is not None
-        ga, gb = bars["coefficients_alpha"], bars["coefficients_beta"]
+        (ga, gb), core_bar, three_center_bar, metric_bar = fock_pullback(seeds)
         cg = ga[:, obs:] + gb[:, obs:]
         transfer = checked_run(
             frame_kernel_cotangent(atomic, rank),
@@ -267,9 +247,9 @@ def reference_cabs_singles(
             )
         cobs = np.stack([ga[:obs, :obs], gb[:obs, :obs]])
         weights = {
-            "hcore": bars["hcore_ao"],
-            "metric": bars["metric/coulomb"],
-            "three_center": bars["ao_coulomb"],
+            "hcore": core_bar,
+            "metric": metric_bar,
+            "three_center": three_center_bar,
             "obs_coefficients": cobs
             if expected == 2
             else np.sum(cobs, axis=0, keepdims=True),
@@ -283,7 +263,7 @@ def reference_cabs_singles(
                 reference,
                 one,
                 complement,
-                values,
+                obs_sources(three_center, frames, obs, checked_run),
                 whitener,
                 weights,
                 checked_run,
