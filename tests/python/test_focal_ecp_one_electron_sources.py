@@ -182,9 +182,9 @@ def test_focal_reference_keeps_ecp_on_orbital_system_only() -> None:
     with pytest.raises(ValueError, match="JKFit describes Coulomb fitting"):
         df_reference(req)
     bare_fit = replace(req.basis, jk_fit=req.basis.cabs)
-    with pytest.raises(NotImplementedError, match="native CUDA DF-UHF"):
+    with pytest.raises(NotImplementedError, match="native CUDA fitted HF"):
         df_reference(replace(req, basis=bare_fit))
-    with pytest.raises(NotImplementedError, match="native CUDA DF-UHF"):
+    with pytest.raises(NotImplementedError, match="native CUDA fitted HF"):
         df_reference(
             replace(req, basis=bare_fit, root_id="rhf", multiplicity=1, backend="cuda")
         )
