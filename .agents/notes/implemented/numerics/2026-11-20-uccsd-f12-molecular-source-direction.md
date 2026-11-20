@@ -135,3 +135,23 @@ maximum discrepancy of 2.25e-10 Eh/bohr against the three independent Fock
 displacements. The signed `molecular_cartesian_nh2/l20_ordinary_fock_hcore/passed.json`
 identifies the returned combined-basis H, dH, S and dS and the checked 54
 spin-block derivatives.
+
+The ordinary spin Fock cotangents can now propagate through the shared DF
+Coulomb charge, spin-diagonal exchange and the implicit fit. The reverse map
+returns energy weights for the Coulomb metric, AO three-center tensor and
+the two complete ordinary MO coefficient matrices. Frozen occupied electrons
+participate in the mean field. Nuclear force uses the negative action of
+these four weights. Independent finite differences differentiate an AO
+density-matrix J/K with one frozen alpha orbital and unequal occupations.
+
+With the six NH2/D device weights, the geometry-derived CPU reference fit
+and both native Gaussian derivative contractions reproduce the nine retained
+moving-MO J−K force components within 1.50e-12 Eh/bohr. At H1-z the fitting
+metric gives +0.001018189062, three-center integrals −0.055121304711 and
+the two spin coefficient responses +0.023776332292 Eh/bohr. Independent
+displaced Fock checks at H1-z and N-x agree within 2.27e-10 Eh/bohr.
+The separate molecular qualification uses three shell centers, 158 combined
+spherical AOs and the 198-function common fit. The coefficient derivatives,
+the two previously verified Hcore terms and the other source, UHF and CABS
+actions remain inputs. The validation directory is
+`molecular_cartesian_nh2/l20_ordinary_fock_jk/` in the area described above.

@@ -48,20 +48,25 @@ def _orbital_sources(
     orbital_weights: dict[str, np.ndarray] | None,
     *,
     projected: dict[str, np.ndarray] | None,
-    role: Literal["shared", "pairs", "fock"] = "shared",
+    role: Literal["shared", "pairs", "fock", "ordinary_jk"] = "shared",
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray] | None]:
     # A combined energy/response evaluation owns the forward buffers through
     # the reverse pass. Standalone evaluations build their own projections.
     oa, ob, obs, ext, aux = space
-    if not (0 <= oa < obs and 0 <= ob < obs < ext and oa + ob > 0):
+    valid_frame = obs == ext if role == "ordinary_jk" else obs < ext
+    if not (0 <= oa < obs and 0 <= ob < obs and valid_frame and oa + ob > 0):
         raise ValueError("Invalid UHF occupied, OBS, or extended dimensions")
-    nc = len(ao["overlap_ao"])
+    nc = len(ao["coefficients_alpha"])
     occupied = {"alpha": oa, "beta": ob}
-    cross = unrestricted_cross_frame_overlap(nc, ext)
-    csrc = {k: ao[k] for k in ("overlap_ao", "coefficients_alpha", "coefficients_beta")}
+    needs_cross = role in ("shared", "pairs")
+    if needs_cross:
+        cross = unrestricted_cross_frame_overlap(nc, ext)
+        csrc = {
+            k: ao[k] for k in ("overlap_ao", "coefficients_alpha", "coefficients_beta")
+        }
     if projected is None:
         data = {"space": np.array(space)}
-        if role != "fock":
+        if needs_cross:
             data["cross_overlap"] = run(cross, csrc).outputs["cross_overlap"]
     else:
         data = projected
@@ -70,7 +75,7 @@ def _orbital_sources(
         bars = {
             k: np.zeros_like(v) for k, v in ao.items() if k not in ("metric_whitener",)
         }
-        if role != "fock":
+        if needs_cross:
             cross_rev = transpose_program(cross, ("cross_overlap",)).program
             result = run(
                 cross_rev,
@@ -79,7 +84,9 @@ def _orbital_sources(
             for name, value in result.items():
                 bars[name.removeprefix("bar_")] += value
     operators = tuple(_OPERATORS)
-    if role == "fock":
+    if role == "ordinary_jk":
+        operators = ("coulomb",)
+    elif role == "fock":
         operators = ("hcore", "coulomb")
     elif role == "pairs":
         operators = tuple(op for op in operators if op != "hcore")
