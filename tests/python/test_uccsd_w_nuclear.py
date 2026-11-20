@@ -8,7 +8,7 @@ from generativeqc_compiler.tensor import execute
 from tools.generativeqc_cc.uccsd_w_nuclear import unrestricted_cc_w_ao_weights
 
 
-def test_open_shell_frozen_w_ao_weights():
+def test_open_shell_frozen_w_ao_weights() -> None:
     rng = np.random.default_rng(85217)
     n, obs, q = 6, 5, 4
     occupied = {"a": 3, "b": 2}
@@ -49,7 +49,7 @@ def test_open_shell_frozen_w_ao_weights():
         (3, 2, obs, n, q), ao, weights, execute, frozen_occupied=(1, 0)
     )
 
-    def dense(fields):
+    def dense(fields: dict[str, np.ndarray]) -> float:
         coeff = {s[0]: fields["coefficients_" + s] for s in ("alpha", "beta")}
         raw = {
             (s, op): c.T @ fields["ao_" + key] @ c

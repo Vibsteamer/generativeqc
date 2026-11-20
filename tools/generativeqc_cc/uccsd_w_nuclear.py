@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
 from itertools import product
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
-
 from generativeqc._f12_spin_pairs import occupied_pair_blocks
 from generativeqc_compiler.cc.uccsd_f12_sources import unrestricted_f12_pair_sources
 from generativeqc_compiler.mp2.f12_density_fitting import (
@@ -16,6 +14,9 @@ from generativeqc_compiler.mp2.f12_density_fitting import (
 )
 from generativeqc_compiler.mp2.f12_unrestricted import unrestricted_cross_frame_overlap
 from generativeqc_compiler.tensor import Program, transpose_program
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
 
 
 _OPERATOR_FIELDS = {
@@ -34,7 +35,16 @@ class _Frame(NamedTuple):
     fit_bar: np.ndarray
 
 
-def _pair_seed(weights, nocc, frozen, obs, left, right, i, j):
+def _pair_seed(
+    weights: Mapping[str, np.ndarray],
+    nocc: Mapping[str, int],
+    frozen: Mapping[str, int],
+    obs: int,
+    left: str,
+    right: str,
+    i: int,
+    j: int,
+) -> np.ndarray:
     """Transpose the occupied exchange and external spin permutations of the W feeds."""
     seed = np.zeros((obs, obs))
     l, r = left[0], right[0]
