@@ -40,14 +40,16 @@ def one_electron_sources(
     derivatives: bool = True,
     budget_mib: int = 512,
 ) -> FocalOneElectron:
-    """Evaluate all-electron S and T+V on the geometry of an HF+CABS or MP2-F12 request.
+    """Evaluate S and T+V on the geometry of an HF+CABS or MP2-F12 request.
 
     The supplied F12 integral library must implement the requested backend.
     Coordinates are in Bohr. Each matrix starts with all orbital AOs and then
     all atom-centered OptRI AOs, both in native real-spherical order. With
     derivatives=True, each Jacobian has shape (atoms, 3, AOs, AOs) and includes
     the motion of both Gaussian centers and the nuclear attraction centers.
-    The numeric budget bounds native workspace and matrix staging.
+    For scalar ECPs the CPU reference also evaluates through-f semilocal
+    projectors with a zero residual local channel. The point attraction then
+    uses the effective ionic charges. The numeric budget bounds workspace.
     """
     if request.role not in ("hf_cabs", "mp2_f12_correlation"):
         raise ValueError("one-electron F12 sources require an HF+CABS or MP2-F12 role")
@@ -68,11 +70,18 @@ def one_electron_sources(
         request.atoms, (("orbital", basis.orbital), ("CABS", basis.cabs)), maximum
     )
     nuclei = [basis.orbital.by_element[a.atomic_number] for a in request.atoms]
+    terms = {}
     if any(n.ecp_core_electrons for n in nuclei):
-        raise NotImplementedError(
-            "the focal ECP one-electron core requires the residual scalar potential and its nuclear derivatives"
-        )
-    charges = np.asarray([n.nuclear_charge for n in nuclei], dtype=np.int32)
+        from ._f12_focal_ecp import projector_terms
+
+        if request.backend != "cpu_reference":
+            raise NotImplementedError(
+                "CUDA focal scalar ECP projectors require a combined-basis kernel"
+            )
+        terms = projector_terms(nuclei)
+    charges = np.asarray(
+        [n.nuclear_charge - n.ecp_core_electrons for n in nuclei], dtype=np.int32
+    )
     xyz = np.asarray([a.position for a in request.atoms], dtype=np.float64)
     ns = len(shells.angular)
     widths = (2 * shells.angular + 1).tolist()
@@ -163,6 +172,19 @@ def one_electron_sources(
             if first != second:
                 matrices[:, :, right, left] = block.swapaxes(-1, -2)
             pos += a * b
+    if terms:
+        from ._f12_focal_ecp import add_projector_residual
+
+        del block, compact
+        add_projector_residual(
+            matrices[:, 1],
+            shells,
+            transforms,
+            xyz,
+            terms,
+            derivatives,
+            maximum - dense_bytes - retained,
+        )
     jac_shape = (len(nuclei), 3, n, n)
     return FocalOneElectron(
         matrices[0, 0],
