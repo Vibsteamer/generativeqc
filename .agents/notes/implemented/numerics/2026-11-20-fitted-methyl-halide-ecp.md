@@ -22,3 +22,6 @@ differences for the exact requested force scope. The conventional triples
 and fixed-geminal correlation layers have their own angular and storage
 limits. A successful fitted reference therefore qualifies that reference
 alone.
+
+The [C/H monohalide admission](2026-11-21-fitted-carbon-halide-ecp.md) supersedes
+the C1H3X1 topology restriction.

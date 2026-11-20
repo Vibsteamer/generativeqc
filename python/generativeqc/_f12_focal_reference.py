@@ -176,8 +176,8 @@ def df_reference(
     Use root_id="rhf" or "uhf" and optionally transport an occupied seed.
     Seed projection and the cross-geometry overlap check use host setup. Both J and K
     use the same Coulomb metric with relative cutoff 1e-10. A scalar ECP on
-    the OBS uses native CUDA FP64 fitted HF on admitted hydrides and methyl halides. The
-    JKFit supplies only Coulomb fitting functions. With forces=True
+    the OBS uses native CUDA FP64 fitted HF on admitted hydrides and C/H monohalides.
+    The JKFit supplies only Coulomb fitting functions. With forces=True
     the same solve also evaluates the reference's analytic nuclear forces.
     The CUDA path uses the native CUDA DF operator and derivative providers
     with host SCF control. The budget limits detached output and native reference

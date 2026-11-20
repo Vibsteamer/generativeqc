@@ -11,6 +11,7 @@
 #include "cli/json.hpp"
 #include "cli/native_basis.hpp"
 #include "dft/grid.hpp"
+#include "molecule/small_core_halide.hpp"
 #include "runtime/resource_planning.hpp"
 #include "scf/hf_cuda_resources.hpp"
 #include "scf/hf_df_resources.hpp"
@@ -222,7 +223,8 @@ bool pbe_dispersion_inventory(const RunOptions& options) {
 // The CLI repeats topology metadata; the native owner performs the same full
 // bucket, retained-fleet and detached-retry composition as the Python API.
 Json cuda_df_candidates(const Topology& orbital, const Topology& auxiliary, Bytes atoms,
-                        Bytes spins, Bytes nalpha, Bytes nbeta, const RunOptions& options) {
+                        Bytes spins, Bytes nalpha, Bytes nbeta, Bytes ecp_workspace,
+                        const RunOptions& options) {
   const scf::CudaDfResourceItem item{atoms,
                                      orbital.nbf,
                                      orbital.cartesian_nbf,
@@ -256,9 +258,9 @@ Json cuda_df_candidates(const Topology& orbital, const Topology& auxiliary, Byte
                                    : candidate.kind == 1 ? "cuda-df-source"
                                                          : "cuda-df-packed"},
                           {"retained_host", candidate.retained_host},
-                          {"workspace_host", candidate.workspace_host},
+                          {"workspace_host", sum({candidate.workspace_host, ecp_workspace})},
                           {"retained_device", candidate.retained_device},
-                          {"workspace_device", candidate.workspace_device},
+                          {"workspace_device", sum({candidate.workspace_device, ecp_workspace})},
                           {"runtime_allowance_device", candidate.runtime_allowance_device},
                           {"sub_budget", candidate.sub_budget},
                           {"tile_pairs", tile[1]},
@@ -381,7 +383,21 @@ int resources_command(const RunOptions& options, std::span<const generativeqc_at
       options.backend != GENERATIVEQC_BACKEND_CUDA)
     throw UsageError("CUDA density fitting requires --backend cuda");
   plan["backend"] = cpu ? "cpu" : "cuda";
-  if (orbital.angular > (cpu ? 4u : 3u)) {
+  molecule::SmallCoreHalideComposition halide;
+  if (basis.core_electrons.size() == atoms.size()) {
+    for (std::size_t i = 0; i < atoms.size(); ++i)
+      halide.add(atoms[i].atomic_number, basis.core_electrons[i]);
+  }
+  const bool fitted_spin = (options.method == GENERATIVEQC_METHOD_RHF && options.multiplicity == 1) ||
+                           (options.method == GENERATIVEQC_METHOD_UHF && options.multiplicity == 2);
+  const auto orbital_limit = halide.fitted_orbital_angular_limit(
+      options.charge, options.multiplicity, electrons);
+  const bool fitted_halide = fitted_spin && orbital_limit && !cpu && !basis.ecp_terms.empty() &&
+      options.density_fitting == GENERATIVEQC_DENSITY_FITTING_CUDA && options.auxiliary_basis_explicit &&
+      basis.representation == GENERATIVEQC_BASIS_SPHERICAL;
+  // CLI execution uses the expanded ECP system constructor, which accepts through f.
+  const auto cli_orbital_limit = cpu && basis.ecp_terms.empty() ? 4u : 3u;
+  if (orbital.angular > cli_orbital_limit) {
     plan["diagnostic"] = "orbital angular momentum exceeds the native inventory domain";
     return emit();
   }
@@ -418,31 +434,15 @@ int resources_command(const RunOptions& options, std::span<const generativeqc_at
        {options.grid.radial_points, options.grid.angular_polar, options.grid.angular_azimuth}}};
   plan["orbital"] = topology_json(orbital);
   Bytes ecp_workspace = 0;
-  bool halogen_uhf = options.method_name == "uhf" && !cpu && options.density_fitting == GENERATIVEQC_DENSITY_FITTING_CUDA &&
-                     options.charge == 0 && options.multiplicity == 2 && !options.auxiliary_basis_name.empty() &&
-                     basis.representation == GENERATIVEQC_BASIS_SPHERICAL && basis.core_electrons.size() == atoms.size();
-  bool bromine = false;
-  unsigned heavy = 0;
-  if (halogen_uhf) {
-    for (std::size_t i = 0; i < atoms.size(); ++i) {
-      const auto z = atoms[i].atomic_number;
-      const auto core = basis.core_electrons[i];
-      if (z == 1 && core == 0) continue;
-      ++heavy;
-      bromine |= z == 35 && core == 10;
-      halogen_uhf &= (z == 35 && core == 10) || (z == 53 && core == 28);
-    }
-    halogen_uhf &= heavy == 1;
-  }
   if (generativeqc_resource_ecp_workspace_v2(orbital.nbf, orbital.cartesian_nbf, atoms.size(),
                                              orbital.primitives, basis.ecp_terms.size(),
-                                             cpu ? 0 : 1, halogen_uhf && bromine, &ecp_workspace))
+                                             cpu ? 0 : 1, fitted_halide && halide.bromine == 1, &ecp_workspace))
     throw UsageError("ECP allocation inventory overflows native bounds");
   if (!basis.ecp_terms.empty()) {
     plan["orbital"]["ecp_terms"] = basis.ecp_terms.size();
     plan["orbital"]["ecp_core_electrons"] = basis.core_electrons;
     plan["ecp_workspace"] = ecp_workspace;
-    if (fitted && !halogen_uhf) {
+    if (fitted && !fitted_halide) {
       plan["diagnostic"] = "ECP density fitting is not qualified";
       return emit();
     }
@@ -468,7 +468,7 @@ int resources_command(const RunOptions& options, std::span<const generativeqc_at
               : expanded.identity;
     } else
       auxiliary = orbital;
-    if (auxiliary->angular > (halogen_uhf ? 5u : (cpu ? 4u : 3u))) {
+    if (auxiliary->angular > (fitted_halide ? 5u : (cpu ? 4u : 3u))) {
       plan["diagnostic"] = "auxiliary angular momentum exceeds the native inventory domain";
       return emit();
     }
@@ -500,24 +500,26 @@ int resources_command(const RunOptions& options, std::span<const generativeqc_at
     retained = aggregate[12];
     workspace = aggregate[13];
   } else if (hf && fitted) {
-    if (auxiliary->nbf > 128) {
-      plan["diagnostic"] = "CUDA DF inventory requires <=128 auxiliary AOs";
-      return emit();
-    }
-    std::array<Bytes, 2> ordinary{};
-    if (generativeqc_resource_small_hf_cuda_v2(
-            orbital.nbf, orbital.cartesian_nbf, atoms.size(), orbital.shells,
-            orbital.angular_values.data(), orbital.primitive_counts.data(), options.diis_history,
-            spins, 0, convergence.energy_tolerance, options.screening_tolerance.value_or(1e-14),
-            ordinary.data(), ordinary.size())) {
-      plan["diagnostic"] =
-          "CUDA DF inventory requires a CUDA library and ordinary <=16-AO topology";
-      return emit();
+    if (!fitted_halide) {
+      if (auxiliary->nbf > 128) {
+        plan["diagnostic"] = "CUDA DF inventory requires <=128 auxiliary AOs";
+        return emit();
+      }
+      std::array<Bytes, 2> ordinary{};
+      if (generativeqc_resource_small_hf_cuda_v2(
+              orbital.nbf, orbital.cartesian_nbf, atoms.size(), orbital.shells,
+              orbital.angular_values.data(), orbital.primitive_counts.data(), options.diis_history,
+              spins, 0, convergence.energy_tolerance, options.screening_tolerance.value_or(1e-14),
+              ordinary.data(), ordinary.size())) {
+        plan["diagnostic"] =
+            "CUDA DF inventory requires a CUDA library and ordinary <=16-AO topology";
+        return emit();
+      }
     }
     try {
       const auto candidates = cuda_df_candidates(
           orbital, *auxiliary, atoms.size(), spins, static_cast<Bytes>((electrons + unpaired) / 2),
-          static_cast<Bytes>((electrons - unpaired) / 2), options);
+          static_cast<Bytes>((electrons - unpaired) / 2), ecp_workspace, options);
       plan["candidates"] = candidates;
       std::vector<std::string> names;
       for (const auto& candidate : candidates)
@@ -547,6 +549,8 @@ int resources_command(const RunOptions& options, std::span<const generativeqc_at
       if (!feasible) plan["diagnostic"] = "no native DF allocation alternative fits all budgets";
     } catch (const UsageError&) {
       throw;
+    } catch (const scf::CudaDfResourceUnsupported& error) {
+      plan["diagnostic"] = error.what();
     } catch (const std::exception& error) {
       plan["status"] = "infeasible";
       plan["diagnostic"] = error.what();

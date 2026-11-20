@@ -45,17 +45,20 @@ def g_shell_halogen_hydride(basis, atoms):
     )
 
 
-def g_shell_methyl_halide(basis: object, atoms: Sequence[Atom]) -> bool:
-    """C/H carry their full charges and only Br or I carries a small-core ECP."""
+def g_shell_carbon_halide(basis: object, atoms: Sequence[Atom]) -> bool:
+    """One small-core Br or I, at least one all-electron C and optional H."""
     if not isinstance(basis, BasisSet) or basis.representation != "spherical":
         return False
-    numbers = sorted(a.atomic_number for a in atoms)
-    if numbers not in ([1, 1, 1, 6, 35], [1, 1, 1, 6, 53]):
+    elements = [a.atomic_number for a in atoms]
+    if 6 not in elements or sum(z in (35, 53) for z in elements) != 1:
         return False
-    cores = {1: 0, 6: 0, numbers[-1]: 10 if numbers[-1] == 35 else 28}
+    cores = {1: 0, 6: 0, 35: 10, 53: 28}
     return all(
-        z in basis.by_element and basis.by_element[z].ecp_core_electrons == core
-        for z, core in cores.items()
+        z in cores
+        and z in basis.by_element
+        and basis.by_element[z].nuclear_charge == z
+        and basis.by_element[z].ecp_core_electrons == cores[z]
+        for z in set(elements)
     )
 
 
@@ -104,11 +107,18 @@ def fitted_hf_hydride_domain(method, basis, atoms, charge, multiplicity):
 def fitted_hf_ecp_domain(
     method: str, basis: BasisSet, atoms: Sequence[Atom], charge: int, multiplicity: int
 ) -> bool:
+    """Admit the supported small-core halide states and orbital angular momenta."""
     if fitted_hf_hydride_domain(method, basis, atoms, charge, multiplicity):
         return True
+    if charge not in (0, 1) or not g_shell_carbon_halide(basis, atoms):
+        return False
+    electrons = sum(
+        atom.atomic_number - basis.by_element[atom.atomic_number].ecp_core_electrons
+        for atom in atoms
+    ) - charge
     return (
-        (method, charge, multiplicity) in (("rhf", 0, 1), ("uhf", 1, 2))
-        and g_shell_methyl_halide(basis, atoms)
+        (method, multiplicity) in (("rhf", 1), ("uhf", 2))
+        and electrons % 2 == multiplicity - 1
         and all(
             shell.angular_momentum <= 4
             for z in {atom.atomic_number for atom in atoms}
@@ -119,7 +129,7 @@ def fitted_hf_ecp_domain(
 
 def resolve_ecp(basis: typing.Any, atoms: typing.Any) -> typing.Any:
     """Resolve immutable source records to atom-mapped scalar residual terms."""
-    orbital_g = g_shell_halogen_hydride(basis, atoms) or g_shell_methyl_halide(
+    orbital_g = g_shell_halogen_hydride(basis, atoms) or g_shell_carbon_halide(
         basis, atoms
     )
     shell_limit = 4 if orbital_g else 3

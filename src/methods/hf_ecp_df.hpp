@@ -17,15 +17,9 @@ inline void prepare_ecp_df_hf(core::System& system, const scf::ScfOptions& optio
   const auto composition = scf::cuda_execution::halide_composition(system);
   const bool restricted = method == GENERATIVEQC_METHOD_RHF && system.multiplicity == 1;
   const bool unrestricted = method == GENERATIVEQC_METHOD_UHF && system.multiplicity == 2;
-  const bool hydride = composition.hydride() && system.charge == 0 &&
-                       (unrestricted || (restricted && composition.hydrogen == 1 &&
-                                         system.electron_count == 26));
-  const bool methyl = composition.methyl_halide() &&
-                      ((restricted && system.charge == 0 && system.electron_count == 34) ||
-                       (unrestricted && system.charge == 1 && system.electron_count == 33));
-  const unsigned limit = restricted || methyl ||
-                         scf::cuda_execution::fitted_halogen_dihydride_doublet(system) ? 4U : 3U;
-  if ((!hydride && !methyl) || !execution.cuda_requested() ||
+  const auto limit = composition.fitted_orbital_angular_limit(
+      system.charge, system.multiplicity, system.electron_count);
+  if ((!restricted && !unrestricted) || !limit || !execution.cuda_requested() ||
       options.density_fitting_mode != GENERATIVEQC_DENSITY_FITTING_CUDA ||
       options.precision_mode != GENERATIVEQC_PRECISION_FP64 || !auxiliary ||
       system.basis_representation != core::kSphericalBasis ||

@@ -2021,22 +2021,24 @@ class Calculator:
         return self._device_name
 
     def _full_df_basis_consumer(
-        self, operator: str, derivative_order: int = 0, *, atoms=None
+        self, operator: str, derivative_order: int = 0, *, atoms: Sequence[Atom] | None = None
     ) -> str | None:
         """Select value and gradient operators provided by the CUDA fitted Fock source."""
-        if atoms is not None:
-            from .ecp import g_shell_halogen_hydride, g_shell_methyl_halide
+        if (
+            atoms is not None
+            and derivative_order in (0, 1)
+            and operator in ("overlap", "kinetic", "nuclear_attraction", "df_three_center")
+        ):
+            from .ecp import g_shell_carbon_halide, g_shell_halogen_hydride
 
-            methyl = g_shell_methyl_halide(self._basis, atoms)
-            unrestricted = self._method == _native.METHOD_UHF
+            carbon_halide = g_shell_carbon_halide(self._basis, atoms)
+            multiplicity = 2 if self._method == _native.METHOD_UHF else 1
             if (
-                (methyl or g_shell_halogen_hydride(self._basis, atoms))
-                and self._fitted_ecp_hf(
-                    self._basis, atoms, int(methyl and unrestricted), 2 if unrestricted else 1
+                (carbon_halide or g_shell_halogen_hydride(self._basis, atoms))
+                and any(
+                    self._fitted_ecp_hf(self._basis, atoms, charge, multiplicity)
+                    for charge in ((0, 1) if carbon_halide else (0,))
                 )
-                and derivative_order in (0, 1)
-                and operator
-                in ("overlap", "kinetic", "nuclear_attraction", "df_three_center")
             ):
                 return "full_df"
         if (

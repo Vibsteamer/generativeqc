@@ -845,7 +845,11 @@ def hf_resource_request(
                 "auxiliary": auxiliary,
                 "electrons": asdict(electrons),
                 "spins": 1 if method == "rhf" else 2,
-                **({"refine_ecp_quadrature": True} if fitted and 10 in orbital.get("ecp_core_electrons", ()) else {}),
+                **(
+                    {"refine_ecp_quadrature": True}
+                    if fitted_ecp and 10 in orbital.get("ecp_core_electrons", ())
+                    else {}
+                ),
             }
         )
     controls = {
@@ -957,6 +961,26 @@ def hf_resource_request(
                     last_phase=last_phase,
                     requested_budget=density_fitting_memory_budget_bytes,
                 )
+                if has_ecp:
+                    workspace = max(
+                        _ecp_workspace(item, cuda=True, library=library) for item in items
+                    )
+                    ecp_estimates = tuple(
+                        ResourceEstimate(
+                            f"serialized scalar ECP {owner} workspace",
+                            workspace,
+                            space,
+                            first_phase,
+                            last_phase,
+                        )
+                        for owner, space in (
+                            ("host", "pageable"), ("device", f"device:{device_id}")
+                        )
+                    )
+                    candidates = tuple(
+                        replace(candidate, estimates=candidate.estimates + ecp_estimates)
+                        for candidate in candidates
+                    )
                 return ResourceRequest(
                     name,
                     identity,
