@@ -2,6 +2,7 @@
 
 from fractions import Fraction
 
+from ..common.f12_spin import pair_frame_spins
 from ..tensor.ir import (
     Node,
     add,
@@ -73,27 +74,6 @@ def unrestricted_extended_df_fock(
     )
 
 
-def _pair_spins(
-    left: tuple[int, int, int], right: tuple[int, int, int], channel: str
-) -> tuple[str, str]:
-    spins = {
-        "alpha_alpha": ("alpha", "alpha"),
-        "alpha_beta": ("alpha", "beta"),
-        "beta_beta": ("beta", "beta"),
-    }
-    if channel not in spins or any(
-        len(space) != 3 or any(type(n) is not int or n < 1 for n in space)
-        for space in (left, right)
-    ):
-        raise ValueError("Invalid spin channel or occupied/virtual/CABS dimensions")
-    if channel != "alpha_beta" and left != right:
-        raise ValueError(
-            "Both electrons of a same-spin pair need the same orbital frame"
-        )
-
-    return spins[channel]
-
-
 def unrestricted_pair_vx(
     left: tuple[int, int, int], right: tuple[int, int, int], *, channel: str
 ) -> Program:
@@ -109,7 +89,7 @@ def unrestricted_pair_vx(
     select the exchange ket for same-spin pairs. Spin factors and the 3C(FIX)
     B/C contributions belong to the subsequent Hylleraas functional.
     """
-    spins = _pair_spins(left, right, channel)
+    spins = pair_frame_spins(left, right, channel)
 
     def ranges(
         space: tuple[int, int, int], spin: str, name: str
@@ -157,7 +137,7 @@ def unrestricted_pair_coupling(
     pairs share a physical Fock block and virtual spectrum, with a common VJP.
     Summing or antisymmetrizing upstream geminal columns remains linear.
     """
-    spin_left, spin_right = _pair_spins(left, right, channel)
+    spin_left, spin_right = pair_frame_spins(left, right, channel)
 
     def fock_block(
         size: tuple[int, int, int], spin: str

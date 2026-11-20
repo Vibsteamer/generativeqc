@@ -302,6 +302,15 @@ def build_program(oa: int, ob: int, va: int, vb: int) -> Program:
             (half, "ijab,ia,jb->", ("goovv", "t1", "t1")),
         ),
     )
+    return Program(
+        _amplitude_equation_outputs(layout, lowering),
+        provenance={"method": "UCCSD", "version": VERSION},
+    )
+
+
+def _amplitude_equation_outputs(
+    layout: UCCSDLayout, lowering: _SpinLowering
+) -> dict[str, Node]:
     outputs = {"correlation_energy": lowering.tensors["energy"][()]}
     for block in layout.blocks:
         spins = tuple(
@@ -310,4 +319,73 @@ def build_program(oa: int, ob: int, va: int, vb: int) -> Program:
         outputs[block.name.replace("t", "r", 1)] = lowering.tensors[
             block.name[:2].replace("t", "r", 1)
         ][spins]
-    return Program(outputs, provenance={"method": "UCCSD", "version": VERSION})
+    return outputs
+
+
+def build_f12_correction_program(layout: UCCSDLayout) -> Program:
+    """Fixed-cusp F12b energy and residual additions in the five UCCSD blocks.
+
+    W and C are real spin-orbital matrix elements, antisymmetric in the
+    occupied source pair and in the target pair. The cusp coefficient is
+    already included in the source. W uses the standard external projector
+    and C the one-body Fock coupling. Indices are ordered ij,pq. The
+    amplitude-independent energy supplies the separately evaluated V, B
+    and occupied-Fock/X terms in the same convention.
+
+    The input spin blocks are explicit, including permutations. A physical
+    source pullback must sum the cotangents of all its related blocks.
+    """
+    if not isinstance(layout, UCCSDLayout):
+        raise TypeError("UCCSD-F12 equations require UCCSDLayout")
+    lower = _SpinLowering(layout)
+    lower.amplitudes(layout)
+    lower.inputs("w_vo", "oovo")
+    lower.inputs("w_vv", "oovv")
+    lower.inputs("c_f12", "oovv")
+    lower.define("r1", "ov", ((1, "ijaj->ia", ("w_vo",)),))
+    lower.define(
+        "r2",
+        "oovv",
+        (
+            (1, "ijab->ijab", ("w_vv",)),
+            (1, "ijab->ijab", ("c_f12",)),
+            (-1, "ijak,kb->ijab", ("w_vo", "t1")),
+            (1, "ijbk,ka->ijab", ("w_vo", "t1")),
+        ),
+    )
+    lower.define(
+        "energy",
+        "",
+        (
+            (Fraction(1, 4), "ijab,ijab->", ("c_f12", "t2")),
+            (Fraction(1, 4), "ijab,ijab->", ("w_vv", "t2")),
+            # Occupied and virtual exchanges are already antisymmetrized in W.
+            (Fraction(1, 2), "ijab,ia,jb->", ("w_vv", "t1", "t1")),
+            (1, "ia,ia->", ("r1", "t1")),
+        ),
+    )
+    outputs = _amplitude_equation_outputs(layout, lower)
+    fixed = input_tensor("fixed_geminal_energy", lower.spec("", ()))
+    outputs["correlation_energy"] = add(outputs["correlation_energy"], fixed)
+    return Program(
+        outputs,
+        provenance={
+            "method": "unrestricted fixed-cusp CCSD-F12b correction",
+            "reference": "Knizia thesis Eqs. (4.123)–(4.127), spin-orbital form",
+            "domain": "fixed reference orbitals and supplied geminal sources",
+        },
+    )
+
+
+def build_f12_program(layout: UCCSDLayout) -> Program:
+    """Join the ordinary UCCSD equations and the fixed-source F12b correction."""
+    correction = build_f12_correction_program(layout)
+    ordinary = build_program(layout.oa, layout.ob, layout.va, layout.vb)
+    return Program(
+        {name: add(node, correction.outputs[name]) for name, node in ordinary.outputs.items()},
+        provenance={
+            "method": "unrestricted CCSD-F12b with fixed geminal sources",
+            "ordinary": ordinary.logical_hash,
+            "correction": correction.logical_hash,
+        },
+    )

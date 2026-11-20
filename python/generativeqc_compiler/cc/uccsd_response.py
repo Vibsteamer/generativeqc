@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from generativeqc_compiler.cc.uccsd_equations import build_program
+from generativeqc_compiler.cc.uccsd_equations import build_f12_program, build_program
 from generativeqc_compiler.cc.uccsd_layout import BLOCK_NAMES, UCCSDLayout
 from generativeqc_compiler.tensor import (
     JVPProgram,
@@ -59,7 +59,19 @@ def build_response_programs(
     """Generate exact typed derivatives for all five unrestricted blocks."""
     if not isinstance(layout, UCCSDLayout):
         raise TypeError("UCCSD response requires UCCSDLayout")
-    primal = build_program(layout.oa, layout.ob, layout.va, layout.vb)
+    return _response_programs(
+        build_program(layout.oa, layout.ob, layout.va, layout.vb), max_elements
+    )
+
+
+def build_f12_response_programs(
+    layout: UCCSDLayout, *, max_elements: int = 1_000_000
+) -> UCCSDResponsePrograms:
+    """Build fixed-source amplitude and Lambda actions for CCSD-F12b."""
+    return _response_programs(build_f12_program(layout), max_elements)
+
+
+def _response_programs(primal: Program, max_elements: int) -> UCCSDResponsePrograms:
     return UCCSDResponsePrograms(
         primal,
         transpose_program(
@@ -89,13 +101,14 @@ def build_parameter_vjp(
     Seed energy with one and residuals with the full physical-dual lift.
     Several redundant/permuted inputs can depend on one physical Hamiltonian
     perturbation; upstream consumers must accumulate all canonical bindings.
-    This contains neither HF/reference energy, normal-ordering pullback nor
-    orbital/nuclear response, and is not a relaxed density or force by itself.
+    For F12 the caller also pulls source cotangents back through the cusp,
+    projector, integral and metric transformations. Reference energy,
+    normal ordering and orbital/nuclear response are separate.
     """
     if not isinstance(programs, UCCSDResponsePrograms):
         raise TypeError("UCCSD parameter VJP requires response programs")
     if not isinstance(parameter, str) or parameter not in programs.parameter_names:
-        raise ValueError("unknown UCCSD Fock/integral parameter")
+        raise ValueError("unknown UCCSD Fock/integral parameter or F12 source")
     return transpose_program(
         programs.primal,
         ("correlation_energy", *RESIDUALS),
