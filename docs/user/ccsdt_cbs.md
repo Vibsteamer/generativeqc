@@ -849,6 +849,11 @@ With `source_cotangents=True`, the solve also returns
 `solution.source_cotangents.ordinary_weights` and `fixed_source_weights`.
 These are the derivatives of the stationary CC Lagrangian with respect
 to the active canonical MO input tensors in `solution.sources`.
+`provider.ucc_ordinary_source_forces(pair_request, solution)` contracts the
+38 ordinary Hamiltonian weights with their nuclear derivatives in Eh/bohr.
+It uses the original stationary spin orbitals, JKFit for the Fock response,
+and MP2Fit for the 32 antisymmetrized Coulomb blocks. The returned array is
+the ordinary-input contribution to the stationary correlation force.
 
 Use the installed `MolecularFocalProvider` to evaluate a plan step directly
 from its geometry. A single-card CUDA setup looks like this:

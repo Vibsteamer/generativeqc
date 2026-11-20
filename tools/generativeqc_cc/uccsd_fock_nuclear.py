@@ -6,6 +6,7 @@ import numpy as np
 from generativeqc._f12_focal_one_electron import FocalOneElectron
 from generativeqc._f12_spin_ao import _orbital_sources
 from generativeqc._f12_spin_fock import spin_fock_pullback
+from generativeqc._uccsd_df_hamiltonian import _spin_fock_weight
 from generativeqc_compiler.tensor import (
     Index,
     IndexSpace,
@@ -16,26 +17,6 @@ from generativeqc_compiler.tensor import (
     einsum,
     input_tensor,
 )
-
-
-def _spin_fock_weight(
-    weights: Mapping[str, np.ndarray], spin: str, nmo: int, no: int, nf: int
-) -> np.ndarray:
-    if not 0 <= nf <= no <= nmo:
-        raise ValueError("Invalid frozen or occupied spin partition")
-    tag = spin[0] * 2
-    bar = np.zeros((nmo, nmo))
-    slices = {"o": slice(nf, no), "v": slice(no, nmo)}
-    for block in ("oo", "ov", "vv"):
-        name = "f" + block + "_" + tag
-        dst = bar[slices[block[0]], slices[block[1]]]
-        value = weights[name]
-        if value.dtype != np.float64 or value.shape != dst.shape:
-            raise ValueError(f"Inconsistent ordinary Fock cotangent {name}")
-        dst[...] = value
-    # The Fock and Hcore tangents are symmetric. The ov input has a single
-    # copy, so averaging distributes half its weight to each transpose.
-    return (bar + bar.T) / 2
 
 
 def unrestricted_cc_fock_nuclear_forces(

@@ -17,6 +17,26 @@ from generativeqc_compiler.mp2.f12_density_fitting import (
 from generativeqc_compiler.tensor import Program, linearize
 
 
+def _spin_fock_weight(
+    weights: Mapping[str, np.ndarray], spin: str, nmo: int, no: int, nf: int
+) -> np.ndarray:
+    if not 0 <= nf <= no <= nmo:
+        raise ValueError("Invalid frozen or occupied spin partition")
+    tag = spin[0] * 2
+    bar = np.zeros((nmo, nmo))
+    slices = {"o": slice(nf, no), "v": slice(no, nmo)}
+    for block in ("oo", "ov", "vv"):
+        name = "f" + block + "_" + tag
+        dst = bar[slices[block[0]], slices[block[1]]]
+        value = weights[name]
+        if value.dtype != np.float64 or value.shape != dst.shape:
+            raise ValueError(f"Inconsistent ordinary Fock cotangent {name}")
+        dst[...] = value
+    # The Fock and Hcore tangents are symmetric. The ov input has a single
+    # copy, so averaging distributes half its weight to each transpose.
+    return (bar + bar.T) / 2
+
+
 def unrestricted_cc_df_hamiltonian_tangent(
     space: tuple[int, int, int, int, int],
     data: Mapping[str, np.ndarray],

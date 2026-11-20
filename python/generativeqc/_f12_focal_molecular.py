@@ -251,16 +251,35 @@ class MolecularFocalProvider:
             weights = None
         return FocalUCCStationary(sources, primal, dual, weights)
 
-    def _panel(self, request: FocalRequest, role: str) -> _Panel:
+    def ucc_ordinary_source_forces(
+        self, request: FocalRequest, solution: FocalUCCStationary
+    ) -> np.ndarray:
+        """Contract the 38 ordinary stationary MO source weights with nuclear derivatives (Eh/bohr)."""
+        from ._f12_focal_cc_ordinary import ordinary_ucc_source_forces
+
+        weights = solution.source_cotangents
+        if weights is None:
+            raise ValueError(
+                "Ordinary UCC forces require a stationary solution with source_cotangents=True"
+            )
+        return ordinary_ucc_source_forces(
+            self, request, solution.sources, weights.ordinary_weights
+        )
+
+    def _panel(
+        self, request: FocalRequest, role: str, *, orbital_only: bool = False
+    ) -> _Panel:
         host = request.backend == "cpu_reference"
-        ordinary = role == "mp2_fit"
+        ordinary = role == "mp2_fit" or orbital_only
         layout = focal_shell_layout(
             request,
             self.shell_library,
             host_reference=host,
             budget_mib=self.budget_mib,
             ordinary_fit=role if ordinary else None,
-            joint_jk=role == "jk_fit" and request.role == "mp2_f12_correlation",
+            joint_jk=role == "jk_fit"
+            and request.role == "mp2_f12_correlation"
+            and not ordinary,
             projection_library=self.one_electron_library,
         )
         raw, _ = forward_integrals(

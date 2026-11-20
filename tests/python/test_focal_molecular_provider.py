@@ -325,5 +325,26 @@ def test_public_uhf_stationary_lagrangian_on_same_molecular_frame() -> None:
         derivative = (lagrangian(t, plus) - lagrangian(t, minus)) / (2 * h)
         assert derivative == pytest.approx(predicted, rel=0, abs=5e-10)
 
+    # Five-point derivatives of the phase-aligned, displaced native ordinary
+    # inputs at fixed stationary source weights, for all nine Cartesian axes.
+    ordinary_force = provider.ucc_ordinary_source_forces(q, solution)
+    expected = np.array(
+        [
+            [-0.013754271792271061, -0.005831284569426017, 0.002889057415733758],
+            [0.010868287982620494, 0.005496551045856025, -0.002190452201020557],
+            [0.0028859840007737273, 0.0003347334201024103, -0.0006986052157193409],
+        ]
+    )
+    np.testing.assert_allclose(ordinary_force, expected, rtol=0, atol=2e-8)
+    np.testing.assert_allclose(ordinary_force.sum(axis=0), 0, rtol=0, atol=2e-10)
+    with pytest.raises(ValueError, match="stationary root and force request"):
+        provider.ucc_ordinary_source_forces(
+            replace(q, surface_id="different"), solution
+        )
+    with pytest.raises(ValueError, match="source_cotangents=True"):
+        provider.ucc_ordinary_source_forces(
+            q, replace(solution, source_cotangents=None)
+        )
+
     with pytest.raises(ValueError, match="MolecularFocalProvider.cuda"):
         provider.ucc_stationary(replace(q, backend="cuda"))
