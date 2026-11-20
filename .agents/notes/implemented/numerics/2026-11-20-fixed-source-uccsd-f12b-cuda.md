@@ -19,3 +19,17 @@ raises an error. DIIS and packed GMRES continue to run on the host.
 These bindings admit canonical spin-MO inputs already qualified by their
 caller. The molecular integrals, fixed source construction, orbital
 response and nuclear derivatives remain separate from this solver.
+
+## Orbital-gap preconditioning
+
+The fixed-source Lambda owner can explicitly right-precondition its packed
+GMRES iterations with the positive orbital-energy gaps of the unshifted
+reference. The solver binds the immutable gap vector to its identity and
+reserves five packed FP64 vectors for the diagonal, inverse and temporary
+storage. The existing transpose solver still rechecks the unpreconditioned
+residual and the owner still replays physical Lagrangian stationarity.
+
+The 170-variable NH₂ replay with native CPU TensorIR used 25 transpose
+actions under the preconditioned policy. The original unpreconditioned
+replay used 114 actions. The full-space CUDA solve requires an independent
+work and convergence qualification.

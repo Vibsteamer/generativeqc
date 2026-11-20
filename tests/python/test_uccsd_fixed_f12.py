@@ -4,25 +4,27 @@ from dataclasses import replace
 
 import numpy as np
 import pytest
+from generativeqc.response_solver import GMRESOptions
 from generativeqc_compiler.cc.uccsd_equations import build_program
 from generativeqc_compiler.cc.uccsd_layout import UCCSDLayout
 from generativeqc_compiler.tensor import execute
 from test_uccsd_equations import _feeds, _random_hamiltonian
 from test_uccsd_f12 import (
-    _PairSources,
     _dense_correction,
     _pack_residual,
     _pair_sources,
+    _PairSources,
     _source_feeds,
 )
 
 from tools.generativeqc_cc.native_tensor_cpu import NativeCCTensorExecutor
 from tools.generativeqc_cc.solver import SolverOptions
 from tools.generativeqc_cc.uccsd_fixed_f12 import (
+    _OrbitalGapGMRES,
     _PreparedFixedSourceUCCSD,
     _PreparedFixedSourceUCCSDLambda,
 )
-
+from tools.generativeqc_cc.uccsd_lambda import UCCSDLambdaOptions
 
 _LAYOUT = UCCSDLayout(2, 2, 2, 2)
 _ENERGY_ALPHA = np.repeat((-0.8, 0.7), 2)
@@ -87,8 +89,10 @@ def test_zero_sources_recover_ordinary_energy_and_residuals(
         np.testing.assert_allclose(actual[name], ordinary[name], rtol=0, atol=4e-14)
 
 
+@pytest.mark.parametrize("preconditioned", [False, True])
 def test_fixed_source_stationarity_and_cotangent_against_independent_root(
     executor: NativeCCTensorExecutor,
+    preconditioned: bool,
 ) -> None:
     layout = _LAYOUT
     source = _pair_sources(layout, 2237)
@@ -156,10 +160,18 @@ def test_fixed_source_stationarity_and_cotangent_against_independent_root(
         np.testing.assert_allclose(
             state.packed_amplitudes, expected, rtol=0, atol=2e-11
         )
-        with _PreparedFixedSourceUCCSDLambda(owner, state) as response:
+        with _PreparedFixedSourceUCCSDLambda(
+            owner, state, orbital_gap_preconditioner=preconditioned
+        ) as response:
             result = response.solve()
             assert result.converged
             assert result.stationarity_max <= response.options.lambda_tolerance
+            expected_backend = (
+                "host-orbital-gap-response-gmres"
+                if preconditioned
+                else "python-response-gmres"
+            )
+            assert result.provenance["solver_backend"] == expected_backend
             np.testing.assert_allclose(
                 result.packed_multipliers, expected_lambda, rtol=0, atol=3e-11
             )
@@ -191,3 +203,16 @@ def test_fixed_source_binding_and_numeric_admission(
         assert state.converged, state.reason
         with pytest.raises(ValueError, match="identit"):
             _PreparedFixedSourceUCCSDLambda(second, state)
+        restricted = UCCSDLambdaOptions(gmres=GMRESOptions(max_workspace_bytes=1))
+        with pytest.raises(MemoryError, match="orbital-gap workspace"):
+            _PreparedFixedSourceUCCSDLambda(
+                first, state, options=restricted, orbital_gap_preconditioner=True
+            )
+
+
+@pytest.mark.parametrize(
+    "gaps", [np.zeros(2), np.array([1.0, np.nan]), np.ones(3), np.array([1.0, 1e-18])]
+)
+def test_orbital_gap_solver_rejects_invalid_diagonal(gaps: np.ndarray) -> None:
+    with pytest.raises(ValueError, match="orbital gaps|near-zero entry"):
+        _OrbitalGapGMRES(dimension=2, options=GMRESOptions(), gaps=gaps)
