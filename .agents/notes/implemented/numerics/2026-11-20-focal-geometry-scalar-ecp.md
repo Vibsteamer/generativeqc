@@ -44,3 +44,14 @@ derivatives on a tilted three-center through-i model. Real-device numerical
 acceptance uses the molecular CUDA library and the public geometry request.
 Complete energy and gradient consumers also require their fitted
 two-electron, orbital and response terms.
+
+One NVIDIA L20 independently qualified the combined-basis CUDA kernel and
+public request at source f83b22682. HBr/T (381 AOs) gave maximum residual
+matrix and six-coordinate derivative errors of 6.54e-12 Eh and 6.72e-13
+Eh/bohr. For bent IH2/D (310 AOs) the corresponding errors over all nine
+coordinates were 3.20e-12 Eh and 1.20e-13 Eh/bohr. The largest total Hcore
+derivative discrepancy was 1.35e-9 Eh/bohr. Rebuilding independent libcint
+integrals at two fourth-order displacement steps also verified the directional
+residual derivatives to 7.42e-11 Eh/bohr. The raw-output archive from job
+2123734960446648320 has SHA-256
+`45efaad505e6298c115e6210a0879663233243e68612b97d78e05f1c01a32f83`.
