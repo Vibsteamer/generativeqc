@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
     from generativeqc_compiler.tensor import Execution, Program
 
+    from ._f12_cabs import CABSProjector
     from ._f12_focal_one_electron import FocalOneElectron
     from ._f12_focal_reference import FocalReference
     from .experimental.f12_focal import FocalRequest
@@ -78,17 +79,9 @@ def reference_f12_increment(
     and 3-center tensors. All weights are positive energy cotangents. The
     energy excludes HF, ordinary MP2 and CABS singles.
     """
-    from generativeqc_compiler.method.canonical_frame_response import (
-        orbital_rotation_cotangent,
-    )
-    from generativeqc_compiler.mp2.f12_frame_response import frame_kernel_cotangent
     from generativeqc_compiler.tensor import execute
 
-    from ._canonical_frame import canonical_frame_seed
-    from ._f12_focal_frame import METRIC_NAMES, canonical_pair_frame
-    from ._f12_focal_singles_response import relaxed_weights
-    from ._f12_spin_ao import _orbital_sources
-    from ._f12_spin_fock import spin_fock, spin_fock_pullback
+    from ._f12_focal_frame import canonical_pair_frame
     from ._f12_unrestricted import unrestricted_mp2_f12_ao_response
     from .elements import checked_integer
 
@@ -128,14 +121,62 @@ def reference_f12_increment(
         relative_cutoff=relative_cutoff,
         library=library,
     )
-    occs, n = space[:2], one.obs_ao_count
-    atomic = len(one.overlap)
-    complement = proj.frame
-    spins = ("alpha", "beta")
-    spin_indices = reference._pair_spin_indices(request)
     terms, bars = unrestricted_mp2_f12_ao_response(
         space, ao, checked, jkfit=panel, component="f12"
     )
+    weights = relaxed_f12_source_weights(
+        request,
+        reference,
+        one,
+        jk,
+        panel,
+        proj,
+        bars,
+        checked,
+        budget=budget,
+        relative_cutoff=relative_cutoff,
+        library=library,
+        canonical_library=canonical_library,
+    )
+    return FocalF12Increment(
+        terms.f12_increment, terms.active_pairs, proj.rank, *weights
+    )
+
+
+def relaxed_f12_source_weights(
+    request: FocalRequest,
+    reference: FocalReference,
+    one: FocalOneElectron,
+    jk: FocalF12Sources,
+    panel: dict[str, np.ndarray],
+    proj: CABSProjector,
+    bars: dict[str, np.ndarray],
+    checked: Callable,
+    *,
+    budget: int,
+    relative_cutoff: float,
+    library: ctypes.CDLL | None,
+    canonical_library: ctypes.CDLL | None,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """Relax OBS and OptRI coefficient weights and retain the two raw integral fit identities."""
+    from generativeqc_compiler.method.canonical_frame_response import (
+        orbital_rotation_cotangent,
+    )
+    from generativeqc_compiler.mp2.f12_frame_response import frame_kernel_cotangent
+
+    from ._canonical_frame import canonical_frame_seed
+    from ._f12_focal_frame import METRIC_NAMES
+    from ._f12_focal_singles_response import relaxed_weights
+    from ._f12_spin_ao import _orbital_sources
+    from ._f12_spin_fock import spin_fock, spin_fock_pullback
+
+    cuda = request.backend == "cuda"
+    spin_indices = reference._pair_spin_indices(request)
+    occs = tuple(reference.occupied[i] for i in spin_indices)
+    n = one.obs_ao_count
+    atomic = len(one.overlap)
+    complement = proj.frame
+    spins = ("alpha", "beta")
     # Apply the same-space canonical multipliers to the physical OBS Fock,
     # then relax the remaining occupied/virtual torque through coupled HF.
     jkspace = (*occs, n, n, len(jk.whitener))
@@ -232,10 +273,7 @@ def reference_f12_increment(
         relative_cutoff,
         budget,
     )
-    return FocalF12Increment(
-        terms.f12_increment,
-        terms.active_pairs,
-        proj.rank,
+    return (
         {"overlap": relaxed["overlap"] + bars["overlap_ao"], "hcore": relaxed["hcore"]},
         {"metric": relaxed["metric"], "ao_coulomb": relaxed["three_center"]},
         {
