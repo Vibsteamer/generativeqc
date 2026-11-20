@@ -25,7 +25,8 @@ std::unique_ptr<PreparedCalculation> prepare_uccsd_with_reference_fit(
 /** Conventional triples on an already qualified molecular determinant and fitting model. */
 Result focal_ucc_triples(PreparedCalculation& plan,
                          const std::shared_ptr<const hf::UnrestrictedPhysicalReference>& reference,
-                         const molecule::ScalarHamiltonianIdentity& jk, bool forces);
+                         const molecule::ScalarHamiltonianIdentity& jk,
+                         bool refine_ecp_quadrature, bool forces);
 
 }  // namespace generativeqc::methods::detail
 

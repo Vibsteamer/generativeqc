@@ -21,6 +21,7 @@ struct generativeqc_focal_reference {
   generativeqc::molecule::ScalarHamiltonianIdentity jk;
   generativeqc_backend backend;
   int device;
+  bool refine_ecp_quadrature;
 };
 
 namespace {
@@ -184,7 +185,8 @@ generativeqc_status focal_df_reference(generativeqc_context* context,
       }
       *owner = new generativeqc_focal_reference{
           std::move(ref), molecule::ScalarHamiltonianIdentity(aux),
-          static_cast<generativeqc_backend>(backend), context->state.device_id};
+          static_cast<generativeqc_backend>(backend), context->state.device_id,
+          physical.refine_ecp_quadrature};
     }
     return GENERATIVEQC_STATUS_SUCCESS;
   } catch (...) {
@@ -239,7 +241,7 @@ extern "C" generativeqc_status generativeqc_focal_ucc_triples_v1(
         count != 1 + (forces ? 3 * calculation->plan->atom_count() : 0))
       throw std::invalid_argument("inconsistent focal triples output or backend");
     const auto result = generativeqc::methods::detail::focal_ucc_triples(
-        *calculation->plan, owner->uhf, owner->jk, forces);
+        *calculation->plan, owner->uhf, owner->jk, owner->refine_ecp_quadrature, forces);
     if (!std::isfinite(result.energy) || result.forces.size() + 1 != count ||
         !std::all_of(result.forces.begin(), result.forces.end(),
                      [](double x) { return std::isfinite(x); }))

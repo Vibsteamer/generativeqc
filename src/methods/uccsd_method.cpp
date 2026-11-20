@@ -68,21 +68,28 @@ class UccsdPrepared final : public PreparedCalculation {
   }
 
   Result execute_components_impl(bool compute_forces, unsigned components) override {
-    return evaluate(compute_forces, components, {});
+    return evaluate(system_, compute_forces, components, {});
   }
 
   Result triples_on_reference(const std::shared_ptr<const hf::UnrestrictedPhysicalReference>& ref,
-                              const molecule::ScalarHamiltonianIdentity& jk, bool forces) {
+                              const molecule::ScalarHamiltonianIdentity& jk,
+                              bool refine_ecp_quadrature, bool forces) {
     if (!ref || !ref->source_identity || !ref->source_identity->matches(system_) ||
         !fitting_.full_reference || !jk.matches(*fitting_.reference_auxiliary()) ||
         capabilities_.method != GENERATIVEQC_METHOD_UCCSD_T)
       throw std::invalid_argument(
           "focal triples requires the same molecular determinant and JKFit");
-    return evaluate(forces, 0, ref);
+    // Retain the quadrature selected by the physical SCF owner for its
+    // one-electron response. Ordinary evaluations keep their own system.
+    if (system_.refine_ecp_quadrature == refine_ecp_quadrature)
+      return evaluate(system_, forces, 0, ref);
+    auto physical = system_;
+    physical.refine_ecp_quadrature = refine_ecp_quadrature;
+    return evaluate(physical, forces, 0, ref);
   }
 
  private:
-  Result evaluate(bool compute_forces, unsigned components,
+  Result evaluate(const core::System& physical, bool compute_forces, unsigned components,
                   const std::shared_ptr<const hf::UnrestrictedPhysicalReference>& focal) {
     std::lock_guard<std::mutex> lock(mutex_);
     last_.reset();
@@ -95,14 +102,14 @@ class UccsdPrepared final : public PreparedCalculation {
     try {
       const bool triples = capabilities_.method == GENERATIVEQC_METHOD_UCCSD_T;
       const auto derivative_capacity = cuda_ && compute_forces
-                                           ? posthf::one_electron_response_capacity(system_)
+                                           ? posthf::one_electron_response_capacity(physical)
                                            : posthf::source_scratch_bytes;
       if (compute_forces) {
-        const auto nbf = molecule::ao_count(system_);
+        const auto nbf = molecule::ao_count(physical);
         const auto alpha =
-            static_cast<std::size_t>((system_.electron_count + system_.multiplicity - 1) / 2);
+            static_cast<std::size_t>((physical.electron_count + physical.multiplicity - 1) / 2);
         cc::unrestricted_force_capacity(
-            nbf, alpha, system_.electron_count - alpha, options_, triples, reference_capacity_,
+            nbf, alpha, physical.electron_count - alpha, options_, triples, reference_capacity_,
             fitting_.auxiliary && (!fitting_.full_reference || fitting_.separate_reference_auxiliary), derivative_capacity);
       }
       const auto started = std::chrono::steady_clock::now();
@@ -110,7 +117,7 @@ class UccsdPrepared final : public PreparedCalculation {
           fitting_.reference_spec(compute_forces),
           cuda_ ? scf::FockBackend::Cuda : scf::FockBackend::Cpu, 0, fitting_.threshold);
       scf::PreparedFockPlan reference_plan(
-          system_, fitting_.reference_auxiliary(), strategy,
+          physical, fitting_.reference_auxiliary(), strategy,
           cuda_ ? device_ : -1, cuda_ ? options_.max_bytes : 0,
           cuda_ && !fitting_.full_reference && compute_forces && (components & kHfComponent) ? 1
                                                                                              : 0,
@@ -371,10 +378,11 @@ class UccsdPrepared final : public PreparedCalculation {
 
 Result focal_ucc_triples(PreparedCalculation& plan,
                          const std::shared_ptr<const hf::UnrestrictedPhysicalReference>& reference,
-                         const molecule::ScalarHamiltonianIdentity& jk, bool forces) {
+                         const molecule::ScalarHamiltonianIdentity& jk,
+                         bool refine_ecp_quadrature, bool forces) {
   auto* cc = dynamic_cast<UccsdPrepared*>(&plan);
   if (!cc) throw std::invalid_argument("focal triples requires a native UCCSD(T) plan");
-  return cc->triples_on_reference(reference, jk, forces);
+  return cc->triples_on_reference(reference, jk, refine_ecp_quadrature, forces);
 }
 
 generativeqc_status validate_uccsd_system(generativeqc_method method, const core::System& system,
