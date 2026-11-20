@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, overload
 
 import numpy as np
 
@@ -38,9 +38,36 @@ class FocalUCCFixedSources:
     feeds: dict[str, np.ndarray]
 
 
-def molecular_ucc_fixed_sources(
-    provider: MolecularFocalProvider, request: FocalRequest
-) -> FocalUCCFixedSources:
+@dataclass(frozen=True)
+class FocalUCCEquationSources:
+    """Ordinary and fixed-geminal CC inputs for the same canonical UHF determinant."""
+
+    fixed: FocalUCCFixedSources
+    mp2_fit_id: str
+    ordinary: dict[str, np.ndarray]
+
+
+@overload
+def molecular_ucc_sources(
+    provider: MolecularFocalProvider,
+    request: FocalRequest,
+    *,
+    include_ordinary: Literal[False],
+) -> FocalUCCFixedSources: ...
+
+
+@overload
+def molecular_ucc_sources(
+    provider: MolecularFocalProvider,
+    request: FocalRequest,
+    *,
+    include_ordinary: Literal[True],
+) -> FocalUCCEquationSources: ...
+
+
+def molecular_ucc_sources(
+    provider: MolecularFocalProvider, request: FocalRequest, *, include_ordinary: bool
+) -> FocalUCCFixedSources | FocalUCCEquationSources:
     """Calculate fixed-geminal UCC equation inputs on an all-active UHF root."""
     from generativeqc_compiler.tensor import execute
 
@@ -65,6 +92,10 @@ def molecular_ucc_fixed_sources(
         )
     if request.backend not in ("cuda", "cpu_reference"):
         raise ValueError("fixed-cusp UCC sources require an explicit device backend")
+    if include_ordinary and request.basis.mp2_fit is None:
+        raise ValueError(
+            "ordinary UCC Hamiltonian inputs require an explicit correlation fitting basis"
+        )
     cuda = request.backend == "cuda"
     if cuda and (
         provider.run is None
@@ -134,4 +165,45 @@ def molecular_ucc_fixed_sources(
     feeds = unrestricted_cc_f12_fixed_source_feeds(
         space, data, fock, corr.whitener, checked
     )
-    return FocalUCCFixedSources(ref, proj.rank, corr.fit_id, feeds)
+    fixed = FocalUCCFixedSources(ref, proj.rank, corr.fit_id, feeds)
+    if not include_ordinary:
+        return fixed
+
+    from ._uccsd_df_hamiltonian import unrestricted_cc_df_hamiltonian
+
+    assert request.basis.mp2_fit is not None
+    fit_id = request.basis.mp2_fit.identity
+    if fit_id == corr.fit_id:
+        raw, whitener = data, corr.whitener
+    elif fit_id == jk.fit_id:
+        raw, whitener = projected, jk.whitener
+    else:
+        # A third fitting basis needs just the ordinary OBS×OBS Coulomb panel.
+        mp = provider._panel(request, "mp2_fit")
+        whitener = mp.whitener
+        obs_ao = {
+            "ao_coulomb": mp.data["ao_coulomb"],
+            "metric_whitener": whitener,
+            **{
+                "coefficients_" + spin: c
+                for spin, c in zip(("alpha", "beta"), ref.coefficients, strict=True)
+            },
+        }
+        raw, _ = _orbital_sources(
+            (oa, ob, obs, obs, len(whitener)),
+            obs_ao,
+            checked,
+            None,
+            projected=None,
+            role="ordinary_jk",
+        )
+    ordinary = unrestricted_cc_df_hamiltonian(
+        (oa, ob, obs, ext, len(whitener)),
+        raw,
+        fock,
+        whitener,
+        checked,
+        max_output_bytes=(provider.budget_mib << 20)
+        - sum(v.nbytes for v in feeds.values()),
+    )
+    return FocalUCCEquationSources(fixed, fit_id, ordinary)

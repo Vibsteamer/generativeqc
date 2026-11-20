@@ -20,6 +20,9 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+from generativeqc_compiler.cc.uccsd_coulomb_blocks import (
+    antisymmetrized_integral_requests as _antisymmetrized_integral_requests,
+)
 from generativeqc_compiler.cc.uccsd_equations import build_program
 from generativeqc_compiler.cc.uccsd_layout import UCCSDLayout
 from generativeqc_compiler.common.arrays import immutable
@@ -28,7 +31,6 @@ from generativeqc_compiler.common.resources import checked_bytes
 from generativeqc_compiler.tensor.cpu import emit_cpu
 from generativeqc_compiler.tensor.cuda_plan import plan_cuda
 
-from tools.generativeqc_posthf.conventions import SpinMOBlock
 from tools.generativeqc_posthf.providers import ConventionalProvider
 from tools.generativeqc_response.uhf import UHFReferenceSnapshot
 
@@ -38,30 +40,6 @@ from .solver import _DIIS, SolverOptions
 
 if TYPE_CHECKING:
     from typing_extensions import Self
-
-_COULOMB_PERMUTATIONS = (
-    (0, 1, 2, 3),
-    (1, 0, 2, 3),
-    (0, 1, 3, 2),
-    (1, 0, 3, 2),
-    (2, 3, 0, 1),
-    (3, 2, 0, 1),
-    (2, 3, 1, 0),
-    (3, 2, 1, 0),
-)
-
-
-def _canonical_coulomb(block: SpinMOBlock) -> tuple[SpinMOBlock, tuple[int, ...]]:
-    """Use only chemists' eightfold Coulomb symmetry, including spin owners."""
-    permutation = min(
-        _COULOMB_PERMUTATIONS,
-        key=lambda axes: tuple((block.spins[axis], block.slots[axis]) for axis in axes),
-    )
-    canonical = SpinMOBlock(
-        tuple(block.slots[axis] for axis in permutation),
-        tuple(block.spins[axis] for axis in permutation),
-    )
-    return canonical, tuple(permutation.index(axis) for axis in range(4))
 
 
 def _integral_requests(name: str, snapshot: UHFReferenceSnapshot) -> tuple:
@@ -74,27 +52,6 @@ def _integral_requests(name: str, snapshot: UHFReferenceSnapshot) -> tuple:
         for domain, spin in zip(domains, spins, strict=True)
     )
     return _antisymmetrized_integral_requests(slots, spins)
-
-
-def _antisymmetrized_integral_requests(
-    slots: tuple[tuple[int, ...], ...], spins: tuple[str, ...]
-) -> tuple:
-    """Bind direct and exchange legs to their canonical chemists' blocks."""
-    contributions = []
-    for coefficient, axes, output_axes in (
-        (1, (0, 2, 1, 3), (0, 2, 1, 3)),
-        (-1, (0, 3, 1, 2), (0, 2, 3, 1)),
-    ):
-        if spins[axes[0]] != spins[axes[1]] or spins[axes[2]] != spins[axes[3]]:
-            continue
-        block = SpinMOBlock(
-            tuple(slots[axis] for axis in axes), tuple(spins[axis] for axis in axes)
-        )
-        canonical, restore = _canonical_coulomb(block)
-        contributions.append(
-            (coefficient, canonical, tuple(restore[axis] for axis in output_axes))
-        )
-    return tuple(contributions)
 
 
 def _representatives(
@@ -210,9 +167,7 @@ def _denominators(
 def _iteration_bytes(
     layout: UCCSDLayout, options: SolverOptions, feed_bytes: int
 ) -> int:
-    full_bytes = sum(
-        block.full_layout.storage_bytes(8) for block in layout.blocks
-    )
+    full_bytes = sum(block.full_layout.storage_bytes(8) for block in layout.blocks)
     packed_bytes = layout.packed_size * 8
     return checked_bytes(
         feed_bytes

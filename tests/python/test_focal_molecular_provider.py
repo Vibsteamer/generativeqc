@@ -157,3 +157,89 @@ def test_uhf_fixed_cc_feed_fitting_roles() -> None:
     np.testing.assert_allclose(
         a.feeds["c_f12_abab"], -a.feeds["c_f12_baab"].swapaxes(0, 1), rtol=0, atol=1e-11
     )
+
+
+@pytest.mark.parametrize("fits", [(0, 1, 2), (0, 0, 2), (0, 2, 2)])
+def test_uhf_equation_sources_against_independent_df_chemist_blocks(
+    fits: tuple[int, int, int],
+) -> None:
+    shell = os.environ.get("GENERATIVEQC_F12_HOST_SINK")
+    if not shell:
+        pytest.skip("set GENERATIVEQC_F12_HOST_SINK for the molecular shell library")
+    pyscf = pytest.importorskip("pyscf")
+    from pyscf import df, gto
+
+    req = request(XYZ, fits)
+    provider = MolecularFocalProvider(shell_library=Path(shell))
+    full = provider.ucc_equation_sources(req)
+    fixed = provider.ucc_fixed_sources(req)
+    assert full.fixed.f12_fit_id == fixed.f12_fit_id
+    assert full.mp2_fit_id == req.basis.mp2_fit.identity
+    assert len(full.ordinary) == 38 and len(fixed.feeds) == 19
+    for k in fixed.feeds:
+        np.testing.assert_allclose(
+            full.fixed.feeds[k], fixed.feeds[k], rtol=0, atol=1e-12
+        )
+
+    def shells(exps: tuple[float, ...]) -> dict:
+        return {"H": [[0, [e, 1.0]] for e in exps]}
+
+    mol = gto.M(
+        atom=list(zip(["H"] * 3, XYZ, strict=True)),
+        unit="Bohr",
+        basis=shells((1.5, 0.32)),
+        spin=1,
+        verbose=0,
+    )
+
+    def factors(index: int) -> np.ndarray:
+        aux = df.addons.make_auxmol(
+            mol,
+            shells(
+                (
+                    5.0 + index,
+                    1.1 + 0.1 * index,
+                    0.28 + 0.02 * index,
+                    0.07 + 0.01 * index,
+                )
+            ),
+        )
+        m = aux.intor("int2c2e")
+        raw = df.incore.aux_e2(mol, aux, intor="int3c2e", aosym="s1").transpose(2, 0, 1)
+        return np.linalg.solve(np.linalg.cholesky(m), raw.reshape(len(m), -1)).reshape(
+            raw.shape
+        )
+
+    jk, cc = factors(fits[0]), factors(fits[1])
+    c = dict(zip("ab", full.fixed.reference.coefficients, strict=True))
+    density = {
+        s: k[:, :o] @ k[:, :o].T for (s, k), o in zip(c.items(), (2, 1), strict=True)
+    }
+    h = pyscf.scf.hf.get_hcore(mol)
+    j = np.einsum("Qpq,Qrs,rs->pq", jk, jk, density["a"] + density["b"], optimize=True)
+    fmo = {
+        s: k.T
+        @ (h + j - np.einsum("Qpr,Qst,rt->ps", jk, jk, density[s], optimize=True))
+        @ k
+        for s, k in c.items()
+    }
+    mo = {s: k.T @ cc @ k for s, k in c.items()}
+    for name, value in full.ordinary.items():
+        domains, spin = name[1:].split("_")
+        ix = tuple(
+            slice(None, 2 if s == "a" else 1)
+            if d == "o"
+            else slice(2 if s == "a" else 1, None)
+            for s, d in zip(spin, domains, strict=True)
+        )
+        if name.startswith("f"):
+            gold = fmo[spin[0]][ix]
+        else:
+            i, j, k, l = spin
+            eri = np.zeros((mol.nao,) * 4)
+            if i == k and j == l:
+                eri += np.einsum("Qik,Qjl->ijkl", mo[i], mo[j])
+            if i == l and j == k:
+                eri -= np.einsum("Qil,Qjk->ijkl", mo[i], mo[j])
+            gold = eri[ix]
+        np.testing.assert_allclose(value, gold, rtol=0, atol=3e-9, err_msg=name)

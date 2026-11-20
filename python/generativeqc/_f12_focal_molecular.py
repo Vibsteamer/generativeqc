@@ -7,7 +7,11 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from ._f12_focal_cc_sources import FocalUCCFixedSources, molecular_ucc_fixed_sources
+from ._f12_focal_cc_sources import (
+    FocalUCCEquationSources,
+    FocalUCCFixedSources,
+    molecular_ucc_sources,
+)
 from ._f12_focal_increment import FocalF12Sources, reference_f12_increment
 from ._f12_focal_integrals import (
     contract_live_weights,
@@ -135,7 +139,16 @@ class MolecularFocalProvider:
         Supply the all-active UHF pair step with its declared JKFit, F12Fit,
         OptRI and exponent. Returned MO tensors and the reference share a frame.
         """
-        return molecular_ucc_fixed_sources(self, request)
+        return molecular_ucc_sources(self, request, include_ordinary=False)
+
+    def ucc_equation_sources(self, request: FocalRequest) -> FocalUCCEquationSources:
+        """Generate all ordinary and fixed-geminal inputs for one all-active UHF pair step.
+
+        The normal-ordered Fock blocks use JKFit and the antisymmetrized
+        two-electron Hamiltonian blocks use MP2Fit. The fixed sources use
+        this same reference and the requested F12Fit.
+        """
+        return molecular_ucc_sources(self, request, include_ordinary=True)
 
     def _panel(self, request: FocalRequest, role: str) -> _Panel:
         host = request.backend == "cpu_reference"

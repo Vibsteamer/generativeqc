@@ -826,6 +826,12 @@ orders each have `w_vo_*`, `w_vv_*` and `c_f12_*` tensors in the reference's
 OBS frame. `fixed_geminal_energy` contains V+B−X in Eh. The extended Fock
 and positive exchange use JKFit, and the robust geminal projections use
 F12Fit. The CC amplitude and Lambda solvers consume these equation inputs.
+Call `provider.ucc_equation_sources(pair_request)` to generate both
+`result.fixed` and the ordinary Hamiltonian dictionary `result.ordinary`
+from one DF-UHF solve. JKFit defines the Fock matrices, MP2Fit the
+antisymmetrized ordinary two-electron blocks, and F12Fit the geminal
+projections. `result.mp2_fit_id` identifies the ordinary correlation fit.
+The coordinate geometry determines every input to these two dictionaries.
 
 Use the installed `MolecularFocalProvider` to evaluate a plan step directly
 from its geometry. A single-card CUDA setup looks like this:
