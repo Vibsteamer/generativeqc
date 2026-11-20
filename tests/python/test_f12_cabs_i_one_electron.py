@@ -198,3 +198,104 @@ def test_i_batch_compact_projection_and_nonsymmetric_weights(libraries, full_bas
         - (reference(_XYZ + 2 * direction) - reference(_XYZ - 2 * direction))
     ) / (12 * step)
     np.testing.assert_allclose(gradient[0], np.vdot(weights, derivative), rtol=0, atol=3e-8)
+
+
+def test_full_basis_ecp_composition_and_signed_response(libraries):
+    gto = pytest.importorskip("pyscf.gto")
+    from benchmarks.f12_cabs_ecp import CabsEcpOneElectron, ResidualEcpPanel
+    from benchmarks.f12_cabs_h_batch import CabsHShells
+
+    angular = np.array([0, 2, 6])
+    exponents = np.array([0.8, 0.9, 1.0])
+    sizes = 2 * angular + 1
+    n = int(sizes.sum())
+    rng = np.random.default_rng(426)
+    rows = np.full((3, 13), -1)
+    order = rng.permutation(n)
+    offsets = np.concatenate(([0], np.cumsum(sizes)))
+    for shell, (start, stop) in enumerate(zip(offsets[:-1], offsets[1:], strict=True)):
+        rows[shell, :stop - start] = order[start:stop]
+    radial = [
+        (2 * a / np.pi) ** 0.75 * (4 * a) ** (0.5 * int(l))
+        / np.sqrt(prod(range(1, 2 * l + 1, 2)))
+        for l, a in zip(angular, exponents, strict=True)
+    ]
+    shells = [
+        dict(angular_momentum=int(l), atom_index=i, primitives=[[a, 1.0]])
+        for i, (l, a) in enumerate(zip(angular, exponents, strict=True))
+    ]
+    with_rows = {
+        **{f"transform_{l}": gto.cart2sph(l, normalized="sp").T for l in range(7)},
+        "angular": angular,
+        "atom": np.arange(3),
+        "exponents": exponents,
+        "radial": np.array(radial),
+        "orbital_shell_count": 3,
+        "prim_offsets": np.arange(4),
+        "spherical_rows": rows,
+    }
+    residual_map = rng.permutation(n)
+    ix = np.ix_(residual_map, residual_map)
+    raw = rng.normal(size=(n, n)) / n
+    potential = raw + raw.T
+    raw = rng.normal(size=(3, 3, n, n)) / n
+    nuclear = raw + raw.swapaxes(-1, -2)
+    ws, wh = rng.normal(size=(2, n, n))
+    budget = 8 << 20
+
+    def source(geometry, matrix, derivative, labels=residual_map, charges=_CHARGES):
+        bare = CabsHShells(
+            dict(elements=["Br", "I", "H"], coordinates_bohr=geometry, shells=shells),
+            order, {**with_rows, "centers": geometry}, Path(libraries["i"]._name),
+            angular_momentum=6, host_reference=True, effective_charges=_CHARGES, full_basis=True,
+        )
+        residual = ResidualEcpPanel(
+            matrix, derivative, ao_to_source=labels, coordinates_bohr=geometry,
+            effective_charges=charges, resources={"device_bytes": 1},
+        )
+        return bare, residual
+
+    matrix = potential.copy()
+    derivative = nuclear.copy()
+    bare, residual = source(_XYZ, matrix, derivative)
+    matrix[:] = 0
+    derivative[:] = 0
+    provider = CabsEcpOneElectron(bare, residual)
+    with pytest.raises(ValueError, match="current complete"):
+        provider.gradient(ws, wh, budget)
+    s, h, _ = provider.matrices(derivatives=True, max_bytes=budget)
+    bare_s, bare_h = bare.assemble()
+    np.testing.assert_array_equal(s, bare_s)
+    np.testing.assert_allclose(h[ix] - bare_h[ix], potential, rtol=0, atol=5e-14)
+    observed = provider.gradient(ws, wh, budget)
+    point_charge_gradient, _ = bare.high_gradient(ws, wh, budget)
+    expected = point_charge_gradient + np.einsum("axij,ij->ax", nuclear, wh[ix])
+    np.testing.assert_allclose(observed.gradient, expected, rtol=0, atol=3e-13)
+    assert observed.resources["residual_contraction_device_bytes"] > 0
+
+    def signed_energy(atom, axis, step):
+        moved = _XYZ.copy()
+        moved[atom, axis] += step
+        source_bare, ecp = source(moved, potential + step * nuclear[atom, axis], None)
+        s, h, _ = CabsEcpOneElectron(source_bare, ecp).matrices(derivatives=False, max_bytes=budget)
+        return np.vdot(ws, s) + np.vdot(wh, h)
+
+    for step in (2e-4, 1e-4):
+        # Richardson endpoints provide an independent signed-energy oracle for
+        # one ECP-center and one hydrogen-center Cartesian component.
+        for atom, axis in ((1, 0), (2, 2)):
+            def difference(delta):
+                plus = signed_energy(atom, axis, delta)
+                minus = signed_energy(atom, axis, -delta)
+                return (plus - minus) / (2 * delta)
+
+            numeric = (4 * difference(step / 2) - difference(step)) / 3
+            assert abs(numeric - observed.gradient[atom, axis]) < 3e-8
+
+    bare.evaluate(derivatives=False, max_bytes=budget)
+    with pytest.raises(ValueError, match="current complete"):
+        provider.gradient(ws, wh, budget)
+    with pytest.raises(ValueError, match="bijection"):
+        source(_XYZ, potential, nuclear, labels=np.zeros(n, dtype=int))
+    with pytest.raises(ValueError, match="geometry or charge"):
+        CabsEcpOneElectron(*source(_XYZ, potential, nuclear, charges=np.array([35, 53, 1])))

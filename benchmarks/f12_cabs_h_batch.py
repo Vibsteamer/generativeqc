@@ -268,13 +268,19 @@ class CabsHShells:
                     part += w[np.ix_(b, a)].T
                 weights[channel, pos:stop] = part.ravel()
             pos = stop
+        return self._contract_nuclear_panel(self.data[1:], weights, max_bytes)
+
+    def _contract_nuclear_panel(
+        self, jacobian: np.ndarray, weights: np.ndarray, max_bytes: int
+    ) -> tuple[np.ndarray, dict]:
+        """Contract a trusted contiguous nuclear panel with the selected native ABI."""
         out = np.empty_like(self.xyz)
         used = ct.c_size_t()
         t = time.monotonic()
         rc = self.contract(
             out.size,
-            2 * self.size,
-            self.data[1:],
+            weights.size,
+            jacobian,
             weights,
             out,
             max_bytes,
