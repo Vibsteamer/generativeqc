@@ -126,3 +126,12 @@ on Hcore, and −0.030326783358 from Coulomb and exchange. The retained native
 host execution reproduced the archived nuclear Fock force for all nine
 coordinates within 3e-10 Eh/bohr. The other 50 CC source products, UHF and
 CABS singles are separately assembled from their retained values.
+
+Single-L20 job 2123741553728958464 subsequently generated the geometric Hcore
+and all nine AO derivatives on device and contracted the six retained CC Fock
+weights in FP64. Independent raw-array replay gave a maximum AO dH error of
+1.01e-13, a maximum six-block nuclear force error of 1.81e-12 Eh/bohr, and a
+maximum discrepancy of 2.25e-10 Eh/bohr against the three independent Fock
+displacements. The signed `molecular_cartesian_nh2/l20_ordinary_fock_hcore/passed.json`
+identifies the returned combined-basis H, dH, S and dS and the checked 54
+spin-block derivatives.
