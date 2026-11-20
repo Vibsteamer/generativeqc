@@ -51,3 +51,17 @@ duplicates and missing components, and uses the original summation order.
 An explicit `protocol_id` binds the campaign's method and implementation
 revision to the archived surface identity. Physical execution and electronic
 root tracking require evidence from the component provider.
+
+## Geometry-owned one-electron sources
+
+The combined-basis overlap and core Hamiltonian share contraction expansion,
+radial normalization, spherical phases and OBS-first order with the molecular
+integral sink. The one-electron provider packs only the orbital and OptRI
+records. Enumerating fitting triples here would charge a cubic shell table
+to a quadratic operator. The full-basis batch computes the positive nuclear
+Jacobians for both Gaussian centers and for nuclear attraction.
+
+The OH regression places OptRI functions on additional zero-charge centers
+in its independent libcint calculation. Moving each zero-charge center with
+its physical nucleus preserves the public AO order and checks the separate
+basis-center contributions and their sum.

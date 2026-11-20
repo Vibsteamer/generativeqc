@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import ctypes as ct
 import json
-import math
 from typing import TYPE_CHECKING
 
 import numpy as np
+from generativeqc._f12_focal_shells import pack_shells, spherical_projections
 from generativeqc.elements import SYMBOLS
 
 if TYPE_CHECKING:
@@ -41,55 +40,15 @@ def focal_shell_layout(
     else:
         raise ValueError("focal shell integrals require an HF+CABS or MP2-F12 role")
     xyz = np.asarray([atom.position for atom in request.atoms], dtype=np.float64)
-    angular, atom_ids, exponents, radial = [], [], [], []
-    prim_offsets = [0]
-    shell_counts, ao_counts = [], []
-    for name, record in (
-        ("orbital", basis.orbital),
-        ("CABS", basis.cabs),
-        ("fitting", fit),
-    ):
-        if record is None or record.representation != "spherical":
-            raise ValueError(f"{name} requires an explicit real-spherical basis")
-        elements = record.by_element
-        before = len(angular)
-        for index, atom in enumerate(request.atoms):
-            if atom.atomic_number not in elements:
-                raise ValueError(f"{name} lacks element {atom.atomic_number}")
-            for shell in elements[atom.atomic_number].shells:
-                l = shell.angular_momentum
-                if l > 6:
-                    raise ValueError(
-                        "the integral sink supports angular momentum through i"
-                    )
-                e = np.asarray(shell.exponents, dtype=np.float64)
-                if 8 * e.size**2 > budget_mib << 20:
-                    raise MemoryError(
-                        "primitive contraction overlap exceeds the integral budget"
-                    )
-                overlap = (2 * np.sqrt(e[:, None]) * np.sqrt(e) / (e[:, None] + e)) ** (
-                    l + 1.5
-                )
-                scale = (2 * e / np.pi) ** 0.75 * (4 * e) ** (0.5 * l)
-                axial = math.prod(range(1, 2 * l + 1, 2))
-                for coeffs in shell.coefficients:
-                    c = np.asarray(coeffs, dtype=np.float64)
-                    norm = float(c @ overlap @ c)
-                    if not np.isfinite(norm) or norm <= 0:
-                        raise ValueError("invalid contraction norm in focal shell")
-                    values = c * scale / math.sqrt(norm * axial)
-                    if not np.isfinite(values).all():
-                        raise ValueError("nonfinite normalized focal shell")
-                    radial.extend(values)
-                    exponents.extend(e)
-                    angular.append(l)
-                    atom_ids.append(index)
-                    prim_offsets.append(len(exponents))
-        shell_counts.append(len(angular) - before)
-        ao_counts.append(sum(2 * l + 1 for l in angular[before:]))
-
-    ncombined = sum(shell_counts[:2])
-    axes = np.asarray(angular, dtype=np.int32)
+    packed = pack_shells(
+        request.atoms,
+        (("orbital", basis.orbital), ("CABS", basis.cabs), ("fitting", fit)),
+        budget_mib << 20,
+    )
+    axes = packed.angular
+    angular = axes.tolist()
+    ao_counts = packed.ao_counts
+    ncombined = sum(packed.shell_counts[:2])
     carts = [(l + 1) * (l + 2) // 2 for l in angular]
     combined, fitting = carts[:ncombined], carts[ncombined:]
 
@@ -97,11 +56,11 @@ def focal_shell_layout(
         return (sum(sizes) ** 2 + sum(x * x for x in sizes)) // 2
 
     largest = max(triangular_size(fitting), triangular_size(combined) * sum(fitting))
-    if max(largest, len(exponents)) >= 2**31 or largest * 8 > budget_mib << 20:
+    if largest >= 2**31 or largest * 8 > budget_mib << 20:
         raise MemoryError(
             "focal shell offsets or Cartesian integral tensor exceed capacity"
         )
-    xyz_ids = np.asarray(atom_ids, dtype=np.int32)
+    xyz_ids = packed.atom
     rows = np.full((len(axes), 2 * max(angular) + 1), -1, dtype=np.int32)
     for start, end in ((0, ncombined), (ncombined, len(axes))):
         offset = 0
@@ -113,9 +72,9 @@ def focal_shell_layout(
         "angular": axes,
         "atom": xyz_ids,
         "centers": np.ascontiguousarray(xyz[xyz_ids]),
-        "prim_offsets": np.asarray(prim_offsets, dtype=np.int32),
-        "exponents": np.asarray(exponents),
-        "radial": np.asarray(radial),
+        "prim_offsets": packed.prim_offsets,
+        "exponents": packed.exponents,
+        "radial": packed.radial,
         "spherical_rows": rows,
         "orbital_shell_count": np.int32(ncombined),
         "ao_sizes": np.array([sum(ao_counts[:2]), ao_counts[2]], dtype=np.int32),
@@ -146,16 +105,6 @@ def focal_shell_layout(
             counts *= cart_sizes[column]
         layout[group + "_blocks"] = blocks
         layout[group + "_offsets"] = np.r_[0, np.cumsum(counts)].astype(np.int32)
-    native = ct.CDLL(str(library.resolve())).gqc_f12_raw_spherical_projection
-    native.argtypes = [
-        ct.c_uint,
-        np.ctypeslib.ndpointer(np.float64, flags="C_CONTIGUOUS"),
-        ct.c_size_t,
-    ]
-    native.restype = ct.c_int
-    for l in sorted(set(angular)):
-        transform = np.empty((2 * l + 1, (l + 1) * (l + 2) // 2))
-        if native(l, transform, transform.size):
-            raise RuntimeError(f"native spherical projection failed for l={l}")
+    for l, transform in spherical_projections(library, set(angular)).items():
         layout[f"transform_{l}"] = transform
     return layout

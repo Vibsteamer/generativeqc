@@ -59,7 +59,6 @@ def main() -> None:
     source = REPO / "benchmarks/f12_molecular_integral_sink.cu"
     common = [
         compiler,
-        "-std=c++17",
         "-O2",
         "-I" + str(build),
         "-I" + str(REPO / "src"),
@@ -100,8 +99,25 @@ def main() -> None:
             header.write_text(content)
         obj = build / (operator + ".o")
         flags = ["-DGQC_SINK_COULOMB"] if operator == "coulomb" else []
-        run(common + flags + ["-c", str(source), "-o", str(obj)], operator)
+        run(
+            common + ["-std=c++17", *flags, "-c", str(source), "-o", str(obj)], operator
+        )
         objects.append(str(obj))
+    one_electron = build / "one_electron.o"
+    run(
+        common
+        + [
+            "-std=c++20",
+            "-I" + str(REPO / "include"),
+            "-DGQC_F12_CABS_I_ONE_ELECTRON",
+            "-c",
+            str(REPO / "benchmarks/f12_cabs_h_one_electron.cu"),
+            "-o",
+            str(one_electron),
+        ],
+        "one_electron",
+    )
+    objects.append(str(one_electron))
     for source in (
         REPO / "src/molecule/basis.cpp",
         REPO / "benchmarks/f12_shell_projection.cpp",

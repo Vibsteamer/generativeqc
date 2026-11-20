@@ -761,6 +761,23 @@ The reverse call returns the Cartesian gradient of the supplied integral
 weights. The SCF, CABS projector and correlated-state response supply the
 remaining contributions to a molecular force.
 
+Use `generativeqc.experimental.f12_focal.one_electron_sources` with the same
+request to obtain the all-electron overlap and core Hamiltonian. Give it the
+F12 integral library built for the request's backend. Both matrix axes use
+the same OBS-first order as the two- and three-center integrals.
+
+```python
+from generativeqc.experimental.f12_focal import one_electron_sources
+
+request = next(r for r, _ in plan.steps if r.role == "hf_cabs")
+data = one_electron_sources(request, library=integral_library)
+```
+
+`data.d_overlap[atom, axis]` and `data.d_hcore[atom, axis]` are positive
+Cartesian derivatives in bohr⁻¹ and Eh/bohr. They include movement of each
+atom's OBS and OptRI functions and the attraction to the moving nucleus.
+Set `derivatives=False` for energies that need only S and Hcore.
+
 The provider controls electronic execution and is responsible for the
 same-reference CCSD and MP2 differences, convergence and analytic gradients.
 The experimental dispatcher requires a provider for electronic work.

@@ -14,7 +14,7 @@ from typing import Generic, Literal, TypeVar
 
 import numpy as np
 
-from .. import _native
+from .. import _f12_focal_one_electron, _native
 from .._api_types import Atom
 from .._cbs_plan import native_cbs_plan
 from .._model_resolution import snapshot_basis
@@ -33,6 +33,8 @@ Role = Literal[
     "hf_cabs", "mp2_f12_correlation", "post_mp2", "ccsd_minus_mp2", "triples"
 ]
 Backend = Literal["cuda", "cpu_reference"]
+FocalOneElectron = _f12_focal_one_electron.FocalOneElectron
+one_electron_sources = _f12_focal_one_electron.one_electron_sources
 
 
 @dataclass(frozen=True)
