@@ -118,7 +118,7 @@ def contract_geometry(
     status = functions[kernel](
         ncenter,
         _OPCODES[operator],
-        manifest["options"]["f12_beta"],
+        0.0 if operator == "coulomb" else manifest["options"]["f12_beta"],
         len(angular),
         len(exponents),
         nblocks,

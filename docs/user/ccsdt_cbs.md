@@ -750,6 +750,17 @@ cardinal against the planned surface and basis. When archiving components for
 later collection, supply a fixed `protocol_id` that identifies the method
 and implementation version across all jobs.
 
+In a source checkout, the molecular integral benchmark accepts a planned
+`FocalRequest` directly in `forward_integrals` and `contract_live_weights`.
+Build its library with `benchmarks/build_f12_molecular_integral_sink.py`.
+The HF+CABS role evaluates the two Coulomb channels in JKFit. The MP2-F12
+role evaluates the Coulomb and four geminal operators over two and three
+centers in F12 fit. The first combined AO rows belong to the orbital basis,
+followed by the atom-centered OptRI rows, all in native real-spherical order.
+The reverse call returns the Cartesian gradient of the supplied integral
+weights. The SCF, CABS projector and correlated-state response supply the
+remaining contributions to a molecular force.
+
 The provider controls electronic execution and is responsible for the
 same-reference CCSD and MP2 differences, convergence and analytic gradients.
 The experimental dispatcher requires a provider for electronic work.

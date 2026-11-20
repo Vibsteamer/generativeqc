@@ -41,8 +41,10 @@ def main() -> None:
     args = parser.parse_args()
     cuda = args.backend == "cuda"
     compiler = args.nvcc if cuda else args.cxx
-    if not compiler:
-        parser.error("selected backend compiler is unavailable")
+    if not compiler or not args.cxx:
+        parser.error(
+            "the selected backend compiler and a host C++ compiler are required"
+        )
     launcher = resolve_compiler_cache()
     out = args.output_dir.resolve()
     domain_suffix = "_cabs_i" if args.cabs_i else "_cabs_h" if args.cabs_h else ""
@@ -99,6 +101,28 @@ def main() -> None:
         obj = build / (operator + ".o")
         flags = ["-DGQC_SINK_COULOMB"] if operator == "coulomb" else []
         run(common + flags + ["-c", str(source), "-o", str(obj)], operator)
+        objects.append(str(obj))
+    for source in (
+        REPO / "src/molecule/basis.cpp",
+        REPO / "benchmarks/f12_shell_projection.cpp",
+    ):
+        obj = build / (source.stem + ".o")
+        run(
+            [
+                args.cxx,
+                "-std=c++20",
+                "-O2",
+                "-fPIC",
+                *(["-fvisibility=hidden"] if source.stem == "basis" else []),
+                "-I" + str(REPO / "src"),
+                "-I" + str(REPO / "include"),
+                "-c",
+                str(source),
+                "-o",
+                str(obj),
+            ],
+            source.stem,
+        )
         objects.append(str(obj))
     suffix = "" if cuda else "_host"
     target = out / (

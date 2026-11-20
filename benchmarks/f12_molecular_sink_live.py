@@ -5,6 +5,7 @@ import json
 import time
 from collections.abc import Iterator, Mapping
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -16,6 +17,9 @@ from benchmarks.f12_molecular_sink_test import (
     compare_reference,
     contract_geometry,
 )
+
+if TYPE_CHECKING:
+    from generativeqc.experimental.f12_focal import FocalRequest
 
 
 class ShellProjection:
@@ -173,7 +177,7 @@ class ShellProjection:
 
 
 def contract_live_weights(
-    layout: Mapping[str, np.ndarray],
+    layout: "Mapping[str, np.ndarray] | FocalRequest",
     explicit_weights: Mapping[str, np.ndarray],
     library: Path,
     *,
@@ -192,6 +196,13 @@ def contract_live_weights(
     if not 0 < budget_mib <= (2**64 - 1) >> 20:
         raise ValueError("invalid molecular sink budget")
     start = time.monotonic()
+    if not isinstance(layout, Mapping):
+        from benchmarks.f12_focal_shell_layout import focal_shell_layout
+
+        singles_only = singles_only or layout.role == "hf_cabs"
+        layout = focal_shell_layout(
+            layout, library, host_reference=host_reference, budget_mib=budget_mib
+        )
     metadata = json.loads(str(layout["manifest"]))
     channels = {
         channel_name(group, op) for group in ("metric", "ao") for op in _OPCODES

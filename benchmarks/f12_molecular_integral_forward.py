@@ -6,11 +6,15 @@ import json
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from benchmarks.f12_molecular_sink_live import ShellProjection
 from benchmarks.f12_molecular_sink_test import _OPCODES, sha256
+
+if TYPE_CHECKING:
+    from generativeqc.experimental.f12_focal import FocalRequest
 
 
 def bind_forward(library: Path, kind: str, host_reference: bool) -> Callable:
@@ -44,17 +48,29 @@ def bind_forward(library: Path, kind: str, host_reference: bool) -> Callable:
 
 
 def forward_integrals(
-    layout: Mapping[str, np.ndarray],
+    layout: "Mapping[str, np.ndarray] | FocalRequest",
     library: Path,
     *,
     host_reference: bool = False,
     coulomb_only: bool = False,
     budget_mib: int = 512,
 ) -> tuple[dict[str, np.ndarray], dict[str, dict]]:
-    """Return requested integral tensors and their execution records, keyed by operator."""
+    """Evaluate supplied shell tables or build them from a focal geometry and basis.
+
+    Focal sources are ordered OBS first, then OptRI. Each subspace uses the
+    public basis order. The two- and three-center fitting indices share one
+    independently numbered fitting basis.
+    """
     if not 0 < budget_mib <= (2**64 - 1) >> 20:
         raise ValueError("invalid forward device-memory budget")
     budget = budget_mib << 20
+    if not isinstance(layout, Mapping):
+        from benchmarks.f12_focal_shell_layout import focal_shell_layout
+
+        coulomb_only = coulomb_only or layout.role == "hf_cabs"
+        layout = focal_shell_layout(
+            layout, library, host_reference=host_reference, budget_mib=budget_mib
+        )
     common = {
         k: layout[k]
         for k in (
@@ -78,7 +94,7 @@ def forward_integrals(
         key = f"transform_{angular}"
         common[key] = layout[key]
     manifest = json.loads(str(common["manifest"]))
-    beta = manifest["options"]["f12_beta"]
+    beta = 0.0 if coulomb_only else manifest["options"]["f12_beta"]
     geometry = np.asarray(manifest["geometry_bohr"])
     if not np.array_equal(geometry[common["atom"]], common["centers"]):
         raise ValueError("molecular and shell coordinates disagree")
