@@ -175,3 +175,20 @@ retained canonical spin Fock matrices within 2.35e-10 Eh. Native CUDA
 and independent centered controls for this route live in
 `molecular_cartesian_nh2/l20_ordinary_fock_orbital_response/` in the
 validation area above.
+
+For all 32 ordinary two-electron CC blocks the retained unrestricted
+Lagrangian provides independent spin/occupancy-pattern weights. The signed
+direct and exchange permutations use the same requests as the UCC integral
+builder. The reverse maps both MO legs of each fitted Coulomb block to the
+bare three-center integrals, fitting metric and the two MO coefficient
+matrices. The normalized canonical-frame response feeds these coefficient
+weights into the existing coupled-spin adjoint. Its four AO weights combine
+with the explicit three-center and metric weights to give the ERI nuclear
+force. The occupied reference includes any frozen occupied orbitals.
+
+The NH2/D host control in `molecular_cartesian_nh2/l20_ordinary_eri/`
+replayed all nine retained ordinary ERI actions within 2.12e-12 Eh/bohr
+using one 391-rotation solve. The other 18 fixed-source weights and the
+reference and CABS actions are external in this qualification. Separate
+unit checks perturb the metric, bare three-center integrals and each spin
+frame with an unequal frozen-spin partition and explicit dense spin ERIs.
