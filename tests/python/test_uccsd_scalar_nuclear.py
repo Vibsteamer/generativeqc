@@ -4,7 +4,7 @@ import numpy as np
 from generativeqc._f12_cc_spin_sources import unrestricted_cc_f12_fixed_source_feeds
 from generativeqc._f12_spin_ao import unrestricted_orbital_sources
 from generativeqc._f12_spin_fock import spin_fock
-from generativeqc_compiler.tensor import execute
+from generativeqc_compiler.tensor import Program, execute
 
 from tools.generativeqc_cc.uccsd_scalar_nuclear import unrestricted_cc_scalar_ao_weights
 
@@ -62,8 +62,21 @@ def test_frozen_scalar_pullback_to_all_ao_sources() -> None:
         )
 
     weight = -0.73
+
+    def strict_feeds(graph: Program, feeds: dict[str, np.ndarray]) -> object:
+        # The CUDA prepared executor requires a real ndarray even for a scalar seed.
+        for node in graph.live_nodes:
+            if node.op == "input":
+                value = feeds[node.attrs["name"]]
+                assert (
+                    isinstance(value, np.ndarray)
+                    and value.dtype == np.float64
+                    and value.shape == node.spec.shape
+                )
+        return execute(graph, feeds)
+
     v, b, x, bars = unrestricted_cc_scalar_ao_weights(
-        space, factor(ao), np.asarray(weight), execute, frozen_occupied=frozen
+        space, factor(ao), np.asarray(weight), strict_feeds, frozen_occupied=frozen
     )
     np.testing.assert_allclose(v + b - x, energy(ao), atol=2e-12, rtol=0)
     groups = [
@@ -73,7 +86,8 @@ def test_frozen_scalar_pullback_to_all_ao_sources() -> None:
         tuple(
             k
             for k in ao
-            if k.startswith("ao_") or (k.startswith("metric/") and k != "metric/coulomb")
+            if k.startswith("ao_")
+            or (k.startswith("metric/") and k != "metric/coulomb")
         ),
     ]
     for keys in groups:

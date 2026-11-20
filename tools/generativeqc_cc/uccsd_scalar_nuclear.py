@@ -112,7 +112,7 @@ def unrestricted_cc_scalar_ao_weights(
             qbars["fit_" + side] = dbar["source/fit_" + spin][:, active[spin[0]]]
             for op in ("geminal", "squared_geminal", "double_commutator"):
                 qbars[f"raw_{op}_{side}"] = dbar[f"raw/{op}/{spin}"][:, active[spin[0]]]
-        qfields.update(bar_b_energy=seed, bar_x_fock_energy=-seed)
+        qfields.update(bar_b_energy=seed, bar_x_fock_energy=np.asarray(-seed))
         for i, j in pairs:
             selects = {"select_i": eye[i], "select_j": eye[j]}
             linear_slots = {
