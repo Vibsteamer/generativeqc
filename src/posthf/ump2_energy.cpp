@@ -180,7 +180,8 @@ UnrestrictedEnergy conventional_unrestricted_energy(
                           owned.orbital_energies[right].end());
       const std::array<std::string, 3> names{"alpha_alpha", "beta_beta", "alpha_beta"};
       result.channels[channel] =
-          executor->evaluate("mp2_" + names[channel], inputs).at("energy")[0];
+          executor->evaluate("mp2_" + names[channel], cc::borrow_unrestricted_feeds(inputs))
+              .at("energy")[0];
       result.tiles = posthf::checked_add(result.tiles, direct.size());
     }
     return result;

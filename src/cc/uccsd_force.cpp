@@ -83,8 +83,15 @@ class Runtime {
   }
   Values zero_inputs(const std::string& program) const {
     Values result;
-    for (const auto& [name, count] : input_sizes(program)) result[name].resize(count);
+    complete_inputs(program, result);
     return result;
+  }
+  void complete_inputs(const std::string& program, Values& result) const {
+    for (const auto& [name, count] : input_sizes(program)) {
+      const auto [entry, inserted] = result.try_emplace(name, count);
+      if (!inserted && entry->second.size() != count)
+        throw std::logic_error("inconsistent unrestricted response binding: " + name);
+    }
   }
   Values run(const std::string& program, const Values& inputs,
              unsigned phase_iteration_ceiling = 0) {
@@ -99,7 +106,7 @@ class Runtime {
       if (found == inputs.end() || found->second.size() != count || !finite(found->second))
         throw std::invalid_argument("invalid native unrestricted response input: " + name);
     }
-    if (executor) return executor->evaluate(program, inputs);
+    if (executor) return executor->evaluate(program, borrow_unrestricted_feeds(inputs));
     arena.resize(required(program));
     const auto views = graph::response_evaluate(program, sizes[0], sizes[1], sizes[2], sizes[3],
                                                 nbf, nbf, 1, graph::kTriplesMomentPanelLanes,
@@ -205,9 +212,6 @@ Values raw_inputs(Runtime& runtime, const hf::UnrestrictedPhysicalReference& ref
     const std::string suffix = spin ? "b" : "a";
     tensor::cpu_congruence('T', runtime.nbf, reference.coefficients[spin].data(),
                            reference.hcore.data(), inputs.at("h_" + suffix).data(), scratch.data());
-    auto& rotation = inputs.at("rotation_" + suffix);
-    for (std::size_t orbital = 0; orbital < runtime.nbf; ++orbital)
-      rotation[orbital * runtime.nbf + orbital] = 1.0;
   }
   posthf::NativeBlockProvider provider(
       source, reference, budget, runtime.cuda ? 8 : 2,
@@ -231,6 +235,29 @@ Values raw_inputs(Runtime& runtime, const hf::UnrestrictedPhysicalReference& ref
     }
   }
   return inputs;
+}
+
+Values canonical_raw_weights(Runtime& runtime, const Values& inputs,
+                             const std::vector<std::string>& actions, bool keep_integral_weights) {
+  const auto n2 = mul(runtime.nbf, runtime.nbf);
+  Values weights;
+  for (const std::string spin : {"a", "b"}) weights["rotation_" + spin].resize(n2);
+  for (const auto& action : actions) {
+    auto partial = runtime.run(action, inputs);
+    for (auto& [name, values] : partial) {
+      if (name.starts_with("rotation_")) {
+        auto& rotation = weights.at(name);
+        if (rotation.size() != values.size())
+          throw std::logic_error("unrestricted raw rotation dimensions disagree");
+        for (std::size_t index = 0; index < rotation.size(); ++index)
+          rotation[index] += values[index];
+      } else if (keep_integral_weights && !weights.emplace(name, std::move(values)).second) {
+        throw std::logic_error("more than one owner for an unrestricted raw cotangent");
+      }
+    }
+  }
+  weights.merge(runtime.run("frame_transport", weights));
+  return weights;
 }
 
 using TriplesSelection = std::array<std::size_t, 6>;
@@ -585,8 +612,8 @@ std::size_t unrestricted_force_capacity(std::size_t nbf, std::size_t alpha, std:
   const auto primal = unrestricted_capacity(nbf, alpha, beta, options, triples, reference_capacity);
   Runtime runtime(nbf, alpha, beta);
   const std::string suffix = separate_reference ? "_separate" : "";
-  std::vector<std::string> programs{"lambda", "raw" + suffix, "physical" + suffix,
-                                    "correction" + suffix};
+  auto programs = graph::canonical_source_actions(separate_reference);
+  programs.insert(programs.end(), {"lambda", "raw" + suffix, "cc_source_bars", "frame_transport"});
   if (triples)
     for (const auto& channel : std::array<std::string, 4>{"aaa", "aab", "abb", "bbb"}) {
       programs.push_back("vector_panel_" + channel);
@@ -654,7 +681,8 @@ UnrestrictedForce unrestricted_force(
 #if GENERATIVEQC_HAS_CUDA
     runtime.executor =
         make_unrestricted_cuda_executor(reference.nbf, reference.nocc[0], reference.nocc[1], device,
-                                        options.max_bytes - result.numeric_capacity_bytes, true);
+                                        options.max_bytes - result.numeric_capacity_bytes, true,
+                                        false, independent_reference != nullptr);
     posthf::NativeBlockProvider provider(source, reference, options.max_bytes, 8,
                                          posthf::AOTileDomain::Basis);
     result.numeric_capacity_bytes =
@@ -682,34 +710,35 @@ UnrestrictedForce unrestricted_force(
     throw std::runtime_error("unrestricted response raw-Hamiltonian/reference mismatch");
   for (unsigned block = 0; block < amplitudes.size(); ++block)
     fields[amplitudes[block]] = parent.amplitudes[block];
-  const auto replay = runtime.run("cc", fields);
-  double residual = 0;
-  for (const auto* name : residuals)
-    for (double value : replay.at(name)) residual = std::max(residual, std::abs(value));
-  if (std::abs(replay.at("correlation_energy")[0] - parent.correlation_energy) > 1e-10 ||
-      residual > options.residual_tolerance)
-    throw std::runtime_error("unrestricted response failed fresh physical CC replay");
-  auto lambda_inputs = runtime.zero_inputs("lambda");
-  for (auto& [name, values] : lambda_inputs)
-    if (const auto found = fields.find(name); found != fields.end()) values = found->second;
+  {
+    const auto replay = runtime.run("cc", fields);
+    double residual = 0;
+    for (const auto* name : residuals)
+      for (double value : replay.at(name)) residual = std::max(residual, std::abs(value));
+    if (std::abs(replay.at("correlation_energy")[0] - parent.correlation_energy) > 1e-10 ||
+        residual > options.residual_tolerance)
+      throw std::runtime_error("unrestricted response failed fresh physical CC replay");
+  }
+  auto lambda_inputs = std::move(fields);
+  runtime.complete_inputs("lambda", lambda_inputs);
+  runtime.complete_inputs("cc_source_bars", lambda_inputs);
   lambda_inputs.at("bar_correlation_energy")[0] = parent_energy_seed;
-  auto parameter_seeds = runtime.zero_inputs("correction" + suffix);
-  for (auto& [name, values] : parameter_seeds)
-    if (const auto found = raw.find(name); found != raw.end()) values = found->second;
+  const auto source_actions = graph::canonical_source_actions(independent_reference != nullptr);
+  for (const auto& action : source_actions) runtime.complete_inputs(action, raw);
   Values amplitude_bars;
   for (unsigned block = 0; block < amplitudes.size(); ++block)
     amplitude_bars["bar_" + std::string(amplitudes[block])].resize(parent.amplitudes[block].size());
   if (triples) {
     runtime::df_progress::Scope trace("uccsd_triples_response", cuda ? "cuda" : "host");
     double energy = 0;
-    energy += triples_response("aaa", {0, 0, 0}, graph::kBindings_aaa, runtime, reference, fields,
-                               parameter_seeds, amplitude_bars);
-    energy += triples_response("aab", {0, 0, 1}, graph::kBindings_aab, runtime, reference, fields,
-                               parameter_seeds, amplitude_bars);
-    energy += triples_response("abb", {0, 1, 1}, graph::kBindings_abb, runtime, reference, fields,
-                               parameter_seeds, amplitude_bars);
-    energy += triples_response("bbb", {1, 1, 1}, graph::kBindings_bbb, runtime, reference, fields,
-                               parameter_seeds, amplitude_bars);
+    energy += triples_response("aaa", {0, 0, 0}, graph::kBindings_aaa, runtime, reference,
+                               lambda_inputs, raw, amplitude_bars);
+    energy += triples_response("aab", {0, 0, 1}, graph::kBindings_aab, runtime, reference,
+                               lambda_inputs, raw, amplitude_bars);
+    energy += triples_response("abb", {0, 1, 1}, graph::kBindings_abb, runtime, reference,
+                               lambda_inputs, raw, amplitude_bars);
+    energy += triples_response("bbb", {1, 1, 1}, graph::kBindings_bbb, runtime, reference,
+                               lambda_inputs, raw, amplitude_bars);
     if (!std::isfinite(energy) || std::abs(energy - parent.triples_energy) > 1e-10)
       throw std::runtime_error("unrestricted triples response/energy replay mismatch");
   }
@@ -745,18 +774,14 @@ UnrestrictedForce unrestricted_force(
   if (response::stable_norm(pullback(bars, entries)) > 1e-9)
     throw std::runtime_error("fresh unrestricted Lagrangian amplitude stationarity failed");
   lambda_trace.reset();
-  auto physical = runtime.zero_inputs("physical" + suffix);
-  for (auto& [name, values] : physical) {
-    if (const auto found = raw.find(name); found != raw.end()) values = found->second;
-    if (const auto found = lambda_inputs.find(name); found != lambda_inputs.end())
-      values = found->second;
-  }
-  const auto correction = runtime.run("correction" + suffix, parameter_seeds);
-  auto weights = runtime.run("physical" + suffix, physical);
-  accumulate(weights, correction);
+  bars.clear();
+  amplitude_bars.clear();
+  accumulate(raw, runtime.run("cc_source_bars", lambda_inputs));
+  lambda_inputs.clear();
+  const auto orbital_weights = canonical_raw_weights(runtime, raw, source_actions, false);
   std::vector<double> orbital_rhs, diagonal;
   for (unsigned spin = 0; spin < 2; ++spin) {
-    const auto& values = weights.at(spin ? "orbital_rhs_b" : "orbital_rhs_a");
+    const auto& values = orbital_weights.at(spin ? "orbital_rhs_b" : "orbital_rhs_a");
     orbital_rhs.insert(orbital_rhs.end(), values.begin(), values.end());
     for (std::size_t occupied = 0; occupied < reference.nocc[spin]; ++occupied)
       for (std::size_t virtual_orbital = reference.nocc[spin]; virtual_orbital < reference.nbf;
@@ -774,12 +799,14 @@ UnrestrictedForce unrestricted_force(
     if (!result.orbital.converged())
       throw std::runtime_error("unrestricted UHF adjoint did not converge");
   }
-  physical.at("bar_reference_electronic_energy")[0] = parent_energy_seed;
+  raw.at("bar_reference_electronic_energy")[0] = parent_energy_seed;
   std::size_t position = 0;
   for (const auto* name : {"bar_fov_aa", "bar_fov_bb"})
-    for (auto& value : physical.at(name)) value = result.orbital.solution[position++];
-  weights = runtime.run("physical" + suffix, physical);
-  accumulate(weights, correction);
+    for (auto& value : raw.at(name)) value += result.orbital.solution[position++];
+  auto weights = canonical_raw_weights(runtime, raw, source_actions, true);
+  raw.clear();
+  runtime.executor.reset();
+  std::vector<double>().swap(runtime.arena);
   for (const auto* name : {"stationarity_a", "stationarity_b"})
     for (double value : weights.at(name))
       result.stationarity_residual = std::max(result.stationarity_residual, std::abs(value));

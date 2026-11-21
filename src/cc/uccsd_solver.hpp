@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstddef>
+#include <optional>
 #include <vector>
 
 #include "cc/solver.hpp"
@@ -37,13 +38,14 @@ struct UnrestrictedSolve {
  * an error, never authorization to change the backend or scientific model. */
 std::size_t unrestricted_capacity(std::size_t nbf, std::size_t alpha, std::size_t beta,
                                   const SolverOptions& options, bool triples,
-                                  std::size_t reference_capacity);
+                                  std::size_t reference_capacity, bool cuda = false,
+                                  std::optional<std::size_t> provider_capacity = std::nullopt);
 
 /** Shape-only peak of the solver's executed direct/exchange MO requests.
  * Includes provider-owned source storage, but no unrequested full-MO output. */
-std::size_t unrestricted_cuda_solver_provider_capacity(
+std::size_t unrestricted_solver_provider_capacity(
     const hf::UnrestrictedPhysicalReference& reference,
-    const posthf::NativeBlockProvider& provider);
+    const posthf::NativeBlockProvider& provider, bool cuda);
 
 /** Solve/replay CCSD and optionally replay all four standard (T) channels.
  * All scientific contractions are build-time-generated shared TensorIR; this
