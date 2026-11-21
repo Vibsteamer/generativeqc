@@ -538,6 +538,53 @@ def test_rhf_focal_center_and_forward_displacement(
         )
 
 
+def test_hydrogen_atom_four_role_center_and_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One occupied alpha and empty beta have no pair or triples correlation."""
+    from generativeqc.experimental.f12_focal import singlepoint, singlepoint_energy
+
+    if not (shell := os.environ.get("GENERATIVEQC_F12_HOST_SINK")):
+        pytest.skip("set GENERATIVEQC_F12_HOST_SINK for molecular host integrals")
+    atoms = [("H", (0.0, 0.0, 0.0))]
+    b = request(np.zeros((1, 3)), (0, 1, 1)).basis
+    s = FocalSeries(b)
+    args = {
+        "hf_cabs": s,
+        "correlation": s,
+        "f12_doubles": s,
+        "triples": s,
+        "root_id": "uhf",
+        "multiplicity": 2,
+        "correlation_space_id": "all-active",
+        "provider": MolecularFocalProvider(shell_library=Path(shell), budget_mib=768),
+        "backend": "cpu_reference",
+    }
+    center = singlepoint(atoms, post_mp2=None, **args)
+    assert center.references[b.basis_id].reference.occupied == (1, 0)
+    assert center.energy < 0
+    np.testing.assert_allclose(center.forces, np.zeros((1, 3)), atol=2e-12, rtol=0)
+    assert len(center.components) == 4
+    assert all(abs(row.term.energy) < 2e-12 for row in center.components[1:])
+
+    def no_response(*args: object, **kwargs: object) -> None:
+        pytest.fail("a displaced energy evaluated a nuclear derivative")
+
+    for method in ("_gradient", "_ucc_stationary", "low_order_energy_and_forces"):
+        monkeypatch.setattr(MolecularFocalProvider, method, no_response)
+    for step in (4e-4, 2e-4):
+        displacement = [("H", (0.0, 0.0, step))]
+        forward = singlepoint_energy(displacement, center=center, **args)
+        assert forward.energy == pytest.approx(center.energy, abs=2e-12, rel=0)
+        assert forward.cabs_ranks == center.cabs_ranks
+        assert forward.references[b.basis_id].reference.forces is None
+        assert all(abs(row.energy) < 2e-12 for row in forward.components[1:])
+
+    monkeypatch.setattr(MolecularFocalProvider, "low_order_energy", no_response)
+    with pytest.raises(ValueError, match="same molecular bases"):
+        singlepoint_energy(atoms, center=replace(center, references={}), **args)
+
+
 def test_rhf_forward_displacement_with_nonzero_triples(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

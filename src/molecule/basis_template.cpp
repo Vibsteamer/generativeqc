@@ -128,7 +128,7 @@ CheckedBasisTemplate preflight(const generativeqc_basis_template_descriptor_v1& 
   // Template creation lacks charge and multiplicity. The prepared method and spin solver
   // check the electronic state separately when using the extended orbital space.
   const bool halide = representation == GENERATIVEQC_BASIS_SPHERICAL &&
-                      (composition.carbon_halide() ||
+                      (composition.molecular_halide() ||
                        (composition.hydride() && (composition.hydrogen == 1 || composition.hydrogen == 2)));
   require(capacity.ecp_term_count == 0 || maximum_orbital_angular_momentum <= (halide ? 4U : 3U),
           "ECP orbital shell is outside the admitted template domain");

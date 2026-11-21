@@ -62,6 +62,21 @@ def g_shell_carbon_halide(basis: object, atoms: Sequence[Atom]) -> bool:
     )
 
 
+def g_shell_halogen_water(basis: object, atoms: Sequence[Atom]) -> bool:
+    """One small-core Br or I with all-electron oxygen and two hydrogens."""
+    if not isinstance(basis, BasisSet) or basis.representation != "spherical":
+        return False
+    elements = sorted(a.atomic_number for a in atoms)
+    if elements not in ([1, 1, 8, 35], [1, 1, 8, 53]):
+        return False
+    return all(
+        z in basis.by_element
+        and basis.by_element[z].nuclear_charge == z
+        and basis.by_element[z].ecp_core_electrons == core
+        for z, core in ((1, 0), (8, 0), (elements[-1], {35: 10, 53: 28}[elements[-1]]))
+    )
+
+
 def g_shell_halogen_dihydride(basis, atoms):
     return len(atoms) == 3 and g_shell_halogen_hydride(basis, atoms)
 
@@ -110,12 +125,17 @@ def fitted_hf_ecp_domain(
     """Admit the supported small-core halide states and orbital angular momenta."""
     if fitted_hf_hydride_domain(method, basis, atoms, charge, multiplicity):
         return True
-    if charge not in (0, 1) or not g_shell_carbon_halide(basis, atoms):
+    if charge not in (0, 1) or not (
+        g_shell_carbon_halide(basis, atoms) or g_shell_halogen_water(basis, atoms)
+    ):
         return False
-    electrons = sum(
-        atom.atomic_number - basis.by_element[atom.atomic_number].ecp_core_electrons
-        for atom in atoms
-    ) - charge
+    electrons = (
+        sum(
+            atom.atomic_number - basis.by_element[atom.atomic_number].ecp_core_electrons
+            for atom in atoms
+        )
+        - charge
+    )
     return (
         (method, multiplicity) in (("rhf", 1), ("uhf", 2))
         and electrons % 2 == multiplicity - 1
@@ -129,8 +149,10 @@ def fitted_hf_ecp_domain(
 
 def resolve_ecp(basis: typing.Any, atoms: typing.Any) -> typing.Any:
     """Resolve immutable source records to atom-mapped scalar residual terms."""
-    orbital_g = g_shell_halogen_hydride(basis, atoms) or g_shell_carbon_halide(
-        basis, atoms
+    orbital_g = (
+        g_shell_halogen_hydride(basis, atoms)
+        or g_shell_carbon_halide(basis, atoms)
+        or g_shell_halogen_water(basis, atoms)
     )
     shell_limit = 4 if orbital_g else 3
     cores, terms = [], []

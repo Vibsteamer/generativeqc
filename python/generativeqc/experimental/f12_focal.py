@@ -821,10 +821,6 @@ def _molecular_f12_plan(
     for request, _ in plan.steps:
         by_basis.setdefault(request.basis.basis_id, []).append(request)
     if center is not None:
-        if set(center.references) != set(by_basis):
-            raise ValueError(
-                "center and displaced recipe must use the same molecular bases"
-            )
         provider = replace(
             provider, reference_seed=lambda r: center.references[r.basis.basis_id]
         )
@@ -855,6 +851,8 @@ def _molecular_f12_plan(
                     expected_cabs_rank=expected_rank,
                     include_hf_cabs=include_hf_cabs,
                 )
+                if expected_rank is not None and low.cabs_rank != expected_rank:
+                    raise ValueError("displaced CABS rank differs from the analytic center")
             reference = low.reference
             ranks[identity] = low.cabs_rank
             if include_hf_cabs:
@@ -956,6 +954,8 @@ def _molecular_f12_plan(
         parts.append(FocalEnergyComponent(request, value, weight))
     if not forces:
         total = math.fsum(c.energy * c.weight for c in parts)
+        if not math.isfinite(total):
+            raise RuntimeError("combined molecular energy is not finite")
         return FocalEnergyResult(total, tuple(parts), roots, ranks)
     evaluated = []
     for part in parts:
@@ -1022,6 +1022,8 @@ def singlepoint_energy(
         protocol_id=protocol_id,
     )
     if center is not None:
+        if not isinstance(center, FocalMolecularResult):
+            raise TypeError("center must be a molecular focal result")
         cabs_requests = {
             q.basis.basis_id: q
             for q, _ in plan.steps
@@ -1033,6 +1035,8 @@ def singlepoint_energy(
             )
         for identity, q in cabs_requests.items():
             assert q.basis.cabs is not None
+            if q.basis.cabs.representation != "spherical":
+                raise ValueError("molecular CABS requires a real-spherical basis")
             elements = q.basis.cabs.by_element
             dimension = sum(
                 (2 * shell.angular_momentum + 1) * len(shell.coefficients)
@@ -1045,11 +1049,27 @@ def singlepoint_energy(
         weights = tuple(
             (q.role, q.basis.basis_id, q.basis.cardinal, w) for q, w in plan.steps
         )
-        if center.weights != weights or not center.references:
+        if center.weights != weights:
             raise ValueError(
                 "center and displacement must use the same weighted focal recipe"
             )
+        bases = {q.basis.basis_id for q, _ in plan.steps}
+        if set(center.references) != bases:
+            raise ValueError(
+                "center and displacement must use the same molecular bases"
+            )
+        if any(
+            not isinstance(seed, FocalReferenceSeed)
+            or seed.request.basis.basis_id != identity
+            or seed.reference.executed_backend != seed.request.backend
+            for identity, seed in center.references.items()
+        ):
+            raise ValueError("center has an incompatible basis-specific determinant")
         source_atoms = next(iter(center.references.values())).request.atoms
+        if tuple(a.atomic_number for a in source_atoms) != tuple(
+            a.atomic_number for a in plan.steps[0][0].atoms
+        ):
+            raise ValueError("center and displacement must have the same ordered nuclei")
         source_plan = plan_singlepoint(
             source_atoms,
             hf_cabs,
@@ -1065,8 +1085,9 @@ def singlepoint_energy(
             protocol_id=protocol_id,
         )
         if any(
-            q.surface_id != center.references[q.basis.basis_id].request.surface_id
-            for q, _ in source_plan.steps
+            seed.request.atoms != source_atoms
+            or seed.request.surface_id != source_plan.steps[0][0].surface_id
+            for seed in center.references.values()
         ):
             raise ValueError(
                 "center and displacement must use the same electronic surface and protocol"

@@ -754,6 +754,38 @@ request that backend explicitly. A backend mismatch raises before numerical
 assembly. The completed components are returned alongside the combined energy,
 forces and weights.
 
+For the built-in molecular recipe, use `MolecularFocalProvider.cuda(...)` and
+pass `post_mp2=None`, `f12_doubles` and `triples` to `singlepoint`. For example,
+choose separate fully augmented D/T and heavy-augmented D/T bases with their
+matching fits and CABS.
+
+```python
+from generativeqc.experimental.f12_focal import FocalSeries, singlepoint, singlepoint_energy
+
+recipe = dict(
+    hf_cabs=FocalSeries(a_t, a_d, hf_alpha, extrapolation="exponential"),
+    correlation=FocalSeries(a_t, a_d, mp2_power),
+    post_mp2=None,
+    f12_doubles=FocalSeries(ha_t, ha_d, cc_power),
+    triples=FocalSeries(ha_t, ha_d, triples_power),
+    provider=provider,
+    root_id="rhf",
+    correlation_space_id="all-active",
+    protocol_id=recipe_id,
+)
+center = singlepoint(atoms_bohr, **recipe)
+displacement = singlepoint_energy(displaced_atoms_bohr, center=center, **recipe)
+```
+
+The center shares one determinant per distinct complete basis identity and
+returns a Cartesian force array with shape `(N, 3)`. The displacement evaluates energy
+only and checks the weighted recipe, ordered nuclei, occupied reference and
+CABS rank against the center. Use `root_id="uhf"` with the corresponding
+`multiplicity` for an unrestricted determinant. The same series interface
+accepts explicit T/Q or Q/5 basis records. Each electronic solve still has
+its native basis and memory limits. Supply the orbital, JKFit, MP2Fit,
+F12Fit and CABS for the elements and cardinals used in your recipe.
+
 For independent component jobs, call `plan_singlepoint` with the same geometry
 and basis arguments, execute the requests in `plan.steps`, then pass the
 outputs in any completion order to `plan.collect`. It matches each role and
@@ -896,7 +928,10 @@ pair = provider(next(req for req, _ in plan.steps if req.role == "mp2_f12_correl
 
 Pass filesystem paths as `pathlib.Path` objects. The HF+CABS term returns the
 DF-HF energy and forces plus the relaxed spin singles contribution for an
-all-electron RHF or UHF reference. The pair term supports all-active singlet RHF and UHF and
+an RHF or UHF reference. The CUDA fitted HF path accepts small-core Br and I in
+its hydride, C/H monohalide and one-water domains. Select the scalar ECP on the
+orbital record and use Coulomb-only fitting records. The pair term supports
+all-active singlet RHF and UHF and
 returns ordinary DF-MP2 correlation plus the explicit 3C(FIX) increment.
 For a singlet RHF request, both spin channels use the same restricted
 spatial orbitals. Their coefficient derivatives add before the restricted
@@ -905,8 +940,8 @@ Both contributions within that term share one physical determinant. The JK,
 ordinary correlation and explicit correlation fits follow their respective
 basis records. Matching identities share the fitted integrals and their
 nuclear derivatives. The returned forces are Cartesian and in Eh/bohr.
-Supply the `high_order` callable when dispatching a complete plan containing
-post-MP2 or triples terms.
+Supply `high_order` for a custom conventional post-MP2 evaluator when
+dispatching component requests individually.
 
 For an existing reference and OBS-first integral set, call
 `reference_cabs_singles(request, reference, one, complement=frame,

@@ -21,9 +21,9 @@ inline bool fitted_halogen_dihydride_doublet(const core::System& orbital) {
   return halide_composition(orbital).hydride();
 }
 
-inline bool fitted_carbon_halide_doublet(const core::System& orbital) {
+inline bool fitted_molecular_halide_doublet(const core::System& orbital) {
   return orbital.multiplicity == 2 && orbital.basis_representation == core::kSphericalBasis &&
-         !orbital.ecp_terms.empty() && halide_composition(orbital).carbon_halide_reference(
+         !orbital.ecp_terms.empty() && halide_composition(orbital).molecular_halide_reference(
              orbital.charge, orbital.multiplicity, orbital.electron_count);
 }
 
@@ -39,7 +39,7 @@ inline bool all_electron_triplet_hydrogen_dimer(const core::System& orbital) {
 inline void require_cuda_df_spin_domain(const core::System& orbital, FockSpin spin) {
   if (spin != FockSpin::Unrestricted) return;
   const bool supports_orbital_g = fitted_halogen_dihydride_doublet(orbital) ||
-                                  fitted_carbon_halide_doublet(orbital) ||
+                                  fitted_molecular_halide_doublet(orbital) ||
                                   all_electron_triplet_hydrogen_dimer(orbital);
   const unsigned limit = supports_orbital_g ? 4U : 3U;
   for (const auto& shell : orbital.shells)
