@@ -57,3 +57,17 @@ workspace. Physical L20 verification remains an independent gate.
 The unchanged larger light-system cases can still have large dense Lambda
 actions even when their nuclear pullback is partitioned. The existing
 conventional Br/I f-orbital and h-auxiliary capability checks still apply.
+
+## Host force admission
+
+Force admission counts the unique raw and canonical maps that are live
+during replay, Lambda and the source actions. Retired maps do not overlap
+with the derivative scratch. The native provider query adds the maximum
+initial raw block reservation across the separate physical fits. CPU
+generated graph storage and CUDA executor storage are charged separately.
+
+The already admitted native Lambda plan supplies the GMRES allocator's
+workspace allowance. This keeps the existing 30-vector restart and physical
+residual thresholds while avoiding the generic 64 MiB default for larger
+packed amplitudes. The complete molecular byte limit and scalar work policy
+continue to apply.

@@ -25,7 +25,7 @@ std::size_t unrestricted_force_capacity(std::size_t nbf, std::size_t alpha, std:
                                         const SolverOptions& options, bool triples,
                                         std::size_t reference_capacity,
                                         bool separate_reference = false,
-                                        std::size_t derivative_capacity = 0);
+                                        std::size_t derivative_capacity = 0, bool cuda = false);
 
 struct UnrestrictedForce {
   std::vector<double> forces;

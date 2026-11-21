@@ -110,7 +110,8 @@ class UccsdPrepared final : public PreparedCalculation {
             static_cast<std::size_t>((physical.electron_count + physical.multiplicity - 1) / 2);
         cc::unrestricted_force_capacity(
             nbf, alpha, physical.electron_count - alpha, options_, triples, reference_capacity_,
-            fitting_.auxiliary && (!fitting_.full_reference || fitting_.separate_reference_auxiliary), derivative_capacity);
+            fitting_.auxiliary && (!fitting_.full_reference || fitting_.separate_reference_auxiliary),
+            derivative_capacity, cuda_);
       }
       const auto started = std::chrono::steady_clock::now();
       // The retained CUDA focal determinant needs the reference J/K action
@@ -192,7 +193,7 @@ class UccsdPrepared final : public PreparedCalculation {
       if (compute_forces)
         cc::unrestricted_force_capacity(reference.nbf, reference.nocc[0], reference.nocc[1],
                                         options_, triples, retained_reference_capacity,
-                                        independent_reference != nullptr, derivative_capacity);
+                                        independent_reference != nullptr, derivative_capacity, cuda_);
       std::optional<response::SpinResponseProblem> orbital_problem;
       if (compute_forces && (reference.nocc[0] * (reference.nbf - reference.nocc[0]) +
                              reference.nocc[1] * (reference.nbf - reference.nocc[1])))

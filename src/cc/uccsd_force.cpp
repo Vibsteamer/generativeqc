@@ -608,12 +608,37 @@ std::vector<double> derivative(const hf::UnrestrictedPhysicalReference& referenc
 std::size_t unrestricted_force_capacity(std::size_t nbf, std::size_t alpha, std::size_t beta,
                                         const SolverOptions& options, bool triples,
                                         std::size_t reference_capacity, bool separate_reference,
-                                        std::size_t derivative_capacity) {
-  const auto primal = unrestricted_capacity(nbf, alpha, beta, options, triples, reference_capacity);
+                                        std::size_t derivative_capacity, bool cuda) {
+  const auto primal =
+      unrestricted_capacity(nbf, alpha, beta, options, triples, reference_capacity, cuda);
   Runtime runtime(nbf, alpha, beta);
   const std::string suffix = separate_reference ? "_separate" : "";
-  auto programs = graph::canonical_source_actions(separate_reference);
-  programs.insert(programs.end(), {"lambda", "raw" + suffix, "cc_source_bars", "frame_transport"});
+  const auto raw_program = "raw" + suffix;
+  const auto actions = graph::canonical_source_actions(separate_reference);
+  auto programs = actions;
+  programs.insert(programs.end(), {"cc", "lambda", raw_program, "cc_source_bars", "frame_transport"});
+  const auto count = [](const graph::ResponseSizes& sizes) {
+    std::size_t total = 0;
+    for (const auto& [name, extent] : sizes) total = add(total, extent);
+    return total;
+  };
+  const auto merge = [](graph::ResponseSizes& sizes, const graph::ResponseSizes& extra) {
+    for (const auto& [name, extent] : extra) {
+      const auto [entry, inserted] = sizes.emplace(name, extent);
+      if (!inserted && entry->second != extent)
+        throw std::logic_error("inconsistent unrestricted response capacity shape");
+    }
+  };
+  auto raw = runtime.input_sizes(raw_program);
+  std::size_t detached = count(runtime.output_sizes("frame_transport"));
+  for (const auto& action : actions) {
+    merge(raw, runtime.input_sizes(action));
+    detached = add(detached, count(runtime.output_sizes(action)));
+  }
+  auto lambda = runtime.output_sizes(raw_program);
+  merge(lambda, runtime.input_sizes("lambda"));
+  merge(lambda, runtime.input_sizes("cc_source_bars"));
+  std::size_t panel = 0;
   if (triples)
     for (const auto& channel : std::array<std::string, 4>{"aaa", "aab", "abb", "bbb"}) {
       programs.push_back("vector_panel_" + channel);
@@ -621,16 +646,28 @@ std::size_t unrestricted_force_capacity(std::size_t nbf, std::size_t alpha, std:
       for (unsigned axis = 0; axis < 6; ++axis)
         programs.push_back("moment_" + channel + "_" + std::to_string(axis));
     }
-  std::size_t arena = 0, retained = 0;
+  std::size_t arena = 0;
   for (const auto& program : programs) {
-    arena = std::max(arena, runtime.required(program));
-    for (const auto& [name, count] : runtime.input_sizes(program)) retained = add(retained, count);
-    for (const auto& [name, count] : runtime.output_sizes(program)) retained = add(retained, count);
+    if (!cuda) arena = std::max(arena, runtime.required(program));
+    if (program.starts_with("vector_panel_") || program.starts_with("bars_") ||
+        program.starts_with("moment_"))
+      panel = std::max(panel, add(count(runtime.input_sizes(program)),
+                                 count(runtime.output_sizes(program))));
   }
-  // Bound all detached frames, canonical seeds, map copies, derivative buffers
-  // and callback results simultaneously, including overallocated arena capacity.
-  auto count =
-      add(mul(4, retained), add(mul(2, arena), graph::checked_product({16, nbf, nbf, nbf, nbf})));
+  const auto n2 = mul(nbf, nbf), n4 = mul(n2, n2);
+  std::size_t amplitude = 0;
+  const auto cc_inputs = runtime.input_sizes("cc");
+  for (const auto* name : amplitudes) amplitude = add(amplitude, cc_inputs.at(name));
+  // The pre-replay raw holder and packed Lambda map have unique allocations.
+  // Existing packed amplitudes and the fixed parent are retained. At most two
+  // detached Λ action results coexist with the parent, while the all-source CC
+  // cotangent runs after those results and the triples panel are released.
+  const auto action_detached = std::max(
+      add(mul(2, count(runtime.output_sizes("lambda"))), mul(2, panel)),
+      count(runtime.output_sizes("cc_source_bars")));
+  auto graph_elements = add(add(count(raw), count(lambda)), add(amplitude, action_detached));
+  graph_elements = std::max(graph_elements, add(count(raw), detached));
+  graph_elements = add(graph_elements, add(amplitude, mul(2, arena)));
   const auto pairs = [](std::size_t count) { return count < 2 ? 0 : mul(count, count - 1) / 2; };
   const auto dimension =
       add(add(mul(alpha, nbf - alpha), mul(beta, nbf - beta)),
@@ -639,11 +676,24 @@ std::size_t unrestricted_force_capacity(std::size_t nbf, std::size_t alpha, std:
   const auto orbital_dimension = add(mul(alpha, nbf - alpha), mul(beta, nbf - beta));
   response::GmresOptions controls;
   controls.absolute_tolerance = 1e-11;
-  auto peak = add(primal, add(mul(count, sizeof(double)),
-                              std::max(derivative_capacity, posthf::source_scratch_bytes)));
-  if (dimension) peak = add(peak, response::prepare_gmres(dimension, controls).workspace_bytes);
+  controls.max_iterations = 300;
+  // The live packed excitation table and action vectors are outside the GMRES
+  // allocator. Reserve conservatively for its growing entry vector and every
+  // temporary packed callback vector. The output solutions remain live.
+  const auto packed_metadata = mul(dimension, add(mul(2, sizeof(Excitation)), 8 * sizeof(double)));
+  auto solving = add(mul(graph_elements, sizeof(double)), packed_metadata);
+  if (dimension) solving = add(solving, response::prepare_gmres(dimension, controls).workspace_bytes);
   if (orbital_dimension)
-    peak = add(peak, response::prepare_gmres(orbital_dimension, controls).workspace_bytes);
+    solving = add(solving, response::prepare_gmres(orbital_dimension, controls).workspace_bytes);
+  // Nuclear evaluation starts after retiring the raw graph and its arena.
+  // Keep the direct AO tensor path bound even for a fitted source. A fitted
+  // provider's own preparation, seed and derivative reservations are included
+  // in its retained reference capacity by the molecular method owner.
+  const auto derivative_scratch = add(
+      mul(add(add(add(detached, amplitude), mul(4, n4)), mul(12, n2)), sizeof(double)),
+      std::max(derivative_capacity, posthf::source_scratch_bytes));
+  auto peak = std::max(primal, add(reference_capacity,
+                                   std::max(solving, add(derivative_scratch, packed_metadata))));
   if (peak > options.max_bytes)
     throw std::length_error(
         "complete native unrestricted force endpoint exceeds numeric memory budget");
@@ -668,7 +718,7 @@ UnrestrictedForce unrestricted_force(
   UnrestrictedForce result;
   result.numeric_capacity_bytes = unrestricted_force_capacity(
       reference.nbf, reference.nocc[0], reference.nocc[1], options, triples, reference_capacity,
-      independent_reference != nullptr, derivative_capacity);
+      independent_reference != nullptr, derivative_capacity, cuda);
   mp2::validate_unrestricted_energy_input(reference, source, options.denominator_threshold);
   if (!parent.converged || reference.commutator_residual > 1e-8 ||
       std::max(parent.replay_singles_residual, parent.replay_doubles_residual) >
@@ -677,19 +727,26 @@ UnrestrictedForce unrestricted_force(
   Runtime runtime(reference.nbf, reference.nocc[0], reference.nocc[1]);
   runtime.cuda = cuda;
   runtime.device = device;
+  const Shape full_shape{reference.nbf, reference.nbf, reference.nbf, reference.nbf};
+  const auto raw_stage = [&](const integrals::ElectronInteractionSource& interaction) {
+    posthf::NativeBlockProvider provider(
+        interaction, reference, options.max_bytes, cuda ? 8 : 2,
+        cuda ? posthf::AOTileDomain::Basis : posthf::AOTileDomain::Shell);
+    return provider.batch_bytes(full_shape, 1, cuda);
+  };
+  auto provider_peak = raw_stage(source);
+  if (independent_reference) provider_peak = std::max(provider_peak, raw_stage(*independent_reference));
+  result.numeric_capacity_bytes = add(result.numeric_capacity_bytes, provider_peak);
+  if (result.numeric_capacity_bytes > options.max_bytes)
+    throw std::length_error("complete unrestricted raw force staging exceeds numeric memory budget");
   if (cuda) {
 #if GENERATIVEQC_HAS_CUDA
     runtime.executor =
         make_unrestricted_cuda_executor(reference.nbf, reference.nocc[0], reference.nocc[1], device,
                                         options.max_bytes - result.numeric_capacity_bytes, true,
                                         false, independent_reference != nullptr);
-    posthf::NativeBlockProvider provider(source, reference, options.max_bytes, 8,
-                                         posthf::AOTileDomain::Basis);
     result.numeric_capacity_bytes =
-        add(result.numeric_capacity_bytes,
-            add(runtime.executor->numeric_capacity_bytes(),
-                provider.batch_bytes({reference.nbf, reference.nbf, reference.nbf, reference.nbf},
-                                     1, true)));
+        add(result.numeric_capacity_bytes, runtime.executor->numeric_capacity_bytes());
     if (result.numeric_capacity_bytes > options.max_bytes)
       throw std::length_error("complete unrestricted CUDA force exceeds numeric memory budget");
 #else
@@ -762,8 +819,14 @@ UnrestrictedForce unrestricted_force(
   };
   result.lambda.status = response::GmresStatus::initial_residual;
   if (!entries.empty()) {
+    auto plan = response::prepare_gmres(entries.size(), controls);
+    // The response capacity already charged this exact restart and dimension.
+    // Give the GMRES owner just that reservation without increasing the
+    // molecular byte budget or changing its numerical tolerances.
+    controls.max_workspace_bytes = std::max(controls.max_workspace_bytes, plan.workspace_bytes);
+    plan.options.max_workspace_bytes = controls.max_workspace_bytes;
     result.lambda =
-        response::solve_gmres(response::prepare_gmres(entries.size(), controls), action, rhs);
+        response::solve_gmres(plan, action, rhs);
     if (!result.lambda.converged())
       throw std::runtime_error("unrestricted corrected Lambda did not converge");
   }
