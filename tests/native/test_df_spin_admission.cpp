@@ -201,12 +201,50 @@ void neutral_oh_value_domain() {
   require(!cuda_df_value_domain(oh, auxiliary, policy, detail),
           "the OH spin-domain update retains the range-separated source guard");
 }
+
+void neutral_oh_public_plan_admission() {
+  generativeqc_context context;
+  context.state.executed_backend = GENERATIVEQC_BACKEND_CUDA;
+  context.state.device_id = -1;
+  generativeqc_system orbital;
+  orbital.data.atoms = {{8, {0, 0, 0}}, {1, {0, 0, 1.834281919177214}}};
+  orbital.data.shells = {{0, 4, {{1.0, 1.0}}}};
+  orbital.data.electron_count = 9;
+  orbital.data.multiplicity = 2;
+  orbital.data.basis_representation = GENERATIVEQC_BASIS_SPHERICAL;
+  auto auxiliary = orbital;
+  auxiliary.data.shells[0].angular_momentum = 0;
+  for (unsigned derivative : {0U, 1U}) {
+    for (bool fully_fitted : {false, true}) {
+      generativeqc_fock_spec spec{
+          sizeof(spec), GENERATIVEQC_ABI_VERSION, 1, GENERATIVEQC_FOCK_UNRESTRICTED, derivative,
+          {1, 1.0, GENERATIVEQC_FOCK_FULL_RANGE, 0.0, GENERATIVEQC_FOCK_DENSITY_FITTED},
+          {1, -1.0, GENERATIVEQC_FOCK_FULL_RANGE, 0.0,
+           fully_fitted ? GENERATIVEQC_FOCK_DENSITY_FITTED : GENERATIVEQC_FOCK_EXACT}};
+      generativeqc_fock_plan* plan = nullptr;
+      const auto status =
+          generativeqc_fock_plan_create(&context, &orbital, &auxiliary, &spec, nullptr, &plan);
+      require(plan == nullptr, "invalid device must not publish an OH plan");
+      if (derivative == 0 && fully_fitted) {
+        require(status == GENERATIVEQC_STATUS_NOT_IMPLEMENTED ||
+                    (status == GENERATIVEQC_STATUS_INVALID_ARGUMENT &&
+                     context.last_detail == "CUDA prepared Fock requires a device"),
+                "neutral spherical OH fully fitted values must reach device setup");
+      } else {
+        require(status == GENERATIVEQC_STATUS_INVALID_ARGUMENT &&
+                    context.last_detail.find("unrestricted CUDA DF") != std::string::npos,
+                "neutral OH g must reject derivatives and mixed exact/fitted plans");
+      }
+    }
+  }
+}
 }  // namespace
 
 int main() {
   try {
     fully_polarized_hydrogen_domain();
     neutral_oh_value_domain();
+    neutral_oh_public_plan_admission();
     public_plan_admission();
     independent_source_limits();
     resident_admission();

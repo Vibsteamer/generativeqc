@@ -242,8 +242,10 @@ struct PreparedFockPlan::Impl {
     validate_resolved_fock_build(strategy);
     if (strategy.backend == FockBackend::Cuda &&
         needs(strategy.spec, FockApproximation::DensityFitted)) {
+      auto fitted_hf_values = make_hf_fock_spec(strategy.spec.spin, FockApproximation::DensityFitted);
+      fitted_hf_values.derivative_order = 0;
       const bool fitted_values_only =
-          strategy.spec == make_hf_fock_spec(strategy.spec.spin, FockApproximation::DensityFitted) &&
+          strategy.spec == fitted_hf_values &&
           retained_direct_derivative_order == 0 && retained_fitted_derivative_order == 0;
       cuda_execution::require_cuda_df_spin_domain(system, strategy.spec.spin, fitted_values_only);
     }
