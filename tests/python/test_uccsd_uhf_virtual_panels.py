@@ -2,6 +2,10 @@
 
 import numpy as np
 import pytest
+from generativeqc._uccsd_rhf_virtual_pairs import (
+    prepare_spatial_virtual_pair_operators,
+    spatial_virtual_pair_storage,
+)
 from generativeqc._uccsd_uhf_virtual_panels import (
     prepare_uhf_mixed_virtual_panels,
     uhf_mixed_virtual_panel_storage,
@@ -13,6 +17,7 @@ from generativeqc_compiler.cc.uccsd_layout import UCCSDLayout
 from generativeqc_compiler.cc.uccsd_uhf_virtual_panels import (
     MIXED_AMPLITUDES,
     build_uccsd_uhf_mixed_virtual_panel_programs,
+    build_uccsd_uhf_same_spin_virtual_pair_programs,
 )
 from generativeqc_compiler.tensor import execute
 
@@ -92,3 +97,69 @@ def test_uhf_mixed_panel_preflights_host_before_native_call() -> None:
         prepare_uhf_mixed_virtual_panels(
             *factors, never_run, width=2, max_host_bytes=bounds - 1
         )
+
+
+@pytest.mark.parametrize("spin,channel", [("alpha", "aa"), ("beta", "bb")])
+def test_independent_packed_same_spin_virtual_pair_actions(
+    spin: str, channel: str
+) -> None:
+    layout = UCCSDLayout(3, 2, 3, 4)
+    rng = np.random.default_rng(737222)
+    auxiliary = 5
+    factors = {}
+    seed = rng.normal(scale=0.3, size=(auxiliary, auxiliary))
+    metric = seed @ seed.T + np.eye(auxiliary)
+    for owner, extent in (("alpha", layout.va), ("beta", layout.vb)):
+        raw = rng.normal(scale=0.1, size=(auxiliary, extent, extent))
+        raw += raw.swapaxes(1, 2).copy()
+        fit = np.linalg.solve(metric, raw.reshape(auxiliary, -1)).reshape(raw.shape)
+        factors["fit_left_" + owner] = fit
+        factors["raw_right_" + owner] = raw
+    fit, raw = (factors[name + "_" + spin] for name in ("fit_left", "raw_right"))
+    bound, retained = spatial_virtual_pair_storage(
+        fit.shape[1], auxiliary, 3, include_symmetric=False
+    )
+    operator = prepare_spatial_virtual_pair_operators(
+        fit, raw, execute, row_tile=3, max_bytes=bound, include_symmetric=False
+    )
+    assert set(operator) == {"spatial_coulomb_antisymmetric"}
+    assert operator["spatial_coulomb_antisymmetric"].nbytes == retained
+    packed = build_uccsd_uhf_same_spin_virtual_pair_programs(layout, spin)
+    reference = build_uccsd_df_virtual_ladder_amplitude_programs(layout, auxiliary)
+    amplitudes = layout.unpack(rng.normal(scale=0.1, size=layout.packed_size))
+    tangents = {
+        "d_" + name: value
+        for name, value in layout.unpack(rng.normal(size=layout.packed_size)).items()
+    }
+    dense_fields, pair_fields = {**amplitudes, **factors}, {**amplitudes, **operator}
+    residual = "r2" + channel
+    for graph, control, extra in (
+        (packed.primal, reference.primal, {}),
+        (packed.jvp.program, reference.residual_jvp.program, tangents),
+    ):
+        actual = execute(graph, {**pair_fields, **extra}).outputs
+        expected = execute(control, {**dense_fields, **extra}).outputs
+        for name, value in actual.items():
+            np.testing.assert_allclose(value, expected[name], rtol=0, atol=5e-15)
+    packed_seed = layout.pack_dual(layout.unpack(rng.normal(size=layout.packed_size)))
+    seeds = {
+        "bar_" + name.replace("t", "r", 1): value
+        for name, value in layout.unpack_dual(packed_seed).items()
+    }
+    for name, value in seeds.items():
+        if name != "bar_" + residual:
+            value.fill(0)
+    actual = execute(packed.vjp.program, {**pair_fields, **seeds}).outputs
+    expected = execute(
+        reference.residual_vjp.program, {**dense_fields, **seeds}
+    ).outputs
+    actual_dual, expected_dual = (
+        layout.pack_dual(
+            {
+                name: bars.get("bar_" + name, np.zeros_like(value))
+                for name, value in amplitudes.items()
+            }
+        )
+        for bars in (actual, expected)
+    )
+    np.testing.assert_allclose(actual_dual, expected_dual, rtol=0, atol=5e-14)

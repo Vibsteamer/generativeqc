@@ -104,6 +104,15 @@ class UCCRHFVirtualPairPrograms:
     residual_vjp: VJPProgram
 
 
+def _packed_same_spin_ladder(
+    tau: Node, occupied: _Pairs, virtual: _Pairs, operator: Node
+) -> Node:
+    matrix = reshape(tau, (occupied.full_index, virtual.full_index))
+    block = virtual.pack(occupied.pack(matrix, 0), 1)
+    result = einsum("oe,ea->oa", block, operator)
+    return reshape(occupied.expand(virtual.expand(result, 1), 0), tau.spec.indices)
+
+
 def build_uccsd_rhf_virtual_pair_programs(
     layout: UCCSDLayout, *, max_elements: int = 1_000_000
 ) -> UCCRHFVirtualPairPrograms:
@@ -131,14 +140,6 @@ def build_uccsd_rhf_virtual_pair_programs(
     minus = antisymmetric.operator("spatial_coulomb_antisymmetric")
     tau_aa, tau_ab, tau_bb = _canonical_tau(layout)
 
-    def same_spin(tau: Node) -> Node:
-        matrix = reshape(tau, (occupied.full_index, antisymmetric.full_index))
-        block = antisymmetric.pack(occupied.pack(matrix, 0), 1)
-        result = einsum("oe,ea->oa", block, minus)
-        return reshape(
-            occupied.expand(antisymmetric.expand(result, 1), 0), tau.spec.indices
-        )
-
     # Opposite spin keeps both virtual parity channels and all ordered
     # occupied spectators. Any mixed-spin pair relation is unnecessary.
     mixed = reshape(tau_ab, (occupied.full_index, symmetric.full_index))
@@ -151,12 +152,12 @@ def build_uccsd_rhf_virtual_pair_programs(
     )
     primal = Program(
         {
-            "r2aa": same_spin(tau_aa),
+            "r2aa": _packed_same_spin_ladder(tau_aa, occupied, antisymmetric, minus),
             "r2ab": add(
                 reshape(plus_result, tau_ab.spec.indices),
                 reshape(minus_result, tau_ab.spec.indices),
             ),
-            "r2bb": same_spin(tau_bb),
+            "r2bb": _packed_same_spin_ladder(tau_bb, occupied, antisymmetric, minus),
         },
         provenance={
             "method": "UCCSD",

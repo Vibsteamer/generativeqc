@@ -45,8 +45,18 @@ def rhf_virtual_pair_storage(
     virtual: int, auxiliary: int, row_tile: int
 ) -> tuple[int, int]:
     """Logical added host preparation and retained operator bytes."""
+    return spatial_virtual_pair_storage(
+        virtual, auxiliary, row_tile, include_symmetric=True
+    )
+
+
+def spatial_virtual_pair_storage(
+    virtual: int, auxiliary: int, row_tile: int, *, include_symmetric: bool
+) -> tuple[int, int]:
+    """Host staging for one canonical spin frame's virtual pair operator."""
     n_pair = virtual * (virtual + 1) // 2
     n_strict = n_pair - virtual
+    n_symmetric = n_pair**2 if include_symmetric else 0
     width = min(row_tile, n_pair)
     preparation = checked_bytes(
         8
@@ -57,11 +67,11 @@ def rhf_virtual_pair_storage(
             + 5 * width * n_pair
             + 8 * n_pair,
             n_pair**2 + max(5 * auxiliary * virtual, 5 * width * n_pair) + 8 * n_pair,
-            2 * n_pair**2 + n_strict**2 + virtual**2 + 12 * n_pair,
+            n_pair**2 + n_symmetric + n_strict**2 + virtual**2 + 12 * n_pair,
         ),
         "RHF virtual pair preparation storage",
     )
-    return preparation, 8 * (n_pair**2 + n_strict**2)
+    return preparation, 8 * (n_symmetric + n_strict**2)
 
 
 def prepare_rhf_virtual_pair_operators(
@@ -71,6 +81,21 @@ def prepare_rhf_virtual_pair_operators(
     *,
     row_tile: int,
     max_bytes: int,
+) -> dict[str, np.ndarray]:
+    """Prepare both spatial parity channels for the shared restricted frame."""
+    return prepare_spatial_virtual_pair_operators(
+        fit, raw, run, row_tile=row_tile, max_bytes=max_bytes, include_symmetric=True
+    )
+
+
+def prepare_spatial_virtual_pair_operators(
+    fit: np.ndarray,
+    raw: np.ndarray,
+    run: Callable,
+    *,
+    row_tile: int,
+    max_bytes: int,
+    include_symmetric: bool,
 ) -> dict[str, np.ndarray]:
     """Prepare the restricted operator once from canonical MP2Fit factors.
 
@@ -100,7 +125,9 @@ def prepare_rhf_virtual_pair_operators(
     n_pair = virtual * (virtual + 1) // 2
     n_strict = n_pair - virtual
     width = min(row_tile, n_pair)
-    required, _ = rhf_virtual_pair_storage(virtual, auxiliary, row_tile)
+    required, _ = spatial_virtual_pair_storage(
+        virtual, auxiliary, row_tile, include_symmetric=include_symmetric
+    )
     if required > max_bytes:
         raise MemoryError("RHF virtual pair operators exceed the host numeric budget")
     for array in (fit, raw):
@@ -143,23 +170,24 @@ def prepare_rhf_virtual_pair_operators(
     lookup = np.empty((virtual, virtual), dtype=np.int64)
     lookup[first, second] = lookup[second, first] = np.arange(n_pair)
     strict_first, strict_second = map(np.asarray, zip(*strict, strict=True))
-    symmetric = np.empty_like(coulomb)
+    operators = {}
+    if include_symmetric:
+        symmetric = np.empty_like(coulomb)
+        for row, (e, f) in enumerate(pairs):
+            symmetric[row] = coulomb[lookup[first, e], lookup[second, f]]
+            if e != f:
+                symmetric[row] += coulomb[lookup[first, f], lookup[second, e]]
+        symmetric.setflags(write=False)
+        operators["spatial_coulomb_symmetric"] = symmetric
     antisymmetric = np.empty((n_strict, n_strict), dtype=np.float64)
-    for row, (e, f) in enumerate(pairs):
-        symmetric[row] = coulomb[lookup[first, e], lookup[second, f]]
-        if e != f:
-            symmetric[row] += coulomb[lookup[first, f], lookup[second, e]]
     for row, (e, f) in enumerate(strict):
         antisymmetric[row] = (
             coulomb[lookup[strict_first, e], lookup[strict_second, f]]
             - coulomb[lookup[strict_first, f], lookup[strict_second, e]]
         )
-    symmetric.setflags(write=False)
     antisymmetric.setflags(write=False)
-    return {
-        "spatial_coulomb_symmetric": symmetric,
-        "spatial_coulomb_antisymmetric": antisymmetric,
-    }
+    operators["spatial_coulomb_antisymmetric"] = antisymmetric
+    return operators
 
 
 def prepare_rhf_f12_lambda_action(
