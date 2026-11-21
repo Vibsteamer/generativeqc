@@ -181,8 +181,10 @@ def df_reference(
     The JKFit supplies only Coulomb fitting functions. With forces=True
     the same solve also evaluates the reference's analytic nuclear forces.
     The CUDA path uses the native CUDA DF operator and derivative providers
-    with host SCF control. The budget limits detached output and native reference
-    capacity separately and sets the CUDA DF provider workspace allowance.
+    with host SCF control. Its fitted g-shell value route also covers singlet
+    hydroxide and the water–hydroxide complex. The budget limits detached output
+    and native reference capacity separately and sets the CUDA DF provider
+    workspace allowance.
     CPU DF integral scratch is additional. Results use public AO order.
     """
     if seed is not None and not isinstance(seed, FocalReferenceSeed):
@@ -231,13 +233,21 @@ def df_reference(
     cuda = request.backend == "cuda"
     calculator = Calculator
     nuclei = tuple(atom.atomic_number for atom in request.atoms)
-    water_values = request.root_id == "rhf" and tuple(sorted(nuclei)) == (1, 1, 8)
-    oh_values = request.root_id == "uhf" and request.multiplicity == 2 and nuclei == (8, 1)
+    rhf_values = (
+        request.root_id == "rhf"
+        and (request.charge, tuple(sorted(nuclei)))
+        in {(0, (1, 1, 8)), (-1, (1, 8)), (-1, (1, 1, 1, 8, 8))}
+    )
+    oh_values = (
+        request.root_id == "uhf"
+        and request.charge == 0
+        and request.multiplicity == 2
+        and nuclei == (8, 1)
+    )
     if (
         cuda
         and not forces
-        and request.charge == 0
-        and (water_values or oh_values)
+        and (rhf_values or oh_values)
         and all(
             not orb.by_element[z].ecp_core_electrons and not orb.by_element[z].ecp_data
             for z in (8, 1)

@@ -9,6 +9,9 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
+from generativeqc import Atom, _native
+from generativeqc._f12_focal_reference import df_reference
+from generativeqc.basis import BasisShell
 from generativeqc.experimental.f12_focal import (
     FocalBasis,
     FocalEvaluation,
@@ -51,6 +54,65 @@ def term(request: FocalRequest, energy: float, forces: np.ndarray) -> FocalTerm:
         energy,
         forces,
     )
+
+
+@pytest.mark.parametrize(
+    "nuclei,charge,forces,admitted",
+    [
+        (("O", "H"), -1, False, True),
+        (("O", "H", "O", "H", "H"), -1, False, True),
+        (("O", "H", "H"), 0, False, True),
+        (("O", "H"), -1, True, False),
+        (("O", "H", "O", "H", "H"), -1, True, False),
+        (("O", "H", "O", "H", "H"), 1, False, False),
+        (("O", "O"), 0, False, False),
+    ],
+)
+def test_focal_rhf_g_shell_value_preflight(
+    nuclei: tuple[str, ...],
+    charge: int,
+    forces: bool,
+    admitted: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    small = basis(2).orbital
+    h, o = (small.by_element[z] for z in (1, 8))
+    orbital_g = replace(o, shells=(*o.shells, BasisShell(4, ("0.3",), (("1",),))))
+    fit_h = replace(o, shells=(*o.shells, BasisShell(5, ("0.2",), (("1",),))))
+    q = FocalBasis(
+        4,
+        "orbital-g",
+        replace(small, elements=(h, orbital_g)),
+        jk_fit=replace(small, elements=(h, fit_h)),
+    )
+    request = FocalRequest(
+        atoms=tuple(Atom.from_value((s, (0, 0, i * 1.9))) for i, s in enumerate(nuclei)),
+        charge=charge,
+        multiplicity=1,
+        root_id="rhf",
+        correlation_space_id="all-active",
+        surface_id="value-preflight",
+        basis=q,
+        role="mp2_f12_correlation",
+        backend="cuda",
+    )
+
+    class ReachedNativeContext(Exception):
+        pass
+
+    def stop_at_context(*_: object) -> None:
+        raise ReachedNativeContext
+
+    # Use the native method metadata, and stop before opening a CUDA context.
+    lib = _native.load_library(device="cpu")
+    monkeypatch.setattr(_native, "load_library", lambda **_: lib)
+    monkeypatch.setattr(lib, "generativeqc_context_create", stop_at_context)
+    if admitted:
+        with pytest.raises(ReachedNativeContext):
+            df_reference(request, forces=forces)
+    else:
+        with pytest.raises(NotImplementedError, match=r"l=4: cuda/overlap"):
+            df_reference(request, forces=forces)
 
 
 def test_independent_components_match_serial_and_reject_incomplete_or_stale_results() -> None:
