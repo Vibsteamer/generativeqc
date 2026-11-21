@@ -7,6 +7,13 @@ from functools import partial
 from math import fsum, isfinite
 from typing import TYPE_CHECKING
 
+from ._f12_focal_tplus_sources import (
+    OccupiedMP2F12,
+    SpinOccupied,
+    add_distinct_pair,
+    add_occupied_pair_matrix,
+)
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
@@ -28,6 +35,7 @@ class FocalLowOrderEnergy:
     cabs_spin_energies: tuple[float, float] | None
     ordinary_mp2_spin_energies: tuple[float, float, float]
     f12_increment: float
+    occupied_mp2_f12: OccupiedMP2F12 | None = None
 
     @property
     def hf_cabs_energy(self) -> float:
@@ -64,6 +72,7 @@ def _ordinary_energies(
     spin_indices: tuple[int, int],
     source: FocalCoulombSource,
     run: Callable,
+    occupied_mp2: SpinOccupied | None = None,
 ) -> tuple[float, float, float]:
     from generativeqc_compiler.mp2.ordinary_df_factors import ordinary_df_factors
     from generativeqc_compiler.mp2.unrestricted_df_response import df_ump2_pair_response
@@ -95,12 +104,16 @@ def _ordinary_energies(
             energies.append(0.0)
             continue
         left, right = spins[i], spins[j]
-        pair = df_ump2_pair_response(left + "_" + right, q, ni, n - ni, nj, n - nj, 1)
-        value = run(
-            Program({"energy": pair.outputs["energy"]}),
-            {**controls[left], **controls[right]},
+        pair = df_ump2_pair_response(
+            left + "_" + right, q, ni, n - ni, nj, n - nj, 1,
+            occupied_partition=occupied_mp2 is not None,
         )
-        energies.append(float(value.outputs["energy"]))
+        output = "energy" if occupied_mp2 is None else "pair_energies"
+        value = run(Program({output: pair.outputs[output]}), {**controls[left], **controls[right]}).outputs[output]
+        if occupied_mp2 is not None:
+            add_occupied_pair_matrix(occupied_mp2[i], occupied_mp2[j], value)
+            value = value.sum()
+        energies.append(float(value))
     return tuple(energies)
 
 
@@ -146,7 +159,9 @@ def molecular_low_order_energy(
     expected_cabs_rank: int | None,
     *,
     include_hf_cabs: bool = True,
+    include_occupied_partitions: bool = False,
 ) -> FocalLowOrderEnergy:
+    import numpy as np
     from generativeqc_compiler.tensor import execute
 
     from ._f12_cabs_fock import physical_fock
@@ -242,19 +257,32 @@ def molecular_low_order_energy(
         )
     channels = {("alpha", "alpha"): [], ("alpha", "beta"): [], ("beta", "beta"): []}
     increments = []
+    occupied = (
+        OccupiedMP2F12((np.zeros(oa), np.zeros(ob)), (np.zeros(oa), np.zeros(ob)))
+        if include_occupied_partitions
+        else None
+    )
+    # Use the identical ordinary canonical source in both the occupied
+    # partition and its relaxed reverse, even when the fitted panels coincide.
+    shared_pairs = mp2 is f12 and occupied is None
     for item in molecular_pair_energies(
-        space, data, sources(data), fock, run, include_ordinary=mp2 is f12
+        space, data, sources(data), fock, run, include_ordinary=shared_pairs
     ):
         if item.mp2 is not None:
             channels[item.spins].append(item.mp2)
         increments.append(item.f12)
+        if occupied is not None:
+            add_distinct_pair(occupied.f12_increment, item.spins, item.occupied_indices, item.f12)
     ordinary = (
         tuple(fsum(values) for values in channels.values())
-        if mp2 is f12
-        else _ordinary_energies(ref, indices, mp2.obs(request, obs), run)
+        if shared_pairs
+        else _ordinary_energies(
+            ref, indices, mp2.obs(request, obs), run,
+            None if occupied is None else occupied.mp2,
+        )
     )
     result = FocalLowOrderEnergy(
-        ref, projector.rank, singles, ordinary, fsum(increments)
+        ref, projector.rank, singles, ordinary, fsum(increments), occupied
     )
     if not isfinite(result.mp2_f12_correlation_energy) or (
         include_hf_cabs and not isfinite(result.energy)

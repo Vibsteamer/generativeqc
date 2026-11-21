@@ -57,7 +57,8 @@ std::size_t reserve(std::size_t& cursor, std::size_t n) {
 
 struct Layout {
   std::array<std::size_t, 9> sizes{}, inputs{};
-  std::size_t panels{}, moments{}, partials{}, energies{}, energy{}, error{}, library{};
+  std::size_t panels{}, moments{}, partials{}, energies{}, energy{}, occupied_energies{}, error{},
+      library{};
   std::size_t execution_storage{}, paired_pointers{}, paired_pointer_bytes{};
   std::size_t arena{}, total{}, panel_capacity{}, v3{}, tiles{};
   unsigned blocks{};
@@ -67,7 +68,7 @@ Layout layout(std::size_t o, std::size_t v, std::size_t q, std::size_t panels,
               std::size_t execution_bytes = 0, std::size_t host_binding_bytes = 0,
               std::size_t execution_provider_bytes = provider_allowance,
               std::size_t library_bytes = blas_workspace, bool external_inputs = false,
-              std::size_t paired_pointer_bytes = 0) {
+              std::size_t paired_pointer_bytes = 0, bool occupied_partition = false) {
   const auto oo = checked_mul(o, o), vv = checked_mul(v, v), ov = checked_mul(o, v);
   const auto ovv = checked_mul(o, vv);
   // Check every dimension and physical leading dimension before reading inputs
@@ -106,6 +107,7 @@ Layout layout(std::size_t o, std::size_t v, std::size_t q, std::size_t panels,
   p.partials = reserve(cursor, bytes(p.blocks));
   p.energies = reserve(cursor, bytes(p.tiles));
   p.energy = reserve(cursor, sizeof(double));
+  if (occupied_partition) p.occupied_energies = reserve(cursor, bytes(o));
   p.error = reserve(cursor, sizeof(int));
   p.library = reserve(cursor, library_bytes);
   p.arena = align256(cursor);
@@ -416,10 +418,7 @@ __global__ void scatter_gap(std::size_t v, std::size_t i, std::size_t j, std::si
     virtuals[x] = generativeqc_tensor::finite(virtuals[x] + values.bar_eps_v[x], error, 9);
 }
 
-// Deterministic generic reduction, shared by each tile and final publication.
-__global__ void reduce(const double* values, std::size_t count, double* output, int* error) {
-  double sum = 0.0;
-  for (std::size_t x = threadIdx.x; x < count; x += blockDim.x) sum += values[x];
+__device__ void store_reduction(double sum, double* output, int* error) {
   __shared__ double sums[256];
   sums[threadIdx.x] = sum;
   __syncthreads();
@@ -429,6 +428,25 @@ __global__ void reduce(const double* values, std::size_t count, double* output, 
   }
   if (threadIdx.x == 0) *output = generativeqc_tensor::finite(sums[0], error, 3);
 }
+
+// Deterministic generic reduction, shared by each tile and final publication.
+__global__ void reduce(const double* values, std::size_t count, double* output, int* error) {
+  double sum = 0.0;
+  for (std::size_t x = threadIdx.x; x < count; x += blockDim.x) sum += values[x];
+  store_reduction(sum, output, error);
+}
+
+__global__ void reduce_occupied_energies(const double* tiles, std::size_t occupied,
+                                         double* output, int* error) {
+  const std::size_t orbital = blockIdx.x;
+  double sum = 0.0;
+  for (std::size_t first = threadIdx.x; first < occupied; first += blockDim.x)
+    for (std::size_t second = 0; second <= first; ++second) {
+      const auto share = detail::occupied_tile_share(orbital, first, second);
+      sum += static_cast<double>(share.count) * tiles[share.index];
+    }
+  store_reduction(sum * generated_df::occupied_orbital_share, output + orbital, error);
+}
 }  // namespace
 
 DFCudaResult evaluate_df_cuda(std::size_t o, std::size_t v, std::size_t q, const double* bov,
@@ -436,7 +454,7 @@ DFCudaResult evaluate_df_cuda(std::size_t o, std::size_t v, std::size_t q, const
                               const double* fov, const double* t1, const double* t2,
                               const double* eps_o, const double* eps_v, double threshold,
                               std::size_t max_bytes, int device, std::size_t max_panel_buffers,
-                              runtime::PrecisionDirective admitted_w) {
+                              runtime::PrecisionDirective admitted_w, bool occupied_partition) {
   const auto started = Clock::now();
   phase_observation::Scope observed_triples(phase_observation::Site::triples_inclusive, o, v);
   if (!o || !v || !q || !max_bytes || device < 0 || !std::isfinite(threshold) || threshold <= 0 ||
@@ -447,10 +465,14 @@ DFCudaResult evaluate_df_cuda(std::size_t o, std::size_t v, std::size_t q, const
   library_available = !reject_w_library_for_test;
 #endif
   auto execution_plan = generated_df::prepare_w_plan(admitted_w, library_available);
+  const auto occupied_result_bytes = occupied_partition ? bytes(o) : 0;
+  const auto host_bytes = [&](const auto& plan) {
+    return checked_add(generated_df::WExecution::host_bytes(plan), occupied_result_bytes);
+  };
   const auto planned_layout = [&](std::size_t panels) {
     return layout(o, v, q, panels, execution_plan.storage_bytes(o, v, std::min(o, panels)),
-                  generated_df::WExecution::host_bytes(execution_plan),
-                  execution_plan.provider_bytes(), 0);
+                  host_bytes(execution_plan), execution_plan.provider_bytes(), 0, false, 0,
+                  occupied_partition);
   };
   auto p = planned_layout(max_panel_buffers);
   if (p.total > max_bytes) p = planned_layout(1);
@@ -469,8 +491,8 @@ DFCudaResult evaluate_df_cuda(std::size_t o, std::size_t v, std::size_t q, const
   if (p.panel_capacity == 3 && execution_plan.pair_pointer_bytes()) {
     const auto paired =
         layout(o, v, q, p.panel_capacity, execution_plan.storage_bytes(o, v, p.panel_capacity),
-               generated_df::WExecution::host_bytes(execution_plan),
-               execution_plan.provider_bytes(), 0, false, execution_plan.pair_pointer_bytes());
+               host_bytes(execution_plan), execution_plan.provider_bytes(), 0, false,
+               execution_plan.pair_pointer_bytes(), occupied_partition);
     if (paired.total <= max_bytes) p = paired;
   }
   const std::array<const double*, 9> host{bov, bvv, ovoo, ovov, fov, t1, t2, eps_o, eps_v};
@@ -478,6 +500,7 @@ DFCudaResult evaluate_df_cuda(std::size_t o, std::size_t v, std::size_t q, const
 
   // Borrowed D2H destinations outlive Context's exception-path stream drain.
   DFCudaResult result;
+  if (occupied_partition) result.occupied_energies.resize(o);
   result.resource_fallback = resource_fallback;
   int failed = 0;
   {
@@ -510,7 +533,7 @@ DFCudaResult evaluate_df_cuda(std::size_t o, std::size_t v, std::size_t q, const
                                        result.fp64_gemms, result.fp32_gemms,
                                        result.contraction_summands, result.precision_cast_elements);
     const auto& selected = execution.plan();
-    result.host_binding_bytes = generated_df::WExecution::host_bytes(selected);
+    result.host_binding_bytes = host_bytes(selected);
     result.resource_fallback =
         result.resource_fallback || selected.selected != execution_plan.selected;
     result.precision = selected.precision.arithmetic;
@@ -685,13 +708,28 @@ DFCudaResult evaluate_df_cuda(std::size_t o, std::size_t v, std::size_t q, const
     generativeqc_tensor::cuda_check(cudaGetLastError());
     ++result.reduction_kernels;
     final_reduction.close();
+    auto* occupied_energies = reinterpret_cast<double*>(context.arena + p.occupied_energies);
+    if (occupied_partition) {
+      phase_observation::Scope occupied_reduction(
+          phase_observation::Site::triples_reduction_submission, p.tiles, o,
+          reinterpret_cast<std::uintptr_t>(context.stream));
+      reduce_occupied_energies<<<static_cast<unsigned>(o), 256, 0, context.stream>>>(
+          energies, o, occupied_energies, context.error);
+      generativeqc_tensor::cuda_check(cudaGetLastError());
+      ++result.reduction_kernels;
+    }
+    result.d2h_bytes = checked_add(sizeof(double) + sizeof(int), occupied_result_bytes);
     phase_observation::Scope download(phase_observation::Site::triples_download_submission, 0,
-                                      sizeof(double) + sizeof(int),
+                                      result.d2h_bytes,
                                       reinterpret_cast<std::uintptr_t>(context.stream));
     generativeqc_tensor::cuda_check(cudaMemcpyAsync(&result.energy, energy, sizeof(double),
                                                     cudaMemcpyDeviceToHost, context.stream));
     generativeqc_tensor::cuda_check(cudaMemcpyAsync(&failed, context.error, sizeof(int),
                                                     cudaMemcpyDeviceToHost, context.stream));
+    if (occupied_partition)
+      generativeqc_tensor::cuda_check(cudaMemcpyAsync(
+          result.occupied_energies.data(), occupied_energies, occupied_result_bytes,
+          cudaMemcpyDeviceToHost, context.stream));
     download.close();
     {
       phase_observation::Scope wait(phase_observation::Site::explicit_wait, 0, 0,
@@ -708,7 +746,6 @@ DFCudaResult evaluate_df_cuda(std::size_t o, std::size_t v, std::size_t q, const
     result.arena_bytes = p.arena;
     result.provider_retained_bytes = execution.provider_bytes();
     result.panel_capacity = p.panel_capacity;
-    result.d2h_bytes = sizeof(double) + sizeof(int);
   }  // Drain/destroy the stream, buffers and BLAS provider inside endpoint timing.
   result.seconds = std::chrono::duration<double>(Clock::now() - started).count();
   return result;

@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from ._f12_cc_stationary import UCCSDF12Pullback
+    from ._f12_focal_tplus_sources import SpinOccupied
     from ._f12_ucc_solver import (
         CudaCCTensorExecutor,
         NativeCCTensorExecutor,
@@ -77,6 +78,15 @@ class FocalUCCSDResult:
     ordinary_cc_forces: np.ndarray
     fixed_cc_forces: np.ndarray
     stationary: FocalUCCStationary
+
+
+@dataclass(frozen=True)
+class FocalTriplesEvaluation:
+    """One triples increment with its own force and complementary-space rank."""
+
+    energy: float
+    forces: np.ndarray | None
+    cabs_rank: int | None = None
 
 
 @dataclass
@@ -139,6 +149,12 @@ class MolecularFocalProvider:
     canonical_library: ctypes.CDLL | None = None
     run: Callable | None = None
     high_order: Callable[[FocalRequest], FocalEvaluation] | None = None
+    # One model owner call for all triples variants on a common basis and root.
+    # The owner may reuse matching CC and DF state and must return role-keyed
+    # increments with exactly the requested derivative scope.
+    triples_models: Callable[..., dict[str, FocalTriplesEvaluation]] | None = None
+    # Availability of both energy and full analytic force for this exact request.
+    qualified_tplus: Callable[[FocalRequest], bool] | None = None
     relative_cutoff: float = 1e-9
     budget_mib: int = 1536
     _cuda_cc_target: tuple[str, Path, Callable[[dict], None] | None] | None = field(
@@ -178,6 +194,8 @@ class MolecularFocalProvider:
         budget_mib: int = 1536,
         relative_cutoff: float = 1e-9,
         high_order: Callable[[FocalRequest], FocalEvaluation] | None = None,
+        triples_models: Callable[..., dict[str, FocalTriplesEvaluation]] | None = None,
+        qualified_tplus: Callable[[FocalRequest], bool] | None = None,
         record_graph: Callable[[dict], None] | None = None,
         lambda_options: UCCSDLambdaOptions | None = None,
         rhf_df_ladder: RHFDFLadderOptions | None = None,
@@ -215,6 +233,8 @@ class MolecularFocalProvider:
             relative_cutoff=relative_cutoff,
             budget_mib=budget,
             high_order=high_order,
+            triples_models=triples_models,
+            qualified_tplus=qualified_tplus,
             lambda_options=lambda_options,
             rhf_df_ladder=rhf_df_ladder,
             uhf_df_ladder=uhf_df_ladder,
@@ -228,6 +248,7 @@ class MolecularFocalProvider:
         *,
         expected_cabs_rank: int | None = None,
         include_hf_cabs: bool = True,
+        include_occupied_partitions: bool = False,
     ) -> FocalLowOrderEnergy:
         """Return HF+CABS and MP2-F12 energies for one all-active pair request.
 
@@ -235,10 +256,42 @@ class MolecularFocalProvider:
         Only forward integrals and electronic contractions are evaluated.
         Pass the center CABS rank to track its differentiable branch at a displaced point.
         Set include_hf_cabs=False when only the pair component is required.
+        Occupied partitions retain the canonical spin order for triples scaling.
         """
         return molecular_low_order_energy(
-            self, request, expected_cabs_rank, include_hf_cabs=include_hf_cabs
+            self,
+            request,
+            expected_cabs_rank,
+            include_hf_cabs=include_hf_cabs,
+            include_occupied_partitions=include_occupied_partitions,
         )
+
+    def tplus_scaling_forces(
+        self,
+        request: FocalRequest,
+        reference: FocalReference,
+        mp2_weights: SpinOccupied,
+        f12_weights: SpinOccupied,
+        *,
+        expected_cabs_rank: int,
+    ) -> np.ndarray:
+        """Relax the MP2 and F12 orbital energy seeds supplied by a (T+) owner."""
+        budget = _check_request(self, request)
+        one = one_electron_sources(
+            request,
+            library=self.one_electron_library or self.shell_library,
+            derivatives=True,
+            budget_mib=budget,
+        )
+        return self._pair_components(
+            request,
+            reference,
+            one,
+            self._pair_panels(request),
+            expected_cabs_rank=expected_cabs_rank,
+            mp2_weights=mp2_weights,
+            f12_weights=f12_weights,
+        )[3]
 
     def low_order_energy_and_forces(
         self, request: FocalRequest, *, include_hf_cabs: bool = True
@@ -635,6 +688,21 @@ class MolecularFocalProvider:
     def __call__(self, request: FocalRequest) -> FocalEvaluation:
         from .experimental.f12_focal import FocalEvaluation, FocalTerm
 
+        if (
+            request.role in ("triples_plus", "triples_f12")
+            and self.triples_models is not None
+        ):
+            from .experimental.f12_focal import (
+                FocalMolecularResult,
+                FocalPlan,
+                _molecular_f12_plan,
+            )
+
+            result = _molecular_f12_plan(
+                FocalPlan(((request, 1.0),)), self, forces=True
+            )
+            assert isinstance(result, FocalMolecularResult)
+            return result.components[0]
         if request.role not in (
             "hf_cabs",
             "mp2_f12_correlation",
@@ -825,6 +893,8 @@ class MolecularFocalProvider:
         panels: tuple[_Panel, _Panel, _Panel],
         *,
         expected_cabs_rank: int | None,
+        mp2_weights: SpinOccupied | None = None,
+        f12_weights: SpinOccupied | None = None,
     ) -> tuple[tuple[float, float, float], float, int, np.ndarray]:
         n = one.obs_ao_count
         jk, mp2, f12 = panels
@@ -836,6 +906,8 @@ class MolecularFocalProvider:
             run=self.run,
             library=self.response_library,
             budget_mib=self.budget_mib,
+            occupied_weights=mp2_weights,
+            canonical_library=self.canonical_library,
         )
         explicit = reference_f12_increment(
             request,
@@ -849,6 +921,7 @@ class MolecularFocalProvider:
             run=self.run,
             library=self.response_library,
             canonical_library=self.canonical_library,
+            occupied_weights=f12_weights,
         )
         # A shared fitted operator has one nuclear derivative. Scatter the OBS
         # cotangents into the leading block of its OBS+OptRI basis, including

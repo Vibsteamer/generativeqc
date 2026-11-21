@@ -718,6 +718,23 @@ and pass the `triples` term or series by keyword. Each correction accepts
 a single term or its own cardinal pair. Difference CCSD and MP2 using the same
 orbital basis, fitted auxiliary policy and correlated space at each cardinal.
 
+A triples mapping selects independent recipes in one call. The keys
+`conventional`, `tplus` and `f12` refer to the conventional correction, the
+Kállay occupied-orbital scaling and the explicitly correlated triples equation.
+For example, `triples={"tplus": basis, "f12": basis}` returns
+`FocalTriplesAlternatives` with one result per method under `.variants`.
+Each energy and force includes its own triples correction exactly once. A
+molecular model owner receives all requested variants on a shared determinant
+and matching basis together. Pass the same alternatives to `singlepoint_energy`
+with their analytic center for signed energy checks.
+
+The built-in molecular provider still evaluates conventional triples. A
+provider must supply the new molecular models before either explicit selection
+can run. For an unpinned recipe with a single triples basis, automatic
+`tplus` selection requires a provider that qualifies both energy and full
+analytic force for every requested cardinal. An existing `protocol_id` and
+explicit method mappings keep the selected recipe fixed.
+
 A single upper term selects a finite endpoint. Giving a lower term and a
 positive exponent selects an inverse-power limit. For an exponential HF plus
 CABS limit use `FocalSeries(upper, lower, alpha, extrapolation="exponential")`.

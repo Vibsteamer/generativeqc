@@ -84,3 +84,21 @@ extern "C" int df_triples_probe_v2(std::size_t o, std::size_t v, std::size_t q,
     return 1;
   }
 }
+
+extern "C" int df_triples_occupied_probe_v1(std::size_t o, std::size_t v, std::size_t q,
+                                            const double* const* inputs, double* values,
+                                            std::size_t values_size) noexcept {
+  try {
+    if (!values || !values_size || values_size - 1 != o)
+      throw std::invalid_argument("incorrect occupied triples output capacity");
+    const auto result = generativeqc::cc::triples::evaluate_df_cuda(
+        o, v, q, inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5], inputs[6],
+        inputs[7], inputs[8], 1e-10, std::size_t{1} << 30, 0, 3,
+        generativeqc::runtime::strict_fp64_precision(), true);
+    values[0] = result.energy;
+    std::copy(result.occupied_energies.begin(), result.occupied_energies.end(), values + 1);
+    return 0;
+  } catch (const std::exception&) {
+    return 1;
+  }
+}

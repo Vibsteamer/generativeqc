@@ -277,7 +277,8 @@ static DFCCSDTResult run_df_ccsdt_native_attempt(
       result.triples = cc::triples::evaluate_df_cuda(
           o, v, q, p.df_bov.data(), p.df_bvv.data(), p.ovoo.data(), p.ovov.data(), p.fov.data(),
           state.solved.t1.data(), state.solved.t2.data(), state.eps_o.data(), state.eps_v.data(),
-          1e-10, difference(budget, base), device, 3, admitted_triples_w);
+          1e-10, difference(budget, base), device, 3, admitted_triples_w,
+          demand.triples_occupied_partition);
       result.numeric_capacity_bytes = std::max(result.numeric_capacity_bytes,
                                                checked_add(base, result.triples.workspace_bytes));
     }
@@ -303,7 +304,8 @@ static DFCCSDTResult run_df_ccsdt_native_attempt(
     if (demand.companions & kMp2Component) {
       const auto companion = cc::evaluate_df_mp2_cuda(
           o, v, q, p.df_bov, state.eps_o, state.eps_v, p.df_source_identity, false, budget, device,
-          checked_add(base, capacity({&state.eps_o, &state.eps_v})),
+          checked_add(base, capacity({&state.eps_o, &state.eps_v,
+                                      &result.triples.occupied_energies})),
           descriptor.mp2_denominator_threshold ? descriptor.mp2_denominator_threshold : 1e-10);
       Result::Companion component;
       component.energy = result.reference_energy + companion.opposite_spin + companion.same_spin;
@@ -863,6 +865,8 @@ DFCCSDTResult run_df_ccsdt_native(
     bool lambda_resident_krylov, double ccsd_mixed_switch_residual, DFCorrelationDemand demand,
     core::CorrelationConvergence convergence) {
   if (demand.mp2 && with_triples) throw std::invalid_argument("DF-MP2 cannot request CC triples");
+  if (demand.triples_occupied_partition && (forces || !with_triples))
+    throw std::invalid_argument("occupied triples partition requires a DF-RCCSD(T) energy request");
   if (reference_experiment && reference_experiment->reference)
     throw std::invalid_argument("clear the previous experiment reference before reuse");
   // Resolve endpoint policy before passing a positive limit to the solver.

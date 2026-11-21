@@ -8,6 +8,7 @@ import numpy as np
 from generativeqc_compiler.tensor import Program, transpose_program
 
 from ._f12_cabs import cabs_singles
+from ._f12_focal_tplus_sources import SpinOccupied, checked_occupied_weights
 from ._f12_spin_ao import _orbital_sources
 from ._f12_spin_fock import spin_fock, spin_fock_pullback
 from ._f12_spin_pairs import occupied_pair_blocks, pair_operands
@@ -99,6 +100,7 @@ def unrestricted_mp2_f12_ao_response(
     auxiliary_batch_size: int | None = None,
     jkfit: Mapping[str, np.ndarray] | None = None,
     component: Literal["all", "ordinary", "f12", "singles"] = "all",
+    occupied_f12_weights: SpinOccupied | None = None,
 ) -> tuple[UnrestrictedF12Energy, dict[str, np.ndarray]]:
     """Evaluate the correlation and singles energies and their common AO cotangents.
 
@@ -112,9 +114,14 @@ def unrestricted_mp2_f12_ao_response(
     energy and transposes its own seed through both fits and orbital frames.
     Both fits share the AO rows, spin frames
     and physical core. JKFit integral weights have the prefix "jkfit/".
+    Selecting the F12 component can also seed its occupied energy partition.
     """
     if component not in ("all", "ordinary", "f12", "singles"):
         raise ValueError("unknown unrestricted F12 component")
+    if occupied_f12_weights is not None:
+        if component != "f12":
+            raise ValueError("occupied F12 weights require the F12 component")
+        checked_occupied_weights(occupied_f12_weights, space[:2])
     jk_data = None
     if jkfit is not None:
         if set(jkfit) != {"ao_coulomb", "metric/coulomb", "metric_whitener"}:
@@ -156,6 +163,7 @@ def unrestricted_mp2_f12_ao_response(
         energies=True,
         fock_data=jk_data,
         component=component,
+        occupied_f12_weights=occupied_f12_weights,
     )
     _, bars = _orbital_sources(space, ao, run, weights, projected=data, role=pair_role)
     assert terms is not None and bars is not None
@@ -181,6 +189,7 @@ def _projected_response(
     energies: bool,
     fock_data: dict[str, np.ndarray] | None = None,
     component: str = "all",
+    occupied_f12_weights: SpinOccupied | None = None,
 ) -> tuple[
     dict[str, np.ndarray], UnrestrictedF12Energy | None, dict[str, np.ndarray] | None
 ]:
@@ -239,14 +248,19 @@ def _projected_response(
         for i, j in pairs:
             primal = pair_operands(data, sources, fock, sl, sr, nl, nr, ext, i, j)
             feeds = {k: np.ascontiguousarray(v) for k, v in primal.items()}
-            feeds.update({"bar_" + name: np.array(1.0) for name in selected})
+            weight = (
+                1.0
+                if occupied_f12_weights is None
+                else (occupied_f12_weights[sl == "beta"][i] + occupied_f12_weights[sr == "beta"][j]) * 0.5
+            )
+            feeds.update({"bar_" + name: np.array(weight) for name in selected})
             result = run(kernel, feeds).outputs
             if energies:
                 count += 1
                 if "ordinary_pair_energy" in selected:
                     mp2_terms.append(float(result["ordinary_pair_energy"]))
                 if "pair_energy" in selected:
-                    f12_terms.append(float(result["pair_energy"]))
+                    f12_terms.append(float(result["pair_energy"]) * weight)
             # Pair operands are views into the molecular arrays. Shared metric,
             # Fock, and repeated occupied-leg entries accumulate independently.
             buffers = pair_operands(

@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from generativeqc_compiler.tensor import Execution, Program
 
     from ._f12_focal_reference import FocalReference
+    from ._f12_focal_tplus_sources import SpinOccupied
     from .experimental.f12_focal import FocalRequest
 
 
@@ -48,6 +49,8 @@ def reference_df_ump2(
     run: Callable | None = None,
     library: ctypes.CDLL | None = None,
     budget_mib: int = 512,
+    occupied_weights: SpinOccupied | None = None,
+    canonical_library: ctypes.CDLL | None = None,
 ) -> FocalUMP2Weights:
     """Calculate ordinary MP2 and relax its integral weights using the same canonical root.
 
@@ -55,12 +58,19 @@ def reference_df_ump2(
     Return derivatives with respect to overlap, core, JKFit and MP2Fit raw
     three-center integrals and metrics. Nuclear forces are minus their
     contractions with the corresponding physical integral derivatives.
+    Occupied weights select a linear combination of the canonical orbital
+    increments. This observable also needs the same-space canonical Fock
+    constraints, since unequal weights depend on the chosen occupied orbitals.
     """
     from generativeqc_compiler.mp2.ordinary_df_factors import ordinary_df_factors
     from generativeqc_compiler.mp2.unrestricted_df_response import df_ump2_pair_response
     from generativeqc_compiler.tensor import Program, execute, transpose_program
 
     from ._f12_focal_singles_response import relaxed_reference_weights
+    from ._f12_focal_tplus_sources import (
+        checked_occupied_weights,
+        occupied_pair_energy_seed,
+    )
     from ._f12_spin_ao import _orbital_sources
     from ._f12_spin_fock import spin_fock, spin_fock_pullback
     from .elements import checked_integer
@@ -99,6 +109,8 @@ def reference_df_ump2(
     occs = tuple(reference.occupied[k] for k in spin_indices)
     if len(occs) != 2 or any(not 0 <= o < n for o in occs) or not any(occs):
         raise ValueError("invalid HF occupations")
+    if occupied_weights is not None:
+        checked_occupied_weights(occupied_weights, occs)
     for source, fit in ((jk, request.basis.jk_fit), (mp2, request.basis.mp2_fit)):
         if fit is None or (
             source.executed_backend,
@@ -168,18 +180,36 @@ def reference_df_ump2(
         if not ol or not orr or (il == ir and ol == 1):
             energies.append(0.0)
             continue
-        graph = df_ump2_pair_response(
-            left + "_" + right, q, ol, n - ol, orr, n - orr, 1, source_weights=True
-        )
-        result = checked(
-            graph, {**controls[left], **controls[right], "bar_force": np.array([-1.0])}
-        ).outputs
-        energies.append(float(result["energy"]))
+        pair_inputs = {**controls[left], **controls[right]}
+        if occupied_weights is None:
+            graph = df_ump2_pair_response(
+                left + "_" + right, q, ol, n - ol, orr, n - orr, 1, source_weights=True
+            )
+            result = checked(
+                graph, {**pair_inputs, "bar_force": np.array([-1.0])}
+            ).outputs
+            energies.append(float(result["energy"]))
+        else:
+            graph = df_ump2_pair_response(
+                left + "_" + right, q, ol, n - ol, orr, n - orr, 1, occupied_partition=True
+            )
+            reverse = transpose_program(graph, ("pair_energies",)).program
+            seed = occupied_pair_energy_seed(occupied_weights[il], occupied_weights[ir])
+            result = checked(
+                Program({**graph.outputs, **reverse.outputs}),
+                {**pair_inputs, "bar_pair_energies": seed},
+            ).outputs
+            energies.append(float(np.vdot(seed, result["pair_energies"])))
         for k in sorted({il, ir}):
             spin, o = spins[k], occs[k]
             seeds[spin] += result["bar_B_" + spin]
-            fock_seeds["fock_" + spin][:o, :o] += result["bar_Fo_" + spin]
-            fock_seeds["fock_" + spin][o:, o:] += result["bar_Fv_" + spin]
+            if occupied_weights is None:
+                fock_seeds["fock_" + spin][:o, :o] += result["bar_Fo_" + spin]
+                fock_seeds["fock_" + spin][o:, o:] += result["bar_Fv_" + spin]
+            else:
+                fock_seeds["fock_" + spin] += np.diag(
+                    np.concatenate((result["bar_eo_" + spin], result["bar_ev_" + spin]))
+                )
 
     mp2_raw_bar = np.zeros_like(mp2.three_center)
     mp2_metric_bar = np.zeros_like(mp2.metric)
@@ -224,6 +254,31 @@ def reference_df_ump2(
             atol=2e-8,
         ):
             raise ValueError("JKFit does not reproduce the canonical physical HF Fock")
+    if occupied_weights is not None:
+        from generativeqc_compiler.method.canonical_frame_response import (
+            orbital_rotation_cotangent,
+        )
+
+        from ._canonical_frame import canonical_frame_seed
+        from ._f12_focal_increment import _canonical_occupied_virtual_blocks
+
+        restricted = len(reference.occupied) == 1
+        for k, spin in enumerate(spins):
+            idx = spin_indices[k]
+            bar = cbar[idx] * (0.5 if restricted else 1.0)
+            rotation = checked(
+                orbital_rotation_cotangent(n, n),
+                {"coefficients": reference.coefficients[idx], "frame_bar": bar},
+            ).outputs["rotation_gradient"]
+            eps, occupied = reference.orbital_energies[idx], occs[k]
+            canonical = (
+                canonical_frame_seed(
+                    rotation, eps, occupied, maximum_bytes=budget << 20, library=canonical_library
+                )[0]
+                if cuda
+                else _canonical_occupied_virtual_blocks(rotation, eps, occupied)
+            )
+            fock_seeds["fock_" + spin] += canonical
     fseed = spin_fock_pullback(fspace, values, fock_seeds, checked)
     _, bars = _orbital_sources(
         space,

@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from ._f12_cabs import CABSProjector
     from ._f12_focal_one_electron import FocalOneElectron
     from ._f12_focal_reference import FocalReference
+    from ._f12_focal_tplus_sources import SpinOccupied
     from .experimental.f12_focal import FocalRequest
 
 
@@ -70,6 +71,7 @@ def reference_f12_increment(
     run: Callable | None = None,
     library: ctypes.CDLL | None = None,
     canonical_library: ctypes.CDLL | None = None,
+    occupied_weights: SpinOccupied | None = None,
 ) -> FocalF12Increment:
     """Calculate only the explicit fixed-cusp F12 pair energy and its relaxed AO weights.
 
@@ -78,6 +80,8 @@ def reference_f12_increment(
     f12, f12_squared, f12_over_coulomb and double_commutator, with their metrics
     and 3-center tensors. All weights are positive energy cotangents. The
     energy excludes HF, ordinary MP2 and CABS singles.
+    Supplying occupied weights selects the corresponding linear combination of
+    orbital increments and relaxes it on the same canonical reference.
     """
     from generativeqc_compiler.tensor import execute
 
@@ -122,7 +126,8 @@ def reference_f12_increment(
         library=library,
     )
     terms, bars = unrestricted_mp2_f12_ao_response(
-        space, ao, checked, jkfit=panel, component="f12"
+        space, ao, checked, jkfit=panel, component="f12",
+        occupied_f12_weights=occupied_weights,
     )
     weights = relaxed_f12_source_weights(
         request,

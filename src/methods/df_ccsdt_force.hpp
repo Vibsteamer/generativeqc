@@ -63,6 +63,8 @@ struct DFCorrelationDemand {
   unsigned companions{};
   /** Explicit scientific model change, never inferred from resource refusal. */
   bool df_reference{};
+  /** Supplement the energy-only physical triples result with its occupied partition. */
+  bool triples_occupied_partition{};
 };
 
 /** Cold normalized geometry -> selected native CUDA RHF -> DF source -> CCSD(T)

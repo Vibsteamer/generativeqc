@@ -48,13 +48,30 @@ Role = Literal[
     "ccsd_minus_mp2",
     "ccsd_f12b_minus_mp2_f12",
     "triples",
+    "triples_plus",
+    "triples_f12",
 ]
+TriplesMethod = Literal["conventional", "tplus", "f12"]
+_TRIPLES_ROLES: dict[TriplesMethod, Role] = {
+    "conventional": "triples",
+    "tplus": "triples_plus",
+    "f12": "triples_f12",
+}
+_METHOD_BY_ROLE = {role: method for method, role in _TRIPLES_ROLES.items()}
+_CABS_ROLES = {
+    "hf_cabs",
+    "mp2_f12_correlation",
+    "ccsd_f12b_minus_mp2_f12",
+    "triples_plus",
+    "triples_f12",
+}
 Backend = Literal["cuda", "cpu_reference"]
 MolecularFocalProvider = _f12_focal_molecular.MolecularFocalProvider
 RHFDFLadderOptions = _uccsd_rhf_virtual_pairs.RHFDFLadderOptions
 UHFDFLadderOptions = _uccsd_uhf_virtual_ladder.UHFDFLadderOptions
 FocalLowOrderForces = _f12_focal_molecular.FocalLowOrderForces
 FocalLowOrderEnergy = _f12_focal_molecular.FocalLowOrderEnergy
+FocalTriplesEvaluation = _f12_focal_molecular.FocalTriplesEvaluation
 FocalUCCEquationSources = _f12_focal_molecular.FocalUCCEquationSources
 FocalUCCFixedSources = _f12_focal_molecular.FocalUCCFixedSources
 FocalUCCStationary = _f12_focal_molecular.FocalUCCStationary
@@ -236,6 +253,21 @@ class FocalSeries(Generic[_Endpoint]):
     extrapolation: Literal["inverse_power", "exponential"] = "inverse_power"
 
 
+_TriplesInput = (
+    _Endpoint
+    | FocalSeries[_Endpoint]
+    | Mapping[TriplesMethod, _Endpoint | FocalSeries[_Endpoint]]
+)
+_Result = TypeVar("_Result")
+
+
+@dataclass(frozen=True)
+class FocalTriplesAlternatives(Generic[_Result]):
+    """One total per requested triples method, in the requested method order."""
+
+    variants: Mapping[TriplesMethod, _Result]
+
+
 @dataclass(frozen=True)
 class FocalResult:
     """The composed energy and forces and their actual per-role input weights."""
@@ -409,7 +441,7 @@ def _weighted_terms(
     hf_cabs: FocalSeries[_Endpoint],
     correlation: FocalSeries[_Endpoint],
     post_mp2: _Endpoint | FocalSeries[_Endpoint] | None,
-    triples: _Endpoint | FocalSeries[_Endpoint] | None,
+    triples: _TriplesInput[_Endpoint] | None,
     *,
     f12_doubles: _Endpoint | FocalSeries[_Endpoint] | None = None,
     nuclei: set[int] | None = None,
@@ -435,10 +467,16 @@ def _weighted_terms(
             raise ValueError(
                 "separate triples require a ccsd_minus_mp2 increment or F12 doubles"
             )
-        triple_series = (
-            triples if isinstance(triples, FocalSeries) else FocalSeries(triples)
+        alternatives = (
+            triples if isinstance(triples, Mapping) else {"conventional": triples}
         )
-        roles.append((triple_series, "triples"))
+        if not alternatives:
+            raise ValueError("select at least one triples method")
+        for method, source in alternatives.items():
+            if method not in _TRIPLES_ROLES:
+                raise ValueError(f"unknown focal triples method {method!r}")
+            series = source if isinstance(source, FocalSeries) else FocalSeries(source)
+            roles.append((series, _TRIPLES_ROLES[method]))
     weighted = []
     for series, role in roles:
         upper, lower = series.upper, series.lower
@@ -540,14 +578,28 @@ def _assemble(weighted: list[tuple[Role, FocalTerm, float]]) -> FocalResult:
     return FocalResult(e, f, tuple(inputs))
 
 
+def _alternative_indices(roles: Iterable[Role]) -> dict[TriplesMethod, tuple[int, ...]]:
+    roles = tuple(roles)
+    return {
+        method: tuple(
+            i
+            for i, role in enumerate(roles)
+            if role not in _METHOD_BY_ROLE or role == selected
+        )
+        for method, selected in dict.fromkeys(
+            (_METHOD_BY_ROLE[role], role) for role in roles if role in _METHOD_BY_ROLE
+        )
+    }
+
+
 def combine(
     hf_cabs: FocalSeries[FocalTerm],
     correlation: FocalSeries[FocalTerm],
     post_mp2: FocalTerm | FocalSeries[FocalTerm] | None,
     *,
-    triples: FocalTerm | FocalSeries[FocalTerm] | None = None,
+    triples: _TriplesInput[FocalTerm] | None = None,
     f12_doubles: FocalTerm | FocalSeries[FocalTerm] | None = None,
-) -> FocalResult:
+) -> FocalResult | FocalTriplesAlternatives[FocalResult]:
     """Apply fixed coefficients to both E and -dE/dR after the electronic solves.
 
     Correlation includes ordinary MP2 correlation plus the explicit F12 pair term.
@@ -560,11 +612,18 @@ def combine(
     Exponential extrapolation is available for the HF plus CABS series.
     All energy and force terms must describe the same ordered geometry.
     """
-    return _assemble(
-        _weighted_terms(
-            hf_cabs, correlation, post_mp2, triples, f12_doubles=f12_doubles
-        )
+    weighted = _weighted_terms(
+        hf_cabs, correlation, post_mp2, triples, f12_doubles=f12_doubles
     )
+    alternatives = _alternative_indices(role for role, _, _ in weighted)
+    if len(alternatives) > 1:
+        return FocalTriplesAlternatives(
+            {
+                method: _assemble([weighted[i] for i in selected])
+                for method, selected in alternatives.items()
+            }
+        )
+    return _assemble(weighted)
 
 
 def _hamiltonian(
@@ -578,7 +637,12 @@ def _hamiltonian(
     for role, basis, _ in weighted:
         if not isinstance(basis, FocalBasis):
             raise TypeError("singlepoint requires FocalBasis inputs")
-        f12_pair = role in ("mp2_f12_correlation", "ccsd_f12b_minus_mp2_f12")
+        f12_pair = role in (
+            "mp2_f12_correlation",
+            "ccsd_f12b_minus_mp2_f12",
+            "triples_plus",
+            "triples_f12",
+        )
         if f12_pair and basis.beta is None:
             raise ValueError("F12 pair correlation requires an explicit beta")
         for name, record, required in (
@@ -627,7 +691,7 @@ def plan_singlepoint(
     charge: int = 0,
     multiplicity: int = 1,
     backend: Backend = "cuda",
-    triples: FocalBasis | FocalSeries[FocalBasis] | None = None,
+    triples: _TriplesInput[FocalBasis] | None = None,
     f12_doubles: FocalBasis | FocalSeries[FocalBasis] | None = None,
     protocol_id: str | None = None,
 ) -> FocalPlan:
@@ -737,7 +801,27 @@ class FocalPlan:
         result = _assemble(weighted)
         return FocalRunResult(result.energy, result.forces, result.weights, evaluations)
 
-    def collect(self, evaluations: Iterable[FocalEvaluation]) -> FocalRunResult:
+    def _selections(self) -> dict[TriplesMethod, tuple[int, ...]]:
+        return _alternative_indices(request.role for request, _ in self.steps)
+
+    def _finish_variants(
+        self, evaluations: tuple[FocalEvaluation, ...]
+    ) -> FocalRunResult | FocalTriplesAlternatives[FocalRunResult]:
+        variants = self._selections()
+        if len(variants) <= 1:
+            return self._finish(evaluations)
+        return FocalTriplesAlternatives(
+            {
+                method: FocalPlan(tuple(self.steps[i] for i in selected))._finish(
+                    tuple(evaluations[i] for i in selected)
+                )
+                for method, selected in variants.items()
+            }
+        )
+
+    def collect(
+        self, evaluations: Iterable[FocalEvaluation]
+    ) -> FocalRunResult | FocalTriplesAlternatives[FocalRunResult]:
         """Validate independently returned components and combine them in recipe order.
 
         Supply one converged result per role and cardinal from the same method
@@ -759,7 +843,52 @@ class FocalPlan:
         missing = requests.keys() - received.keys()
         if missing:
             raise ValueError(f"missing focal components: {sorted(missing)}")
-        return self._finish(tuple(received[key] for key in requests))
+        return self._finish_variants(tuple(received[key] for key in requests))
+
+
+def _prefer_qualified_tplus(
+    plan: FocalPlan,
+    provider: object,
+    triples: _TriplesInput[FocalBasis] | None,
+    protocol_id: str | None,
+) -> FocalPlan:
+    if (
+        protocol_id is not None
+        or triples is None
+        or isinstance(triples, Mapping)
+        or not isinstance(provider, MolecularFocalProvider)
+        or provider.triples_models is None
+        or provider.qualified_tplus is None
+        or not any(q.role == "ccsd_f12b_minus_mp2_f12" for q, _ in plan.steps)
+    ):
+        return plan
+    candidate = FocalPlan(
+        tuple(
+            (
+                replace(request, role="triples_plus")
+                if request.role == "triples"
+                else request,
+                weight,
+            )
+            for request, weight in plan.steps
+        )
+    )
+    plus = [request for request, _ in candidate.steps if request.role == "triples_plus"]
+    if all(
+        request.basis.cabs is not None
+        and request.basis.f12_fit is not None
+        and request.basis.beta is not None
+        and provider.qualified_tplus(request) is True
+        for request in plus
+    ):
+        nuclei = {atom.atomic_number for atom in plus[0].atoms}
+        if all(
+            nuclei <= request.basis.cabs.by_element.keys()
+            and nuclei <= request.basis.f12_fit.by_element.keys()
+            for request in plus
+        ):
+            return candidate
+    return plan
 
 
 def singlepoint(
@@ -774,14 +903,17 @@ def singlepoint(
     charge: int = 0,
     multiplicity: int = 1,
     backend: Backend = "cuda",
-    triples: FocalBasis | FocalSeries[FocalBasis] | None = None,
+    triples: _TriplesInput[FocalBasis] | None = None,
     f12_doubles: FocalBasis | FocalSeries[FocalBasis] | None = None,
     protocol_id: str | None = None,
-) -> FocalRunResult:
+) -> FocalRunResult | FocalTriplesAlternatives[FocalRunResult]:
     """Evaluate a geometry (Bohr) and compose energies (Eh) and forces (Eh/Bohr).
 
     Pass post_mp2=None to evaluate only HF+CABS and MP2-F12 correlation.
     Each provider result is checked and copied before the next provider call.
+    A triples mapping selects conventional, tplus or f12 contributions,
+    each with its own total. New unpinned recipes with a single triples basis
+    may prefer tplus when the native provider qualifies the whole recipe.
     """
     if not callable(provider):
         raise TypeError("a focal component provider is required")
@@ -799,18 +931,19 @@ def singlepoint(
         f12_doubles=f12_doubles,
         protocol_id=protocol_id,
     )
+    plan = _prefer_qualified_tplus(plan, provider, triples, protocol_id)
     if (
         isinstance(provider, MolecularFocalProvider)
         and provider.high_order is None
         and post_mp2 is None
     ):
         molecular = _molecular_f12_plan(plan, provider, forces=True)
-        assert isinstance(molecular, FocalMolecularResult)
+        assert isinstance(molecular, (FocalMolecularResult, FocalTriplesAlternatives))
         return molecular
     evaluations = tuple(
         _accepted(request, provider(request)) for request, _ in plan.steps
     )
-    return plan._finish(evaluations)
+    return plan._finish_variants(evaluations)
 
 
 def _molecular_f12_plan(
@@ -819,8 +952,19 @@ def _molecular_f12_plan(
     *,
     forces: bool,
     center: FocalMolecularResult | None = None,
-) -> FocalMolecularResult | FocalEnergyResult:
+) -> (
+    FocalMolecularResult
+    | FocalEnergyResult
+    | FocalTriplesAlternatives[FocalMolecularResult]
+    | FocalTriplesAlternatives[FocalEnergyResult]
+):
     """Compose molecular roles and share compatible determinants at one geometry."""
+    model_roles = {"triples_plus", "triples_f12"}
+    evaluate_models = provider.triples_models
+    if evaluate_models is None and any(q.role in model_roles for q, _ in plan.steps):
+        raise NotImplementedError(
+            "this molecular provider has no native tplus or f12 triples models"
+        )
     by_basis: dict[str, list[FocalRequest]] = {}
     for request, _ in plan.steps:
         by_basis.setdefault(request.basis.basis_id, []).append(request)
@@ -841,6 +985,7 @@ def _molecular_f12_plan(
         roles = {r.role for r in requests}
         pair = replace(requests[0], role="mp2_f12_correlation")
         reference = None
+        low_order = None
         fit_key = None
         if share_references:
             origin = center.references[identity] if center is not None else None
@@ -871,6 +1016,7 @@ def _molecular_f12_plan(
                     pair, include_hf_cabs=include_hf_cabs
                 )
                 low = low_forces.energies
+                low_order = low_forces
                 if include_hf_cabs:
                     gradients[identity, "hf_cabs"] = low_forces.hf_cabs_forces
                 gradients[identity, "mp2_f12_correlation"] = (
@@ -881,7 +1027,13 @@ def _molecular_f12_plan(
                     pair,
                     expected_cabs_rank=expected_rank,
                     include_hf_cabs=include_hf_cabs,
+                    **(
+                        {"include_occupied_partitions": True}
+                        if "triples_plus" in roles
+                        else {}
+                    ),
                 )
+                low_order = low
                 if expected_rank is not None and low.cabs_rank != expected_rank:
                     raise ValueError(
                         "displaced CABS rank differs from the analytic center"
@@ -969,7 +1121,42 @@ def _molecular_f12_plan(
         if fit_key is not None:
             references_by_fit[fit_key] = reference
         roots[identity] = FocalReferenceSeed(pair, reference)
-        if "triples" in roles:
+        if roles & model_roles:
+            assert evaluate_models is not None
+            selected = tuple(r for r in requests if r.role in _METHOD_BY_ROLE)
+            returned = evaluate_models(
+                selected,
+                reference=reference,
+                low_order=low_order,
+                forces=forces,
+                expected_cabs_rank=expected_rank,
+            )
+            if set(returned) != {r.role for r in selected}:
+                raise ValueError(
+                    "native triples results do not match the requested models"
+                )
+            for r in selected:
+                result = returned[r.role]
+                if not isinstance(result, FocalTriplesEvaluation):
+                    raise TypeError("expected a FocalTriplesEvaluation")
+                if r.role in model_roles:
+                    rank = checked_integer(result.cabs_rank, "triples CABS rank", low=1)
+                    for other in (ranks.get(identity), expected_rank):
+                        if other is not None and other != rank:
+                            raise ValueError(
+                                "native triples CABS rank differs from the shared or center rank"
+                            )
+                    ranks[identity] = rank
+                if (result.forces is not None) != forces:
+                    raise ValueError(
+                        "native triples result has the wrong derivative scope"
+                    )
+                key = identity, r.role
+                energies[key] = result.energy
+                if forces:
+                    assert result.forces is not None
+                    gradients[key] = np.asarray(result.forces).copy()
+        elif "triples" in roles:
             triple = replace(pair, role="triples")
             key = identity, "triples"
             # Fewer than three occupied spin orbitals leaves no triples determinants at any geometry.
@@ -993,11 +1180,39 @@ def _molecular_f12_plan(
         if not math.isfinite(value):
             raise RuntimeError(f"nonfinite {request.role} molecular energy")
         parts.append(FocalEnergyComponent(request, value, weight))
+    variants = plan._selections()
+
+    def frames(
+        subset: Iterable[tuple[FocalRequest, float]],
+    ) -> tuple[dict[str, FocalReferenceSeed], dict[str, int]]:
+        subset = tuple(subset)
+        bases = {r.basis.basis_id for r, _ in subset}
+        complementary = {r.basis.basis_id for r, _ in subset if r.role in _CABS_ROLES}
+        return (
+            {key: seed for key, seed in roots.items() if key in bases},
+            {key: rank for key, rank in ranks.items() if key in complementary},
+        )
+
     if not forces:
-        total = math.fsum(c.energy * c.weight for c in parts)
-        if not math.isfinite(total):
-            raise RuntimeError("combined molecular energy is not finite")
-        return FocalEnergyResult(total, tuple(parts), roots, ranks)
+
+        def energy_result(selected: Iterable[int]) -> FocalEnergyResult:
+            selected = tuple(selected)
+            chosen = tuple(parts[i] for i in selected)
+            total = math.fsum(c.energy * c.weight for c in chosen)
+            if not math.isfinite(total):
+                raise RuntimeError("combined molecular energy is not finite")
+            return FocalEnergyResult(
+                total, chosen, *frames(plan.steps[i] for i in selected)
+            )
+
+        if len(variants) > 1:
+            return FocalTriplesAlternatives(
+                {
+                    method: energy_result(selected)
+                    for method, selected in variants.items()
+                }
+            )
+        return energy_result(range(len(parts)))
     evaluated = []
     for part in parts:
         r = part.request
@@ -1011,9 +1226,73 @@ def _molecular_f12_plan(
             gradients[r.basis.basis_id, r.role],
         )
         evaluated.append(_accepted(r, FocalEvaluation(term, r.backend, True)))
-    result = plan._finish(tuple(evaluated))
-    return FocalMolecularResult(
-        result.energy, result.forces, result.weights, result.components, roots, ranks
+
+    def force_result(selected: Iterable[int]) -> FocalMolecularResult:
+        selected = tuple(selected)
+        subset = tuple(plan.steps[i] for i in selected)
+        result = FocalPlan(subset)._finish(tuple(evaluated[i] for i in selected))
+        return FocalMolecularResult(
+            result.energy,
+            result.forces,
+            result.weights,
+            result.components,
+            *frames(subset),
+        )
+
+    if len(variants) > 1:
+        return FocalTriplesAlternatives(
+            {method: force_result(selected) for method, selected in variants.items()}
+        )
+    return force_result(range(len(evaluated)))
+
+
+def _plan_weights(
+    steps: Iterable[tuple[FocalRequest, float]],
+) -> tuple[tuple[Role, str, int, float], ...]:
+    return tuple((q.role, q.basis.basis_id, q.basis.cardinal, w) for q, w in steps)
+
+
+def _shared_center(
+    plan: FocalPlan,
+    centers: FocalTriplesAlternatives[FocalMolecularResult],
+) -> FocalMolecularResult:
+    selections = plan._selections()
+    if set(centers.variants) != set(selections):
+        raise ValueError(
+            "center and displacement must select the same triples alternatives"
+        )
+    references = {}
+    ranks = {}
+    for method, indices in selections.items():
+        center = centers.variants[method]
+        steps = tuple(plan.steps[i] for i in indices)
+        if (
+            not isinstance(center, FocalMolecularResult)
+            or center.weights != _plan_weights(steps)
+            or set(center.references) != {q.basis.basis_id for q, _ in steps}
+            or set(center.cabs_ranks)
+            != {q.basis.basis_id for q, _ in steps if q.role in _CABS_ROLES}
+        ):
+            raise ValueError(
+                "center and displacement must use matching molecular recipes"
+            )
+        for key, seed in center.references.items():
+            if key in references and references[key] is not seed:
+                raise ValueError(
+                    "triples alternatives must share a determinant at a common basis"
+                )
+            references[key] = seed
+        for key, rank in center.cabs_ranks.items():
+            if key in ranks and ranks[key] != rank:
+                raise ValueError(
+                    "triples alternatives must share CABS ranks at a common basis"
+                )
+            ranks[key] = rank
+    return replace(
+        next(iter(centers.variants.values())),
+        weights=_plan_weights(plan.steps),
+        references=references,
+        cabs_ranks=ranks,
     )
 
 
@@ -1029,15 +1308,18 @@ def singlepoint_energy(
     charge: int = 0,
     multiplicity: int = 1,
     backend: Backend = "cuda",
-    triples: FocalBasis | FocalSeries[FocalBasis] | None = None,
+    triples: _TriplesInput[FocalBasis] | None = None,
     f12_doubles: FocalBasis | FocalSeries[FocalBasis] | None = None,
     protocol_id: str | None = None,
-    center: FocalMolecularResult | None = None,
-) -> FocalEnergyResult:
+    center: FocalMolecularResult
+    | FocalTriplesAlternatives[FocalMolecularResult]
+    | None = None,
+) -> FocalEnergyResult | FocalTriplesAlternatives[FocalEnergyResult]:
     """Evaluate one molecular HF+CABS/MP2-F12 recipe with optional F12 doubles and (T).
 
-    Positions are in Bohr and energies in Hartree. Each basis uses one forward-only
-    determinant. Supply the analytic center to track its occupied root and CABS rank.
+    Positions are in Bohr and energies in Hartree. Each compatible basis uses one
+    forward-only determinant. Supply the center result for the same single recipe
+    or alternatives to track the occupied root and CABS rank.
     """
     if post_mp2 is not None:
         raise ValueError("use f12_doubles for a molecular CCSD-F12b recipe")
@@ -1062,13 +1344,14 @@ def singlepoint_energy(
         f12_doubles=f12_doubles,
         protocol_id=protocol_id,
     )
+    plan = _prefer_qualified_tplus(plan, provider, triples, protocol_id)
+    if isinstance(center, FocalTriplesAlternatives):
+        center = _shared_center(plan, center)
     if center is not None:
         if not isinstance(center, FocalMolecularResult):
             raise TypeError("center must be a molecular focal result")
         cabs_requests = {
-            q.basis.basis_id: q
-            for q, _ in plan.steps
-            if q.role in ("hf_cabs", "mp2_f12_correlation", "ccsd_f12b_minus_mp2_f12")
+            q.basis.basis_id: q for q, _ in plan.steps if q.role in _CABS_ROLES
         }
         if set(center.cabs_ranks) != set(cabs_requests):
             raise ValueError(
@@ -1087,10 +1370,7 @@ def singlepoint_energy(
             checked_integer(
                 center.cabs_ranks[identity], "center CABS rank", low=1, high=dimension
             )
-        weights = tuple(
-            (q.role, q.basis.basis_id, q.basis.cardinal, w) for q, w in plan.steps
-        )
-        if center.weights != weights:
+        if center.weights != _plan_weights(plan.steps):
             raise ValueError(
                 "center and displacement must use the same weighted focal recipe"
             )
@@ -1136,5 +1416,5 @@ def singlepoint_energy(
                 "center and displacement must use the same electronic surface and protocol"
             )
     result = _molecular_f12_plan(plan, provider, forces=False, center=center)
-    assert isinstance(result, FocalEnergyResult)
+    assert isinstance(result, (FocalEnergyResult, FocalTriplesAlternatives))
     return result

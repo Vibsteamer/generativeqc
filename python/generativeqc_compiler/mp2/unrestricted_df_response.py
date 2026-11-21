@@ -1,6 +1,16 @@
 """Analytic spin-resolved DF-UMP2 force on a moving orthonormal orbital frame."""
 
-from ..tensor.ir import Node, add, broadcast, divide, einsum, input_tensor, multiply, reduce_sum, transpose
+from ..tensor.ir import (
+    Node,
+    add,
+    broadcast,
+    divide,
+    einsum,
+    input_tensor,
+    multiply,
+    reduce_sum,
+    transpose,
+)
 from ..tensor.program import Program
 from ..tensor.types import Index, IndexSpace, TensorSpec
 
@@ -15,6 +25,7 @@ def df_ump2_pair_response(
     directions: int,
     *,
     source_weights: bool = False,
+    occupied_partition: bool = False,
 ) -> Program:
     """Return energy and separate factor-/Fock-response forces for one spin pair.
 
@@ -34,6 +45,8 @@ def df_ump2_pair_response(
         raise ValueError("a DF-UMP2 response graph requires positive dimensions")
     if source_weights and directions != 1:
         raise ValueError("a source cotangent requires a single force seed")
+    if occupied_partition and source_weights:
+        raise ValueError("an occupied partition takes its own pair-energy cotangent")
     left_spin, right_spin = channel.split("_")
     same = left_spin == right_spin
     if same and (left_occupied, left_virtuals) != (right_occupied, right_virtuals):
@@ -42,7 +55,9 @@ def df_ump2_pair_response(
     x = Index("x", IndexSpace("coordinate", "batch", directions))
 
     def input_(name: str, *indices: Index) -> Node:
-        live = source_weights and name.startswith(("dB_", "dFo_", "dFv_"))
+        live = (source_weights and name.startswith(("dB_", "dFo_", "dFv_"))) or (
+            occupied_partition and name.startswith(("B_", "eo_", "ev_"))
+        )
         return input_tensor(name, TensorSpec(indices, role="input", differentiable=live))
 
     def spin_inputs(spin: str, nocc: int, nvir: int, olab: str, vlab: str) -> dict[str, Node]:
@@ -68,6 +83,16 @@ def df_ump2_pair_response(
     numerator = add(direct, transpose(direct, (0, 1, 3, 2)), coefficients=(1, -1)) if same else direct
     amplitude = divide(numerator, denominator)
     weight = "1/4" if same else 1
+    if occupied_partition:
+        return Program(
+            {"pair_energies": add(reduce_sum(multiply(amplitude, numerator), (2, 3)),
+                                  coefficients=(weight,))},
+            provenance={
+                "method": "canonical occupied-partition DF-MP2",
+                "spin_pair": channel,
+                "ordered_occupied_sum": True,
+            },
+        )
     energy = add(reduce_sum(multiply(amplitude, numerator), (0, 1, 2, 3)), coefficients=(weight,))
 
     # In the full ordered same-spin sum, applying the exchange permutation to
