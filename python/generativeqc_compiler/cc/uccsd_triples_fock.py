@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
 
 def build_tile_resolvent_program(
-    layout: UCCSDLayout, channel: str, shape: tuple[int, ...]
+    layout: UCCSDLayout, channel: str, shape: tuple[int, ...], *, lanes: int | None = None
 ) -> TriplesTileProgram:
     """Return the scalar energy and bounded X=C/D, Y=(C+V)/D outputs.
 
@@ -42,7 +42,49 @@ def build_tile_resolvent_program(
     that factor exactly once. The caller owns complete paired-grid admission,
     fresh parent qualification and at-most-two-page vector retention.
     """
-    return _build_tile_program(layout, channel, shape, resolvents=True)
+    return _build_tile_program(layout, channel, shape, resolvents=True, lanes=lanes)
+
+
+def _axis_moment(
+    channel: str,
+    axis: int,
+    equation: str,
+    x_left: Node,
+    y_left: Node,
+    x_right: Node,
+    y_right: Node,
+) -> Program:
+    domain, spin = ("o" if axis < 3 else "v"), (channel * 2)[axis]
+    multiplicity = Fraction(comb(3, channel.count("a")) ** 2, 36)
+    factor = (-1 if axis < 3 else 1) * multiplicity / 2
+    return Program(
+        {
+            f"f{domain * 2}_{spin * 2}": add(
+                einsum(equation, x_left, y_right),
+                einsum(equation, y_left, x_right),
+                coefficients=(factor, factor),
+            )
+        },
+        provenance={
+            "method": "UCCSD(T)",
+            "spin_channel": channel,
+            "resolvent_axis": axis,
+            "spin_multiplicity": (multiplicity.numerator, multiplicity.denominator),
+            "contract": "symmetric complete same-space separable Fock resolvent moment",
+        },
+    )
+
+
+def _vector(name: str, indices: tuple[Index, ...]) -> Node:
+    return input_tensor(
+        name,
+        TensorSpec(
+            indices,
+            representation="spin_orbital",
+            role="parameter",
+            differentiable=True,
+        ),
+    )
 
 
 def build_axis_moment_program(
@@ -113,36 +155,26 @@ def build_axis_moment_program(
         for position, index in enumerate(left_indices)
     )
 
-    def vector(name: str, indices: tuple[Index, ...]) -> Node:
-        return input_tensor(
-            name,
-            TensorSpec(
-                indices,
-                representation="spin_orbital",
-                role="parameter",
-                differentiable=True,
-            ),
-        )
-
-    x_left, y_left = (vector(name, left_indices) for name in ("x_left", "y_left"))
-    x_right, y_right = (vector(name, right_indices) for name in ("x_right", "y_right"))
+    x_left, y_left = (_vector(name, left_indices) for name in ("x_left", "y_left"))
+    x_right, y_right = (_vector(name, right_indices) for name in ("x_right", "y_right"))
     left_labels = "ijkabc"
     right_labels = left_labels[:axis] + "p" + left_labels[axis + 1 :]
     equation = f"{left_labels},{right_labels}->{left_labels[axis]}p"
-    multiplicity = Fraction(comb(3, channel.count("a")) ** 2, 36)
-    factor = ((-1) if axis < 3 else 1) * multiplicity / 2
-    output = add(
-        einsum(equation, x_left, y_right),
-        einsum(equation, y_left, x_right),
-        coefficients=(factor, factor),
-    )
-    return Program(
-        {f"f{domain * 2}_{spin * 2}": output},
-        provenance={
-            "method": "UCCSD(T)",
-            "spin_channel": channel,
-            "resolvent_axis": axis,
-            "spin_multiplicity": (multiplicity.numerator, multiplicity.denominator),
-            "contract": "symmetric complete same-space separable Fock resolvent moment",
-        },
-    )
+    return _axis_moment(channel, axis, equation, x_left, y_left, x_right, y_right)
+
+
+def build_axis_moment_panel_program(
+    layout: UCCSDLayout, channel: str, axis: int, lanes: int
+) -> Program:
+    """Contract a bounded panel of shared complements over a full open axis."""
+    if type(axis) is not int or not 0 <= axis < 6:
+        raise ValueError("triples Fock moment axis must be an integer in [0, 6)")
+    if type(lanes) is not int or lanes < 1:
+        raise ValueError("triples Fock moment panel requires positive lanes")
+    extent = channel_shape(layout, channel)[axis]
+    spin = "alpha" if (channel * 2)[axis] == "a" else "beta"
+    domain = "occupied" if axis < 3 else "virtual"
+    orbital = Index("i", IndexSpace("triples_panel_orbital", domain, extent, spin))
+    complement = Index("q", IndexSpace("triples_panel_complement", "batch", lanes))
+    x, y = (_vector(name, (orbital, complement)) for name in ("x", "y"))
+    return _axis_moment(channel, axis, "iq,jq->ij", x, y, x, y)

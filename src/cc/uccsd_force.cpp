@@ -8,6 +8,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 #include "cc/uccsd_executor.hpp"
 #include "core/work_budget.hpp"
@@ -65,16 +66,20 @@ class Runtime {
       : sizes{alpha, beta, nbf - alpha, nbf - beta}, nbf(nbf) {}
 
   graph::ResponseSizes input_sizes(const std::string& program) const {
-    return graph::response_inputs(program, sizes[0], sizes[1], sizes[2], sizes[3], nbf, nbf, 1);
+    return graph::response_inputs(program, sizes[0], sizes[1], sizes[2], sizes[3], nbf, nbf, 1,
+                                  graph::kTriplesMomentPanelLanes);
   }
   graph::ResponseSizes output_sizes(const std::string& program) const {
-    return graph::response_outputs(program, sizes[0], sizes[1], sizes[2], sizes[3], nbf, nbf, 1);
+    return graph::response_outputs(program, sizes[0], sizes[1], sizes[2], sizes[3], nbf, nbf, 1,
+                                   graph::kTriplesMomentPanelLanes);
   }
   std::size_t required(const std::string& program) const {
-    return graph::response_required(program, sizes[0], sizes[1], sizes[2], sizes[3], nbf, nbf, 1);
+    return graph::response_required(program, sizes[0], sizes[1], sizes[2], sizes[3], nbf, nbf, 1,
+                                    graph::kTriplesMomentPanelLanes);
   }
   std::size_t work(const std::string& program) const {
-    return graph::response_work(program, sizes[0], sizes[1], sizes[2], sizes[3], nbf, nbf, 1);
+    return graph::response_work(program, sizes[0], sizes[1], sizes[2], sizes[3], nbf, nbf, 1,
+                                graph::kTriplesMomentPanelLanes);
   }
   Values zero_inputs(const std::string& program) const {
     Values result;
@@ -97,7 +102,8 @@ class Runtime {
     if (executor) return executor->evaluate(program, inputs);
     arena.resize(required(program));
     const auto views = graph::response_evaluate(program, sizes[0], sizes[1], sizes[2], sizes[3],
-                                                nbf, nbf, 1, inputs, arena.data(), arena.size());
+                                                nbf, nbf, 1, graph::kTriplesMomentPanelLanes,
+                                                inputs, arena.data(), arena.size());
     Values result;
     for (const auto& [name, count] : output_sizes(program)) {
       auto& values = result[name];
@@ -227,46 +233,70 @@ Values raw_inputs(Runtime& runtime, const hf::UnrestrictedPhysicalReference& ref
   return inputs;
 }
 
-template <class Bindings, class Consume>
-Values tile_inputs(const Bindings& bindings, const std::array<std::size_t, 6>& selected,
-                   const std::array<unsigned, 3>& spins, const Runtime& runtime,
-                   const hf::UnrestrictedPhysicalReference& reference, const Values& feeds,
-                   Consume consume) {
-  Values result;
+using TriplesSelection = std::array<std::size_t, 6>;
+constexpr std::string_view triples_labels = "ijkabc";
+
+template <class Bindings, class BoundOperand>
+void visit_triples_panel(const Bindings& bindings, const std::vector<TriplesSelection>& selected,
+                         const Runtime& runtime, BoundOperand bound_operand) {
   for (const auto& binding : bindings) {
-    auto& buffer = result[binding.name];
-    if (std::string(binding.source).starts_with("eps_")) {
-      const auto position = std::string("ijkabc").find(binding.labels[0]);
-      const auto spin = spins[position % 3];
-      buffer = {reference.orbital_energies[spin][selected[position] +
-                                                 (position < 3 ? 0 : reference.nocc[spin])]};
-      continue;
-    }
+    const std::string_view source = binding.source;
+    if (source.starts_with("eps_")) continue;
     const auto spec =
         std::find_if(graph::kFeeds.begin(), graph::kFeeds.end(),
-                     [&](const auto& item) { return std::string(item.name) == binding.source; });
+                     [&](const auto& item) { return item.name == source; });
     if (spec == graph::kFeeds.end())
       throw std::invalid_argument("unknown unrestricted triples source");
+    std::array<std::size_t, 4> positions{};
     const auto dimensions = shape(*spec, runtime.sizes);
     Shape tile_shape{1, 1, 1, 1};
-    for (unsigned axis = 0; axis < binding.rank; ++axis)
-      if (binding.labels[axis] == 'm' || binding.labels[axis] == 'e')
+    for (unsigned axis = 0; axis < binding.rank; ++axis) {
+      positions[axis] = triples_labels.find(binding.labels[axis]);
+      if (positions[axis] == std::string_view::npos)
         tile_shape[axis] = dimensions[binding.axes[axis]];
-    buffer.resize(
-        graph::checked_product({tile_shape[0], tile_shape[1], tile_shape[2], tile_shape[3]}));
-    for (std::size_t flat = 0; flat < buffer.size(); ++flat) {
-      const auto indices = coordinates(flat, tile_shape, binding.rank);
-      Shape source_indices{};
-      for (unsigned axis = 0; axis < binding.rank; ++axis) {
-        const auto external = std::string("ijkabc").find(binding.labels[axis]);
-        source_indices[binding.axes[axis]] =
-            external == std::string::npos ? indices[axis] : selected[external];
-      }
-      const auto source_offset = offset(source_indices, dimensions, binding.rank);
-      buffer[flat] = feeds.at(binding.source)[source_offset];
-      consume(binding, flat, source_offset);
     }
+    const auto size = graph::checked_product(
+        {tile_shape[0], tile_shape[1], tile_shape[2], tile_shape[3]});
+    const auto consume = bound_operand(binding);
+    for (std::size_t lane = 0; lane < selected.size(); ++lane)
+      for (std::size_t flat = 0; flat < size; ++flat) {
+        const auto indices = coordinates(flat, tile_shape, binding.rank);
+        Shape source_indices{};
+        for (unsigned axis = 0; axis < binding.rank; ++axis)
+          source_indices[binding.axes[axis]] = positions[axis] == std::string_view::npos
+                                                 ? indices[axis]
+                                                 : selected[lane][positions[axis]];
+        consume(lane * size + flat, offset(source_indices, dimensions, binding.rank));
+      }
   }
+}
+
+template <class Bindings>
+Values triples_panel_inputs(const std::string& program, const Bindings& bindings,
+                            const std::vector<TriplesSelection>& selected,
+                            const std::array<unsigned, 3>& spins, const Runtime& runtime,
+                            const hf::UnrestrictedPhysicalReference& reference,
+                            const Values& feeds) {
+  auto result = runtime.zero_inputs(program);
+  for (const auto& binding : bindings)
+    if (std::string_view(binding.source).starts_with("eps_")) {
+      const auto axis = triples_labels.find(binding.labels[0]);
+      const auto spin = spins[axis % 3];
+      const auto first = axis < 3 ? 0 : reference.nocc[spin];
+      const auto& energies = reference.orbital_energies[spin];
+      auto& buffer = result.at(binding.name);
+      // Pad absent lanes with a qualified denominator and zero numerators.
+      std::fill(buffer.begin(), buffer.end(), energies[first + selected.front()[axis]]);
+      for (std::size_t lane = 0; lane < selected.size(); ++lane)
+        buffer[lane] = energies[first + selected[lane][axis]];
+    }
+  visit_triples_panel(bindings, selected, runtime, [&](const auto& binding) {
+    const auto& values = feeds.at(binding.source);
+    auto& buffer = result.at(binding.name);
+    return [&buffer, &values](auto panel_offset, auto source_offset) {
+      buffer[panel_offset] = values[source_offset];
+    };
+  });
   return result;
 }
 
@@ -279,8 +309,8 @@ bool repeated(const std::array<std::size_t, 6>& selected, const std::array<unsig
   return false;
 }
 
-/** Bounded singleton reverse tiles plus paired X/Y pages. Off-diagonal Fock
- * bars are generated at exactly the same parent amplitudes as diagonal bars. */
+/** Pack independent reverse tiles and X/Y resolvent moments. Same-space Fock
+ * bars are generated at exactly the same parent amplitudes as the energy. */
 template <class Bindings>
 double triples_response(const std::string& channel, const std::array<unsigned, 3>& spins,
                         const Bindings& bindings, Runtime& runtime,
@@ -304,55 +334,98 @@ double triples_response(const std::string& channel, const std::array<unsigned, 3
     }
     return selected;
   };
-  const auto gather = [&](const auto& selected) {
-    return tile_inputs(bindings, selected, spins, runtime, reference, feeds,
-                       [](const auto&, auto, auto) {});
+  constexpr auto panel_lanes = graph::kTriplesMomentPanelLanes;
+  std::vector<TriplesSelection> selected;
+  selected.reserve(panel_lanes);
+  const auto run_panel = [&](const auto& program, bool reverse) {
+    auto inputs = triples_panel_inputs(program, bindings, selected, spins, runtime,
+                                       reference, feeds);
+    if (reverse) {
+      auto& seed = inputs.at("bar_triples_energy");
+      std::fill_n(seed.begin(), selected.size(), 1.0);
+    }
+    return runtime.run(program, inputs);
   };
+  const auto bar_program = "bars_" + channel;
   double energy = 0.0;
+  const auto flush_bars = [&] {
+    if (selected.empty()) return;
+    const auto bars = run_panel(bar_program, true);
+    const auto& energies = bars.at("triples_energy");
+    for (std::size_t lane = 0; lane < selected.size(); ++lane) energy += energies[lane];
+    visit_triples_panel(bindings, selected, runtime, [&](const auto& binding) {
+      const std::string source = binding.source;
+      const auto& values = bars.at("bar_" + std::string(binding.name));
+      auto& target = source.starts_with('t') ? amplitude_bars.at("bar_" + source)
+                                             : parameter_seeds.at("bar_" + source);
+      return [&target, &values](auto panel_offset, auto source_offset) {
+        target[source_offset] += values[panel_offset];
+      };
+    });
+    selected.clear();
+  };
   for (std::size_t flat = 0; flat < count; ++flat) {
-    const auto selected = select(flat, dimensions);
-    if (repeated(selected, spins)) continue;
-    auto inputs = gather(selected);
-    energy += runtime.run("vectors_" + channel, inputs).at("triples_energy")[0];
-    inputs["bar_triples_energy"] = {1.0};
-    const auto bars = runtime.run("bars_" + channel, inputs);
-    tile_inputs(bindings, selected, spins, runtime, reference, feeds,
-                [&](const auto& binding, auto tile_offset, auto source_offset) {
-                  const auto& source = std::string(binding.source);
-                  const auto value = bars.at("bar_" + std::string(binding.name))[tile_offset];
-                  auto& target = source.starts_with('t') ? amplitude_bars.at("bar_" + source)
-                                                         : parameter_seeds.at("bar_" + source);
-                  target[source_offset] += value;
-                });
+    const auto point = select(flat, dimensions);
+    if (repeated(point, spins)) continue;
+    selected.push_back(point);
+    if (selected.size() == panel_lanes) flush_bars();
   }
+  flush_bars();
+
+  const auto vectors_program = "vector_panel_" + channel;
+  std::vector<std::size_t> destinations;
+  destinations.reserve(panel_lanes);
   for (unsigned axis = 0; axis < 6; ++axis) {
     auto extents = dimensions;
     extents[axis] = 1;
-    const auto others = count / dimensions[axis];
-    std::vector<double> numerators(dimensions[axis]), resolvents(dimensions[axis]);
+    const auto orbitals = dimensions[axis];
+    const auto others = count / orbitals;
     const auto program = "moment_" + channel + "_" + std::to_string(axis);
     const auto spin = spins[axis % 3];
     const std::string name = std::string(axis < 3 ? "foo_" : "fvv_") + (spin ? "bb" : "aa");
     auto& target = parameter_seeds.at("bar_" + name);
-    for (std::size_t flat = 0; flat < others; ++flat) {
-      auto selected = select(flat, extents);
-      for (std::size_t orbital = 0; orbital < dimensions[axis]; ++orbital) {
-        selected[axis] = orbital;
-        numerators[orbital] = resolvents[orbital] = 0.0;
-        if (repeated(selected, spins)) continue;
-        const auto vectors = runtime.run("vectors_" + channel, gather(selected));
-        numerators[orbital] = vectors.at("x")[0];
-        resolvents[orbital] = vectors.at("y")[0];
+    auto packed = runtime.zero_inputs(program);
+    auto& numerators = packed.at("x");
+    auto& resolvents = packed.at("y");
+    const auto flush_vectors = [&] {
+      if (selected.empty()) return;
+      const auto vectors = run_panel(vectors_program, false);
+      const auto& x = vectors.at("x");
+      const auto& y = vectors.at("y");
+      for (std::size_t lane = 0; lane < selected.size(); ++lane) {
+        numerators[destinations[lane]] = x[lane];
+        resolvents[destinations[lane]] = y[lane];
       }
-      for (std::size_t left = 0; left < dimensions[axis]; ++left)
-        for (std::size_t right = left; right < dimensions[axis]; ++right) {
-          const auto moment = runtime.run(program, {{"x_left", {numerators[left]}},
-                                                    {"y_left", {resolvents[left]}},
-                                                    {"x_right", {numerators[right]}},
-                                                    {"y_right", {resolvents[right]}}});
-          const auto value = moment.at(name)[0];
-          target[left * dimensions[axis] + right] += value;
-          if (left != right) target[right * dimensions[axis] + left] += value;
+      selected.clear();
+      destinations.clear();
+    };
+    for (std::size_t first = 0; first < others;) {
+      const auto lanes = std::min(panel_lanes, others - first);
+      std::fill(numerators.begin(), numerators.end(), 0.0);
+      std::fill(resolvents.begin(), resolvents.end(), 0.0);
+      bool active = false;
+      for (std::size_t lane = 0; lane < lanes; ++lane) {
+        auto point = select(first + lane, extents);
+        for (std::size_t orbital = 0; orbital < orbitals; ++orbital) {
+          point[axis] = orbital;
+          if (repeated(point, spins)) continue;
+          active = true;
+          selected.push_back(point);
+          destinations.push_back(orbital * panel_lanes + lane);
+          if (selected.size() == panel_lanes) flush_vectors();
+        }
+      }
+      flush_vectors();
+      first += lanes;
+      if (!active) continue;
+      if (!active) continue;
+      const auto moments = runtime.run(program, packed);
+      const auto& moment = moments.at(name);
+      for (std::size_t left = 0; left < orbitals; ++left)
+        for (std::size_t right = left; right < orbitals; ++right) {
+          const auto value = moment[left * orbitals + right];
+          target[left * orbitals + right] += value;
+          if (left != right) target[right * orbitals + left] += value;
         }
     }
   }
@@ -516,7 +589,7 @@ std::size_t unrestricted_force_capacity(std::size_t nbf, std::size_t alpha, std:
                                     "correction" + suffix};
   if (triples)
     for (const auto& channel : std::array<std::string, 4>{"aaa", "aab", "abb", "bbb"}) {
-      programs.push_back("vectors_" + channel);
+      programs.push_back("vector_panel_" + channel);
       programs.push_back("bars_" + channel);
       for (unsigned axis = 0; axis < 6; ++axis)
         programs.push_back("moment_" + channel + "_" + std::to_string(axis));
