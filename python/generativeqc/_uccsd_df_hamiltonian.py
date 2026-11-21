@@ -13,6 +13,7 @@ from generativeqc_compiler.cc.uccsd_layout import BLOCK_NAMES
 from generativeqc_compiler.common.arrays import immutable
 from generativeqc_compiler.mp2.f12_density_fitting import (
     coulomb_fit_response,
+    coulomb_pair_projection,
     fitted_integral_block,
 )
 from generativeqc_compiler.tensor import Program, linearize
@@ -159,6 +160,7 @@ def _hamiltonian_blocks(
     }
     solve = coulomb_fit_response(aux, obs * obs)
     fit_graph = Program({"fit": solve.outputs["fit"]})
+    projection = coulomb_pair_projection(aux, obs) if bounded else None
     dfit_graph = unrestricted_cc_obs_fit_direction(aux, obs)
     factors = {}
     for spin in spins.values():
@@ -170,7 +172,13 @@ def _hamiltonian_blocks(
         ):
             raise ValueError("Expected a finite FP64 extended spin Fock matrix")
         name = "source/raw_coulomb_" + spin
-        raw = np.ascontiguousarray(data[name][:, :obs, :obs]).reshape(aux, -1)
+        raw = np.ascontiguousarray(data[name][:, :obs, :obs])
+        if projection is not None:
+            # The inverse metric can amplify roundoff in the two MO orders.
+            if not np.allclose(raw, raw.swapaxes(1, 2), rtol=0, atol=1e-10):
+                raise ValueError(f"Raw ordinary Coulomb pairs lack symmetry for {spin}")
+            raw = run(projection, {"raw_coulomb": raw}).outputs["raw_coulomb"]
+        raw = raw.reshape(aux, -1)
         fit = run(
             fit_graph, {"metric_whitener": whitener, "three_center": raw}
         ).outputs["fit"]

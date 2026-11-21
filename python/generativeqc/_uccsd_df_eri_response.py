@@ -13,6 +13,7 @@ from generativeqc_compiler.mp2.f12_density_fitting import (
     coulomb_fit_response,
     fitted_integral_block,
     molecular_orbital_sources,
+    symmetric_coulomb_pairs,
 )
 from generativeqc_compiler.tensor import Program, transpose_program
 
@@ -96,6 +97,10 @@ def unrestricted_cc_eri_pullback(
     }
     # The full OBS projection and implicit solve are reused by every signed block.
     mo_source = molecular_orbital_sources(nao, nmo, 0, aux).outputs["raw_coulomb"]
+    if virtual_factor_weights is not None:
+        # Transposing this graph applies the same self-adjoint pair projection
+        # to the combined weight from the bare factors and the metric solve.
+        mo_source = symmetric_coulomb_pairs(mo_source)
     project = Program({"raw_coulomb": mo_source})
     project_rev = transpose_program(project, ("raw_coulomb",)).program
     solve = coulomb_fit_response(aux, nmo * nmo)

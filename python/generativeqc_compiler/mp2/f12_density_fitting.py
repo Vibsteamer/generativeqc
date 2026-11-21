@@ -6,6 +6,19 @@ from ..tensor.robust_density_fit import robust_fitted_operator
 from ..tensor.types import Index, IndexSpace, TensorSpec
 
 
+def symmetric_coulomb_pairs(raw: Node) -> Node:
+    """Project a three-center Coulomb tensor onto symmetric orbital pairs."""
+    return add(raw, transpose(raw, (0, 2, 1)), coefficients=("1/2", "1/2"))
+
+
+def coulomb_pair_projection(auxiliaries: int, orbitals: int) -> Program:
+    aux = Index("a", IndexSpace("fitting_basis", "auxiliary", auxiliaries))
+    mo = IndexSpace("ordinary_orbital", "orbital", orbitals)
+    axes = (aux, Index("p", mo), Index("q", mo))
+    raw = input_tensor("raw_coulomb", TensorSpec(axes, role="input"))
+    return Program({"raw_coulomb": symmetric_coulomb_pairs(raw)})
+
+
 def molecular_orbital_sources(
     atomic: int, orbitals: int, occupied: int, auxiliaries: int
 ) -> Program:

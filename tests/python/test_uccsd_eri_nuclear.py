@@ -13,6 +13,37 @@ from generativeqc_compiler.tensor import execute, transpose_program
 from tools.generativeqc_cc.uccsd_eri_nuclear import unrestricted_cc_eri_pullback
 
 
+def test_bounded_pair_projection_precedes_ill_conditioned_fit() -> None:
+    rng = np.random.default_rng(637)
+    obs, aux = 4, 3
+    raw = rng.normal(size=(aux, obs, obs))
+    raw = (raw + raw.swapaxes(1, 2)) / 2
+    raw[0, 2, 3] += 2e-12
+    whitener = np.diag([1e4, 1.0, 1.0])
+    projected = (raw + raw.swapaxes(1, 2)) / 2
+    expected_fit = np.linalg.solve(
+        np.diag([1e-8, 1.0, 1.0]), projected.reshape(aux, -1)
+    ).reshape(aux, obs, obs)
+    assert abs(raw[0, 2, 3] - raw[0, 3, 2]) / 1e-8 > 1e-6
+    fock = np.diag(np.linspace(-1, 1, obs))
+    factors = {}
+    unrestricted_cc_df_hamiltonian(
+        (2, 2, obs, obs, aux),
+        {"source/raw_coulomb_alpha": raw, "source/raw_coulomb_beta": raw},
+        {"fock_alpha": fock, "fock_beta": fock},
+        whitener,
+        execute,
+        retain_rhf_virtual_factors=factors,
+    )
+    np.testing.assert_array_equal(factors["raw_right"], projected[:, 2:, 2:])
+    np.testing.assert_array_equal(
+        factors["fit_left"], factors["fit_left"].swapaxes(1, 2)
+    )
+    np.testing.assert_allclose(
+        factors["fit_left"], expected_fit[:, 2:, 2:], rtol=2e-15
+    )
+
+
 def test_frozen_unrestricted_eri_reverse() -> None:
     rng = np.random.default_rng(629)
     n, obs, q = 6, 5, 4
@@ -154,7 +185,7 @@ def test_virtual_factor_bars_share_the_ordinary_ao_and_metric_pullback() -> None
     )
     assert dense.keys() - bounded.keys() == set(virtual_names)
     for name, value in bounded.items():
-        np.testing.assert_array_equal(value, dense[name])
+        np.testing.assert_allclose(value, dense[name], rtol=0, atol=2e-15)
     assert all(not factors[name].flags.writeable for name in FACTOR_INPUTS)
     factor_bars = {name: np.empty_like(value) for name, value in factors.items()}
     for start, stop in ((0, 2), (2, 4), (4, 5)):
@@ -187,5 +218,7 @@ def test_virtual_factor_bars_share_the_ordinary_ao_and_metric_pullback() -> None
         frozen_occupied=frozen,
         virtual_factor_weights=factor_bars,
     )
+    dense_ao = expected["ao_coulomb"]
+    expected["ao_coulomb"] = (dense_ao + dense_ao.swapaxes(1, 2)) / 2
     for name, value in expected.items():
         np.testing.assert_allclose(calculated[name], value, rtol=0, atol=2e-13)
