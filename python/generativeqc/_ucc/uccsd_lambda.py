@@ -247,6 +247,12 @@ class _PackedUCCSDLambda:
 
     _parent_type: type[_PackedUCCSD]
 
+    def _extra_response_bytes(self) -> int:
+        return 0
+
+    def _response_setup_work(self) -> int:
+        return 0
+
     def __init__(
         self,
         prepared: _PackedUCCSD,
@@ -271,7 +277,7 @@ class _PackedUCCSDLambda:
             "reference_id": prepared.reference.identity,
             "hamiltonian_id": prepared.reference.hamiltonian_id,
             "integral_hash": prepared.integral_hash,
-            "equation_hash": prepared.program.logical_hash,
+            "equation_hash": prepared.equation_hash,
         }
         if any(
             state.provenance.get(name) != value for name, value in identities.items()
@@ -355,6 +361,7 @@ class _PackedUCCSDLambda:
             raise MemoryError("UCCSD Lambda Krylov workspace budget exceeded")
         self.peak_bytes = checked_bytes(
             self.base_bytes
+            + self._extra_response_bytes()
             + krylov_bytes
             + max(resource.native_bytes for resource in self._resources.values()),
             "UCCSD Lambda simultaneous numeric storage",
@@ -363,7 +370,10 @@ class _PackedUCCSDLambda:
             raise MemoryError(
                 "UCCSD Lambda state, maps, native and Krylov budget exceeded"
             )
-        planned_work = self._resources[prepared.program.logical_hash].scalar_work
+        planned_work = (
+            self._resources[prepared.program.logical_hash].scalar_work
+            + self._response_setup_work()
+        )
         if dimension:
             planned_work += (
                 self._resources[self.programs.energy_vjp.derivative_hash].scalar_work

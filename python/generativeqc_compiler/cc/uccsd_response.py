@@ -121,7 +121,13 @@ def build_f12_df_remainder_source_vjps(
     programs: UCCSDF12DFResponsePrograms, *, max_elements: int = 1_000_000
 ) -> tuple[VJPProgram, VJPProgram]:
     """Keep the large three-virtual source cotangents separate from other sources."""
-    remainder = programs.remainder
+    return _df_remainder_source_vjps(programs.remainder, max_elements)
+
+
+def _df_remainder_source_vjps(
+    remainder: UCCSDResponsePrograms,
+    max_elements: int,
+) -> tuple[VJPProgram, VJPProgram]:
     three_virtual = tuple(
         name for name in remainder.parameter_names if name.startswith("govvv_")
     )

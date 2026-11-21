@@ -193,6 +193,16 @@ class _PackedUCCSD:
             getattr(self.executor.compiler, "target", None),
         )
 
+    @property
+    def equation_hash(self) -> str:
+        return self.program.logical_hash
+
+    def _evaluate_physical(self, amplitudes: Mapping[str, np.ndarray]) -> dict:
+        return self.executor.execute(self.program, {**self.feeds, **amplitudes})
+
+    def _work_provenance(self, evaluations: int) -> dict[str, int]:
+        return {}
+
     def evaluate(self, packed: np.ndarray) -> dict[str, np.ndarray]:
         """Evaluate physical residuals on the selected backend with owned feeds."""
         if self._closed:
@@ -202,7 +212,7 @@ class _PackedUCCSD:
                 "UCCSD executor configuration changed; prepare a fresh owner"
             )
         amplitudes = self.layout.unpack(packed)
-        outputs = self.executor.execute(self.program, {**self.feeds, **amplitudes})
+        outputs = self._evaluate_physical(amplitudes)
         expected = {
             "correlation_energy": (),
             **{
@@ -330,7 +340,7 @@ class _PackedUCCSD:
                 "hamiltonian_id": self.reference.hamiltonian_id,
                 "integral_source_id": self.integral_source_id,
                 "integral_hash": self.integral_hash,
-                "equation_hash": self.program.logical_hash,
+                "equation_hash": self.equation_hash,
                 "tensor_backend": self.executor.backend,
                 "integral_backend": self.integral_backend,
                 "source_backend": self.source_backend,
@@ -342,6 +352,7 @@ class _PackedUCCSD:
                 "provider_peak_bytes": self.provider_peak_bytes,
                 "integral_request_count": self.integral_request_count,
                 "physical_evaluations": evaluations,
+                **self._work_provenance(evaluations),
                 "diis_restarts": diis.restarts,
                 "options": MappingProxyType(asdict(self.options)),
                 "preparation_seconds": self.preparation_seconds,

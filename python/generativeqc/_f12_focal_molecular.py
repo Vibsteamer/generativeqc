@@ -46,6 +46,7 @@ if TYPE_CHECKING:
         UCCSDLambdaResult,
         UCCSDResult,
     )
+    from ._uccsd_rhf_virtual_pairs import RHFDFLadderOptions
     from .experimental.f12_focal import FocalEvaluation, FocalRequest
 
 
@@ -124,6 +125,7 @@ class MolecularFocalProvider:
     between CCSD-F12b and MP2-F12 correlation energies and forces.
     lambda_options controls the stationary multiplier solve of each CC role.
     Its workspace is bounded by budget_mib.
+    rhf_df_ladder selects the bounded DF virtual ladder on a restricted reference.
     Supply reference_seed to transport a converged determinant between geometries
     in internally evaluated molecular roles. A callable can select each basis seed.
     """
@@ -141,6 +143,7 @@ class MolecularFocalProvider:
         default=None, repr=False, compare=False
     )
     lambda_options: UCCSDLambdaOptions | None = None
+    rhf_df_ladder: RHFDFLadderOptions | None = None
 
     reference_seed: (
         FocalReferenceSeed | Callable[[FocalRequest], FocalReferenceSeed] | None
@@ -174,6 +177,7 @@ class MolecularFocalProvider:
         high_order: Callable[[FocalRequest], FocalEvaluation] | None = None,
         record_graph: Callable[[dict], None] | None = None,
         lambda_options: UCCSDLambdaOptions | None = None,
+        rhf_df_ladder: RHFDFLadderOptions | None = None,
         reference_seed: (
             FocalReferenceSeed | Callable[[FocalRequest], FocalReferenceSeed] | None
         ) = None,
@@ -208,6 +212,7 @@ class MolecularFocalProvider:
             budget_mib=budget,
             high_order=high_order,
             lambda_options=lambda_options,
+            rhf_df_ladder=rhf_df_ladder,
             reference_seed=reference_seed,
             _cuda_cc_target=(architecture, cache_directory, record_graph),
         )
@@ -495,7 +500,11 @@ class MolecularFocalProvider:
                 "Ordinary UCC forces require a stationary solution with source_cotangents=True"
             )
         return ordinary_ucc_source_forces(
-            self, request, solution.sources, weights.ordinary_weights
+            self,
+            request,
+            solution.sources,
+            weights.ordinary_weights,
+            virtual_factor_weights=weights.virtual_factor_weights,
         )
 
     def _ucc_correlation_forces(

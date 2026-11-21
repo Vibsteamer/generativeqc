@@ -17,6 +17,9 @@ class UCCSDF12Pullback:
     lambda_stationarity_norm: float
     ordinary_weights: dict[str, np.ndarray]
     fixed_source_weights: dict[str, np.ndarray]
+    virtual_factor_weights: dict[str, np.ndarray] | None = None
+    numeric_bound_bytes: int | None = None
+    planned_scalar_work: int | None = None
 
 
 def unrestricted_cc_f12_stationary_pullback(

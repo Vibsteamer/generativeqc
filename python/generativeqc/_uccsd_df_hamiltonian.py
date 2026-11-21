@@ -10,6 +10,7 @@ from generativeqc_compiler.cc.uccsd_coulomb_blocks import (
 from generativeqc_compiler.cc.uccsd_equations import build_program
 from generativeqc_compiler.cc.uccsd_f12_sources import unrestricted_cc_obs_fit_direction
 from generativeqc_compiler.cc.uccsd_layout import BLOCK_NAMES
+from generativeqc_compiler.common.arrays import immutable
 from generativeqc_compiler.mp2.f12_density_fitting import (
     coulomb_fit_response,
     fitted_integral_block,
@@ -76,8 +77,9 @@ def unrestricted_cc_df_hamiltonian(
     *,
     frozen_occupied: tuple[int, int] = (0, 0),
     max_output_bytes: int | None = None,
+    retain_rhf_virtual_factors: dict[str, np.ndarray] | None = None,
 ) -> dict[str, np.ndarray]:
-    """Build the normal-ordered Fock and antisymmetrized DF Coulomb blocks."""
+    """Build ordinary sources, optionally retaining a single RHF virtual factor pair."""
     return _hamiltonian_blocks(
         space,
         data,
@@ -87,6 +89,7 @@ def unrestricted_cc_df_hamiltonian(
         frozen_occupied,
         direction=None,
         max_output_bytes=max_output_bytes,
+        retain_rhf_virtual_factors=retain_rhf_virtual_factors,
     )
 
 
@@ -99,22 +102,36 @@ def _hamiltonian_blocks(
     frozen_occupied: tuple[int, int],
     direction: tuple[Mapping[str, np.ndarray], np.ndarray] | None,
     max_output_bytes: int | None = None,
+    retain_rhf_virtual_factors: dict[str, np.ndarray] | None = None,
 ) -> dict[str, np.ndarray]:
     oa, ob, obs, ext, aux = space
     fa, fb = frozen_occupied
     if not (0 <= fa <= oa < obs and 0 <= fb <= ob < obs <= ext and aux > 0):
         raise ValueError("Invalid UCC occupied, frozen, OBS or fitting dimensions")
+    if retain_rhf_virtual_factors is not None and (
+        oa != ob or fa != fb or retain_rhf_virtual_factors or direction is not None
+    ):
+        raise ValueError("Bounded virtual preparation requires a matched RHF frame")
     ordinary = build_program(oa - fa, ob - fb, obs - oa, obs - ob)
     shapes = {
         node.attrs["name"]: node.spec.shape
         for node in ordinary.live_nodes
-        if node.op == "input" and node.attrs["name"] not in BLOCK_NAMES
+        if node.op == "input"
+        and node.attrs["name"] not in BLOCK_NAMES
+        and (
+            retain_rhf_virtual_factors is None
+            or not node.attrs["name"].startswith("gvvvv_")
+        )
     }
     if max_output_bytes is not None:
         retained_bytes = (
             sum(prod(shape) for shape in shapes.values())
-            * np.dtype(np.float64).itemsize
-        )
+            + (
+                2 * aux * (obs - oa) ** 2
+                if retain_rhf_virtual_factors is not None
+                else 0
+            )
+        ) * np.dtype(np.float64).itemsize
         if retained_bytes > max_output_bytes:
             raise MemoryError(
                 f"ordinary UCC Hamiltonian outputs require {retained_bytes} bytes with {max_output_bytes} available"
@@ -160,6 +177,19 @@ def _hamiltonian_blocks(
             fields.update(d_fit_left=dfit, d_raw_right=draw)
         factors[spin] = {k: v.reshape(aux, obs, obs) for k, v in fields.items()}
 
+    virtual_factors = None
+    if retain_rhf_virtual_factors is not None:
+        # This path comes from a single RHF coefficient matrix. Confirm that
+        # both projected fits describe that same spatial Hamiltonian.
+        alpha, beta = factors["alpha"], factors["beta"]
+        if any(not np.array_equal(alpha[key], beta[key]) for key in alpha):
+            raise ValueError(
+                "Bounded virtual preparation requires identical RHF factors"
+            )
+        virtual_factors = {
+            key: immutable(alpha[key][:, oa:, oa:]) for key in ("fit_left", "raw_right")
+        }
+
     kernels = {}
     result = {}
     for name, shape in shapes.items():
@@ -193,4 +223,7 @@ def _hamiltonian_blocks(
                 chemists = run(kernels[nl, nr], fields).outputs[output]
                 value += sign * chemists.reshape(request.shape).transpose(axes)
         result[name] = value
+    if virtual_factors is not None:
+        assert retain_rhf_virtual_factors is not None
+        retain_rhf_virtual_factors.update(virtual_factors)
     return result

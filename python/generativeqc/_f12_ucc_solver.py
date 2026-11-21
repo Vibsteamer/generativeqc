@@ -3,7 +3,14 @@
 from collections.abc import Iterator
 from contextlib import contextmanager
 
+import numpy as np
+from generativeqc_compiler.cc.uccsd_df_virtual_ladder import (
+    FACTOR_INPUTS,
+    build_uccsd_df_virtual_ladder_amplitude_programs,
+)
 from generativeqc_compiler.cc.uccsd_layout import UCCSDLayout
+from generativeqc_compiler.cc.uccsd_response import _df_remainder_source_vjps
+from generativeqc_compiler.common.resources import checked_bytes
 
 from generativeqc.profiles import canonical_hash
 
@@ -40,6 +47,10 @@ def _prepare_focal_ucc(
     else:
         oa, ob = ref.occupied
         ea, eb = ref.orbital_energies
+        if sources.rhf_df_ladder is not None:
+            raise ValueError(
+                "The bounded spatial ladder requires an actual RHF reference"
+            )
     layout = UCCSDLayout(oa, ob, len(ea) - oa, len(eb) - ob)
     hamiltonian_id = canonical_hash(
         {
@@ -61,6 +72,8 @@ def _prepare_focal_ucc(
         reference_energy=ref.energy,
         options=options,
         executor=executor,
+        rhf_df_ladder=sources.rhf_df_ladder,
+        virtual_factors=sources.virtual_factors,
     )
 
 
@@ -125,6 +138,8 @@ def _weights(
     dual: UCCSDLambdaResult,
 ) -> UCCSDF12Pullback:
     cc = response.prepared
+    if cc.rhf_df_ladder is not None:
+        return _bounded_weights(sources, response, dual)
     packed = response._packed_result(dual)
     weights = unrestricted_cc_f12_stationary_pullback(
         cc.layout,
@@ -137,6 +152,136 @@ def _weights(
     if abs(weights.correlation_energy - response.correlation_energy) > 1e-11:
         raise ValueError("Molecular source weights failed the stationary energy replay")
     return weights
+
+
+def _bounded_weights(
+    sources: FocalUCCEquationSources,
+    response: _PreparedFixedSourceUCCSDLambda,
+    dual: UCCSDLambdaResult,
+) -> UCCSDF12Pullback:
+    """Compute grouped ordinary/geminal and separate MP2Fit source cotangents."""
+    cc = response.prepared
+    limits, factors = cc.rhf_df_ladder, cc.virtual_factors
+    assert limits is not None and factors is not None
+    extent = factors["fit_left"].shape[0]
+    width = min(extent, limits.auxiliary_tile)
+    n_full, tail = divmod(extent, width)
+    element_limit = response.options.max_bytes // 8
+    ordinary_programs = tuple(
+        vjp.program
+        for vjp in _df_remainder_source_vjps(response.programs, element_limit)
+    )
+    auxiliary_programs = {
+        n: build_uccsd_df_virtual_ladder_amplitude_programs(
+            cc.layout, n, max_elements=element_limit
+        ).factor_vjp.program
+        for n in {width, tail}
+        if n
+    }
+    resources = tuple(response._resource(graph) for graph in ordinary_programs)
+    auxiliary_resources = {
+        n: response._resource(graph) for n, graph in auxiliary_programs.items()
+    }
+    additional_work = (
+        sum(resource.scalar_work for resource in resources)
+        + n_full * auxiliary_resources[width].scalar_work
+        + (auxiliary_resources[tail].scalar_work if tail else 0)
+    )
+    work = checked_bytes(
+        additional_work
+        + response.qualification_scalar_work
+        + response._response_setup_work(),
+        "bounded RHF complete source work",
+    )
+    if work > limits.max_source_work:
+        raise MemoryError("Bounded RHF source semantic-work budget exceeded")
+    retained = 0
+    graph_peaks = []
+    for graph, resource in zip(ordinary_programs, resources, strict=True):
+        graph_peaks.append(retained + resource.native_bytes)
+        retained += sum(
+            output.spec.itemsize * output.spec.size for output in graph.outputs.values()
+        )
+    retained += 2 * sum(value.nbytes for value in factors.values())
+    graph_peaks.extend(
+        retained + resource.native_bytes for resource in auxiliary_resources.values()
+    )
+    assert response._repeated is not None
+    released = response._repeated.remainder.retained_bytes + sum(
+        value.nbytes for value in cc.spatial_operators.values()
+    )
+    peak = checked_bytes(
+        response.base_bytes
+        + response._extra_response_bytes()
+        - released
+        + max(graph_peaks),
+        "bounded RHF complete source numeric storage",
+    )
+    if peak > response.options.max_bytes:
+        raise MemoryError("Bounded RHF source numeric storage budget exceeded")
+    packed, diagnostics = response.qualify(dual)
+    response.release_repeated_operators()
+    seeds = response._seeds(packed)
+    ordinary, fixed = {}, {}
+    for graph in ordinary_programs:
+        bars = cc.executor.execute(
+            graph, {**response.feeds, **seeds, "bar_correlation_energy": np.array(1.0)}
+        )
+        for name, value in bars.items():
+            source = name.removeprefix("bar_")
+            weights = ordinary if source in sources.ordinary else fixed
+            specification = (
+                sources.ordinary if weights is ordinary else sources.fixed.feeds
+            )
+            if (
+                value.dtype != np.float64
+                or value.shape != specification[source].shape
+                or not np.isfinite(value).all()
+            ):
+                raise ValueError(
+                    "Bounded RHF source cotangent failed physical shape/finite validation"
+                )
+            weights[source] = value
+        del bars
+    if ordinary.keys() != sources.ordinary.keys() or fixed.keys() != {
+        name for name in cc.feeds if name in sources.fixed.feeds
+    }:
+        raise ValueError("Incomplete bounded RHF stationary source cotangents")
+    virtual = {
+        name: np.empty_like(factors[name.removesuffix("_alpha").removesuffix("_beta")])
+        for name in FACTOR_INPUTS
+    }
+    for begin in range(0, extent, width):
+        stop = min(begin + width, extent)
+        inputs = {
+            name: np.ascontiguousarray(
+                factors[name.removesuffix("_alpha").removesuffix("_beta")][begin:stop]
+            )
+            for name in FACTOR_INPUTS
+        }
+        graph = auxiliary_programs[stop - begin]
+        bars = cc.executor.execute(graph, {**response.amplitudes, **inputs, **seeds})
+        for name, target in virtual.items():
+            value = bars["bar_" + name]
+            if (
+                value.dtype != np.float64
+                or value.shape != target[begin:stop].shape
+                or not np.isfinite(value).all()
+            ):
+                raise ValueError(
+                    "Bounded RHF factor cotangent failed physical shape/finite validation"
+                )
+            target[begin:stop] = value
+    return UCCSDF12Pullback(
+        response.correlation_energy,
+        diagnostics["primal_residual_max"],
+        diagnostics["stationarity_norm"],
+        ordinary,
+        fixed,
+        virtual,
+        peak,
+        work,
+    )
 
 
 def solve_focal_uccsd_f12b_with_cotangents(
@@ -153,6 +298,28 @@ def solve_focal_uccsd_f12b_with_cotangents(
         dual,
     ):
         return state, dual, _weights(sources, response, state, dual)
+
+
+def replay_focal_uccsd_f12b_with_cotangents(
+    sources: FocalUCCEquationSources,
+    packed_amplitudes: np.ndarray,
+    packed_multipliers: np.ndarray,
+    correlation_energy: float,
+    *,
+    options: SolverOptions,
+    lambda_options: UCCSDLambdaOptions,
+    executor: NativeCCTensorExecutor | CudaCCTensorExecutor,
+) -> tuple[UCCSDResult, UCCSDLambdaResult, UCCSDF12Pullback]:
+    """Qualify archived T and Lambda against the complete current molecular equations."""
+    with _prepare_focal_ucc(sources, options, executor) as cc:
+        state = cc._replay_fixed_source_amplitudes(
+            packed_amplitudes, correlation_energy
+        )
+        with _PreparedFixedSourceUCCSDLambda(
+            cc, state, options=lambda_options, orbital_gap_preconditioner=True
+        ) as response:
+            dual = response._replay_multipliers(packed_multipliers)
+            return state, dual, _weights(sources, response, state, dual)
 
 
 def focal_ucc_source_cotangents(
@@ -187,6 +354,7 @@ __all__ = [
     "UCCSDLambdaResult",
     "UCCSDResult",
     "focal_ucc_source_cotangents",
+    "replay_focal_uccsd_f12b_with_cotangents",
     "solve_focal_uccsd_f12b",
     "solve_focal_uccsd_f12b_energy",
     "solve_focal_uccsd_f12b_with_cotangents",

@@ -4,10 +4,22 @@ from dataclasses import replace
 
 import numpy as np
 import pytest
+from generativeqc._f12_focal_cc_sources import (
+    FocalUCCEquationSources,
+    FocalUCCFixedSources,
+)
+from generativeqc._f12_focal_reference import FocalReference
+from generativeqc._f12_ucc_solver import (
+    replay_focal_uccsd_f12b_with_cotangents,
+    solve_focal_uccsd_f12b_energy,
+    solve_focal_uccsd_f12b_with_cotangents,
+)
+from generativeqc.experimental.f12_focal import RHFDFLadderOptions
 from generativeqc.response_solver import GMRESOptions
 from generativeqc_compiler.cc.uccsd_equations import build_program
 from generativeqc_compiler.cc.uccsd_layout import UCCSDLayout
 from generativeqc_compiler.tensor import execute
+from test_uccsd_df_virtual_ladder import _dense_virtual_blocks, _dense_virtual_integrals
 from test_uccsd_equations import _determinant_oracle, _feeds, _random_hamiltonian
 from test_uccsd_f12 import (
     _dense_correction,
@@ -45,6 +57,120 @@ def executor(tmp_path_factory: pytest.TempPathFactory) -> NativeCCTensorExecutor
         max_bytes=_OPTIONS.max_bytes,
         cache=tmp_path_factory.mktemp("uccsd-fixed-f12-native"),
     )
+
+
+def test_native_molecular_rhf_bounded_state_and_source_response(
+    executor: NativeCCTensorExecutor,
+) -> None:
+    layout = _LAYOUT
+    _, integrals = _random_hamiltonian(layout)
+    eps = _ENERGY_ALPHA
+    fock = np.diag(np.r_[eps[:2], eps[:2], eps[2:], eps[2:]])
+    shapes = layout.unpack(np.zeros(layout.packed_size))
+    ordinary = _feeds(layout, fock, integrals, shapes)
+    ordinary = {name: value for name, value in ordinary.items() if name not in shapes}
+    tags = tuple(name for name in ordinary if name.startswith("gvvvv_"))
+    rng = np.random.default_rng(814)
+    raw = rng.normal(scale=0.1, size=(3, 2, 2))
+    raw = raw + raw.swapaxes(-2, -1)
+    fit = raw / 2
+    factors = {"fit_left": fit, "raw_right": raw}
+    for value in factors.values():
+        value.setflags(write=False)
+    expanded = {
+        name + "_" + spin: value
+        for name, value in factors.items()
+        for spin in ("alpha", "beta")
+    }
+    ordinary.update(
+        _dense_virtual_blocks(layout, _dense_virtual_integrals(2, 2, expanded), tags)
+    )
+    ref = FocalReference(
+        energy=_REFERENCE_ENERGY,
+        forces=None,
+        overlap=np.eye(4),
+        hcore=np.diag(eps),
+        coefficients=np.eye(4)[None],
+        orbital_energies=eps[None],
+        density=2 * np.diag([1.0, 1.0, 0.0, 0.0])[None],
+        fock=np.diag(eps)[None],
+        occupied=(2,),
+        iterations=4,
+        executed_backend="cpu_reference",
+        surface_id="toy-rhf",
+        basis_id="toy-df",
+        orbital_id="toy-orbital",
+        jk_fit_id="toy-jk",
+    )
+    fixed = FocalUCCFixedSources(
+        ref, 2, "toy-f12", _source_feeds(layout, _pair_sources(layout, 53))
+    )
+    dense = FocalUCCEquationSources(fixed, "toy-mp2", ordinary)
+    bounded = FocalUCCEquationSources(
+        fixed,
+        "toy-mp2",
+        {name: value for name, value in ordinary.items() if name not in tags},
+        RHFDFLadderOptions(
+            max_primal_work=10**10, max_source_work=10**10, row_tile=2, auxiliary_tile=2
+        ),
+        factors,
+    )
+    options = UCCSDLambdaOptions(max_operator_actions=100, max_total_work=10**11)
+    dense_primal, dense_dual, dense_source = solve_focal_uccsd_f12b_with_cotangents(
+        dense,
+        options=_OPTIONS,
+        lambda_options=options,
+        executor=executor,
+    )
+    primal, dual, source = solve_focal_uccsd_f12b_with_cotangents(
+        bounded,
+        options=_OPTIONS,
+        lambda_options=options,
+        executor=executor,
+    )
+    assert (
+        primal.provenance["equation_hash"] != dense_primal.provenance["equation_hash"]
+    )
+    np.testing.assert_allclose(
+        primal.correlation_energy, dense_primal.correlation_energy, atol=2e-13, rtol=0
+    )
+    np.testing.assert_allclose(
+        primal.packed_amplitudes, dense_primal.packed_amplitudes, atol=2e-12, rtol=0
+    )
+    np.testing.assert_allclose(
+        dual.packed_multipliers, dense_dual.packed_multipliers, atol=2e-11, rtol=0
+    )
+    assert source.virtual_factor_weights and dense_source.virtual_factor_weights is None
+    for grouped, expected in (
+        (source.ordinary_weights, dense_source.ordinary_weights),
+        (source.fixed_source_weights, dense_source.fixed_source_weights),
+    ):
+        for key, value in grouped.items():
+            np.testing.assert_allclose(value, expected[key], atol=2e-11, rtol=0)
+    np.testing.assert_allclose(
+        solve_focal_uccsd_f12b_energy(bounded, options=_OPTIONS, executor=executor),
+        primal.correlation_energy,
+        atol=2e-13,
+        rtol=0,
+    )
+    archived_t, archived_dual, archived_source = (
+        replay_focal_uccsd_f12b_with_cotangents(
+            bounded,
+            dense_primal.packed_amplitudes,
+            dense_dual.packed_multipliers,
+            dense_primal.correlation_energy,
+            options=_OPTIONS,
+            lambda_options=options,
+            executor=executor,
+        )
+    )
+    assert archived_t.provenance["physical_evaluations"] == 1
+    assert archived_dual.operator_actions == archived_dual.iterations == 0
+    assert archived_dual.stationarity_norm < 1e-9
+    for key, value in archived_source.virtual_factor_weights.items():
+        np.testing.assert_allclose(
+            value, source.virtual_factor_weights[key], atol=2e-11, rtol=0
+        )
 
 
 def _prepare(
@@ -207,7 +333,9 @@ def test_fixed_source_stationarity_and_cotangent_against_independent_root(
                     for sign in (1, -1)
                 ]
                 ep, em = (reference(root(s), s)[0] for s in sources)
-                assert derivative == pytest.approx((ep - em) / (2 * h), rel=0, abs=3e-10)
+                assert derivative == pytest.approx(
+                    (ep - em) / (2 * h), rel=0, abs=3e-10
+                )
             with pytest.raises(ValueError, match="fixed-source direction"):
                 response.fixed_source_directional_derivative(result, {})
             # The ordinary Hamiltonian is linear at fixed amplitudes. Direct
@@ -223,18 +351,26 @@ def test_fixed_source_stationarity_and_cotangent_against_independent_root(
             )
             ref = -0.031
             combined = response.molecular_directional_derivative(
-                result, ordinary_direction=ordinary,
-                fixed_source_direction=changes, reference_derivative=ref,
+                result,
+                ordinary_direction=ordinary,
+                fixed_source_direction=changes,
+                reference_derivative=ref,
             )
-            assert combined == pytest.approx(ref + ordinary_bar + derivative, abs=3e-10, rel=0)
+            assert combined == pytest.approx(
+                ref + ordinary_bar + derivative, abs=3e-10, rel=0
+            )
             with pytest.raises(ValueError, match="ordinary Hamiltonian"):
                 response.molecular_directional_derivative(
-                    result, ordinary_direction={}, fixed_source_direction=changes,
+                    result,
+                    ordinary_direction={},
+                    fixed_source_direction=changes,
                     reference_derivative=ref,
                 )
             with pytest.raises(TypeError, match="ordinary Hamiltonian"):
                 response.molecular_directional_derivative(
-                    result, ordinary_direction=None, fixed_source_direction=changes,
+                    result,
+                    ordinary_direction=None,
+                    fixed_source_direction=changes,
                     reference_derivative=ref,
                 )
             alpha_direction = direction[:2, :2, :2, :2].copy()

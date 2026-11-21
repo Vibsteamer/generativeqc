@@ -7,6 +7,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Literal, overload
 
 import numpy as np
+from generativeqc_compiler.common.arrays import immutable
 
 from ._f12_cc_fock_pullback import extended_fock_response
 from ._f12_cc_spin_sources import unrestricted_cc_f12_fixed_source_feeds
@@ -20,6 +21,7 @@ if TYPE_CHECKING:
 
     from ._f12_focal_molecular import MolecularFocalProvider
     from ._f12_focal_reference import FocalReference
+    from ._uccsd_rhf_virtual_pairs import RHFDFLadderOptions
     from .experimental.f12_focal import FocalRequest
 
 
@@ -45,6 +47,8 @@ class FocalUCCEquationSources:
     fixed: FocalUCCFixedSources
     mp2_fit_id: str
     ordinary: dict[str, np.ndarray]
+    rhf_df_ladder: RHFDFLadderOptions | None = None
+    virtual_factors: dict[str, np.ndarray] | None = None
 
 
 @overload
@@ -216,6 +220,8 @@ def molecular_ucc_sources(
             projected=None,
             role="ordinary_jk",
         )
+    ladder = provider.rhf_df_ladder if request.root_id == "rhf" else None
+    factors: dict[str, np.ndarray] | None = {} if ladder is not None else None
     ordinary = unrestricted_cc_df_hamiltonian(
         (oa, ob, obs, ext, len(whitener)),
         raw,
@@ -224,5 +230,12 @@ def molecular_ucc_sources(
         checked,
         max_output_bytes=(provider.budget_mib << 20)
         - sum(v.nbytes for v in feeds.values()),
+        retain_rhf_virtual_factors=factors,
     )
-    return FocalUCCEquationSources(fixed, fit_id, ordinary)
+    if ladder is not None:
+        # The solver borrows these permanently read-only buffers instead of
+        # retaining a second copy of all ordinary and fixed MO sources.
+        for mapping in (ordinary, feeds):
+            for name, value in mapping.items():
+                mapping[name] = immutable(value)
+    return FocalUCCEquationSources(fixed, fit_id, ordinary, ladder, factors)

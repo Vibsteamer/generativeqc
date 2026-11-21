@@ -1,16 +1,67 @@
 """Prepare fixed spatial virtual Coulomb matrices for repeated RHF CC actions."""
 
-from collections.abc import Callable, Mapping
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 from generativeqc_compiler.cc.uccsd_layout import BLOCK_NAMES, UCCSDLayout
 from generativeqc_compiler.cc.uccsd_response import (
+    UCCRHFRepeatedLambdaPrograms,
     build_f12_rhf_repeated_lambda_programs,
 )
 from generativeqc_compiler.cc.uccsd_rhf_virtual_pairs import virtual_pair_coordinates
 from generativeqc_compiler.common.resources import checked_bytes
 from generativeqc_compiler.mp2.f12_density_fitting import fitted_integral_block
-from generativeqc_compiler.tensor import Program
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
+
+    from generativeqc_compiler.tensor import Program
+
+
+@dataclass(frozen=True, kw_only=True)
+class RHFDFLadderOptions:
+    """Explicit logical work budgets for the bounded RHF molecular CC route."""
+
+    max_primal_work: int
+    max_source_work: int
+    row_tile: int = 256
+    auxiliary_tile: int = 8
+
+    def __post_init__(self) -> None:
+        for name in (
+            "max_primal_work",
+            "max_source_work",
+            "row_tile",
+            "auxiliary_tile",
+        ):
+            if checked_bytes(getattr(self, name), name) <= 0:
+                raise ValueError(f"RHF DF ladder option {name} must be positive")
+
+
+def rhf_virtual_pair_storage(
+    virtual: int, auxiliary: int, row_tile: int
+) -> tuple[int, int]:
+    """Logical added host preparation and retained operator bytes."""
+    n_pair = virtual * (virtual + 1) // 2
+    n_strict = n_pair - virtual
+    width = min(row_tile, n_pair)
+    preparation = checked_bytes(
+        8
+        * max(
+            2 * auxiliary * n_pair + 2 * n_pair,
+            n_pair**2
+            + auxiliary * (n_pair + 3 * width)
+            + 5 * width * n_pair
+            + 8 * n_pair,
+            n_pair**2 + max(5 * auxiliary * virtual, 5 * width * n_pair) + 8 * n_pair,
+            2 * n_pair**2 + n_strict**2 + virtual**2 + 12 * n_pair,
+        ),
+        "RHF virtual pair preparation storage",
+    )
+    return preparation, 8 * (n_pair**2 + n_strict**2)
 
 
 def prepare_rhf_virtual_pair_operators(
@@ -49,21 +100,7 @@ def prepare_rhf_virtual_pair_operators(
     n_pair = virtual * (virtual + 1) // 2
     n_strict = n_pair - virtual
     width = min(row_tile, n_pair)
-    # Include the fitting staging and symmetry-check operands in the first
-    # phase and the reusable operators plus source matrix in the second.
-    required = checked_bytes(
-        8
-        * max(
-            2 * auxiliary * n_pair + 2 * n_pair,
-            n_pair**2
-            + auxiliary * (n_pair + 3 * width)
-            + 5 * width * n_pair
-            + 8 * n_pair,
-            n_pair**2 + max(5 * auxiliary * virtual, 5 * width * n_pair) + 8 * n_pair,
-            2 * n_pair**2 + n_strict**2 + virtual**2 + 12 * n_pair,
-        ),
-        "RHF virtual pair preparation storage",
-    )
+    required, _ = rhf_virtual_pair_storage(virtual, auxiliary, row_tile)
     if required > max_bytes:
         raise MemoryError("RHF virtual pair operators exceed the host numeric budget")
     for array in (fit, raw):
@@ -133,7 +170,8 @@ def prepare_rhf_f12_lambda_action(
     run: Callable,
     *,
     max_retained_bytes: int,
-) -> Callable[[np.ndarray], np.ndarray]:
+    programs: UCCRHFRepeatedLambdaPrograms | None = None,
+) -> _RHFVirtualLambdaAction:
     """Prepare an exact physical Λ transpose for one fixed-reference epoch.
 
     The caller owns the remaining immutable equation feeds and spatial
@@ -141,9 +179,12 @@ def prepare_rhf_f12_lambda_action(
     the unpacked amplitudes. Complete native executor/work admission and
     state and Lambda qualification belong to the higher stationary owner.
     """
-    programs = build_f12_rhf_repeated_lambda_programs(
-        layout, max_retained_bytes=max_retained_bytes
-    )
+    if programs is None:
+        programs = build_f12_rhf_repeated_lambda_programs(
+            layout, max_retained_bytes=max_retained_bytes
+        )
+    if programs.remainder.retained_bytes > max_retained_bytes:
+        raise MemoryError("RHF Lambda frontier retained storage exceeds the budget")
     amplitudes = layout.unpack(packed_amplitudes)
 
     def bind(graph: Program, values: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
@@ -173,17 +214,33 @@ def prepare_rhf_f12_lambda_action(
     )
     bare = bind(programs.bare, {**operators, **amplitudes})
 
-    def apply(dual: np.ndarray) -> np.ndarray:
-        seeds = {
-            "bar_" + name.replace("t", "r", 1): value
-            for name, value in layout.unpack_dual(dual).items()
-        }
-        remainder = run(programs.remainder.replay, {**replay, **seeds}).outputs
-        ladder = run(programs.bare, {**bare, **seeds}).outputs
-        result = {
-            name: remainder["bar_" + name] + ladder["bar_" + name]
+    return _RHFVirtualLambdaAction(layout, run, programs, replay, bare)
+
+
+@dataclass(frozen=True)
+class _RHFVirtualLambdaAction:
+    layout: UCCSDLayout
+    run: Callable
+    programs: UCCRHFRepeatedLambdaPrograms
+    replay: dict[str, np.ndarray]
+    bare: dict[str, np.ndarray]
+
+    def bars(self, seeds: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
+        remainder = self.run(
+            self.programs.remainder.replay, {**self.replay, **seeds}
+        ).outputs
+        ladder = self.run(self.programs.bare, {**self.bare, **seeds}).outputs
+        return {
+            "bar_" + name: remainder["bar_" + name] + ladder["bar_" + name]
             for name in BLOCK_NAMES
         }
-        return layout.pack_dual(result)
 
-    return apply
+    def __call__(self, dual: np.ndarray) -> np.ndarray:
+        seeds = {
+            "bar_" + name.replace("t", "r", 1): value
+            for name, value in self.layout.unpack_dual(dual).items()
+        }
+        result = self.bars(seeds)
+        return self.layout.pack_dual(
+            {name: result["bar_" + name] for name in BLOCK_NAMES}
+        )

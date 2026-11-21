@@ -24,6 +24,7 @@ from .. import (
     _f12_focal_ucc_triples,
     _f12_focal_ump2,
     _native,
+    _uccsd_rhf_virtual_pairs,
 )
 from .._api_types import Atom
 from .._cbs_plan import native_cbs_plan
@@ -49,6 +50,7 @@ Role = Literal[
 ]
 Backend = Literal["cuda", "cpu_reference"]
 MolecularFocalProvider = _f12_focal_molecular.MolecularFocalProvider
+RHFDFLadderOptions = _uccsd_rhf_virtual_pairs.RHFDFLadderOptions
 FocalLowOrderForces = _f12_focal_molecular.FocalLowOrderForces
 FocalLowOrderEnergy = _f12_focal_molecular.FocalLowOrderEnergy
 FocalUCCEquationSources = _f12_focal_molecular.FocalUCCEquationSources
@@ -852,7 +854,9 @@ def _molecular_f12_plan(
                     include_hf_cabs=include_hf_cabs,
                 )
                 if expected_rank is not None and low.cabs_rank != expected_rank:
-                    raise ValueError("displaced CABS rank differs from the analytic center")
+                    raise ValueError(
+                        "displaced CABS rank differs from the analytic center"
+                    )
             reference = low.reference
             ranks[identity] = low.cabs_rank
             if include_hf_cabs:
@@ -1069,7 +1073,9 @@ def singlepoint_energy(
         if tuple(a.atomic_number for a in source_atoms) != tuple(
             a.atomic_number for a in plan.steps[0][0].atoms
         ):
-            raise ValueError("center and displacement must have the same ordered nuclei")
+            raise ValueError(
+                "center and displacement must have the same ordered nuclei"
+            )
         source_plan = plan_singlepoint(
             source_atoms,
             hf_cabs,
