@@ -1,10 +1,18 @@
-"""Check bounded unlike-spin panels against a whole independent-spin DF graph."""
+"""Check bounded unrestricted operators against a whole independent-spin DF graph."""
+
+from dataclasses import replace
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
 from generativeqc._uccsd_rhf_virtual_pairs import (
     prepare_spatial_virtual_pair_operators,
     spatial_virtual_pair_storage,
+)
+from generativeqc._uccsd_uhf_virtual_ladder import (
+    UHFVirtualGraphResources,
+    UHFVirtualLadderLimits,
+    prepare_uhf_virtual_ladder,
 )
 from generativeqc._uccsd_uhf_virtual_panels import (
     prepare_uhf_mixed_virtual_panels,
@@ -20,6 +28,10 @@ from generativeqc_compiler.cc.uccsd_uhf_virtual_panels import (
     build_uccsd_uhf_same_spin_virtual_pair_programs,
 )
 from generativeqc_compiler.tensor import execute
+from generativeqc_compiler.tensor.cpu import emit_cpu
+
+if TYPE_CHECKING:
+    from generativeqc_compiler.tensor import Program
 
 
 @pytest.mark.parametrize("width", [1, 2, 3])
@@ -163,3 +175,77 @@ def test_independent_packed_same_spin_virtual_pair_actions(
         for bars in (actual, expected)
     )
     np.testing.assert_allclose(actual_dual, expected_dual, rtol=0, atol=5e-14)
+
+
+@pytest.mark.parametrize("beta_occupied", [0, 2])
+def test_all_uhf_operators_admit_before_native_setup_and_share_physical_vjp(
+    beta_occupied: int,
+) -> None:
+    layout = UCCSDLayout(3, beta_occupied, 3, 4)
+    reference = build_uccsd_df_virtual_ladder_amplitude_programs(layout, 3)
+    rng = np.random.default_rng(103497)
+    factors = {}
+    for spin, extent in (("alpha", layout.va), ("beta", layout.vb)):
+        raw = rng.normal(scale=0.1, size=(3, extent, extent))
+        raw += raw.swapaxes(1, 2).copy()
+        factors["fit_left_" + spin] = raw.copy()
+        factors["raw_right_" + spin] = raw
+
+    def graph_resource(program: "Program") -> UHFVirtualGraphResources:
+        _, plan = emit_cpu(program, max_bytes=1 << 24, max_work=1 << 30)
+        return UHFVirtualGraphResources(plan["required_bytes"], 0, plan["scalar_work"])
+
+    def never_run(*values: object) -> None:
+        raise AssertionError("Native fitting started before joint work admission")
+
+    limits = UHFVirtualLadderLimits(
+        max_host_bytes=1 << 24,
+        max_device_bytes=1 << 24,
+        max_setup_work=1 << 20,
+        max_action_work=1 << 20,
+        pair_rows=2,
+        mixed_alpha_width=2,
+    )
+    with pytest.raises(MemoryError, match="setup or action work"):
+        prepare_uhf_virtual_ladder(
+            layout,
+            factors,
+            never_run,
+            graph_resource,
+            replace(limits, max_setup_work=1),
+        )
+    with pytest.raises(MemoryError, match="host or device allowance"):
+        prepare_uhf_virtual_ladder(
+            layout,
+            factors,
+            never_run,
+            graph_resource,
+            replace(limits, max_host_bytes=1),
+        )
+    operator = prepare_uhf_virtual_ladder(
+        layout, factors, execute, graph_resource, limits
+    )
+    assert (
+        0
+        < operator.retained_host_bytes
+        <= operator.planned_host_bytes
+        <= limits.max_host_bytes
+    )
+    amplitudes = layout.unpack(rng.normal(size=layout.packed_size))
+    seeds = {
+        "bar_" + name.replace("t", "r", 1): value
+        for name, value in layout.unpack_dual(
+            rng.normal(size=layout.packed_size)
+        ).items()
+    }
+    expected_primal = execute(reference.primal, {**amplitudes, **factors}).outputs
+    for name, value in operator.residual(amplitudes).items():
+        np.testing.assert_allclose(value, expected_primal[name], rtol=0, atol=5e-14)
+    expected_bars = execute(
+        reference.residual_vjp.program, {**amplitudes, **factors, **seeds}
+    ).outputs
+    duals = (
+        layout.pack_dual({name: bars["bar_" + name] for name in amplitudes})
+        for bars in (operator.amplitude_bars(amplitudes, seeds), expected_bars)
+    )
+    np.testing.assert_allclose(*duals, rtol=0, atol=5e-14)
