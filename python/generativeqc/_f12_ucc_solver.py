@@ -42,6 +42,10 @@ def _prepare_focal_ucc(
         )
     if len(ref.occupied) == 1:
         # RHF has one independent spatial orbital variable for both spin lines.
+        if sources.uhf_df_ladder is not None:
+            raise ValueError(
+                "The independent-spin bounded ladder requires an actual UHF reference"
+            )
         oa = ob = ref.occupied[0]
         ea = eb = ref.orbital_energies[0]
     else:
@@ -74,6 +78,7 @@ def _prepare_focal_ucc(
         executor=executor,
         rhf_df_ladder=sources.rhf_df_ladder,
         virtual_factors=sources.virtual_factors,
+        uhf_df_ladder=sources.uhf_df_ladder,
     )
 
 
@@ -138,7 +143,7 @@ def _weights(
     dual: UCCSDLambdaResult,
 ) -> UCCSDF12Pullback:
     cc = response.prepared
-    if cc.rhf_df_ladder is not None:
+    if cc.rhf_df_ladder is not None or cc.uhf_df_ladder is not None:
         return _bounded_weights(sources, response, dual)
     packed = response._packed_result(dual)
     weights = unrestricted_cc_f12_stationary_pullback(
@@ -161,9 +166,16 @@ def _bounded_weights(
 ) -> UCCSDF12Pullback:
     """Compute grouped ordinary/geminal and separate MP2Fit source cotangents."""
     cc = response.prepared
-    limits, factors = cc.rhf_df_ladder, cc.virtual_factors
+    limits, factors = cc.rhf_df_ladder or cc.uhf_df_ladder, cc.virtual_factors
     assert limits is not None and factors is not None
-    extent = factors["fit_left"].shape[0]
+    if cc.rhf_df_ladder is not None:
+        spin_factors = {
+            name: factors[name.removesuffix("_alpha").removesuffix("_beta")]
+            for name in FACTOR_INPUTS
+        }
+    else:
+        spin_factors = factors
+    extent = spin_factors["fit_left_alpha"].shape[0]
     width = min(extent, limits.auxiliary_tile)
     n_full, tail = divmod(extent, width)
     element_limit = response.options.max_bytes // 8
@@ -191,10 +203,10 @@ def _bounded_weights(
         additional_work
         + response.qualification_scalar_work
         + response._response_setup_work(),
-        "bounded RHF complete source work",
+        "bounded DF complete source work",
     )
     if work > limits.max_source_work:
-        raise MemoryError("Bounded RHF source semantic-work budget exceeded")
+        raise MemoryError("Bounded DF source semantic-work budget exceeded")
     retained = 0
     graph_peaks = []
     for graph, resource in zip(ordinary_programs, resources, strict=True):
@@ -202,23 +214,26 @@ def _bounded_weights(
         retained += sum(
             output.spec.itemsize * output.spec.size for output in graph.outputs.values()
         )
-    retained += 2 * sum(value.nbytes for value in factors.values())
+    retained += sum(value.nbytes for value in spin_factors.values())
     graph_peaks.extend(
         retained + resource.native_bytes for resource in auxiliary_resources.values()
     )
-    assert response._repeated is not None
-    released = response._repeated.remainder.retained_bytes + sum(
-        value.nbytes for value in cc.spatial_operators.values()
-    )
+    if response._repeated is not None:
+        released = response._repeated.remainder.retained_bytes + sum(
+            value.nbytes for value in cc.spatial_operators.values()
+        )
+    else:
+        assert cc.uhf_bare is not None
+        released = cc.uhf_bare.retained_host_bytes
     peak = checked_bytes(
         response.base_bytes
         + response._extra_response_bytes()
         - released
         + max(graph_peaks),
-        "bounded RHF complete source numeric storage",
+        "bounded DF complete source numeric storage",
     )
     if peak > response.options.max_bytes:
-        raise MemoryError("Bounded RHF source numeric storage budget exceeded")
+        raise MemoryError("Bounded DF source numeric storage budget exceeded")
     packed, diagnostics = response.qualify(dual)
     response.release_repeated_operators()
     seeds = response._seeds(packed)
@@ -239,24 +254,19 @@ def _bounded_weights(
                 or not np.isfinite(value).all()
             ):
                 raise ValueError(
-                    "Bounded RHF source cotangent failed physical shape/finite validation"
+                    "Bounded DF source cotangent failed physical shape/finite validation"
                 )
             weights[source] = value
         del bars
     if ordinary.keys() != sources.ordinary.keys() or fixed.keys() != {
         name for name in cc.feeds if name in sources.fixed.feeds
     }:
-        raise ValueError("Incomplete bounded RHF stationary source cotangents")
-    virtual = {
-        name: np.empty_like(factors[name.removesuffix("_alpha").removesuffix("_beta")])
-        for name in FACTOR_INPUTS
-    }
+        raise ValueError("Incomplete bounded DF stationary source cotangents")
+    virtual = {name: np.empty_like(spin_factors[name]) for name in FACTOR_INPUTS}
     for begin in range(0, extent, width):
         stop = min(begin + width, extent)
         inputs = {
-            name: np.ascontiguousarray(
-                factors[name.removesuffix("_alpha").removesuffix("_beta")][begin:stop]
-            )
+            name: np.ascontiguousarray(spin_factors[name][begin:stop])
             for name in FACTOR_INPUTS
         }
         graph = auxiliary_programs[stop - begin]
@@ -269,7 +279,7 @@ def _bounded_weights(
                 or not np.isfinite(value).all()
             ):
                 raise ValueError(
-                    "Bounded RHF factor cotangent failed physical shape/finite validation"
+                    "Bounded DF factor cotangent failed physical shape/finite validation"
                 )
             target[begin:stop] = value
     return UCCSDF12Pullback(

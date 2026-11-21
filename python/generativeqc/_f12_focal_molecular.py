@@ -47,6 +47,7 @@ if TYPE_CHECKING:
         UCCSDResult,
     )
     from ._uccsd_rhf_virtual_pairs import RHFDFLadderOptions
+    from ._uccsd_uhf_virtual_ladder import UHFDFLadderOptions
     from .experimental.f12_focal import FocalEvaluation, FocalRequest
 
 
@@ -126,6 +127,7 @@ class MolecularFocalProvider:
     lambda_options controls the stationary multiplier solve of each CC role.
     Its workspace is bounded by budget_mib.
     rhf_df_ladder selects the bounded DF virtual ladder on a restricted reference.
+    uhf_df_ladder selects independent virtual operators on an unrestricted reference.
     Supply reference_seed to transport a converged determinant between geometries
     in internally evaluated molecular roles. A callable can select each basis seed.
     """
@@ -144,6 +146,7 @@ class MolecularFocalProvider:
     )
     lambda_options: UCCSDLambdaOptions | None = None
     rhf_df_ladder: RHFDFLadderOptions | None = None
+    uhf_df_ladder: UHFDFLadderOptions | None = None
 
     reference_seed: (
         FocalReferenceSeed | Callable[[FocalRequest], FocalReferenceSeed] | None
@@ -178,6 +181,7 @@ class MolecularFocalProvider:
         record_graph: Callable[[dict], None] | None = None,
         lambda_options: UCCSDLambdaOptions | None = None,
         rhf_df_ladder: RHFDFLadderOptions | None = None,
+        uhf_df_ladder: UHFDFLadderOptions | None = None,
         reference_seed: (
             FocalReferenceSeed | Callable[[FocalRequest], FocalReferenceSeed] | None
         ) = None,
@@ -213,6 +217,7 @@ class MolecularFocalProvider:
             high_order=high_order,
             lambda_options=lambda_options,
             rhf_df_ladder=rhf_df_ladder,
+            uhf_df_ladder=uhf_df_ladder,
             reference_seed=reference_seed,
             _cuda_cc_target=(architecture, cache_directory, record_graph),
         )

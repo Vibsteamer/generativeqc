@@ -39,6 +39,13 @@ from generativeqc._uccsd_rhf_virtual_pairs import (
     prepare_rhf_virtual_pair_operators,
     rhf_virtual_pair_storage,
 )
+from generativeqc._uccsd_uhf_virtual_ladder import (
+    UHFDFLadderOptions,
+    UHFVirtualGraphResources,
+    UHFVirtualLadderLimits,
+    UHFVirtualLadderResourcePlan,
+    prepare_uhf_virtual_ladder,
+)
 from generativeqc.response_solver import DiagonalPreconditioner, solve
 
 from .implicit import ImplicitSolveError, ResponseGMRES
@@ -182,6 +189,7 @@ class _PreparedFixedSourceUCCSD(_PackedUCCSD):
         executor: NativeCCTensorExecutor | CudaCCTensorExecutor | None = None,
         rhf_df_ladder: RHFDFLadderOptions | None = None,
         virtual_factors: Mapping[str, np.ndarray] | None = None,
+        uhf_df_ladder: UHFDFLadderOptions | None = None,
     ) -> None:
         started = time.perf_counter()
         if not isinstance(layout, UCCSDLayout):
@@ -207,11 +215,14 @@ class _PreparedFixedSourceUCCSD(_PackedUCCSD):
             )
         self.layout, self.options, self.executor = layout, options, executor
         self.rhf_df_ladder = rhf_df_ladder
+        self.uhf_df_ladder = uhf_df_ladder
+        self.uhf_bare = None
+        self._uhf_ladder_hash = None
         self.virtual_factors = None
         self.spatial_operators = MappingProxyType({})
         self.bare_programs = None
         self.bounded_primal_work = 0
-        if rhf_df_ladder is None:
+        if rhf_df_ladder is None and uhf_df_ladder is None:
             if virtual_factors is not None:
                 raise ValueError(
                     "Unexpected virtual factors for dense fixed-source UCCSD"
@@ -219,11 +230,19 @@ class _PreparedFixedSourceUCCSD(_PackedUCCSD):
             self.program = build_f12_program(layout)
         else:
             if (
-                not isinstance(rhf_df_ladder, RHFDFLadderOptions)
-                or virtual_factors is None
+                virtual_factors is None
+                or (
+                    rhf_df_ladder is not None
+                    and not isinstance(rhf_df_ladder, RHFDFLadderOptions)
+                )
+                or (
+                    uhf_df_ladder is not None
+                    and not isinstance(uhf_df_ladder, UHFDFLadderOptions)
+                )
+                or (rhf_df_ladder is not None and uhf_df_ladder is not None)
             ):
                 raise ValueError(
-                    "Bounded fixed-source UCCSD requires RHF factors and limits"
+                    "Bounded fixed-source UCCSD requires one matching factor and limits contract"
                 )
             self.program = build_f12_df_remainder_program(layout)
         inputs = {
@@ -321,6 +340,98 @@ class _PreparedFixedSourceUCCSD(_PackedUCCSD):
             bounded_resident = shared + operator_bytes
             pair_preparation_bytes = feed_bytes + shared + preparation + fit_peak
             self.bounded_extra_bytes = bounded_resident
+        elif uhf_df_ladder is not None:
+            assert virtual_factors is not None
+            if any(value.flags.writeable for value in virtual_factors.values()):
+                raise ValueError(
+                    "Bounded UHF CC requires immutable independent MP2Fit factors"
+                )
+            factor_bytes = sum(value.nbytes for value in virtual_factors.values())
+            inputs_coexist = sum(
+                value.nbytes
+                for value in (
+                    *ordinary_feeds.values(),
+                    *fixed_source_feeds.values(),
+                    *virtual_factors.values(),
+                )
+                if not _has_immutable_buffer(value)
+            )
+            shared = (
+                factor_bytes
+                + inputs_coexist
+                + sum(
+                    value.nbytes
+                    for name, value in fixed_source_feeds.items()
+                    if name not in source_keys
+                )
+            )
+            iteration_reserve = _iteration_bytes(
+                layout, options, feed_bytes + reference_bytes + shared
+            )
+            remainder_resource = _action_resource(executor, self.program)
+
+            def admit_uhf(plan: UHFVirtualLadderResourcePlan) -> None:
+                self.primal_preparation_work = plan.setup_work
+                self.primal_action_work = (
+                    remainder_resource.scalar_work + plan.primal_work
+                )
+                self.bounded_primal_work = checked_bytes(
+                    plan.setup_work
+                    + (3 * options.max_iterations + 2) * self.primal_action_work,
+                    "bounded UHF amplitude work",
+                )
+                if self.bounded_primal_work > uhf_df_ladder.max_primal_work:
+                    raise MemoryError(
+                        "Bounded UHF amplitude semantic-work budget exceeded"
+                    )
+                needed = iteration_reserve + max(
+                    plan.host + plan.device,
+                    plan.retained + remainder_resource.native_bytes,
+                )
+                if needed > options.max_bytes:
+                    raise MemoryError(
+                        "Bounded UHF amplitude combined numeric budget exceeded"
+                    )
+
+            def uhf_resource(graph: Program) -> UHFVirtualGraphResources:
+                resource = _action_resource(executor, graph)
+                if isinstance(executor, CudaCCTensorExecutor):
+                    plan = plan_cuda(
+                        graph, executor.compiler.target, max_bytes=executor.max_bytes
+                    )
+                    return UHFVirtualGraphResources(
+                        plan.host_bytes, plan.device_bytes, resource.scalar_work
+                    )
+                return UHFVirtualGraphResources(
+                    resource.native_bytes, 0, resource.scalar_work
+                )
+
+            self.uhf_bare = prepare_uhf_virtual_ladder(
+                layout,
+                virtual_factors,
+                lambda graph, feeds: _run(executor, graph, feeds),
+                uhf_resource,
+                UHFVirtualLadderLimits(
+                    max_host_bytes=options.max_bytes,
+                    max_device_bytes=executor.max_bytes,
+                    max_setup_work=uhf_df_ladder.max_primal_work,
+                    max_action_work=uhf_df_ladder.max_primal_work,
+                    pair_rows=uhf_df_ladder.pair_rows,
+                    mixed_alpha_width=uhf_df_ladder.mixed_alpha_width,
+                ),
+                admit=admit_uhf,
+            )
+            bounded_resident = shared + self.uhf_bare.retained_host_bytes
+            self.bounded_extra_bytes = bounded_resident
+            self._uhf_ladder_hash = tuple(
+                sector.actions.primal.logical_hash for sector in self.uhf_bare.sectors
+            )
+            self.virtual_factors = MappingProxyType(
+                {
+                    name: _checked_array(name, value, value.shape, share=True)
+                    for name, value in virtual_factors.items()
+                }
+            )
         self.host_iteration_bytes = _iteration_bytes(
             layout, options, feed_bytes + reference_bytes + bounded_resident
         )
@@ -340,6 +451,13 @@ class _PreparedFixedSourceUCCSD(_PackedUCCSD):
             full = sum(block.full_layout.storage_bytes(8) for block in layout.blocks)
             self.execution_peak_bytes = max(
                 self.execution_peak_bytes, bare.native_bytes + full
+            )
+        elif self.uhf_bare is not None:
+            self.execution_peak_bytes = max(
+                self.execution_peak_bytes,
+                self.uhf_bare.planned_host_bytes
+                - self.uhf_bare.retained_host_bytes
+                + self.uhf_bare.planned_device_bytes,
             )
         preparation_bytes = (
             feed_bytes
@@ -400,7 +518,7 @@ class _PreparedFixedSourceUCCSD(_PackedUCCSD):
                 name,
                 (fixed_source_feeds if name in source_keys else ordinary_feeds)[name],
                 shape,
-                share=rhf_df_ladder is not None,
+                share=rhf_df_ladder is not None or uhf_df_ladder is not None,
             )
             for name, shape in inputs.items()
         }
@@ -416,9 +534,11 @@ class _PreparedFixedSourceUCCSD(_PackedUCCSD):
         )
         self.integral_source_id = reference_id
         self.integral_backend = (
-            "supplied-canonical-spin-MO-feeds"
-            if self.bare_programs is None
+            "bounded-uhf-independent-virtual-panels"
+            if uhf_df_ladder is not None
             else "bounded-rhf-spatial-virtual-pairs"
+            if rhf_df_ladder is not None
+            else "supplied-canonical-spin-MO-feeds"
         )
         self.source_backend = "supplied-fixed-geminal-sources"
         self.integral_request_count = self.provider_peak_bytes = 0
@@ -429,6 +549,13 @@ class _PreparedFixedSourceUCCSD(_PackedUCCSD):
 
     @property
     def equation_hash(self) -> str:
+        if self._uhf_ladder_hash is not None:
+            return canonical_hash(
+                {
+                    "remainder": self.program.logical_hash,
+                    "bare_uhf": self._uhf_ladder_hash,
+                }
+            )
         if self.bare_programs is None:
             return super().equation_hash
         return canonical_hash(
@@ -446,12 +573,16 @@ class _PreparedFixedSourceUCCSD(_PackedUCCSD):
             )
             if bare.keys() != self.bare_programs.primal.outputs.keys():
                 raise ValueError("Bounded RHF ladder returned incomplete doubles")
-            for name, value in bare.items():
-                remainder[name] = remainder[name] + value
+        elif self.uhf_bare is not None:
+            bare = self.uhf_bare.residual(amplitudes)
+        else:
+            return remainder
+        for name, value in bare.items():
+            remainder[name] = remainder[name] + value
         return remainder
 
     def _work_provenance(self, evaluations: int) -> dict[str, int]:
-        if self.bare_programs is None:
+        if self.rhf_df_ladder is None and self.uhf_df_ladder is None:
             return {}
         return {
             "planned_semantic_scalar_work": self.bounded_primal_work,
@@ -462,12 +593,14 @@ class _PreparedFixedSourceUCCSD(_PackedUCCSD):
 
     def close(self) -> None:
         self.spatial_operators = MappingProxyType({})
+        self.uhf_bare = None
         self.virtual_factors = None
         super().close()
 
     def release_repeated_operators(self) -> None:
         """Release the prepared spatial matrices after amplitude and dual qualification."""
         self.spatial_operators = MappingProxyType({})
+        self.uhf_bare = None
 
     def _replay_fixed_source_amplitudes(
         self, packed_amplitudes: np.ndarray, correlation_energy: float
@@ -591,6 +724,8 @@ class _PreparedFixedSourceUCCSDLambda(_PackedUCCSDLambda):
     def _build_response_programs(
         self, layout: UCCSDLayout, *, max_elements: int
     ) -> UCCSDResponsePrograms:
+        if self.prepared.uhf_bare is not None:
+            return _response_programs(self.prepared.program, max_elements)
         if self.prepared.bare_programs is None:
             return build_f12_response_programs(layout, max_elements=max_elements)
         self._repeated = build_f12_rhf_repeated_lambda_programs(
@@ -599,6 +734,8 @@ class _PreparedFixedSourceUCCSDLambda(_PackedUCCSDLambda):
         return _response_programs(self.prepared.program, max_elements)
 
     def _extra_response_bytes(self) -> int:
+        if self.prepared.uhf_df_ladder is not None:
+            return self.prepared.bounded_extra_bytes
         if self._repeated is None:
             return 0
         full = sum(block.full_layout.storage_bytes(8) for block in self.layout.blocks)
@@ -612,6 +749,31 @@ class _PreparedFixedSourceUCCSDLambda(_PackedUCCSDLambda):
         return 0 if self._repeated is None else self._repeated_preparation.scalar_work
 
     def _resource(self, program: Any) -> _Resource:
+        if self.prepared.uhf_bare is not None:
+            ladder = self.prepared.uhf_bare
+            if program.logical_hash == self.prepared.program.logical_hash:
+                return _Resource(
+                    self.prepared.execution_peak_bytes, self.prepared.primal_action_work
+                )
+            raw = super()._resource(program)
+            if program.logical_hash in (
+                self.programs.residual_vjp.derivative_hash,
+                self.programs.stationarity_vjp.derivative_hash,
+            ):
+                remainder_bars = sum(
+                    block.full_layout.storage_bytes(8) for block in self.layout.blocks
+                )
+                ladder_numerics = (
+                    ladder.planned_host_bytes
+                    - ladder.retained_host_bytes
+                    + ladder.planned_device_bytes
+                    + remainder_bars
+                )
+                return _Resource(
+                    max(raw.native_bytes, ladder_numerics),
+                    raw.scalar_work + ladder.adjoint_work,
+                )
+            return raw
         if self._repeated is None:
             return super()._resource(program)
         identity = program.logical_hash
@@ -652,6 +814,20 @@ class _PreparedFixedSourceUCCSDLambda(_PackedUCCSDLambda):
         self, program: Any, extra: Mapping[str, np.ndarray], counter: _Counter
     ) -> dict:
         identity = program.logical_hash
+        if self.prepared.uhf_bare is not None and identity in (
+            self.programs.residual_vjp.derivative_hash,
+            self.programs.stationarity_vjp.derivative_hash,
+        ):
+            remainder = super()._execute(program, extra, counter)
+            bare = self.prepared.uhf_bare.amplitude_bars(self.amplitudes, extra)
+            counter.native_calls += len(self.prepared.uhf_bare.sectors)
+            for name, value in bare.items():
+                remainder[name] = remainder[name] + value
+            if any(not np.isfinite(value).all() for value in remainder.values()):
+                raise FloatingPointError(
+                    "UHF Lambda action returned nonfinite physical bars"
+                )
+            return remainder
         if self._repeated is None or identity not in (
             self.programs.residual_vjp.derivative_hash,
             self.programs.stationarity_vjp.derivative_hash,
@@ -694,6 +870,8 @@ class _PreparedFixedSourceUCCSDLambda(_PackedUCCSDLambda):
         result = super()._qualify_parent(counter)
         if self._repeated is not None:
             counter.native_calls += 1
+        elif self.prepared.uhf_bare is not None:
+            counter.native_calls += len(self.prepared.uhf_bare.sectors)
         return result
 
     def close(self) -> None:
@@ -792,9 +970,9 @@ class _PreparedFixedSourceUCCSDLambda(_PackedUCCSDLambda):
         ordinary: Mapping[str, np.ndarray] | None,
     ) -> float:
         self._check_open()
-        if self._repeated is not None:
+        if self._repeated is not None or self.prepared.uhf_df_ladder is not None:
             raise ValueError(
-                "Bounded RHF directions require the stationary source cotangent route"
+                "Bounded DF directions require the stationary source cotangent route"
             )
         expected = {k: v for k, v in self.prepared.feeds.items() if _source_key(k)}
         if not expected.keys() <= fixed.keys() or any(

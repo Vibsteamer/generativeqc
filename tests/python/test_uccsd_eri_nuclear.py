@@ -1,6 +1,7 @@
 """Check the CC two-electron source reverse with a dense spin-orbital DF oracle."""
 
 import numpy as np
+from generativeqc._uccsd_df_hamiltonian import unrestricted_cc_df_hamiltonian
 from generativeqc_compiler.cc.uccsd_df_virtual_ladder import (
     FACTOR_INPUTS,
     build_uccsd_df_virtual_ladder_amplitude_programs,
@@ -129,12 +130,32 @@ def test_virtual_factor_bars_share_the_ordinary_ao_and_metric_pullback() -> None
     }
 
     factors = {}
-    for spin, no in zip(spins, occupied, strict=True):
-        frame = coefficients[spin][:, no:]
-        raw = frame.T @ ao @ frame
-        fit = np.linalg.solve(metric, raw.reshape(aux, -1)).reshape(raw.shape)
-        factors["raw_right_" + spin] = raw
-        factors["fit_left_" + spin] = fit
+    data = {
+        "source/raw_coulomb_" + spin: frame.T @ ao @ frame
+        for spin, frame in coefficients.items()
+    }
+    fock = {"fock_" + spin: np.diag(np.linspace(-1, 1, obs)) for spin in spins}
+    bounded = unrestricted_cc_df_hamiltonian(
+        (*occupied, obs, obs, aux),
+        data,
+        fock,
+        whitener,
+        execute,
+        frozen_occupied=frozen,
+        retain_uhf_virtual_factors=factors,
+    )
+    dense = unrestricted_cc_df_hamiltonian(
+        (*occupied, obs, obs, aux),
+        data,
+        fock,
+        whitener,
+        execute,
+        frozen_occupied=frozen,
+    )
+    assert dense.keys() - bounded.keys() == set(virtual_names)
+    for name, value in bounded.items():
+        np.testing.assert_array_equal(value, dense[name])
+    assert all(not factors[name].flags.writeable for name in FACTOR_INPUTS)
     factor_bars = {name: np.empty_like(value) for name, value in factors.items()}
     for start, stop in ((0, 2), (2, 4), (4, 5)):
         graph = build_uccsd_df_virtual_ladder_amplitude_programs(

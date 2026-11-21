@@ -64,6 +64,32 @@ class UHFVirtualLadderLimits:
                 raise ValueError(f"{name} must be positive")
 
 
+@dataclass(frozen=True, kw_only=True)
+class UHFDFLadderOptions:
+    """Explicit UHF electronic work allowances for the molecular CC owner."""
+
+    max_primal_work: int
+    max_source_work: int
+    pair_rows: int = 256
+    mixed_alpha_width: int = 16
+    auxiliary_tile: int = 8
+
+    def __post_init__(self) -> None:
+        for name in self.__dataclass_fields__:
+            if checked_bytes(getattr(self, name), name) == 0:
+                raise ValueError(f"{name} must be positive")
+
+
+@dataclass(frozen=True)
+class UHFVirtualLadderResourcePlan:
+    retained: int
+    host: int
+    device: int
+    setup_work: int
+    primal_work: int
+    adjoint_work: int
+
+
 @dataclass(frozen=True)
 class _Sector:
     name: str
@@ -145,6 +171,8 @@ def prepare_uhf_virtual_ladder(
     run: Callable,
     graph_resources: Callable[[Program], UHFVirtualGraphResources],
     limits: UHFVirtualLadderLimits,
+    *,
+    admit: Callable[[UHFVirtualLadderResourcePlan], None] | None = None,
 ) -> UHFBareVirtualLadder:
     """Plan all setup and residual/transpose graphs before staging any operator.
 
@@ -245,6 +273,17 @@ def prepare_uhf_virtual_ladder(
             "UHF bare virtual ladder exceeds its setup or action work allowance"
         )
 
+    if admit is not None:
+        admit(
+            UHFVirtualLadderResourcePlan(
+                retained,
+                host,
+                device,
+                setup_work,
+                primal.scalar_work,
+                adjoint.scalar_work,
+            )
+        )
     sectors = []
     pair_name = "spatial_coulomb_antisymmetric"
     for spin, tile, cap, actions in same_spins:

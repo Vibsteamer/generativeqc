@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from ._f12_focal_molecular import MolecularFocalProvider
     from ._f12_focal_reference import FocalReference
     from ._uccsd_rhf_virtual_pairs import RHFDFLadderOptions
+    from ._uccsd_uhf_virtual_ladder import UHFDFLadderOptions
     from .experimental.f12_focal import FocalRequest
 
 
@@ -49,6 +50,7 @@ class FocalUCCEquationSources:
     ordinary: dict[str, np.ndarray]
     rhf_df_ladder: RHFDFLadderOptions | None = None
     virtual_factors: dict[str, np.ndarray] | None = None
+    uhf_df_ladder: UHFDFLadderOptions | None = None
 
 
 @overload
@@ -221,7 +223,10 @@ def molecular_ucc_sources(
             role="ordinary_jk",
         )
     ladder = provider.rhf_df_ladder if request.root_id == "rhf" else None
-    factors: dict[str, np.ndarray] | None = {} if ladder is not None else None
+    uhf_ladder = provider.uhf_df_ladder if request.root_id == "uhf" else None
+    factors: dict[str, np.ndarray] | None = (
+        {} if ladder is not None or uhf_ladder is not None else None
+    )
     ordinary = unrestricted_cc_df_hamiltonian(
         (oa, ob, obs, ext, len(whitener)),
         raw,
@@ -230,12 +235,13 @@ def molecular_ucc_sources(
         checked,
         max_output_bytes=(provider.budget_mib << 20)
         - sum(v.nbytes for v in feeds.values()),
-        retain_rhf_virtual_factors=factors,
+        retain_rhf_virtual_factors=factors if ladder is not None else None,
+        retain_uhf_virtual_factors=factors if uhf_ladder is not None else None,
     )
-    if ladder is not None:
+    if factors is not None:
         # The solver borrows these permanently read-only buffers instead of
         # retaining a second copy of all ordinary and fixed MO sources.
         for mapping in (ordinary, feeds):
             for name, value in mapping.items():
                 mapping[name] = immutable(value)
-    return FocalUCCEquationSources(fixed, fit_id, ordinary, ladder, factors)
+    return FocalUCCEquationSources(fixed, fit_id, ordinary, ladder, factors, uhf_ladder)

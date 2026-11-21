@@ -78,6 +78,7 @@ def unrestricted_cc_df_hamiltonian(
     frozen_occupied: tuple[int, int] = (0, 0),
     max_output_bytes: int | None = None,
     retain_rhf_virtual_factors: dict[str, np.ndarray] | None = None,
+    retain_uhf_virtual_factors: dict[str, np.ndarray] | None = None,
 ) -> dict[str, np.ndarray]:
     """Build ordinary sources, optionally retaining a single RHF virtual factor pair."""
     return _hamiltonian_blocks(
@@ -90,6 +91,7 @@ def unrestricted_cc_df_hamiltonian(
         direction=None,
         max_output_bytes=max_output_bytes,
         retain_rhf_virtual_factors=retain_rhf_virtual_factors,
+        retain_uhf_virtual_factors=retain_uhf_virtual_factors,
     )
 
 
@@ -103,25 +105,36 @@ def _hamiltonian_blocks(
     direction: tuple[Mapping[str, np.ndarray], np.ndarray] | None,
     max_output_bytes: int | None = None,
     retain_rhf_virtual_factors: dict[str, np.ndarray] | None = None,
+    retain_uhf_virtual_factors: dict[str, np.ndarray] | None = None,
 ) -> dict[str, np.ndarray]:
     oa, ob, obs, ext, aux = space
     fa, fb = frozen_occupied
     if not (0 <= fa <= oa < obs and 0 <= fb <= ob < obs <= ext and aux > 0):
         raise ValueError("Invalid UCC occupied, frozen, OBS or fitting dimensions")
     if retain_rhf_virtual_factors is not None and (
-        oa != ob or fa != fb or retain_rhf_virtual_factors or direction is not None
+        oa != ob
+        or fa != fb
+        or retain_rhf_virtual_factors
+        or direction is not None
+        or retain_uhf_virtual_factors is not None
     ):
         raise ValueError("Bounded virtual preparation requires a matched RHF frame")
+    if retain_uhf_virtual_factors is not None and (
+        retain_uhf_virtual_factors or direction is not None
+    ):
+        raise ValueError(
+            "UHF virtual factor destination must be empty with no direction"
+        )
+    bounded = (
+        retain_rhf_virtual_factors is not None or retain_uhf_virtual_factors is not None
+    )
     ordinary = build_program(oa - fa, ob - fb, obs - oa, obs - ob)
     shapes = {
         node.attrs["name"]: node.spec.shape
         for node in ordinary.live_nodes
         if node.op == "input"
         and node.attrs["name"] not in BLOCK_NAMES
-        and (
-            retain_rhf_virtual_factors is None
-            or not node.attrs["name"].startswith("gvvvv_")
-        )
+        and (not bounded or not node.attrs["name"].startswith("gvvvv_"))
     }
     if max_output_bytes is not None:
         retained_bytes = (
@@ -129,6 +142,8 @@ def _hamiltonian_blocks(
             + (
                 2 * aux * (obs - oa) ** 2
                 if retain_rhf_virtual_factors is not None
+                else 2 * aux * ((obs - oa) ** 2 + (obs - ob) ** 2)
+                if bounded
                 else 0
             )
         ) * np.dtype(np.float64).itemsize
@@ -189,6 +204,12 @@ def _hamiltonian_blocks(
         virtual_factors = {
             key: immutable(alpha[key][:, oa:, oa:]) for key in ("fit_left", "raw_right")
         }
+    elif retain_uhf_virtual_factors is not None:
+        virtual_factors = {
+            f"{key}_{spin}": immutable(factors[spin][key][:, occupied:, occupied:])
+            for spin, occupied in (("alpha", oa), ("beta", ob))
+            for key in ("fit_left", "raw_right")
+        }
 
     kernels = {}
     result = {}
@@ -224,6 +245,11 @@ def _hamiltonian_blocks(
                 value += sign * chemists.reshape(request.shape).transpose(axes)
         result[name] = value
     if virtual_factors is not None:
-        assert retain_rhf_virtual_factors is not None
-        retain_rhf_virtual_factors.update(virtual_factors)
+        destination = (
+            retain_rhf_virtual_factors
+            if retain_rhf_virtual_factors is not None
+            else retain_uhf_virtual_factors
+        )
+        assert destination is not None
+        destination.update(virtual_factors)
     return result

@@ -14,7 +14,7 @@ from generativeqc._f12_ucc_solver import (
     solve_focal_uccsd_f12b_energy,
     solve_focal_uccsd_f12b_with_cotangents,
 )
-from generativeqc.experimental.f12_focal import RHFDFLadderOptions
+from generativeqc.experimental.f12_focal import RHFDFLadderOptions, UHFDFLadderOptions
 from generativeqc.response_solver import GMRESOptions
 from generativeqc_compiler.cc.uccsd_equations import build_program
 from generativeqc_compiler.cc.uccsd_layout import UCCSDLayout
@@ -59,13 +59,16 @@ def executor(tmp_path_factory: pytest.TempPathFactory) -> NativeCCTensorExecutor
     )
 
 
-def test_native_molecular_rhf_bounded_state_and_source_response(
+@pytest.mark.parametrize("kind", ["rhf", "uhf"])
+def test_native_molecular_bounded_state_and_source_response(
     executor: NativeCCTensorExecutor,
+    kind: str,
 ) -> None:
     layout = _LAYOUT
     _, integrals = _random_hamiltonian(layout)
     eps = _ENERGY_ALPHA
-    fock = np.diag(np.r_[eps[:2], eps[:2], eps[2:], eps[2:]])
+    beta = eps if kind == "rhf" else _ENERGY_BETA
+    fock = np.diag(np.r_[eps[:2], beta[:2], eps[2:], beta[2:]])
     shapes = layout.unpack(np.zeros(layout.packed_size))
     ordinary = _feeds(layout, fock, integrals, shapes)
     ordinary = {name: value for name, value in ordinary.items() if name not in shapes}
@@ -82,22 +85,29 @@ def test_native_molecular_rhf_bounded_state_and_source_response(
         for name, value in factors.items()
         for spin in ("alpha", "beta")
     }
+    if kind == "uhf":
+        expanded.update(raw_right_beta=0.7 * raw, fit_left_beta=0.7 * fit)
+        for value in expanded.values():
+            value.setflags(write=False)
     ordinary.update(
         _dense_virtual_blocks(layout, _dense_virtual_integrals(2, 2, expanded), tags)
     )
+    independent = 1 if kind == "rhf" else 2
+    energies = np.stack((eps, beta))[:independent]
+    density = np.diag([1.0, 1.0, 0.0, 0.0])
     ref = FocalReference(
         energy=_REFERENCE_ENERGY,
         forces=None,
         overlap=np.eye(4),
         hcore=np.diag(eps),
-        coefficients=np.eye(4)[None],
-        orbital_energies=eps[None],
-        density=2 * np.diag([1.0, 1.0, 0.0, 0.0])[None],
-        fock=np.diag(eps)[None],
-        occupied=(2,),
+        coefficients=np.repeat(np.eye(4)[None], independent, axis=0),
+        orbital_energies=energies,
+        density=np.repeat(density[None], independent, axis=0) * (2 // independent),
+        fock=np.stack([np.diag(e) for e in energies]),
+        occupied=(2,) * independent,
         iterations=4,
         executed_backend="cpu_reference",
-        surface_id="toy-rhf",
+        surface_id="toy-" + kind,
         basis_id="toy-df",
         orbital_id="toy-orbital",
         jk_fit_id="toy-jk",
@@ -106,14 +116,23 @@ def test_native_molecular_rhf_bounded_state_and_source_response(
         ref, 2, "toy-f12", _source_feeds(layout, _pair_sources(layout, 53))
     )
     dense = FocalUCCEquationSources(fixed, "toy-mp2", ordinary)
+    rhf = RHFDFLadderOptions(
+        max_primal_work=10**10, max_source_work=10**10, row_tile=2, auxiliary_tile=2
+    )
+    uhf = UHFDFLadderOptions(
+        max_primal_work=10**10,
+        max_source_work=10**10,
+        pair_rows=2,
+        mixed_alpha_width=1,
+        auxiliary_tile=2,
+    )
     bounded = FocalUCCEquationSources(
         fixed,
         "toy-mp2",
         {name: value for name, value in ordinary.items() if name not in tags},
-        RHFDFLadderOptions(
-            max_primal_work=10**10, max_source_work=10**10, row_tile=2, auxiliary_tile=2
-        ),
-        factors,
+        rhf_df_ladder=rhf if kind == "rhf" else None,
+        virtual_factors=factors if kind == "rhf" else expanded,
+        uhf_df_ladder=uhf if kind == "uhf" else None,
     )
     options = UCCSDLambdaOptions(max_operator_actions=100, max_total_work=10**11)
     dense_primal, dense_dual, dense_source = solve_focal_uccsd_f12b_with_cotangents(

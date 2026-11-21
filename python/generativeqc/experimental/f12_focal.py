@@ -25,6 +25,7 @@ from .. import (
     _f12_focal_ump2,
     _native,
     _uccsd_rhf_virtual_pairs,
+    _uccsd_uhf_virtual_ladder,
 )
 from .._api_types import Atom
 from .._cbs_plan import native_cbs_plan
@@ -51,6 +52,7 @@ Role = Literal[
 Backend = Literal["cuda", "cpu_reference"]
 MolecularFocalProvider = _f12_focal_molecular.MolecularFocalProvider
 RHFDFLadderOptions = _uccsd_rhf_virtual_pairs.RHFDFLadderOptions
+UHFDFLadderOptions = _uccsd_uhf_virtual_ladder.UHFDFLadderOptions
 FocalLowOrderForces = _f12_focal_molecular.FocalLowOrderForces
 FocalLowOrderEnergy = _f12_focal_molecular.FocalLowOrderEnergy
 FocalUCCEquationSources = _f12_focal_molecular.FocalUCCEquationSources
