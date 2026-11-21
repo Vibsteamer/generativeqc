@@ -2,15 +2,20 @@
 
 import numpy as np
 import pytest
-from generativeqc._uccsd_rhf_virtual_pairs import prepare_rhf_virtual_pair_operators
+from generativeqc._uccsd_rhf_virtual_pairs import (
+    prepare_rhf_f12_lambda_action,
+    prepare_rhf_virtual_pair_operators,
+)
 from generativeqc_compiler.cc.uccsd_df_virtual_ladder import (
     build_uccsd_df_virtual_ladder_amplitude_programs,
 )
 from generativeqc_compiler.cc.uccsd_layout import BLOCK_NAMES, UCCSDLayout
+from generativeqc_compiler.cc.uccsd_response import build_f12_response_programs
 from generativeqc_compiler.cc.uccsd_rhf_virtual_pairs import (
     build_uccsd_rhf_virtual_pair_programs,
 )
 from generativeqc_compiler.tensor import execute
+from test_uccsd_df_virtual_ladder import _dense_virtual_blocks, _dense_virtual_integrals
 
 
 def _factor_fixture(auxiliary: int, virtual: int) -> tuple[np.ndarray, np.ndarray]:
@@ -96,3 +101,52 @@ def test_resource_or_nonphysical_factor_rejection() -> None:
         prepare_rhf_virtual_pair_operators(
             fit, raw, execute, row_tile=2, max_bytes=1 << 20
         )
+
+
+def test_stationary_epoch_replays_complete_physical_lambda_action() -> None:
+    layout = UCCSDLayout(2, 2, 4, 4)
+    fit, raw = _factor_fixture(5, 4)
+    operators = prepare_rhf_virtual_pair_operators(
+        fit, raw, execute, row_tile=3, max_bytes=1 << 20
+    )
+    dense = build_f12_response_programs(layout)
+    rng = np.random.default_rng(758)
+    feeds = {
+        node.attrs["name"]: rng.normal(scale=0.2, size=node.spec.shape)
+        for node in dense.primal.live_nodes
+        if node.op == "input" and node.attrs["name"] not in BLOCK_NAMES
+    }
+    names = tuple(name for name in feeds if name.startswith("gvvvv_"))
+    factors = {
+        key + "_" + spin: value
+        for spin in ("alpha", "beta")
+        for key, value in (("fit_left", fit), ("raw_right", raw))
+    }
+    feeds.update(
+        _dense_virtual_blocks(layout, _dense_virtual_integrals(4, 4, factors), names)
+    )
+    for value in feeds.values():
+        value.setflags(write=False)
+    packed = rng.normal(scale=0.1, size=layout.packed_size)
+    amplitudes = layout.unpack(packed)
+    with pytest.raises(MemoryError, match="frontier retained storage"):
+        prepare_rhf_f12_lambda_action(
+            layout, packed, feeds, operators, execute, max_retained_bytes=1
+        )
+    action = prepare_rhf_f12_lambda_action(
+        layout, packed, feeds, operators, execute, max_retained_bytes=1 << 20
+    )
+    # The caller's amplitude work vector may be reused while this fixed epoch
+    # owns its own snapshot.
+    packed.fill(0.0)
+    for _ in range(3):
+        dual = rng.normal(size=layout.packed_size)
+        seeds = {
+            "bar_" + name.replace("t", "r", 1): value
+            for name, value in layout.unpack_dual(dual).items()
+        }
+        bars = execute(
+            dense.residual_vjp.program, {**feeds, **amplitudes, **seeds}
+        ).outputs
+        expected = layout.pack_dual({name: bars["bar_" + name] for name in BLOCK_NAMES})
+        np.testing.assert_allclose(action(dual), expected, rtol=0, atol=2e-13)

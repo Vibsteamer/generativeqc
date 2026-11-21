@@ -1,11 +1,16 @@
 """Prepare fixed spatial virtual Coulomb matrices for repeated RHF CC actions."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import numpy as np
+from generativeqc_compiler.cc.uccsd_layout import BLOCK_NAMES, UCCSDLayout
+from generativeqc_compiler.cc.uccsd_response import (
+    build_f12_rhf_repeated_lambda_programs,
+)
 from generativeqc_compiler.cc.uccsd_rhf_virtual_pairs import virtual_pair_coordinates
 from generativeqc_compiler.common.resources import checked_bytes
 from generativeqc_compiler.mp2.f12_density_fitting import fitted_integral_block
+from generativeqc_compiler.tensor import Program
 
 
 def prepare_rhf_virtual_pair_operators(
@@ -118,3 +123,67 @@ def prepare_rhf_virtual_pair_operators(
         "spatial_coulomb_symmetric": symmetric,
         "spatial_coulomb_antisymmetric": antisymmetric,
     }
+
+
+def prepare_rhf_f12_lambda_action(
+    layout: UCCSDLayout,
+    packed_amplitudes: np.ndarray,
+    equation_feeds: Mapping[str, np.ndarray],
+    operators: Mapping[str, np.ndarray],
+    run: Callable,
+    *,
+    max_retained_bytes: int,
+) -> Callable[[np.ndarray], np.ndarray]:
+    """Prepare an exact physical Λ transpose for one fixed-reference epoch.
+
+    The caller owns the remaining immutable equation feeds and spatial
+    operators. This coordinator retains the derived remainder frontier and
+    the unpacked amplitudes. Complete native executor/work admission and
+    state and Lambda qualification belong to the higher stationary owner.
+    """
+    programs = build_f12_rhf_repeated_lambda_programs(
+        layout, max_retained_bytes=max_retained_bytes
+    )
+    amplitudes = layout.unpack(packed_amplitudes)
+
+    def bind(graph: Program, values: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
+        feeds = {}
+        for node in graph.live_nodes:
+            if node.op != "input":
+                continue
+            name = node.attrs["name"]
+            if name.startswith("bar_"):
+                continue
+            value = values[name]
+            if value.dtype != np.float64 or value.shape != node.spec.shape:
+                raise ValueError("RHF Lambda epoch received an invalid FP64 binding")
+            if name not in amplitudes and value.flags.writeable:
+                raise ValueError("RHF Lambda epoch requires immutable static inputs")
+            feeds[name] = value
+        return feeds
+
+    preparation = bind(programs.remainder.prepare, {**equation_feeds, **amplitudes})
+    retained = run(programs.remainder.prepare, preparation).outputs
+    if retained.keys() != programs.remainder.prepare.outputs.keys():
+        raise ValueError("RHF Lambda preparation returned incomplete retained inputs")
+    for value in retained.values():
+        value.setflags(write=False)
+    replay = bind(
+        programs.remainder.replay, {**equation_feeds, **amplitudes, **retained}
+    )
+    bare = bind(programs.bare, {**operators, **amplitudes})
+
+    def apply(dual: np.ndarray) -> np.ndarray:
+        seeds = {
+            "bar_" + name.replace("t", "r", 1): value
+            for name, value in layout.unpack_dual(dual).items()
+        }
+        remainder = run(programs.remainder.replay, {**replay, **seeds}).outputs
+        ladder = run(programs.bare, {**bare, **seeds}).outputs
+        result = {
+            name: remainder["bar_" + name] + ladder["bar_" + name]
+            for name in BLOCK_NAMES
+        }
+        return layout.pack_dual(result)
+
+    return apply

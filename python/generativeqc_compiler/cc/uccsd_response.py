@@ -20,6 +20,9 @@ from generativeqc_compiler.cc.uccsd_equations import (
     build_program,
 )
 from generativeqc_compiler.cc.uccsd_layout import BLOCK_NAMES, UCCSDLayout
+from generativeqc_compiler.cc.uccsd_rhf_virtual_pairs import (
+    build_uccsd_rhf_virtual_pair_programs,
+)
 from generativeqc_compiler.tensor import (
     JVPProgram,
     Program,
@@ -29,6 +32,11 @@ from generativeqc_compiler.tensor import (
     input_tensor,
     linearize,
     transpose_program,
+)
+from generativeqc_compiler.tensor.iteration_reuse import (
+    IterationReusePrograms,
+    analyze_iteration_reuse,
+    materialize_iteration_frontier,
 )
 
 RESIDUALS = tuple(name.replace("t", "r", 1) for name in BLOCK_NAMES)
@@ -133,6 +141,37 @@ def build_f12_df_remainder_source_vjps(
             inputs=remaining,
             max_elements=max_elements,
         ),
+    )
+
+
+@dataclass(frozen=True)
+class UCCRHFRepeatedLambdaPrograms:
+    """The retained remainder and fixed spatial bare parts of a physical transpose."""
+
+    remainder: IterationReusePrograms
+    bare: Program
+
+
+def build_f12_rhf_repeated_lambda_programs(
+    layout: UCCSDLayout, *, max_retained_bytes: int, max_elements: int = 1_000_000
+) -> UCCRHFRepeatedLambdaPrograms:
+    """Bind the remainder's immutable frontier at the current stationary amplitudes."""
+    bare = build_uccsd_rhf_virtual_pair_programs(layout, max_elements=max_elements)
+    base = build_f12_df_remainder_program(layout)
+    adjoint = transpose_program(
+        base, RESIDUALS, inputs=BLOCK_NAMES, max_elements=max_elements
+    ).program
+    frozen = tuple(
+        node.attrs["name"]
+        for node in adjoint.live_nodes
+        if node.op == "input" and not node.attrs["name"].startswith("bar_")
+    )
+    plan = analyze_iteration_reuse(adjoint, invariant_inputs=frozen)
+    return UCCRHFRepeatedLambdaPrograms(
+        materialize_iteration_frontier(
+            adjoint, plan, max_retained_bytes=max_retained_bytes
+        ),
+        bare.residual_vjp.program,
     )
 
 

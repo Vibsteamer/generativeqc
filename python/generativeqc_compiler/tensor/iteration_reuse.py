@@ -10,18 +10,15 @@ remain responsible for retained-storage admission, failure and publication.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, replace
 
 from generativeqc_compiler.common.liveness import EffectKind
 from generativeqc_compiler.common.provenance import canonical_hash
 from generativeqc_compiler.common.resources import checked_bytes
 
+from .ir import Node, input_tensor
 from .optimize import _tensor_effect
 from .program import Program, node_hashes
-
-if TYPE_CHECKING:
-    from .ir import Node
 
 
 @dataclass(frozen=True)
@@ -41,6 +38,68 @@ class IterationReusePlan:
     invariant_inputs: tuple[str, ...]
     retained_bytes: int
     identity: str
+
+
+@dataclass(frozen=True)
+class IterationReusePrograms:
+    """Executable preparation and replay for one immutable set of inputs."""
+
+    prepare: Program
+    replay: Program
+    retained_bytes: int
+
+
+def materialize_iteration_frontier(
+    program: Program, plan: IterationReusePlan, *, max_retained_bytes: int
+) -> IterationReusePrograms:
+    """Bind dependency-proven retained values as explicit replay inputs.
+
+    Supports the plain arithmetic graph used by stationary CC response. The
+    caller runs preparation once, retains its owned outputs, and charges
+    simultaneous execution storage separately from the logical frontier.
+    """
+    if type(max_retained_bytes) is not int or max_retained_bytes < 0:
+        raise ValueError("frontier storage budget must be a nonnegative integer")
+    if "precision_execution" in program.provenance:
+        raise ValueError("frontier materialization requires a plain arithmetic graph")
+    frontier = invariant_frontier(program, plan)
+    if not frontier:
+        raise ValueError("iteration program has no retained frontier values")
+    if plan != analyze_iteration_reuse(program, invariant_inputs=plan.invariant_inputs):
+        raise ValueError("frontier materialization requires this graph's default proof")
+    retained = checked_bytes(
+        sum(node.spec.size * node.spec.itemsize for node in frontier),
+        "iteration frontier retained bytes",
+    )
+    if retained > max_retained_bytes:
+        raise MemoryError("iteration frontier retained storage budget exceeded")
+    name_by_node = {
+        node: f"iteration_frontier_{number}" for number, node in enumerate(frontier)
+    }
+    if set(name_by_node.values()) & {
+        node.attrs["name"] for node in program.live_nodes if node.op == "input"
+    }:
+        raise ValueError("frontier replay input names collide with the original graph")
+    provenance = {"iteration_reuse": plan.identity}
+    prepared = Program(
+        {name: node for node, name in name_by_node.items()},
+        provenance={**provenance, "phase": "prepare"},
+    )
+    replacements = {
+        node: input_tensor(name, replace(node.spec, role="input"))
+        for node, name in name_by_node.items()
+    }
+    for node in program.live_nodes:
+        if node.op == "input":
+            replacements[node] = node
+    for node in plan.dynamic_nodes:
+        inputs = tuple(replacements[child] for child in node.inputs)
+        replacements[node] = Node(node.op, inputs, node.spec, node.attributes)
+    replay = Program(
+        {name: replacements[node] for name, node in program.outputs.items()},
+        provenance={**provenance, "phase": "replay"},
+    )
+    return IterationReusePrograms(prepared, replay, retained)
 
 
 def invariant_frontier(program: Program, plan: IterationReusePlan) -> tuple[Node, ...]:
