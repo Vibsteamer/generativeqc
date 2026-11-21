@@ -1,6 +1,7 @@
 """Occupied MP2/F12 partitions and their weighted analytic source response."""
 
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -8,6 +9,8 @@ import pytest
 import test_focal_df_reference as reference_tests
 from generativeqc._f12_focal_energy import FocalLowOrderEnergy
 from generativeqc._f12_focal_tplus_sources import (
+    FocalOccupiedTriples,
+    OccupiedMP2F12,
     SpinOccupied,
     add_distinct_pair,
     add_occupied_pair_matrix,
@@ -23,6 +26,64 @@ from generativeqc_compiler.tensor import execute, transpose_program
 from test_f12_separate_fitting_spaces import inputs, whitener
 
 hydrogen_bases = reference_tests.hydrogen_bases
+
+
+@pytest.mark.parametrize("root", ["rhf", "uhf"])
+def test_molecular_tplus_joins_only_the_exact_frame_and_fit(hydrogen_bases, root):
+    from generativeqc._f12_focal_molecular import MolecularFocalProvider
+    from generativeqc._f12_focal_reference import FocalReference
+    from generativeqc.experimental.f12_focal import FocalSeries, plan_singlepoint
+
+    rhf = root == "rhf"
+    basis = hydrogen_bases[0]
+    plan = plan_singlepoint(
+        [("H", (0., 0., float(i))) for i in range(4 if rhf else 3)],
+        FocalSeries(basis), FocalSeries(basis), None,
+        multiplicity=1 if rhf else 4, root_id=root,
+        correlation_space_id="all-active", backend="cpu_reference",
+    )
+    request = next(r for r, _ in plan.steps if r.role == "mp2_f12_correlation")
+    matrix = np.eye(4)
+    blocks = matrix[None, :, :] if rhf else np.stack((matrix, matrix))
+    ref = FocalReference(
+        -1., None, matrix, matrix, blocks, np.zeros(blocks.shape[:2]), blocks,
+        blocks, (2,) if rhf else (3, 0), 1, request.backend,
+        request.surface_id, basis.basis_id, basis.orbital.identity, basis.jk_fit.identity,
+    )
+    bare = np.array([-.15, -.11] if rhf else [-.15, -.11, -.20])
+    increment = np.array([-.012, -.023] if rhf else [-.012, -.023, -.005])
+    conventional = np.array([-.001, -.003] if rhf else [-.001, -.003, -.002])
+    parts = OccupiedMP2F12(
+        (bare / 2, bare / 2) if rhf else (bare, np.empty(0)),
+        (increment / 2, increment / 2) if rhf else (increment, np.empty(0)),
+    )
+    low = FocalLowOrderEnergy(ref, 6, None, (0., float(bare.sum()), 0.), float(increment.sum()), parts)
+    triples = FocalOccupiedTriples(ref, "all-active", basis.mp2_fit.identity,
+                                    conventional if rhf else (conventional, np.empty(0)))
+    provider = MolecularFocalProvider(shell_library=Path("unused"))
+    result = provider.tplus_from_occupied(request, low, triples)
+    ratio = 1 + increment / bare
+    assert result.energy == pytest.approx(float(np.dot(ratio, conventional)), abs=2e-16)
+    np.testing.assert_allclose(result.mp2[0], -increment * conventional / bare**2)
+    np.testing.assert_allclose(result.f12_increment[0], conventional / bare)
+    if rhf:
+        np.testing.assert_array_equal(result.mp2[0], result.mp2[1])
+        np.testing.assert_allclose(result.triples, ratio)
+    else:
+        assert result.mp2[1].shape == result.triples[1].shape == (0,)
+        np.testing.assert_allclose(result.triples[0], ratio)
+    for different in (replace(triples, reference=replace(ref)), replace(triples, correlation_fit_id="other")):
+        with pytest.raises(ValueError, match="same determinant, basis and correlation fit"):
+            provider.tplus_from_occupied(request, low, different)
+    with pytest.raises(ValueError, match="partitions disagree with their unscaled energies"):
+        provider.tplus_from_occupied(request, replace(low, f12_increment=0.0), triples)
+
+    cuda_request = replace(request, backend="cuda")
+    cuda_ref = replace(ref, executed_backend="cuda")
+    cuda_provider = replace(provider, run=execute, metric_library=Path("unused"), response_library=object())
+    with pytest.raises(RuntimeError, match="FP64 CUDA executor"):
+        cuda_provider.tplus_from_occupied(cuda_request, replace(low, reference=cuda_ref),
+                                         replace(triples, reference=cuda_ref))
 
 
 @pytest.mark.parametrize("channel", ["alpha_alpha", "alpha_beta", "beta_beta"])

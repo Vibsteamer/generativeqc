@@ -38,7 +38,11 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from ._f12_cc_stationary import UCCSDF12Pullback
-    from ._f12_focal_tplus_sources import SpinOccupied
+    from ._f12_focal_tplus_sources import (
+        FocalOccupiedTriples,
+        FocalTPlusWeights,
+        SpinOccupied,
+    )
     from ._f12_ucc_solver import (
         CudaCCTensorExecutor,
         NativeCCTensorExecutor,
@@ -292,6 +296,94 @@ class MolecularFocalProvider:
             mp2_weights=mp2_weights,
             f12_weights=f12_weights,
         )[3]
+
+    def tplus_from_occupied(
+        self,
+        request: FocalRequest,
+        low_order: FocalLowOrderEnergy,
+        triples: FocalOccupiedTriples,
+        *,
+        inactive: tuple[bool, ...] | None = None,
+    ) -> FocalTPlusWeights:
+        """Combine source partitions on one exact frame and return the three seeds.
+
+        This step does not solve the conventional CC parent or the weighted
+        triples response. Feed the MP2 and F12 seeds to tplus_scaling_forces
+        and the triples seed to the same conventional triples response owner.
+        """
+        from generativeqc_compiler.cc.tplus import evaluate_tplus
+
+        from ._f12_focal_tplus_sources import FocalTPlusWeights, checked_occupied_weights
+
+        _check_request(self, request)
+        ref, source = low_order.reference, low_order.occupied_mp2_f12
+        basis = request.basis
+        if (
+            source is None
+            or triples.reference is not ref
+            or ref.surface_id != request.surface_id
+            or ref.basis_id != basis.basis_id
+            or ref.orbital_id != basis.orbital.identity
+            or ref.jk_fit_id != basis.jk_fit.identity
+            or ref.executed_backend != request.backend
+            or triples.correlation_space_id != request.correlation_space_id
+            or basis.mp2_fit is None
+            or triples.correlation_fit_id != basis.mp2_fit.identity
+        ):
+            raise ValueError("(T+) sources require the same determinant, basis and correlation fit")
+        spins = ref._pair_spin_indices(request)
+        counts = tuple(ref.occupied[index] for index in spins)
+        mp2 = checked_occupied_weights(source.mp2, counts)
+        f12 = checked_occupied_weights(source.f12_increment, counts)
+        if not np.allclose(
+            [sum(np.sum(block) for block in parts) for parts in (mp2, f12)],
+            [sum(low_order.ordinary_mp2_spin_energies), low_order.f12_increment],
+            atol=1e-10, rtol=1e-10,
+        ):
+            raise ValueError("(T+) occupied partitions disagree with their unscaled energies")
+        values = triples.values
+        runner = self.run if request.backend == "cuda" else None
+
+        def run(program, inputs):
+            assert runner is not None
+            result = runner(program, inputs)
+            if result.backend != "cuda-fp64-ordinary-stream":
+                raise RuntimeError("(T+) scalar requires the FP64 CUDA executor")
+            return result
+
+        if request.root_id == "rhf":
+            if (
+                not isinstance(values, np.ndarray)
+                or values.dtype != np.float64
+                or values.shape != (counts[0],)
+            ):
+                raise ValueError("RHF (T+) requires one spatial occupied triples vector")
+            scaled = evaluate_tplus(
+                mp2[0] + mp2[1], f12[0] + f12[1], values,
+                inactive=inactive, run=run if runner is not None else None,
+            )
+            mp2_seed = np.array(scaled.mp2_cotangent)
+            f12_seed = np.array(scaled.f12_cotangent)
+            return FocalTPlusWeights(
+                scaled.energy, (mp2_seed, mp2_seed.copy()),
+                (f12_seed, f12_seed.copy()), np.array(scaled.triples_cotangent),
+            )
+        if not isinstance(values, tuple):
+            raise ValueError("UHF (T+) requires separate alpha and beta triples vectors")
+        values = checked_occupied_weights(values, counts)
+        scaled = evaluate_tplus(
+            np.concatenate(mp2), np.concatenate(f12), np.concatenate(values),
+            inactive=inactive, run=run if runner is not None else None,
+        )
+
+        def split(source):
+            weights = np.array(source)
+            return weights[:counts[0]], weights[counts[0]:]
+
+        return FocalTPlusWeights(
+            scaled.energy, split(scaled.mp2_cotangent), split(scaled.f12_cotangent),
+            split(scaled.triples_cotangent),
+        )
 
     def low_order_energy_and_forces(
         self, request: FocalRequest, *, include_hf_cabs: bool = True

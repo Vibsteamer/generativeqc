@@ -23,7 +23,11 @@ from generativeqc_compiler.tensor import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable, Mapping
+
+    import numpy as np
+
+    from generativeqc_compiler.tensor import Execution
 
 
 @dataclass(frozen=True)
@@ -94,8 +98,9 @@ def evaluate_tplus(
     triples: Iterable[Real],
     *,
     inactive: Iterable[bool] | None = None,
+    run: Callable[[Program, Mapping[str, np.ndarray]], Execution] | None = None,
 ) -> TPlusResponse:
-    """Evaluate the packed equation with the TensorIR reference executor.
+    """Evaluate the packed equation using the caller's executor or the reference.
 
     Each slot is an occupied orbital and must come from one identity-matched
     orbital frame. The three inputs are conventional MP2, the F12 increment
@@ -141,11 +146,21 @@ def evaluate_tplus(
         name: np.asarray(tuple(data[i] for i in selected), dtype=np.float64)
         for name, data in operands.items()
     }
-    outputs = execute(build_tplus_program(len(selected)), feeds).outputs
+    program = build_tplus_program(len(selected))
+    outputs = (execute if run is None else run)(program, feeds).outputs
+    if np.shape(outputs["energy"]) != () or not isfinite(float(outputs["energy"])):
+        raise ArithmeticError("(T+) executor returned an invalid energy")
 
     def scatter(name: str) -> tuple[float, ...]:
+        output = np.asarray(outputs[name])
+        if (
+            output.shape != (len(selected),)
+            or output.dtype != np.float64
+            or not np.isfinite(output).all()
+        ):
+            raise ArithmeticError(f"(T+) executor returned an invalid {name}")
         result = [0.0] * size
-        for orbital, value in zip(selected, outputs[name], strict=True):
+        for orbital, value in zip(selected, output, strict=True):
             result[orbital] = float(value)
         return tuple(result)
 
