@@ -6,6 +6,7 @@
 #include <stdexcept>
 
 #include "generated_scf_array_native.hpp"
+#include "tensor/cpu_compensated_sum.hpp"
 
 namespace generativeqc::scf::reference {
 
@@ -67,6 +68,17 @@ double electronic_energy(const Matrix& density, const Matrix& hcore, const Matri
     energy += 0.5 * density[i] * (hcore[i] + fock[i]);
   }
   return energy;
+}
+
+double compensated_electronic_energy(const Matrix& density, const Matrix& hcore,
+                                    const Matrix& fock) {
+  if (density.size() != hcore.size() || density.size() != fock.size())
+    throw std::invalid_argument("restricted electronic energy matrix extents differ");
+  tensor::CpuCompensatedSum energy;
+  for (std::size_t i = 0; i < density.size(); ++i) {
+    energy.add(0.5 * density[i] * (hcore[i] + fock[i]));
+  }
+  return energy.value();
 }
 
 Matrix commutator_residual(const Matrix& fock, const Matrix& density, const Matrix& overlap,

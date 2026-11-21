@@ -171,6 +171,9 @@ struct ScfOptions {
   ScfHooks* hooks{};
   /** Diagnostic proposal bridge rejects malformed seeds instead of normalizing them. */
   bool strict_initial_density{};
+  /** Seeded focal CUDA DF-RHF energy uses compensated energies and can test
+   * the physical density step in an orthonormal overlap metric. */
+  bool stabilize_focal_rhf_convergence{};
   /** False for an explicit energy-only endpoint. Backends must then omit
    * derivative evaluation and return an empty force vector. */
   bool compute_forces{true};

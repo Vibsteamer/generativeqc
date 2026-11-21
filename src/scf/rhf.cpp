@@ -1324,7 +1324,9 @@ ScfResult run_prepared_fock_strategy(const PreparedFockPlan& plan, const ScfOpti
                            : generalized_eigen(ref->fock, orthogonalizer, n);
     ref->coefficients = std::move(canonical.vectors);
     ref->orbital_energies = std::move(canonical.values);
-    ref->energy = electronic_energy(ref->density, ref->hcore, ref->fock) +
+    const auto evaluate_energy = options.stabilize_focal_rhf_convergence
+                                     ? reference::compensated_electronic_energy : electronic_energy;
+    ref->energy = evaluate_energy(ref->density, ref->hcore, ref->fock) +
                   plan.one_electron().nuclear_repulsion;
     ref->numeric_capacity_bytes = capacity;
     validate_physical_reference(*ref);

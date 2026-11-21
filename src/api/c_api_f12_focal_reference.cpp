@@ -77,9 +77,11 @@ generativeqc_status focal_df_reference(generativeqc_context* context,
       throw std::invalid_argument("focal reference requires an explicit CPU or CUDA context");
     const bool cuda = backend == core::kCudaBackend;
     scf::ScfOptions options;
-    const auto capacity = spins == 1
-                              ? posthf::rhf_reference_capacity(sys, options.diis_history, false)
-                              : posthf::uhf_reference_capacity(sys, options.diis_history, false);
+    options.stabilize_focal_rhf_convergence = cuda && spins == 1 && initial_density && !forces;
+    auto capacity = spins == 1 ? posthf::rhf_reference_capacity(sys, options.diis_history, false)
+                               : posthf::uhf_reference_capacity(sys, options.diis_history, false);
+    if (options.stabilize_focal_rhf_convergence)
+      capacity = runtime::size_add(capacity, runtime::size_mul(nn, 8 * sizeof(double)));
     if (capacity > budget) {
       context->last_detail = "DF-HF physical reference exceeds its numeric capacity budget";
       return GENERATIVEQC_STATUS_OUT_OF_MEMORY;

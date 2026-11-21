@@ -190,7 +190,7 @@ EigenResult diagonalize(const PreparedFockPlan& plan, const Matrix& matrix,
 
 void finalize_scf(const PreparedFockPlan& plan, const integrals::IntegralData& ints,
                   const Matrix& orthogonalizer, std::size_t occupied, Matrix& density,
-                  bool compute_forces, ScfResult& result,
+                  const ScfOptions& options, ScfResult& result,
                   const initial_guess::EigenOperation& target_eigen) {
   const std::size_t n = ints.nbf;
   runtime::host_trace::Region final_trace("host_finalization", n);
@@ -199,13 +199,19 @@ void finalize_scf(const PreparedFockPlan& plan, const integrals::IntegralData& i
                                      PreparedFockPlan::EigenUse::Finalization, target_eigen);
   density = density_from_orbitals(orbitals.vectors, n, occupied);
   final_fock = build_fock(plan, ints.hcore, density);
-  result.energy = electronic_energy(density, ints.hcore, final_fock) + ints.nuclear_repulsion;
-  if (compute_forces) {
+  const auto evaluate_energy = options.stabilize_focal_rhf_convergence
+                                   ? reference::compensated_electronic_energy : electronic_energy;
+  result.energy = evaluate_energy(density, ints.hcore, final_fock) + ints.nuclear_repulsion;
+  if (options.compute_forces) {
     const Matrix weighted = reference::physical_weighted_density(density, final_fock, n, 2.0);
     result.forces =
         gradient::analytic_forces(ints, density, weighted, plan.energy_derivative(density));
   }
   result.density = density;
+}
+
+double congruence_rms(const Matrix& matrix, const Matrix& basis, std::size_t n) {
+  return residual_rms(multiply(reference::transpose(basis, n), multiply(matrix, basis, n), n));
 }
 
 std::uint64_t next_host_final_state_epoch() {
@@ -341,6 +347,9 @@ ScfResult run_rhf_host_plan(const core::System& system, const ScfOptions& option
   result.initial_density_used = initial_density != nullptr;
   ExactIncrementalDirectJk incremental_jk(plan, options, result.incremental_direct_jk);
   const bool require_residual = options.hooks && options.hooks->propose;
+  const bool stabilize = options.stabilize_focal_rhf_convergence;
+  const auto evaluate_energy = stabilize ? reference::compensated_electronic_energy : electronic_energy;
+  Matrix density_metric_basis;
 
   struct RhfEvaluation {
     Matrix fock;
@@ -349,6 +358,7 @@ ScfResult run_rhf_host_plan(const core::System& system, const ScfOptions& option
     double energy{};
     double state_rms{};
     double residual_rms{};
+    double ao_density_rms{};
   };
 
   const ::generativeqc::solver::SelfConsistentPolicy policy{
@@ -362,20 +372,35 @@ ScfResult run_rhf_host_plan(const core::System& system, const ScfOptions& option
             assemble_host_fock(plan, ints.hcore, incremental_jk.build(current_density)).alpha;
         const runtime::CpuRetainedCapacity anchor_capacity(incremental_jk.numeric_capacity());
         const double energy =
-            electronic_energy(current_density, ints.hcore, fock) + ints.nuclear_repulsion;
+            evaluate_energy(current_density, ints.hcore, fock) + ints.nuclear_repulsion;
         Matrix residual = commutator_residual(fock, current_density, ints.overlap, n);
         const Matrix effective_fock = diis.update(fock, residual);
         orbitals = diagonalize(plan, effective_fock, ints, orthogonalizer,
                                PreparedFockPlan::EigenUse::Iteration, target_eigen);
         Matrix next_density = density_from_orbitals(orbitals.vectors, n, occupied);
 
+        const double ao_rms = density_rms(next_density, current_density);
+        double state_rms = ao_rms;
+        // With diffuse OBS, a well-conditioned physical step can look large
+        // in raw AO coefficients. Only consider the metric step when the
+        // energy and the unextrapolated physical Fock are also stationary.
+        if (stabilize && ao_rms >= options.density_tolerance && result.iterations != 0 &&
+            std::abs(energy - result.energy) < options.energy_tolerance &&
+            congruence_rms(residual, orthogonalizer, n) < options.density_tolerance) {
+          if (density_metric_basis.empty())
+            density_metric_basis = multiply(ints.overlap, orthogonalizer, n);
+          Matrix delta(next_density.size());
+          for (std::size_t i = 0; i < delta.size(); ++i)
+            delta[i] = next_density[i] - current_density[i];
+          const double metric_rms = congruence_rms(delta, density_metric_basis, n);
+          if (metric_rms < options.density_tolerance) state_rms = metric_rms;
+        }
         sample_scf_buffers(plan, diis, orthogonalizer, current_density, fock, residual,
-                           effective_fock, orbitals.values, orbitals.vectors, next_density);
-
-        const double state_rms = density_rms(next_density, current_density);
+                           effective_fock, orbitals.values, orbitals.vectors, next_density,
+                           density_metric_basis);
         const double physical_residual_rms = require_residual ? residual_rms(residual) : 0.0;
         return RhfEvaluation{std::move(fock), std::move(residual), std::move(next_density),
-                             energy,          state_rms,           physical_residual_rms};
+                             energy, state_rms, physical_residual_rms, ao_rms};
       },
       [&](const Matrix& current_density, RhfEvaluation evaluation,
           const ::generativeqc::solver::SelfConsistentProgress& progress) {
@@ -397,11 +422,11 @@ ScfResult run_rhf_host_plan(const core::System& system, const ScfOptions& option
         }
         return next_density;
       },
-      [&](const ::generativeqc::solver::SelfConsistentProgress& progress, const RhfEvaluation&) {
+      [&](const ::generativeqc::solver::SelfConsistentProgress& progress, const RhfEvaluation& evaluation) {
         result.iterations = progress.iteration;
         result.energy = progress.energy;
         result.energy_change = progress.energy_change;
-        result.density_rms = progress.state_rms;
+        result.density_rms = evaluation.ao_density_rms;
       });
   density = std::move(outcome.state);
   result.converged = outcome.converged;
@@ -417,7 +442,7 @@ ScfResult run_rhf_host_plan(const core::System& system, const ScfOptions& option
 
   // Rebuild and diagonalize the un-extrapolated converged Fock matrix. The
   // resulting orbitals define the energy-weighted density in the Pulay term.
-  finalize_scf(plan, ints, orthogonalizer, occupied, density, options.compute_forces, result,
+  finalize_scf(plan, ints, orthogonalizer, occupied, density, options, result,
                target_eigen);
   return result;
 }
