@@ -1,8 +1,13 @@
 """Check the CC two-electron source reverse with a dense spin-orbital DF oracle."""
 
 import numpy as np
+from generativeqc_compiler.cc.uccsd_df_virtual_ladder import (
+    FACTOR_INPUTS,
+    build_uccsd_df_virtual_ladder_amplitude_programs,
+)
 from generativeqc_compiler.cc.uccsd_equations import build_program
-from generativeqc_compiler.tensor import execute
+from generativeqc_compiler.cc.uccsd_layout import UCCSDLayout
+from generativeqc_compiler.tensor import execute, transpose_program
 
 from tools.generativeqc_cc.uccsd_eri_nuclear import unrestricted_cc_eri_pullback
 
@@ -80,3 +85,86 @@ def test_frozen_unrestricted_eri_reverse() -> None:
         eps = 2e-5
         finite = (energy(eps, k) - energy(-eps, k)) / (2 * eps)
         np.testing.assert_allclose(np.vdot(bars[k], dx), finite, rtol=2e-8, atol=3e-6)
+
+
+def test_virtual_factor_bars_share_the_ordinary_ao_and_metric_pullback() -> None:
+    rng = np.random.default_rng(633)
+    nao, obs, aux = 6, 5, 5
+    occupied, frozen = (3, 2), (1, 0)
+    layout = UCCSDLayout(2, 2, 2, 3)
+    spins = ("alpha", "beta")
+    coefficients = {spin: rng.normal(scale=0.2, size=(nao, obs)) for spin in spins}
+    ao = rng.normal(scale=0.3, size=(aux, nao, nao))
+    ao += ao.swapaxes(1, 2)
+    metric = rng.normal(scale=0.2, size=(aux, aux))
+    metric = metric @ metric.T + np.eye(aux)
+    whitener = np.linalg.inv(np.linalg.cholesky(metric))
+    amplitudes = layout.unpack(rng.normal(scale=0.1, size=layout.packed_size))
+    seeds = {
+        "bar_" + name.replace("t", "r", 1): value
+        for name, value in layout.unpack_dual(
+            rng.normal(size=layout.packed_size)
+        ).items()
+    }
+
+    full = build_program(layout.oa, layout.ob, layout.va, layout.vb)
+    virtual_names = tuple(
+        node.attrs["name"]
+        for node in full.live_nodes
+        if node.op == "input" and node.attrs["name"].startswith("gvvvv_")
+    )
+    full_action = transpose_program(
+        full, ("r2aa", "r2ab", "r2bb"), inputs=virtual_names
+    ).program
+    dense_bars = {
+        name.removeprefix("bar_"): value
+        for name, value in execute(full_action, {**amplitudes, **seeds}).outputs.items()
+    }
+    other_bars = {
+        node.attrs["name"]: rng.normal(scale=0.2, size=node.spec.shape)
+        for node in full.live_nodes
+        if node.op == "input"
+        and node.attrs["name"].startswith("g")
+        and node.attrs["name"] not in virtual_names
+    }
+
+    factors = {}
+    for spin, no in zip(spins, occupied, strict=True):
+        frame = coefficients[spin][:, no:]
+        raw = frame.T @ ao @ frame
+        fit = np.linalg.solve(metric, raw.reshape(aux, -1)).reshape(raw.shape)
+        factors["raw_right_" + spin] = raw
+        factors["fit_left_" + spin] = fit
+    factor_bars = {name: np.empty_like(value) for name, value in factors.items()}
+    for start, stop in ((0, 2), (2, 4), (4, 5)):
+        graph = build_uccsd_df_virtual_ladder_amplitude_programs(
+            layout, stop - start
+        ).factor_vjp.program
+        slab = {name: factors[name][start:stop] for name in FACTOR_INPUTS}
+        bars = execute(graph, {**amplitudes, **slab, **seeds}).outputs
+        for name in FACTOR_INPUTS:
+            factor_bars[name][start:stop] = bars["bar_" + name]
+
+    expected = unrestricted_cc_eri_pullback(
+        occupied,
+        {**other_bars, **dense_bars},
+        coefficients,
+        ao,
+        metric,
+        whitener,
+        execute,
+        frozen_occupied=frozen,
+    )
+    calculated = unrestricted_cc_eri_pullback(
+        occupied,
+        other_bars,
+        coefficients,
+        ao,
+        metric,
+        whitener,
+        execute,
+        frozen_occupied=frozen,
+        virtual_factor_weights=factor_bars,
+    )
+    for name, value in expected.items():
+        np.testing.assert_allclose(calculated[name], value, rtol=0, atol=2e-13)

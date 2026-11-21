@@ -7,6 +7,7 @@ import numpy as np
 from generativeqc_compiler.cc.uccsd_coulomb_blocks import (
     antisymmetrized_integral_requests,
 )
+from generativeqc_compiler.cc.uccsd_df_virtual_ladder import FACTOR_INPUTS
 from generativeqc_compiler.cc.uccsd_equations import build_program
 from generativeqc_compiler.mp2.f12_density_fitting import (
     coulomb_fit_response,
@@ -26,6 +27,7 @@ def unrestricted_cc_eri_pullback(
     run: Callable,
     *,
     frozen_occupied: tuple[int, int] = (0, 0),
+    virtual_factor_weights: Mapping[str, np.ndarray] | None = None,
 ) -> dict[str, np.ndarray]:
     """Transpose all live antisymmetrized ordinary ERI blocks of the UCC Lagrangian.
 
@@ -36,6 +38,8 @@ def unrestricted_cc_eri_pullback(
     metric integrals and on the complete ordinary MO columns in each spin.
     Frozen orbitals occur in the UHF reference but are omitted from active ERI
     occupied legs. Only one reconstructed four-index tile is needed at a time.
+    A bounded virtual ladder supplies its four accumulated fit/raw factor
+    cotangents in place of the dense four-virtual ERI block cotangents.
     """
     spins = {"a": "alpha", "b": "beta"}
     nao, nmo = coefficients["alpha"].shape
@@ -61,12 +65,30 @@ def unrestricted_cc_eri_pullback(
     needed = {
         node.attrs["name"]: node.spec.shape
         for node in cc.live_nodes
-        if node.op == "input" and node.attrs["name"].startswith("g")
+        if node.op == "input"
+        and node.attrs["name"].startswith("g")
+        and (
+            virtual_factor_weights is None
+            or not node.attrs["name"].startswith("gvvvv_")
+        )
     }
     if set(weights) != set(needed):
         raise ValueError(
             "Expected every live ordinary antisymmetrized two-electron weight"
         )
+    if virtual_factor_weights is not None:
+        extents = (nmo - oa, nmo - ob) * 2
+        if set(virtual_factor_weights) != set(FACTOR_INPUTS) or any(
+            value.shape != (aux, extent, extent)
+            or value.dtype != np.float64
+            or not np.isfinite(value).all()
+            for value, extent in zip(
+                (virtual_factor_weights[name] for name in FACTOR_INPUTS),
+                extents,
+                strict=True,
+            )
+        ):
+            raise ValueError("Invalid MP2Fit virtual factor cotangents")
     domains = {
         (label, kind): tuple(range(begin, end))
         for label, no, nf in zip(spins, occupied, frozen_occupied, strict=True)
@@ -80,7 +102,7 @@ def unrestricted_cc_eri_pullback(
     fit_graph = Program({"fit": solve.outputs["fit"]})
     fit_rev = Program({k: solve.outputs[k] for k in ("metric_bar", "three_center_bar")})
     raw, fit, raw_bar, fit_bar = {}, {}, {}, {}
-    for spin in spins.values():
+    for spin, no in zip(spins.values(), occupied, strict=True):
         raw[spin] = run(
             project, {"coefficients": coefficients[spin], "ao_coulomb": three_center}
         ).outputs["raw_coulomb"]
@@ -97,6 +119,9 @@ def unrestricted_cc_eri_pullback(
         )
         raw_bar[spin] = np.zeros_like(raw[spin])
         fit_bar[spin] = np.zeros_like(raw[spin])
+        if virtual_factor_weights is not None:
+            raw_bar[spin][:, no:, no:] = virtual_factor_weights["raw_right_" + spin]
+            fit_bar[spin][:, no:, no:] = virtual_factor_weights["fit_left_" + spin]
     reverse = {}
     for name, shape in needed.items():
         bar = weights[name]

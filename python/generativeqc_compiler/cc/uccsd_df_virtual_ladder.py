@@ -19,7 +19,8 @@ from generativeqc_compiler.tensor import (
     transpose_program,
 )
 
-from .uccsd_layout import UCCSDLayout
+from .uccsd_equations import _canonical_tau
+from .uccsd_layout import BLOCK_NAMES, UCCSDLayout
 
 TAU_INPUTS = ("tau_aa", "tau_ab", "tau_bb")
 FACTOR_INPUTS = (
@@ -61,9 +62,7 @@ def _ladder(tau: Node, fit: Node, raw: Node) -> Node:
     return einsum("Pijaf,Pbf->ijab", projected, raw)
 
 
-def build_uccsd_df_virtual_ladder(
-    layout: UCCSDLayout, auxiliary_slice: int
-) -> Program:
+def build_uccsd_df_virtual_ladder(layout: UCCSDLayout, auxiliary_slice: int) -> Program:
     """Return the bare term 1/2 sum_ef tau_ijef <ab||ef> for one DF slice.
 
     Tau contains T2 plus the disconnected singles product in canonical aa, ab
@@ -77,11 +76,7 @@ def build_uccsd_df_virtual_ladder(
     """
     if not isinstance(layout, UCCSDLayout):
         raise TypeError("DF virtual ladder requires UCCSDLayout")
-    auxiliary = IndexSpace("df_ladder_auxiliary", "auxiliary", auxiliary_slice)
-    if auxiliary.size == 0:
-        raise ValueError("DF virtual ladder requires a nonempty auxiliary slice")
-
-    tau_aa, tau_ab, tau_bb = (
+    tau = tuple(
         input_tensor(
             name,
             replace(
@@ -93,6 +88,16 @@ def build_uccsd_df_virtual_ladder(
         )
         for name, block in zip(TAU_INPUTS, layout.blocks[2:], strict=True)
     )
+    return _virtual_ladder_program(tau, auxiliary_slice, "tau")
+
+
+def _virtual_ladder_program(
+    tau: tuple[Node, ...], auxiliary_slice: int, inputs: str
+) -> Program:
+    auxiliary = IndexSpace("df_ladder_auxiliary", "auxiliary", auxiliary_slice)
+    if auxiliary.size == 0:
+        raise ValueError("DF virtual ladder requires a nonempty auxiliary slice")
+    tau_aa, tau_ab, tau_bb = tau
     va, vb = (index.space for index in tau_ab.spec.indices[2:])
     fit_a, fit_b, raw_a, raw_b = (
         _factor(name, auxiliary, space)
@@ -112,7 +117,16 @@ def build_uccsd_df_virtual_ladder(
             "r2ab": _ladder(tau_ab, fit_a, raw_b),
             "r2bb": same_spin(tau_bb, fit_b, raw_b),
         },
-        provenance={"method": "UCCSD", "term": "bare_df_virtual_ladder", "version": 1},
+        provenance={
+            "method": "UCCSD",
+            "term": "bare_df_virtual_ladder",
+            "version": 1,
+            **(
+                {"input_domain": "physical_amplitudes"}
+                if inputs == "amplitudes"
+                else {}
+            ),
+        },
     )
 
 
@@ -128,4 +142,36 @@ def build_uccsd_df_virtual_ladder_response(
         transpose_program(primal, outputs, inputs=TAU_INPUTS),
         linearize(primal, FACTOR_INPUTS, outputs=outputs),
         transpose_program(primal, outputs, inputs=FACTOR_INPUTS),
+    )
+
+
+@dataclass(frozen=True)
+class UCCDFVirtualLadderAmplitudePrograms:
+    """A bare slice in the full residual convention and its physical input actions."""
+
+    primal: Program
+    residual_jvp: JVPProgram
+    residual_vjp: VJPProgram
+    factor_vjp: VJPProgram
+
+
+def build_uccsd_df_virtual_ladder_amplitude_programs(
+    layout: UCCSDLayout, auxiliary_slice: int, *, max_elements: int = 1_000_000
+) -> UCCDFVirtualLadderAmplitudePrograms:
+    """Link each slice to physical T1/T2, including the disconnected singles derivative."""
+    if not isinstance(layout, UCCSDLayout):
+        raise TypeError("DF virtual ladder requires UCCSDLayout")
+    primal = _virtual_ladder_program(
+        _canonical_tau(layout), auxiliary_slice, "amplitudes"
+    )
+    outputs = tuple(primal.outputs)
+    return UCCDFVirtualLadderAmplitudePrograms(
+        primal,
+        linearize(primal, BLOCK_NAMES, outputs=outputs, max_elements=max_elements),
+        transpose_program(
+            primal, outputs, inputs=BLOCK_NAMES, max_elements=max_elements
+        ),
+        transpose_program(
+            primal, outputs, inputs=FACTOR_INPUTS, max_elements=max_elements
+        ),
     )

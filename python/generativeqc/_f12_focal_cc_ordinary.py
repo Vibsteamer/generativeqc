@@ -22,8 +22,10 @@ def ordinary_ucc_source_forces(
     request: FocalRequest,
     sources: FocalUCCEquationSources,
     weights: Mapping[str, np.ndarray],
+    *,
+    virtual_factor_weights: Mapping[str, np.ndarray] | None = None,
 ) -> np.ndarray:
-    """Return minus the contraction of 38 stationary MO weights with their nuclear derivatives."""
+    """Pull ordinary stationary MO and optional virtual factor weights to the nuclei."""
     from generativeqc_compiler.method.canonical_frame_response import (
         orbital_rotation_cotangent,
     )
@@ -67,7 +69,10 @@ def ordinary_ucc_source_forces(
         raise ValueError(
             "Molecular UCC sources, stationary root and force request must match"
         )
-    if weights.keys() != sources.ordinary.keys():
+    expected = sources.ordinary.keys()
+    if virtual_factor_weights is not None:
+        expected = {name for name in expected if not name.startswith("gvvvv_")}
+    if weights.keys() != expected:
         raise ValueError("Ordinary UCC force requires weights of every ordinary source")
 
     cuda = request.backend == "cuda"
@@ -128,6 +133,7 @@ def ordinary_ucc_source_forces(
         mp.data["metric"],
         mp.whitener,
         run,
+        virtual_factor_weights=virtual_factor_weights,
     )
 
     n = one.obs_ao_count

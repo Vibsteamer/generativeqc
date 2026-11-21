@@ -9,8 +9,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+from generativeqc_compiler.cc.uccsd_df_virtual_ladder import (
+    UCCDFVirtualLadderAmplitudePrograms,
+    build_uccsd_df_virtual_ladder_amplitude_programs,
+)
 from generativeqc_compiler.cc.uccsd_equations import (
     build_f12_correction_program,
+    build_f12_df_remainder_program,
     build_f12_program,
     build_program,
 )
@@ -78,13 +83,68 @@ def build_f12_response_programs(
     return _response_programs(build_f12_program(layout), max_elements)
 
 
+@dataclass(frozen=True)
+class UCCSDF12DFResponsePrograms:
+    """Full F12b residual and response split between one remainder and DF slices.
+
+    Accumulate bare residuals and amplitude actions before packing the physical
+    outputs. Lambda stationarity adds the same slice transposes to the remainder
+    stationarity action. Factor cotangents belong to each DF slice and share the
+    metric and orbital pullback of the ordinary Coulomb sources.
+    """
+
+    remainder: UCCSDResponsePrograms
+    ladder: UCCDFVirtualLadderAmplitudePrograms
+
+
+def build_f12_df_response_programs(
+    layout: UCCSDLayout, auxiliary_slice: int, *, max_elements: int = 1_000_000
+) -> UCCSDF12DFResponsePrograms:
+    """Generate the complete set of electronic response parts for bounded DF."""
+    return UCCSDF12DFResponsePrograms(
+        _response_programs(build_f12_df_remainder_program(layout), max_elements),
+        build_uccsd_df_virtual_ladder_amplitude_programs(
+            layout, auxiliary_slice, max_elements=max_elements
+        ),
+    )
+
+
+def build_f12_df_remainder_source_vjps(
+    programs: UCCSDF12DFResponsePrograms, *, max_elements: int = 1_000_000
+) -> tuple[VJPProgram, VJPProgram]:
+    """Keep the large three-virtual source cotangents separate from other sources."""
+    remainder = programs.remainder
+    three_virtual = tuple(
+        name for name in remainder.parameter_names if name.startswith("govvv_")
+    )
+    remaining = tuple(
+        name for name in remainder.parameter_names if name not in three_virtual
+    )
+    return (
+        transpose_program(
+            remainder.primal,
+            ("correlation_energy", *RESIDUALS),
+            inputs=three_virtual,
+            max_elements=max_elements,
+        ),
+        transpose_program(
+            remainder.primal,
+            ("correlation_energy", *RESIDUALS),
+            inputs=remaining,
+            max_elements=max_elements,
+        ),
+    )
+
+
 def fixed_source_lagrangian_direction(layout: UCCSDLayout) -> Program:
     """Contract all molecular F12 feed tangents with the CC Lagrangian.
 
     Supply the same packed-dual lift as the ordinary residual transpose.
     Differentiating just the F12 additions holds ordinary MO inputs fixed.
     """
-    return _parameter_direction(build_f12_correction_program(layout), "fixed_source_lagrangian")
+    return _parameter_direction(
+        build_f12_correction_program(layout), "fixed_source_lagrangian"
+    )
 
 
 def molecular_lagrangian_direction(layout: UCCSDLayout) -> Program:
@@ -103,7 +163,8 @@ def _parameter_direction(primal: Program, output: str) -> Program:
         terms.append(einsum(f"{axes},{axes}->", seed, residual))
     lagrangian = Program({output: add(*terms)})
     sources = tuple(
-        node.attrs["name"] for node in primal.live_nodes
+        node.attrs["name"]
+        for node in primal.live_nodes
         if node.op == "input" and node.attrs["name"] not in BLOCK_NAMES
     )
     return linearize(lagrangian, sources).program

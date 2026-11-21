@@ -123,6 +123,17 @@ class _SpinLowering:
             ("b", "a", "b", "a"): transpose(mixed, (1, 0, 3, 2)),
         }
 
+    def define_tau(self, name: str, factor: Fraction | int) -> None:
+        self.define(
+            name,
+            "oovv",
+            (
+                (1, "ijab->ijab", ("t2",)),
+                (factor, "ia,jb->ijab", ("t1", "t1")),
+                (-factor, "ib,ja->ijab", ("t1", "t1")),
+            ),
+        )
+
     def define(self, name: str, domains: str, terms: tuple[Term, ...]) -> None:
         """Eliminate forbidden spin assignments before constructing any node."""
         blocks = {}
@@ -168,28 +179,20 @@ def build_program(oa: int, ob: int, va: int, vb: int) -> Program:
     Keeping the full occupied/virtual Fock matrices in these equations makes
     residuals physical, rather than denominator-divided Jacobi proposals.
     """
-    layout = UCCSDLayout(oa, ob, va, vb)
+    return _build_program(UCCSDLayout(oa, ob, va, vb), split_virtual_ladder=False)
+
+
+def _build_program(layout: UCCSDLayout, *, split_virtual_ladder: bool) -> Program:
     lowering = _SpinLowering(layout)
     lowering.amplitudes(layout)
     for name, domains in (("foo", "oo"), ("fov", "ov"), ("fvv", "vv")):
         lowering.inputs(name, domains)
     for domains in INTEGRAL_DOMAINS:
-        lowering.inputs(f"g{domains}", domains)
+        if not split_virtual_ladder or domains != "vvvv":
+            lowering.inputs(f"g{domains}", domains)
     half, quarter = Fraction(1, 2), Fraction(1, 4)
-    disconnected: tuple[Term, ...] = (
-        (1, "ia,jb->ijab", ("t1", "t1")),
-        (-1, "ib,ja->ijab", ("t1", "t1")),
-    )
     for name, factor in (("tau", 1), ("tau_half", half)):
-        lowering.define(
-            name,
-            "oovv",
-            ((1, "ijab->ijab", ("t2",)),)
-            + tuple(
-                (coefficient * factor, equation, operands)
-                for coefficient, equation, operands in disconnected
-            ),
-        )
+        lowering.define_tau(name, factor)
     lowering.define(
         "Fvv",
         "vv",
@@ -218,6 +221,29 @@ def build_program(oa: int, ob: int, va: int, vb: int) -> Program:
             (1, "nf,mnef->me", ("t1", "goovv")),
         ),
     )
+    if split_virtual_ladder:
+        lowering.define("tau_oovv", "oooo", ((1, "ijef,mnef->mnij", ("tau", "goovv")),))
+        lowering.define("tau_ovvv", "ooov", ((1, "ijef,mbef->ijmb", ("tau", "govvv")),))
+        occupied_dressing = (quarter, "mnij->mnij", ("tau_oovv",))
+        # Contract the dressed part with tau without ever forming Wvvvv.
+        virtual_ladder = (
+            (-half, "ijmb,ma->ijab", ("tau_ovvv", "t1")),
+            (half, "ijma,mb->ijab", ("tau_ovvv", "t1")),
+            (Fraction(1, 8), "mnij,mnab->ijab", ("tau_oovv", "tau")),
+        )
+    else:
+        occupied_dressing = (quarter, "ijef,mnef->mnij", ("tau", "goovv"))
+        lowering.define(
+            "Wvvvv",
+            "vvvv",
+            (
+                (1, "abef->abef", ("gvvvv",)),
+                (-1, "ma,mbef->abef", ("t1", "govvv")),
+                (1, "mb,maef->abef", ("t1", "govvv")),
+                (quarter, "mnab,mnef->abef", ("tau", "goovv")),
+            ),
+        )
+        virtual_ladder = ((half, "ijef,abef->ijab", ("tau", "Wvvvv")),)
     lowering.define(
         "Woooo",
         "oooo",
@@ -225,17 +251,7 @@ def build_program(oa: int, ob: int, va: int, vb: int) -> Program:
             (1, "mnij->mnij", ("goooo",)),
             (1, "je,mnie->mnij", ("t1", "gooov")),
             (-1, "ie,mnje->mnij", ("t1", "gooov")),
-            (quarter, "ijef,mnef->mnij", ("tau", "goovv")),
-        ),
-    )
-    lowering.define(
-        "Wvvvv",
-        "vvvv",
-        (
-            (1, "abef->abef", ("gvvvv",)),
-            (-1, "ma,mbef->abef", ("t1", "govvv")),
-            (1, "mb,maef->abef", ("t1", "govvv")),
-            (quarter, "mnab,mnef->abef", ("tau", "goovv")),
+            occupied_dressing,
         ),
     )
     lowering.define(
@@ -281,8 +297,7 @@ def build_program(oa: int, ob: int, va: int, vb: int) -> Program:
     doubles: tuple[Term, ...] = (
         (1, "ijab->ijab", ("goovv",)),
         (half, "mnab,mnij->ijab", ("tau", "Woooo")),
-        (half, "ijef,abef->ijab", ("tau", "Wvvvv")),
-    )
+    ) + virtual_ladder
     for term, occupied, virtual in (
         ((1, "ijae,be->ijab", ("t2", "Fvv_doubles")), False, True),
         ((-1, "imab,mj->ijab", ("t2", "Foo_doubles")), True, False),
@@ -302,9 +317,21 @@ def build_program(oa: int, ob: int, va: int, vb: int) -> Program:
             (half, "ijab,ia,jb->", ("goovv", "t1", "t1")),
         ),
     )
-    return Program(
-        _amplitude_equation_outputs(layout, lowering),
-        provenance={"method": "UCCSD", "version": VERSION},
+    provenance = {"method": "UCCSD", "version": VERSION}
+    if split_virtual_ladder:
+        provenance["virtual_ladder"] = (
+            "reassociated dressing; bare term supplied separately"
+        )
+    return Program(_amplitude_equation_outputs(layout, lowering), provenance=provenance)
+
+
+def _canonical_tau(layout: UCCSDLayout) -> tuple[Node, ...]:
+    """Use the physical disconnected-singles convention in each stored T2 sector."""
+    lowering = _SpinLowering(layout)
+    lowering.amplitudes(layout)
+    lowering.define_tau("tau", 1)
+    return tuple(
+        lowering.tensors["tau"][tuple(spins)] for spins in ("aaaa", "abab", "bbbb")
     )
 
 
@@ -379,10 +406,22 @@ def build_f12_correction_program(layout: UCCSDLayout) -> Program:
 
 def build_f12_program(layout: UCCSDLayout) -> Program:
     """Join the ordinary UCCSD equations and the fixed-source F12b correction."""
+    return _build_f12_program(layout, split_virtual_ladder=False)
+
+
+def build_f12_df_remainder_program(layout: UCCSDLayout) -> Program:
+    """Return the full energy and residuals with the bare DF ladder left to its slices."""
+    return _build_f12_program(layout, split_virtual_ladder=True)
+
+
+def _build_f12_program(layout: UCCSDLayout, *, split_virtual_ladder: bool) -> Program:
     correction = build_f12_correction_program(layout)
-    ordinary = build_program(layout.oa, layout.ob, layout.va, layout.vb)
+    ordinary = _build_program(layout, split_virtual_ladder=split_virtual_ladder)
     return Program(
-        {name: add(node, correction.outputs[name]) for name, node in ordinary.outputs.items()},
+        {
+            name: add(node, correction.outputs[name])
+            for name, node in ordinary.outputs.items()
+        },
         provenance={
             "method": "unrestricted CCSD-F12b with fixed geminal sources",
             "ordinary": ordinary.logical_hash,
