@@ -29,14 +29,17 @@ struct UnrestrictedFitting {
   /** Reserve fitted preparation, spectral conditioning and optional coordinate
    * tensors before constructing the reference provider, including one-electron
    * states for which an MP2 occupied/virtual capacity query is not applicable. */
-  std::size_t reference_capacity(const core::System& system, unsigned history) const {
+  std::size_t reference_capacity(const core::System& system, unsigned history,
+                                 bool reserve_derivatives = true) const {
     auto result = posthf::uhf_reference_capacity(system, history, !full_reference);
     if (!full_reference) return result;
     const auto orbital = molecule::cartesian_ao_count(system);
     const auto auxiliary_count = molecule::cartesian_ao_count(*reference_auxiliary());
     const auto metric = posthf::checked_mul(auxiliary_count, auxiliary_count);
     const auto raw = posthf::checked_mul(posthf::checked_mul(orbital, orbital), auxiliary_count);
-    const auto coordinates = posthf::checked_add(1, posthf::checked_mul(3, system.atoms.size()));
+    const auto coordinates = reserve_derivatives
+                                 ? posthf::checked_add(1, posthf::checked_mul(3, system.atoms.size()))
+                                 : 1;
     auto fitted = posthf::checked_mul(
         16 * sizeof(double), posthf::checked_mul(coordinates, posthf::checked_add(raw, metric)));
     fitted = posthf::checked_add(fitted, posthf::checked_mul(2, posthf::source_scratch_bytes));

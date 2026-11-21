@@ -466,19 +466,9 @@ UnrestrictedSolve solve_unrestricted(const hf::UnrestrictedPhysicalReference& re
       reference.nbf, reference.nocc[0], reference.nocc[1], options, triples, reference_capacity,
       cuda, provider_peak);
   std::unique_ptr<UnrestrictedCudaExecutor> executor;
-  if (cuda) {
-#if GENERATIVEQC_HAS_CUDA
-    executor =
-        make_unrestricted_cuda_executor(reference.nbf, reference.nocc[0], reference.nocc[1], device,
-                                        options.max_bytes - result.numeric_capacity_bytes, false);
-    result.numeric_capacity_bytes =
-        posthf::checked_add(result.numeric_capacity_bytes, executor->numeric_capacity_bytes());
-    if (result.numeric_capacity_bytes > options.max_bytes)
-      throw std::length_error("complete unrestricted CUDA endpoint exceeds numeric memory budget");
-#else
-    throw std::invalid_argument("unrestricted CUDA CC requires a CUDA build");
+#if !GENERATIVEQC_HAS_CUDA
+  if (cuda) throw std::invalid_argument("unrestricted CUDA CC requires a CUDA build");
 #endif
-  }
   Feeds feeds;
   graph::Inputs inputs;
   for (const auto& spec : graph::kFeeds) {
@@ -508,6 +498,18 @@ UnrestrictedSolve solve_unrestricted(const hf::UnrestrictedPhysicalReference& re
     }
     inputs.*(spec.field) = feed.values.data();
   }
+#if GENERATIVEQC_HAS_CUDA
+  if (cuda) {
+    // Integral blocks are staged synchronously. Their temporary device buffers
+    // are gone before reserving the graph arena. Retain the conservative
+    // combined numeric bound for the public correlation memory budget.
+    executor =
+        make_unrestricted_cuda_executor(reference.nbf, reference.nocc[0], reference.nocc[1], device,
+                                        options.max_bytes - result.numeric_capacity_bytes, false);
+    result.numeric_capacity_bytes =
+        posthf::checked_add(result.numeric_capacity_bytes, executor->numeric_capacity_bytes());
+  }
+#endif
   const auto entries = excitations(reference, feeds, options, result.minimum_denominator);
   if (entries.empty()) result.minimum_denominator = 0.0;
   std::vector<double> current(entries.size());

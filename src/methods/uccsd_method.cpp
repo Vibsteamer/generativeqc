@@ -101,6 +101,12 @@ class UccsdPrepared final : public PreparedCalculation {
                         "unrestricted companions require UCCSD(T)");
     try {
       const bool triples = capabilities_.method == GENERATIVEQC_METHOD_UCCSD_T;
+      // CUDA preparation admits a value plan. Reapply the derivative allowance
+      // before constructing any provider for an explicitly requested force.
+      const auto reference_capacity =
+          cuda_ && compute_forces
+              ? fitting_.reference_capacity(physical, reference_options_.diis_history)
+              : reference_capacity_;
       const auto derivative_capacity = cuda_ && compute_forces
                                            ? posthf::one_electron_response_capacity(physical)
                                            : posthf::source_scratch_bytes;
@@ -109,7 +115,7 @@ class UccsdPrepared final : public PreparedCalculation {
         const auto alpha =
             static_cast<std::size_t>((physical.electron_count + physical.multiplicity - 1) / 2);
         cc::unrestricted_force_capacity(
-            nbf, alpha, physical.electron_count - alpha, options_, triples, reference_capacity_,
+            nbf, alpha, physical.electron_count - alpha, options_, triples, reference_capacity,
             fitting_.auxiliary && (!fitting_.full_reference || fitting_.separate_reference_auxiliary),
             derivative_capacity, cuda_);
       }
@@ -148,7 +154,7 @@ class UccsdPrepared final : public PreparedCalculation {
           std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
       const auto& reference = *reference_result.unrestricted_reference;
       auto retained_reference_capacity = posthf::checked_add(
-          reference_capacity_, cuda_ ? reference_plan.diagnostic().peak_device_bytes : 0);
+          reference_capacity, cuda_ ? reference_plan.diagnostic().peak_device_bytes : 0);
       reference_result.density.clear();
       reference_result.density.shrink_to_fit();
       scf::PreparedFockInteractionSourceView reference_source(reference_plan);
@@ -470,8 +476,9 @@ std::unique_ptr<PreparedCalculation> prepare_uccsd_with_reference_fit(
       throw std::invalid_argument("independent UCC JKFit requires full density fitting");
     fitting.separate_reference_auxiliary = *reference_auxiliary;
   }
+  const auto cuda = context.requested_backend == GENERATIVEQC_BACKEND_CUDA;
   const auto reference_capacity =
-      fitting.reference_capacity(system, reference_options.diis_history);
+      fitting.reference_capacity(system, reference_options.diis_history, !cuda);
   const auto nbf = molecule::ao_count(system);
   const auto alpha =
       static_cast<std::size_t>((system.electron_count + system.multiplicity - 1) / 2);
@@ -479,14 +486,13 @@ std::unique_ptr<PreparedCalculation> prepare_uccsd_with_reference_fit(
   try {
     cc::unrestricted_capacity(nbf, alpha, beta, options,
                               capabilities.method == GENERATIVEQC_METHOD_UCCSD_T,
-                              reference_capacity);
+                              reference_capacity, cuda);
   } catch (const std::length_error& error) {
     throw MethodError(GENERATIVEQC_STATUS_OUT_OF_MEMORY, error.what());
   }
   return std::make_unique<UccsdPrepared>(capabilities, system, reference_options, options,
                                          reference_capacity, mp2_threshold,
-                                         context.requested_backend == GENERATIVEQC_BACKEND_CUDA,
-                                         context.device_id, std::move(fitting));
+                                         cuda, context.device_id, std::move(fitting));
 }
 
 }  // namespace generativeqc::methods::detail
