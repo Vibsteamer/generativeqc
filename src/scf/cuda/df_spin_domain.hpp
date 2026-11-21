@@ -36,11 +36,21 @@ inline bool all_electron_triplet_hydrogen_dimer(const core::System& orbital) {
   return true;
 }
 
-inline void require_cuda_df_spin_domain(const core::System& orbital, FockSpin spin) {
+inline bool all_electron_oh_doublet(const core::System& orbital) {
+  return orbital.atoms.size() == 2 && orbital.atoms[0].atomic_number == 8 &&
+         orbital.atoms[1].atomic_number == 1 && orbital.atoms[0].ecp_core == 0 &&
+         orbital.atoms[1].ecp_core == 0 && orbital.ecp_terms.empty() &&
+         orbital.charge == 0 && orbital.electron_count == 9 && orbital.multiplicity == 2 &&
+         orbital.basis_representation == core::kSphericalBasis;
+}
+
+inline void require_cuda_df_spin_domain(const core::System& orbital, FockSpin spin,
+                                        bool fitted_values_only = false) {
   if (spin != FockSpin::Unrestricted) return;
   const bool supports_orbital_g = fitted_halogen_dihydride_doublet(orbital) ||
                                   fitted_molecular_halide_doublet(orbital) ||
-                                  all_electron_triplet_hydrogen_dimer(orbital);
+                                  all_electron_triplet_hydrogen_dimer(orbital) ||
+                                  (fitted_values_only && all_electron_oh_doublet(orbital));
   const unsigned limit = supports_orbital_g ? 4U : 3U;
   for (const auto& shell : orbital.shells)
     if (shell.angular_momentum > limit)

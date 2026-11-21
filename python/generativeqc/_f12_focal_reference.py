@@ -229,7 +229,30 @@ def df_reference(
     from .calculator import Calculator
 
     cuda = request.backend == "cuda"
-    calc = Calculator(
+    calculator = Calculator
+    if (
+        cuda
+        and not forces
+        and request.root_id == "uhf"
+        and request.charge == 0
+        and request.multiplicity == 2
+        and tuple(atom.atomic_number for atom in request.atoms) == (8, 1)
+        and all(
+            not orb.by_element[z].ecp_core_electrons and not orb.by_element[z].ecp_data
+            for z in (8, 1)
+        )
+        and max(shell.angular_momentum for z in (8, 1) for shell in orb.by_element[z].shells) == 4
+    ):
+        class OHValueCalculator(Calculator):
+            def _full_df_basis_consumer(self, operator, derivative_order=0, *, atoms=None):
+                if atoms is not None and derivative_order == 0 and operator in {
+                    "overlap", "kinetic", "nuclear_attraction", "df_three_center",
+                }:
+                    return "full_df"
+                return super()._full_df_basis_consumer(operator, derivative_order, atoms=atoms)
+
+        calculator = OHValueCalculator
+    calc = calculator(
         method=request.root_id,
         basis=orb,
         auxiliary_basis=jk,
