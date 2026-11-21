@@ -1,6 +1,9 @@
 """Conventional (T) has a separately relaxed force on an open-shell surface."""
 
+from __future__ import annotations
+
 from dataclasses import replace
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
@@ -12,6 +15,15 @@ from generativeqc.experimental.f12_focal import (
     conventional_df_ucc_triples,
     plan_singlepoint,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from generativeqc.experimental.f12_focal import (
+        FocalLowOrderEnergy,
+        FocalLowOrderForces,
+        FocalReferenceSeed,
+    )
 
 
 def triples_request() -> FocalRequest:
@@ -188,3 +200,111 @@ def test_triples_from_retained_uhf_and_rhf_references() -> None:
     e, f = molecular_triples_on_reference(rhf, r, budget_mib=1024, forces=True)
     assert e == pytest.approx(-7.4691686931e-6, abs=8e-12)
     assert f[1, 2] == pytest.approx(5.63559527e-6, abs=1e-11)
+
+
+def test_public_split_fit_triples_share_the_reference_at_center_and_displacement(
+    tmp_path: Path,
+) -> None:
+    from generativeqc.experimental.f12_focal import (
+        FocalLowOrderEnergy,
+        FocalLowOrderForces,
+        MolecularFocalProvider,
+        df_reference,
+        singlepoint,
+        singlepoint_energy,
+    )
+
+    def low_order(
+        request: FocalRequest,
+        seed_options: dict[str, FocalReferenceSeed],
+        expected_rank: int | None = None,
+    ) -> FocalLowOrderEnergy:
+        ref = df_reference(request, forces=False, **seed_options)
+        assert expected_rank in (None, 1)
+        return FocalLowOrderEnergy(ref, 1, (0.0, 0.0), (0.0, 0.0, 0.0), 0.0)
+
+    class RetainedTriplesProvider(MolecularFocalProvider):
+        # Exercise the native SCF and (T) paths while isolating the unrelated F12 graph.
+        def low_order_energy_and_forces(
+            self, request: FocalRequest, *, include_hf_cabs: bool = True
+        ) -> FocalLowOrderForces:
+            low = low_order(request, self._seed_options(request))
+            zeros = np.zeros((len(request.atoms), 3))
+            return FocalLowOrderForces(low, zeros, zeros)
+
+        def low_order_energy(
+            self,
+            request: FocalRequest,
+            *,
+            expected_cabs_rank: int | None = None,
+            include_hf_cabs: bool = True,
+        ) -> FocalLowOrderEnergy:
+            return low_order(request, self._seed_options(request), expected_cabs_rank)
+
+        def f12_doubles_energy_and_forces(
+            self, request: FocalRequest, *, low_order: FocalLowOrderForces
+        ) -> tuple[float, np.ndarray]:
+            return 0.0, np.zeros_like(low_order.mp2_f12_correlation_forces)
+
+        def f12_doubles_energy(
+            self,
+            request: FocalRequest,
+            *,
+            low_order: FocalLowOrderEnergy,
+            expected_cabs_rank: int | None = None,
+        ) -> float:
+            return 0.0
+
+    orb, jk = "sto-3g", "def2-svp"
+    low = FocalBasis(
+        2, "f12", orb, jk_fit=jk, mp2_fit=orb, f12_fit=jk, cabs=jk, beta=1.0
+    )
+    high = FocalBasis(2, "conventional", orb, jk_fit=jk, mp2_fit=jk)
+    assert low.basis_id != high.basis_id
+    provider = RetainedTriplesProvider(shell_library=tmp_path / "unused.so")
+    series = FocalSeries(low)
+    options = dict(
+        provider=provider,
+        root_id="rhf",
+        correlation_space_id="all-active",
+        backend="cpu_reference",
+        f12_doubles=low,
+        triples=high,
+    )
+
+    def atoms(z: float) -> list[tuple[str, tuple[float, float, float]]]:
+        return [("Li", (0.0, 0.0, 0.0)), ("H", (0.1, 0.2, z))]
+
+    center = singlepoint(atoms(3.0), series, series, None, **options)
+    assert center.cabs_ranks == {low.basis_id: 1}
+    assert center.references[high.basis_id].reference.basis_id == high.basis_id
+    assert (
+        center.references[high.basis_id].reference.coefficients
+        is center.references[low.basis_id].reference.coefficients
+    )
+    triple = next(p.term for p in center.components if p.term.role == "triples")
+    assert triple.energy == pytest.approx(-7.4691686931e-6, abs=8e-12)
+
+    def forward(z: float) -> float:
+        result = singlepoint_energy(atoms(z), series, series, center=center, **options)
+        assert (
+            result.references[high.basis_id].reference.coefficients
+            is result.references[low.basis_id].reference.coefficients
+        )
+        return next(p.energy for p in result.components if p.request.role == "triples")
+
+    for step in (4e-4, 2e-4):
+        force = (forward(3.0 - step) - forward(3.0 + step)) / (2 * step)
+        assert force == pytest.approx(triple.forces[1, 2], abs=2e-9, rel=0)
+
+    stricter_center = replace(
+        center,
+        references={
+            **center.references,
+            high.basis_id: replace(center.references[high.basis_id], minimum_overlap=1.0),
+        },
+    )
+    with pytest.raises(ValueError, match="Target SCF changed occupied subspace"):
+        singlepoint_energy(
+            atoms(3.0004), series, series, center=stricter_center, **options
+        )

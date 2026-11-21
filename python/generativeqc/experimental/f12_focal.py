@@ -820,14 +820,19 @@ def _molecular_f12_plan(
     forces: bool,
     center: FocalMolecularResult | None = None,
 ) -> FocalMolecularResult | FocalEnergyResult:
-    """Share a determinant within each physical basis for this geometry only."""
+    """Compose molecular roles and share compatible determinants at one geometry."""
     by_basis: dict[str, list[FocalRequest]] = {}
     for request, _ in plan.steps:
         by_basis.setdefault(request.basis.basis_id, []).append(request)
+    share_references = provider.reference_seed is None or center is not None
     if center is not None:
         provider = replace(
             provider, reference_seed=lambda r: center.references[r.basis.basis_id]
         )
+    references_by_fit: dict[
+        tuple[str, Backend, str, str, tuple[int, int, tuple[int, ...], float] | None],
+        FocalReference,
+    ] = {}
     roots = {}
     ranks = {}
     energies = {}
@@ -836,6 +841,28 @@ def _molecular_f12_plan(
         roles = {r.role for r in requests}
         pair = replace(requests[0], role="mp2_f12_correlation")
         reference = None
+        fit_key = None
+        if share_references:
+            origin = center.references[identity] if center is not None else None
+            # A displaced role can reuse a solve only when it tracks the same
+            # center determinant with the same occupied-overlap threshold.
+            seed_key = (
+                (
+                    id(origin.reference.coefficients),
+                    id(origin.reference.overlap),
+                    origin.reference.occupied,
+                    origin.minimum_overlap,
+                )
+                if origin is not None
+                else None
+            )
+            fit_key = (
+                pair.surface_id,
+                pair.backend,
+                pair.basis.orbital.identity,
+                pair.basis.jk_fit.identity,
+                seed_key,
+            )
         expected_rank = center.cabs_ranks.get(identity) if center is not None else None
         if roles & {"mp2_f12_correlation", "ccsd_f12b_minus_mp2_f12"}:
             include_hf_cabs = "hf_cabs" in roles
@@ -923,16 +950,24 @@ def _molecular_f12_plan(
                 )
                 energies[identity, "hf_cabs"] = singles.hf_cabs_energy
         if reference is None:
-            reference = df_reference(
-                pair,
-                forces=False,
-                budget_mib=provider.budget_mib,
-                **provider._seed_options(pair),
-            )
+            shared = references_by_fit.get(fit_key) if fit_key is not None else None
+            if shared is None:
+                reference = df_reference(
+                    pair,
+                    forces=False,
+                    budget_mib=provider.budget_mib,
+                    **provider._seed_options(pair),
+                )
+            else:
+                # The conventional triples role keeps its own correlation fit
+                # and basis provenance while using the original SCF determinant.
+                reference = replace(shared, basis_id=identity)
         if reference.executed_backend != pair.backend:
             raise RuntimeError(
                 "molecular focal reference executed on a different backend"
             )
+        if fit_key is not None:
+            references_by_fit[fit_key] = reference
         roots[identity] = FocalReferenceSeed(pair, reference)
         if "triples" in roles:
             triple = replace(pair, role="triples")
