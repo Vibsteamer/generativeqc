@@ -172,8 +172,13 @@ def focal_shell_layout(
     def triangular_size(sizes: list[int]) -> int:
         return (sum(sizes) ** 2 + sum(x * x for x in sizes)) // 2
 
-    largest = max(triangular_size(fitting), triangular_size(combined) * sum(fitting))
-    if largest >= 2**31 or largest * 8 > budget_mib << 20:
+    metric_cart = triangular_size(fitting)
+    per_fit_cart = triangular_size(combined) * max(fitting)
+    if (
+        metric_cart >= 2**31
+        or per_fit_cart >= 2**31
+        or max(metric_cart, per_fit_cart) * 8 > budget_mib << 20
+    ):
         raise MemoryError(
             "focal shell offsets or Cartesian integral tensor exceed capacity"
         )
@@ -221,7 +226,9 @@ def focal_shell_layout(
         for column in blocks.T:
             counts *= cart_sizes[column]
         layout[group + "_blocks"] = blocks
-        layout[group + "_offsets"] = np.r_[0, np.cumsum(counts)].astype(np.int32)
+        cumsum = np.r_[0, np.cumsum(counts, dtype=np.int64)]
+        offset_dtype = np.int32 if int(cumsum[-1]) < 2**31 else np.int64
+        layout[group + "_offsets"] = cumsum.astype(offset_dtype)
     for l, transform in spherical_projections(
         projection_library or library, set(angular)
     ).items():

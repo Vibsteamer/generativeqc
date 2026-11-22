@@ -545,3 +545,71 @@ def test_auxiliary_tiling_matches_untiled_low_order_and_cabs_fock(monkeypatch):
         assert np.max(np.abs(a0 - a1)) < 1e-13
 
 
+def test_shell_projection_chunking_matches_full_for_int32_and_int64():
+    """Verify ShellProjection block chunking matches full pack/spherical_values bit-for-bit."""
+    from generativeqc._f12_focal_integral_sink import ShellProjection
+
+    rng = np.random.default_rng(77)
+    # 3 orbital shells (s, p, d -> 1+3+5=9 sph, 1+3+6=10 cart), 4 fit shells (s, p, s, d -> 1+3+1+5=10 sph)
+    angular = np.array([0, 1, 2, 0, 1, 0, 2], dtype=np.int32)
+    ncombined = 3
+    nfit = 4
+    rows = np.full((7, 5), -1, dtype=np.int32)
+    off = 0
+    for i in range(ncombined):
+        n = 2 * int(angular[i]) + 1
+        rows[i, :n] = np.arange(off, off + n)
+        off += n
+    norb = off
+    off = 0
+    for i in range(ncombined, 7):
+        n = 2 * int(angular[i]) + 1
+        rows[i, :n] = np.arange(off, off + n)
+        off += n
+    naux = off
+    orb_pairs = np.stack(np.tril_indices(ncombined), axis=1).astype(np.int32)
+    ao_blocks = np.empty((nfit, len(orb_pairs), 3), dtype=np.int32)
+    ao_blocks[:, :, :2] = orb_pairs
+    ao_blocks[:, :, 2] = np.arange(ncombined, 7, dtype=np.int32)[:, None]
+    ao_blocks = ao_blocks.reshape(-1, 3)
+    cart_sizes = np.array([(l + 1) * (l + 2) // 2 for l in angular], dtype=np.int64)
+    counts = np.prod(cart_sizes[ao_blocks], axis=1)
+    offsets_i64 = np.r_[0, np.cumsum(counts, dtype=np.int64)]
+    transforms = {
+        0: np.eye(1),
+        1: np.eye(3),
+        2: rng.normal(size=(5, 6)),
+    }
+    layout = {
+        "angular": angular,
+        "spherical_rows": rows,
+        "ao_sizes": np.array([norb, naux], dtype=np.int32),
+        "orbital_shell_count": np.int32(ncombined),
+        "ao_blocks": ao_blocks,
+        "ao_offsets": offsets_i64,
+        "transform_0": transforms[0],
+        "transform_1": transforms[1],
+        "transform_2": transforms[2],
+    }
+    proj = ShellProjection(layout, "ao")
+    chunks = proj.block_chunks(max_cart=150)
+    assert len(chunks) > 2
+    assert chunks[0][0] == 0 and chunks[-1][1] == len(ao_blocks)
+    for (a0, a1), (b0, b1) in zip(chunks, chunks[1:]):
+        assert a1 == b0
+
+    cart_full = rng.normal(size=int(offsets_i64[-1]))
+    val_full = proj.spherical_values(cart_full)
+    val_chunked = np.empty_like(val_full)
+    for b0, b1 in chunks:
+        s0, s1 = int(offsets_i64[b0]), int(offsets_i64[b1])
+        proj.spherical_values_into(cart_full[s0:s1], val_chunked, b0, b1)
+    np.testing.assert_allclose(val_full, val_chunked, atol=1e-14, rtol=0)
+
+    w = rng.normal(size=(naux, norb, norb))
+    p_full = proj.pack(w)
+    p_chunked = np.concatenate([proj.pack_slice(w, b0, b1) for b0, b1 in chunks])
+    np.testing.assert_allclose(p_full, p_chunked, atol=1e-14, rtol=0)
+
+
+

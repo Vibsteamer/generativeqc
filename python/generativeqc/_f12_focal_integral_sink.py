@@ -95,31 +95,65 @@ class ShellProjection:
             for j, ls in enumerate(kinds)
         ]
 
-    def chunks(self) -> Iterator[tuple]:
+    _MAX_CARTESIAN_CHUNK = 128_000_000
+
+    def block_chunks(self, max_cart: int | None = None) -> list[tuple[int, int]]:
+        """Partition blocks into contiguous ranges each <= max_cart Cartesian integrals."""
+        limit = self._MAX_CARTESIAN_CHUNK if max_cart is None else int(max_cart)
+        limit = min(limit, (2**31) - 1)
+        nblocks = len(self.blocks)
+        total = int(self.offsets[-1])
+        if total <= limit:
+            return [(0, nblocks)]
+        ranges: list[tuple[int, int]] = []
+        b0 = 0
+        while b0 < nblocks:
+            base = int(self.offsets[b0])
+            target = base + limit
+            b1 = int(np.searchsorted(self.offsets, target, side="right")) - 1
+            if b1 <= b0:
+                if int(self.offsets[b0 + 1] - base) >= 2**31:
+                    raise MemoryError("single shell block exceeds int32 Cartesian offset limit")
+                b1 = b0 + 1
+            ranges.append((b0, b1))
+            b0 = b1
+        return ranges
+
+    def chunks_for_slice(self, b0: int, b1: int) -> Iterator[tuple]:
+        base = int(self.offsets[b0])
         for group, angular in self.groups:
+            lo = int(np.searchsorted(group, b0, side="left"))
+            hi = int(np.searchsorted(group, b1, side="left"))
+            if lo >= hi:
+                continue
+            sub = group[lo:hi]
             transforms = [self.transforms[l] for l in angular]
-            for first in range(0, len(group), 128):
-                indices = group[first : first + 128]
+            stride = int(self.offsets[sub[0] + 1] - self.offsets[sub[0]])
+            arange = np.arange(stride, dtype=np.int64)
+            for first in range(0, len(sub), 128):
+                indices = sub[first : first + 128]
                 blocks = self.blocks[indices]
                 rows = [
                     self.spherical_rows[blocks[:, j], : 2 * l + 1]
                     for j, l in enumerate(angular)
                 ]
-                positions = self.offsets[indices, None] + np.arange(
-                    self.offsets[indices[0] + 1] - self.offsets[indices[0]]
-                )
+                positions = (self.offsets[indices].astype(np.int64) - base)[:, None] + arange
                 yield rows, transforms, positions, blocks[:, 0] != blocks[:, 1]
 
-    def pack(self, weights: np.ndarray) -> np.ndarray:
-        """Convert supplied spherical cotangents into one Cartesian weight per integral."""
+    def chunks(self) -> Iterator[tuple]:
+        yield from self.chunks_for_slice(0, len(self.blocks))
+
+    def pack_slice(self, weights: np.ndarray, b0: int, b1: int) -> np.ndarray:
+        """Convert supplied spherical cotangents for blocks [b0, b1) into Cartesian weights."""
         if (
             weights.dtype != np.float64
             or weights.shape != self.shape
             or not np.isfinite(weights).all()
         ):
             raise ValueError(f"expected finite FP64 adjoints with shape {self.shape}")
-        packed = np.empty(self.offsets[-1], dtype=np.float64)
-        for rows, transforms, positions, different in self.chunks():
+        ncart = int(self.offsets[b1] - self.offsets[b0])
+        packed = np.empty(ncart, dtype=np.float64)
+        for rows, transforms, positions, different in self.chunks_for_slice(b0, b1):
             a, b = rows[:2]
             ta, tb = transforms[:2]
             if len(rows) == 2:
@@ -144,12 +178,18 @@ class ShellProjection:
             packed[positions] = raw.reshape(positions.shape)
         return packed
 
-    def spherical_values(self, cartesian: np.ndarray) -> np.ndarray:
-        """Assemble native forward integral values using the transpose of weight packing."""
-        if cartesian.shape != (self.offsets[-1],) or cartesian.dtype != np.float64:
+    def pack(self, weights: np.ndarray) -> np.ndarray:
+        """Convert supplied spherical cotangents into one Cartesian weight per integral."""
+        return self.pack_slice(weights, 0, len(self.blocks))
+
+    def spherical_values_into(
+        self, cartesian: np.ndarray, values: np.ndarray, b0: int, b1: int
+    ) -> None:
+        """Assemble forward integral values for blocks [b0, b1) into preallocated values."""
+        ncart = int(self.offsets[b1] - self.offsets[b0])
+        if cartesian.shape != (ncart,) or cartesian.dtype != np.float64:
             raise ValueError("expected one FP64 value for each Cartesian integral")
-        values = np.empty(self.shape)
-        for rows, transforms, positions, different in self.chunks():
+        for rows, transforms, positions, different in self.chunks_for_slice(b0, b1):
             a, b = rows[:2]
             ta, tb = transforms[:2]
             raw = cartesian[positions].reshape(
@@ -172,6 +212,11 @@ class ShellProjection:
                     b[different, None, None, :],
                     a[different, None, :, None],
                 ] = block[different]
+
+    def spherical_values(self, cartesian: np.ndarray) -> np.ndarray:
+        """Assemble native forward integral values using the transpose of weight packing."""
+        values = np.empty(self.shape)
+        self.spherical_values_into(cartesian, values, 0, len(self.blocks))
         return values
 
 
@@ -233,20 +278,78 @@ def contract_live_weights(
     total = np.zeros((len(metadata["elements"]), 3))
     for group in ("metric", "ao"):
         projection = ShellProjection(topology, group)
+        chunks = projection.block_chunks()
         for operator in operators:
             label = channel_name(group, operator)
-            pack_start = time.monotonic()
-            weights = projection.pack(explicit_weights[label])
-            pack_seconds = time.monotonic() - pack_start
-            _, row = contract_geometry(
-                {**topology, "weights_" + label: weights},
-                metadata,
-                functions,
-                group,
-                operator,
-                budget_mib << 20,
-                host_reference,
-            )
+            pack_seconds = 0.0
+            if len(chunks) == 1:
+                pack_start = time.monotonic()
+                weights = projection.pack(explicit_weights[label])
+                pack_seconds = time.monotonic() - pack_start
+                _, row = contract_geometry(
+                    {
+                        **topology,
+                        group + "_offsets": np.ascontiguousarray(projection.offsets, dtype=np.int32),
+                        "weights_" + label: weights,
+                    },
+                    metadata,
+                    functions,
+                    group,
+                    operator,
+                    budget_mib << 20,
+                    host_reference,
+                )
+            else:
+                grad_sum = np.zeros((len(metadata["elements"]), 3), dtype=np.float64)
+                val_sum = 0.0
+                max_dev = 0
+                kernel_s = 0.0
+                total_s = 0.0
+                checks_ok = True
+                for b0, b1 in chunks:
+                    pack_start = time.monotonic()
+                    packed = projection.pack_slice(explicit_weights[label], b0, b1)
+                    pack_seconds += time.monotonic() - pack_start
+                    c_blocks = np.ascontiguousarray(projection.blocks[b0:b1])
+                    c_offsets = np.ascontiguousarray(
+                        projection.offsets[b0 : b1 + 1] - projection.offsets[b0],
+                        dtype=np.int32,
+                    )
+                    _, crow = contract_geometry(
+                        {
+                            **topology,
+                            group + "_blocks": c_blocks,
+                            group + "_offsets": c_offsets,
+                            "weights_" + label: packed,
+                        },
+                        metadata,
+                        functions,
+                        group,
+                        operator,
+                        budget_mib << 20,
+                        host_reference,
+                    )
+                    del packed
+                    checks_ok = checks_ok and bool(crow["contraction_checks_passed"])
+                    val_sum += float(crow["weighted_value_Eh"])
+                    grad_sum += np.asarray(crow["gradient_Eh_per_bohr"], dtype=np.float64)
+                    max_dev = max(max_dev, int(crow["device_bytes"]))
+                    kernel_s += float(crow["kernel_and_transfer_seconds"])
+                    total_s += float(crow["seconds"])
+                translation = float(np.max(np.abs(grad_sum.sum(axis=0))))
+                row = {
+                    "contraction_checks_passed": bool(
+                        checks_ok and translation <= _TRANSLATION_TOLERANCE
+                    ),
+                    "weighted_value_Eh": val_sum,
+                    "gradient_Eh_per_bohr": grad_sum.tolist(),
+                    "max_translation_residual_Eh_per_bohr": translation,
+                    "shell_blocks": len(projection.blocks),
+                    "cartesian_weights": int(projection.offsets[-1]),
+                    "seconds": total_s,
+                    "kernel_and_transfer_seconds": kernel_s,
+                    "device_bytes": max_dev,
+                }
             if references is not None:
                 row = compare_reference(label, row, references[label])
             else:
@@ -303,22 +406,37 @@ def contract_single_channel(
     topology = {k: layout[k] for k in layout if not k.startswith("weights_")}
     projection = ShellProjection(topology, group)
     label = channel_name(group, operator)
-    packed = projection.pack(weight)
-    _, row = contract_geometry(
-        {**topology, "weights_" + label: packed},
-        metadata,
-        functions,
-        group,
-        operator,
-        budget_mib << 20,
-        host_reference,
-    )
-    del packed
-    if not row["contraction_checks_passed"]:
-        raise ArithmeticError(
-            f"The molecular shell nuclear derivative failed contraction checks for {label}"
+    grad = np.zeros((len(metadata["elements"]), 3), dtype=np.float64)
+    for b0, b1 in projection.block_chunks():
+        packed = projection.pack_slice(weight, b0, b1)
+        c_blocks = np.ascontiguousarray(projection.blocks[b0:b1])
+        c_offsets = np.ascontiguousarray(
+            projection.offsets[b0 : b1 + 1] - projection.offsets[b0], dtype=np.int32
         )
-    grad = np.asarray(row["gradient_Eh_per_bohr"], dtype=np.float64)
+        _, row = contract_geometry(
+            {
+                **topology,
+                group + "_blocks": c_blocks,
+                group + "_offsets": c_offsets,
+                "weights_" + label: packed,
+            },
+            metadata,
+            functions,
+            group,
+            operator,
+            budget_mib << 20,
+            host_reference,
+        )
+        del packed
+        if not row["contraction_checks_passed"]:
+            raise ArithmeticError(
+                f"The molecular shell nuclear derivative failed contraction checks for {label}"
+            )
+        grad += np.asarray(row["gradient_Eh_per_bohr"], dtype=np.float64)
     if not np.isfinite(grad).all():
         raise ValueError(f"non-finite explicit integral gradient for {label}")
+    if float(np.max(np.abs(grad.sum(axis=0)))) > _TRANSLATION_TOLERANCE:
+        raise ArithmeticError(
+            f"The molecular shell nuclear derivative failed translation checks for {label}"
+        )
     return grad

@@ -119,50 +119,62 @@ def forward_integrals(
         projection = ShellProjection(common, group)
         offsets, blocks = projection.offsets, projection.blocks
         nblocks, ncenters = blocks.shape
-        ncart = int(offsets[-1])
+        ncart_total = int(offsets[-1])
+        chunks = projection.block_chunks()
         for op, opcode in ops.items():
             label = group if op == "coulomb" and group == "metric" else group + "_" + op
             start = time.monotonic()
-            raw = np.full(ncart, np.nan)
-            workspace = ct.c_uint64()
-            result = funcs["coulomb" if op == "coulomb" else "geminal"](
-                ncenters,
-                opcode,
-                beta,
-                len(common["angular"]),
-                len(common["exponents"]),
-                nblocks,
-                ncart,
-                common["angular"],
-                common["prim_offsets"],
-                common["exponents"],
-                common["radial"],
-                common["centers"],
-                blocks,
-                offsets,
-                raw,
-                budget,
-                ct.byref(workspace),
-            )
-            kernel_seconds = time.monotonic() - start
-            if result:
-                raise RuntimeError(f"{label} native forward returned status {result}")
-            if not np.isfinite(raw).all() or not (0 < workspace.value <= budget):
-                raise ValueError(
-                    f"{label} incomplete native outputs or invalid workspace"
+            values = np.empty(projection.shape, dtype=np.float64)
+            kernel_seconds = 0.0
+            max_workspace = 0
+            for b0, b1 in chunks:
+                c_blocks = np.ascontiguousarray(blocks[b0:b1])
+                c_offsets = np.ascontiguousarray(offsets[b0 : b1 + 1] - offsets[b0], dtype=np.int32)
+                c_ncart = int(c_offsets[-1])
+                raw = np.full(c_ncart, np.nan)
+                workspace = ct.c_uint64()
+                t_k0 = time.monotonic()
+                result = funcs["coulomb" if op == "coulomb" else "geminal"](
+                    ncenters,
+                    opcode,
+                    beta,
+                    len(common["angular"]),
+                    len(common["exponents"]),
+                    len(c_blocks),
+                    c_ncart,
+                    common["angular"],
+                    common["prim_offsets"],
+                    common["exponents"],
+                    common["radial"],
+                    common["centers"],
+                    c_blocks,
+                    c_offsets,
+                    raw,
+                    budget,
+                    ct.byref(workspace),
                 )
-            tensors[label] = projection.spherical_values(raw)
+                kernel_seconds += time.monotonic() - t_k0
+                if result:
+                    raise RuntimeError(f"{label} native forward returned status {result}")
+                if not np.isfinite(raw).all() or not (0 < workspace.value <= budget):
+                    raise ValueError(
+                        f"{label} incomplete native outputs or invalid workspace"
+                    )
+                max_workspace = max(max_workspace, int(workspace.value))
+                projection.spherical_values_into(raw, values, b0, b1)
+                del raw
+            tensors[label] = values
             resources[label] = {
                 "backend": "host_reference_fp64" if host_reference else "cuda_fp64",
                 "shell_blocks": nblocks,
-                "cartesian_integrals": ncart,
+                "cartesian_integrals": ncart_total,
                 "spherical_elements": tensors[label].size,
                 "kernel_and_transfer_seconds": kernel_seconds,
                 "host_spherical_assembly_seconds": time.monotonic()
                 - start
                 - kernel_seconds,
-                "workspace_bytes": workspace.value,
-                "device_bytes": 0 if host_reference else workspace.value,
+                "workspace_bytes": max_workspace,
+                "device_bytes": 0 if host_reference else max_workspace,
             }
     return tensors, resources
 
@@ -270,34 +282,38 @@ def forward_single_ao_operator(
     func = bind_forward(library, "coulomb" if op == "coulomb" else "geminal", host_reference)
     projection = ShellProjection(common, "ao")
     offsets, blocks = projection.offsets, projection.blocks
-    nblocks, ncenters = blocks.shape
-    ncart = int(offsets[-1])
-    raw = np.full(ncart, np.nan)
-    workspace = ct.c_uint64()
-    result = func(
-        ncenters,
-        _OPCODES[op],
-        beta,
-        len(common["angular"]),
-        len(common["exponents"]),
-        nblocks,
-        ncart,
-        common["angular"],
-        common["prim_offsets"],
-        common["exponents"],
-        common["radial"],
-        common["centers"],
-        blocks,
-        offsets,
-        raw,
-        budget,
-        ct.byref(workspace),
-    )
+    _, ncenters = blocks.shape
     label = "ao_" + op
-    if result:
-        raise RuntimeError(f"{label} native forward returned status {result}")
-    if not np.isfinite(raw).all() or not (0 < workspace.value <= budget):
-        raise ValueError(f"{label} incomplete native outputs or invalid workspace")
-    values = projection.spherical_values(raw)
-    del raw
+    values = np.empty(projection.shape, dtype=np.float64)
+    for b0, b1 in projection.block_chunks():
+        c_blocks = np.ascontiguousarray(blocks[b0:b1])
+        c_offsets = np.ascontiguousarray(offsets[b0 : b1 + 1] - offsets[b0], dtype=np.int32)
+        ncart = int(c_offsets[-1])
+        raw = np.full(ncart, np.nan)
+        workspace = ct.c_uint64()
+        result = func(
+            ncenters,
+            _OPCODES[op],
+            beta,
+            len(common["angular"]),
+            len(common["exponents"]),
+            len(c_blocks),
+            ncart,
+            common["angular"],
+            common["prim_offsets"],
+            common["exponents"],
+            common["radial"],
+            common["centers"],
+            c_blocks,
+            c_offsets,
+            raw,
+            budget,
+            ct.byref(workspace),
+        )
+        if result:
+            raise RuntimeError(f"{label} native forward returned status {result}")
+        if not np.isfinite(raw).all() or not (0 < workspace.value <= budget):
+            raise ValueError(f"{label} incomplete native outputs or invalid workspace")
+        projection.spherical_values_into(raw, values, b0, b1)
+        del raw
     return values
