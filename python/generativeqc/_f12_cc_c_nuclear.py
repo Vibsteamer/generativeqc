@@ -127,7 +127,9 @@ def unrestricted_cc_c_ao_weights(
             channel=left + "_" + right,
         )
         rev = transpose_program(
-            Program({"c_vv": graph.outputs["c_vv"]}), ("c_vv",)
+            Program({"c_vv": graph.outputs["c_vv"]}),
+            ("c_vv",),
+            max_elements=max(1_000_000, ext * ext),
         ).program
         l, r = left[0], right[0]
         for i, j in pairs:

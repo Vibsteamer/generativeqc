@@ -158,7 +158,9 @@ def unrestricted_cc_w_ao_weights(
             channel=f"{left}_{right}",
         )
         reverse = transpose_program(
-            Program({"w_obs": graph.outputs["w_obs"]}), ("w_obs",)
+            Program({"w_obs": graph.outputs["w_obs"]}),
+            ("w_obs",),
+            max_elements=max(1_000_000, ext * ext),
         ).program
         sl, sr = frames[left], frames[right]
         for i, j in pairs:

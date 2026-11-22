@@ -197,7 +197,9 @@ def reference_df_ump2(
             graph = df_ump2_pair_response(
                 left + "_" + right, q, ol_act, n - ol, or_act, n - orr, 1, occupied_partition=True
             )
-            reverse = transpose_program(graph, ("pair_energies",)).program
+            reverse = transpose_program(
+                graph, ("pair_energies",), max_elements=max(1_000_000, n * n)
+            ).program
             seed = occupied_pair_energy_seed(occupied_weights[il], occupied_weights[ir])
             result = checked(
                 Program({**graph.outputs, **reverse.outputs}),

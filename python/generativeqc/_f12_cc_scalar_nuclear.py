@@ -24,7 +24,7 @@ class UnrestrictedCCScalarResponse(NamedTuple):
 
 
 def _with_transpose(primal: Program) -> Program:
-    reverse = transpose_program(primal, tuple(primal.outputs)).program
+    reverse = transpose_program(primal, tuple(primal.outputs), max_elements=4_000_000).program
     return Program({**primal.outputs, **reverse.outputs})
 
 

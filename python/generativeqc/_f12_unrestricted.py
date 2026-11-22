@@ -283,7 +283,9 @@ def _projected_response(
         if spin_sym and sl == "beta" and sr == "beta":
             continue
         primal_graph = Program({name: graph.outputs[name] for name in selected})
-        rev = transpose_program(primal_graph, selected).program
+        rev = transpose_program(
+            primal_graph, selected, max_elements=max(1_000_000, ext * ext)
+        ).program
         kernel = Program({**rev.outputs, **primal_graph.outputs}) if energies else rev
         shared = _shared_contiguous_operands(data, fock, sl, sr)
         mirror_bb = spin_sym and sl == "alpha" and sr == "alpha"
