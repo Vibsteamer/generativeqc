@@ -29,7 +29,7 @@ hydrogen_bases = reference_tests.hydrogen_bases
 
 
 @pytest.mark.parametrize("root", ["rhf", "uhf"])
-def test_molecular_tplus_joins_only_the_exact_frame_and_fit(hydrogen_bases, root):
+def test_molecular_tplus_joins_only_the_exact_frame_and_fit(hydrogen_bases, root, monkeypatch):
     from generativeqc._f12_focal_molecular import MolecularFocalProvider
     from generativeqc._f12_focal_reference import FocalReference
     from generativeqc.experimental.f12_focal import FocalSeries, plan_singlepoint
@@ -84,6 +84,30 @@ def test_molecular_tplus_joins_only_the_exact_frame_and_fit(hydrogen_bases, root
     with pytest.raises(RuntimeError, match="FP64 CUDA executor"):
         cuda_provider.tplus_from_occupied(cuda_request, replace(low, reference=cuda_ref),
                                          replace(triples, reference=cuda_ref))
+    if rhf:
+        from generativeqc import _f12_focal_ucc_triples
+
+        def occupied(req, retain, *, budget_mib):
+            assert req.role == "triples_plus" and retain is cuda_ref
+            return float(conventional.sum()), replace(triples, reference=retain)
+
+        def run(program, feeds):
+            return replace(execute(program, feeds), backend="cuda-fp64-ordinary-stream")
+
+        monkeypatch.setattr(_f12_focal_ucc_triples, "molecular_occupied_triples_on_reference", occupied)
+        cuda_provider = replace(cuda_provider, run=run)
+        plus = replace(cuda_request, role="triples_plus")
+        cuda_low = replace(low, reference=cuda_ref)
+        ordinary, scaled = cuda_provider.restricted_tplus_energy_on_reference(
+            plus, low_order=cuda_low, expected_cabs_rank=6
+        )
+        assert ordinary == conventional.sum()
+        assert scaled.energy == pytest.approx(result.energy, abs=2e-16)
+        assert scaled.cabs_rank == 6 and scaled.forces is None
+        with pytest.raises(ValueError, match="CABS rank differs"):
+            cuda_provider.restricted_tplus_energy_on_reference(
+                plus, low_order=cuda_low, expected_cabs_rank=7
+            )
 
 
 @pytest.mark.parametrize("channel", ["alpha_alpha", "alpha_beta", "beta_beta"])

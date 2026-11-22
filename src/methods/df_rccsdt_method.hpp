@@ -17,9 +17,15 @@ std::unique_ptr<PreparedCalculation> prepare_df_rccsdt_calculation(
     const Capabilities&, core::ContextState&, const core::System&,
     const generativeqc_method_descriptor&, const core::System* auxiliary_basis = nullptr);
 
-double focal_rcc_triples_energy(
+struct FocalRccTriplesValues {
+  double energy{};
+  std::vector<double> occupied;
+};
+
+FocalRccTriplesValues focal_rcc_triples_values(
     PreparedCalculation&, const std::shared_ptr<const hf::PhysicalReference>&,
     const molecule::ScalarHamiltonianIdentity& orbital,
-    const molecule::ScalarHamiltonianIdentity& jk, std::size_t retained_reference_bytes);
+    const molecule::ScalarHamiltonianIdentity& jk, std::size_t retained_reference_bytes,
+    bool occupied_partition);
 
 }  // namespace generativeqc::methods::detail

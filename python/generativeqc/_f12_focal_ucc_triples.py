@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 if TYPE_CHECKING:
     from ._f12_focal_reference import FocalReference
+    from ._f12_focal_tplus_sources import FocalOccupiedTriples
     from .experimental.f12_focal import FocalEvaluation, FocalRequest
 
 
@@ -124,6 +126,41 @@ def molecular_triples_on_reference(
     forces: bool,
 ) -> tuple[float, np.ndarray | None]:
     """Use the native conventional CCSD and triples owner on a retained determinant."""
+    return _retained_conventional_triples(
+        request, reference, budget_mib=budget_mib, forces=forces, occupied_partition=False
+    )
+
+
+def molecular_occupied_triples_on_reference(
+    request: FocalRequest, reference: FocalReference, *, budget_mib: int
+) -> tuple[float, FocalOccupiedTriples]:
+    """Return the conventional scalar and its spatial occupied partition on the (T+) frame."""
+    from ._f12_focal_tplus_sources import FocalOccupiedTriples
+
+    if (
+        request.role != "triples_plus"
+        or request.basis.basis_id != reference.basis_id
+        or request.basis.mp2_fit is None
+    ):
+        raise ValueError("Occupied triples requires the matching (T+) basis and reference")
+    scalar, values = _retained_conventional_triples(
+        replace(request, role="triples"), reference,
+        budget_mib=budget_mib, forces=False, occupied_partition=True,
+    )
+    assert values is not None
+    return scalar, FocalOccupiedTriples(
+        reference, request.correlation_space_id, request.basis.mp2_fit.identity, values
+    )
+
+
+def _retained_conventional_triples(
+    request: FocalRequest,
+    reference: FocalReference,
+    *,
+    budget_mib: int,
+    forces: bool,
+    occupied_partition: bool,
+) -> tuple[float, np.ndarray | None]:
     import ctypes as ct
     from contextlib import ExitStack
 
@@ -146,19 +183,8 @@ def molecular_triples_on_reference(
     spins = reference._pair_spin_indices(request)
     oa, ob = (reference.occupied[k] for k in spins)
     n = len(reference.overlap)
-    # A spin-conserving triple needs enough holes and particles in each spin.
-    if not any(
-        oa >= a and ob >= 3 - a and n - oa >= a and n - ob >= 3 - a for a in range(4)
-    ):
-        return 0.0, np.zeros((len(request.atoms), 3)) if forces else None
-    owner = reference._native_owner
-    if owner is None:
-        raise RuntimeError(
-            "Nonempty focal triples requires the native retained DF reference ABI"
-        )
     split_fit = basis.jk_fit.identity != basis.mp2_fit.identity
-    spatial = None
-    if (
+    spatial_eligible = (
         not forces
         and request.backend == "cuda"
         and request.root_id == "rhf"
@@ -167,10 +193,32 @@ def molecular_triples_on_reference(
             basis.orbital.by_element[a.atomic_number].ecp_core_electrons
             for a in request.atoms
         )
-    ):
-        spatial = getattr(
-            owner.library, "generativeqc_focal_rcc_triples_energy_v1", None
+    )
+    if occupied_partition and not spatial_eligible:
+        raise NotImplementedError(
+            "Occupied triples requires all-electron CUDA RHF with one common fit"
         )
+    # A spin-conserving triple needs enough holes and particles in each spin.
+    if not any(
+        oa >= a and ob >= 3 - a and n - oa >= a and n - ob >= 3 - a for a in range(4)
+    ):
+        if occupied_partition:
+            return 0.0, np.zeros(oa)
+        return 0.0, np.zeros((len(request.atoms), 3)) if forces else None
+    owner = reference._native_owner
+    if owner is None:
+        raise RuntimeError(
+            "Nonempty focal triples requires the native retained DF reference ABI"
+        )
+    spatial = None
+    if spatial_eligible:
+        symbol = (
+            "generativeqc_focal_rcc_triples_occupied_v1"
+            if occupied_partition else "generativeqc_focal_rcc_triples_energy_v1"
+        )
+        spatial = getattr(owner.library, symbol, None)
+        if occupied_partition and spatial is None:
+            raise NotImplementedError("Native occupied triples ABI is unavailable")
 
     def evaluate(
         spatial_energy: ct._CFuncPtr | None,
@@ -220,15 +268,25 @@ def molecular_triples_on_reference(
                 _native.STATUS_OUT_OF_MEMORY,
                 _native.STATUS_RESOURCE_LIMIT,
             )
-            if spatial_energy is not None and status in fallback:
+            if spatial_energy is not None and not occupied_partition and status in fallback:
                 return None
             _native.check(lib, status, context=ctx)
             stack.callback(lib.generativeqc_calculation_destroy, plan)
             if spatial_energy is not None:
+                spatial_energy.restype = ct.c_int
+                if occupied_partition:
+                    spatial_energy.argtypes = [
+                        ct.c_void_p, ct.c_void_p,
+                        np.ctypeslib.ndpointer(np.float64, ndim=1, flags="C_CONTIGUOUS"),
+                        ct.c_size_t,
+                    ]
+                    output = np.empty(oa + 1)
+                    status = spatial_energy(plan, owner.handle, output, output.size)
+                    _native.check(lib, status, context=ctx)
+                    return float(output[0]), output[1:]
                 spatial_energy.argtypes = [
                     ct.c_void_p, ct.c_void_p, ct.POINTER(ct.c_double),
                 ]
-                spatial_energy.restype = ct.c_int
                 energy = ct.c_double()
                 status = spatial_energy(plan, owner.handle, ct.byref(energy))
                 if status in fallback:

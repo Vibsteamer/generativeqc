@@ -41,6 +41,14 @@ GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_energy_v1(
     generativeqc_calculation* calculation, const generativeqc_focal_reference* owner,
     double* output);
 
+/** Return the same value-only (T) energy followed by one contribution for
+ * each spatial occupied orbital, in the retained RHF canonical order.
+ * Count must be exactly one plus the number of occupied spatial orbitals.
+ * Requires CUDA, an all-electron full-DF plan and one common JK/correlation fit. */
+GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_occupied_v1(
+    generativeqc_calculation* calculation, const generativeqc_focal_reference* owner,
+    double* output, size_t count);
+
 #ifdef __cplusplus
 }
 #endif

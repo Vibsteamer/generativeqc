@@ -39,3 +39,16 @@ center and each signed point record whether the spatial ABI published its
 scalar and whether the spin-resolved ABI returned. The early retained-root
 trace inside the solver records entry before the triples calculation, so it
 does not establish which result the caller received.
+
+## Occupied energy partition for (T+)
+
+The same restricted owner now has a separate energy-only ABI that returns the
+conventional scalar and the contributions in retained occupied orbital order.
+The ABI checks the vector length, finite values and closure to the scalar
+before publishing. The focal component can join that vector with MP2 and F12
+partitions on the identical determinant and CABS rank, reusing the spatial CC
+solve for both scalars. The demand is opt-in, so ordinary scalar calls keep
+their original allocation and algorithm. The occupied ABI and scaled component
+still require a native L20 test. Independent fits, ECPs, UHF, and the weighted
+analytic response require separate owners and physical validation before
+automatic selection of (T+).

@@ -266,16 +266,18 @@ extern "C" generativeqc_status generativeqc_focal_ucc_triples_v1(
   }
 }
 
-extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_energy_v1(
+namespace {
+generativeqc_status focal_rcc_triples_values(
     generativeqc_calculation* calculation, const generativeqc_focal_reference* owner,
-    double* output) {
+    double* output, std::size_t count, bool occupied_partition) {
   if (!calculation || !calculation->context || !owner || !output)
     return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
   auto* context = calculation->context;
   std::lock_guard lock(context->mutex);
   try {
     using namespace generativeqc;
-    runtime::df_progress::Scope trace("focal_rcc_triples_energy", "cuda");
+    runtime::df_progress::Scope trace(
+        occupied_partition ? "focal_rcc_triples_occupied" : "focal_rcc_triples_energy", "cuda");
     if (!owner->uhf || !owner->uhf->source_identity ||
         owner->backend != core::kCudaBackend || owner->backend != context->state.executed_backend ||
         owner->device != context->state.device_id)
@@ -283,6 +285,9 @@ extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_e
     // The spatial source accounts for the RHF frame itself. Its existing
     // spin-expanded focal view and identity records also remain live.
     const auto& expanded = *owner->uhf;
+    const auto occupied_count = occupied_partition ? expanded.nocc[0] : 0;
+    if (count != runtime::size_add(1, occupied_count))
+      throw std::invalid_argument("focal spatial triples output has the wrong occupied dimension");
     auto retained = runtime::size_add(owner->jk.storage_bytes(),
                                      expanded.source_identity->storage_bytes());
     auto charge = [&](const std::vector<double>& values) {
@@ -296,10 +301,25 @@ extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_e
       charge(expanded.fock[spin]);
       charge(expanded.orbital_energies[spin]);
     }
-    const auto energy = methods::detail::focal_rcc_triples_energy(
-        *calculation->plan, owner->rhf, *expanded.source_identity, owner->jk, retained);
-    if (!std::isfinite(energy)) throw std::runtime_error("nonfinite focal spatial triples energy");
-    *output = energy;
+    const auto result = methods::detail::focal_rcc_triples_values(
+        *calculation->plan, owner->rhf, *expanded.source_identity, owner->jk, retained,
+        occupied_partition);
+    if (!std::isfinite(result.energy) || result.occupied.size() != occupied_count)
+      throw std::runtime_error("invalid focal spatial triples result");
+    if (occupied_partition) {
+      long double total = 0, magnitude = 0;
+      for (const auto value : result.occupied) {
+        if (!std::isfinite(value))
+          throw std::runtime_error("nonfinite focal spatial occupied triples contribution");
+        total += value;
+        magnitude += std::abs(static_cast<long double>(value));
+      }
+      if (!std::isfinite(total) || !std::isfinite(magnitude) ||
+          std::abs(total - result.energy) > 3e-12L * (1 + magnitude))
+        throw std::runtime_error("focal spatial occupied triples do not close to their scalar");
+      std::copy(result.occupied.begin(), result.occupied.end(), output + 1);
+    }
+    *output = result.energy;
     trace.finish();
     return GENERATIVEQC_STATUS_SUCCESS;
   } catch (const std::length_error& error) {
@@ -308,4 +328,17 @@ extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_e
   } catch (...) {
     return generativeqc::api::map_exception(&context->last_detail);
   }
+}
+}  // namespace
+
+extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_energy_v1(
+    generativeqc_calculation* calculation, const generativeqc_focal_reference* owner,
+    double* output) {
+  return focal_rcc_triples_values(calculation, owner, output, 1, false);
+}
+
+extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_occupied_v1(
+    generativeqc_calculation* calculation, const generativeqc_focal_reference* owner,
+    double* output, std::size_t count) {
+  return focal_rcc_triples_values(calculation, owner, output, count, true);
 }

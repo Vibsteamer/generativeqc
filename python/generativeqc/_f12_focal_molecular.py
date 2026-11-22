@@ -385,6 +385,38 @@ class MolecularFocalProvider:
             split(scaled.triples_cotangent),
         )
 
+    def restricted_tplus_energy_on_reference(
+        self,
+        request: FocalRequest,
+        *,
+        low_order: FocalLowOrderEnergy,
+        expected_cabs_rank: int | None = None,
+    ) -> tuple[float, FocalTriplesEvaluation]:
+        """Evaluate both conventional and scaled (T) energies on one CUDA RHF frame.
+
+        The caller supplies the retained low-order energies and occupied MP2-F12
+        partitions. The two scalars share the native spatial CC solve and the
+        conventional occupied triples contraction. This component path requires
+        a common JK/correlation fit and does not install an analytic (T+) owner.
+        """
+        from ._f12_focal_ucc_triples import molecular_occupied_triples_on_reference
+
+        if request.role != "triples_plus" or request.root_id != "rhf":
+            raise ValueError("Restricted (T+) requires the RHF scaled triples role")
+        if request.backend != "cuda" or self.run is None:
+            raise NotImplementedError("Restricted (T+) energy requires the CUDA executor")
+        pair_request = replace(request, role="mp2_f12_correlation")
+        _check_request(self, pair_request)
+        if expected_cabs_rank is not None and expected_cabs_rank != low_order.cabs_rank:
+            raise ValueError("The displaced (T+) CABS rank differs from the center")
+        if low_order.occupied_mp2_f12 is None:
+            raise ValueError("Restricted (T+) requires the low-order occupied partitions")
+        conventional, occupied = molecular_occupied_triples_on_reference(
+            request, low_order.reference, budget_mib=self.budget_mib
+        )
+        scaled = self.tplus_from_occupied(pair_request, low_order, occupied)
+        return conventional, FocalTriplesEvaluation(scaled.energy, None, low_order.cabs_rank)
+
     def low_order_energy_and_forces(
         self, request: FocalRequest, *, include_hf_cabs: bool = True
     ) -> FocalLowOrderForces:
