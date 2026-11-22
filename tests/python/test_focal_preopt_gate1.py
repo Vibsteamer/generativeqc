@@ -383,3 +383,88 @@ def test_frozen_core_df_mp2_forces_and_weighted_tplus_forces_two_step_fd():
                 f"Frozen-core weighted (T+) MP2 force mismatch at atom={atom_idx} axis={axis} h={h}: "
                 f"analytic={analytic_w[atom_idx, axis]} fd={fd_w} err={err_w}"
             )
+
+
+@pytest.mark.parametrize(
+    "oa,ob,distinct_jk",
+    [(2, 2, True), (2, 2, False), (3, 2, True), (3, 2, False)],
+)
+def test_f12_panel_streaming_exact_parity(oa, ob, distinct_jk):
+    """Streaming single-operator AO load + cotangent sink matches dense F12 response to <1e-13."""
+    from generativeqc._f12_unrestricted import unrestricted_mp2_f12_ao_response
+    from generativeqc_compiler.tensor import execute
+
+    rng = np.random.default_rng(100 + 10 * oa + ob + int(distinct_jk))
+    obs, ext, q, qjk = 5, 8, 12, 10
+    space = (oa, ob, obs, ext, q)
+
+    def spd(n):
+        a = rng.standard_normal((n, n)) * 0.1
+        return a @ a.T + 2.0 * np.eye(n)
+
+    def sym_panel(nq, n):
+        p = rng.standard_normal((nq, n, n)) * 0.02
+        return 0.5 * (p + p.swapaxes(1, 2))
+
+    ca, _ = np.linalg.qr(rng.standard_normal((ext, ext)))
+    cb = (
+        ca.copy()
+        if oa == ob
+        else np.linalg.qr(ca + 0.05 * rng.standard_normal((ext, ext)))[0]
+    )
+    hcore = ca @ np.diag([-3.0, -2.0, -1.0, 0.5, 1.0, 1.5, 2.0, 2.5]) @ ca.T
+    hcore = 0.5 * (hcore + hcore.T)
+    m_c = spd(q)
+    w_c = np.linalg.inv(np.linalg.cholesky(m_c))
+    ao_dense = {
+        "overlap_ao": np.eye(ext),
+        "hcore_ao": hcore,
+        "coefficients_alpha": ca,
+        "coefficients_beta": cb,
+        "metric_whitener": w_c,
+        "metric/coulomb": m_c,
+        "metric/geminal": spd(q),
+        "metric/squared_geminal": spd(q),
+        "metric/geminal_coulomb": spd(q),
+        "metric/double_commutator": spd(q),
+        "ao_coulomb": sym_panel(q, ext),
+        "ao_f12": sym_panel(q, ext),
+        "ao_f12_squared": sym_panel(q, ext),
+        "ao_f12_over_coulomb": sym_panel(q, ext),
+        "ao_double_commutator": sym_panel(q, ext),
+    }
+    jk_dense = jk_stream = None
+    if distinct_jk:
+        m_jk = spd(qjk)
+        w_jk = np.linalg.inv(np.linalg.cholesky(m_jk))
+        ao_jk = sym_panel(qjk, ext)
+        jk_dense = {"ao_coulomb": ao_jk, "metric/coulomb": m_jk, "metric_whitener": w_jk}
+        jk_stream = {
+            "__ao_loader__": lambda _name, _a=ao_jk: _a.copy(),
+            "metric/coulomb": m_jk,
+            "metric_whitener": w_jk,
+        }
+    ao_stream = {k: v for k, v in ao_dense.items() if not k.startswith("ao_")}
+    ao_stream["__ao_loader__"] = lambda name, _d=ao_dense: _d[name].copy()
+    run = lambda g, inp: execute(g, inp, max_bytes=1 << 29)
+    t0, b0 = unrestricted_mp2_f12_ao_response(
+        space, ao_dense, run, frozen_occupied=(1, 1), jkfit=jk_dense, component="f12"
+    )
+    sunk: dict[str, np.ndarray] = {}
+    t1, b1 = unrestricted_mp2_f12_ao_response(
+        space,
+        ao_stream,
+        run,
+        frozen_occupied=(1, 1),
+        jkfit=jk_stream,
+        component="f12",
+        ao_bar_sink=lambda name, mat: sunk.__setitem__(name, mat.copy()),
+    )
+    assert abs(t0.f12_increment - t1.f12_increment) < 1e-14
+    for key, ref_val in b0.items():
+        if key.startswith("ao_"):
+            assert key in sunk and key not in b1
+            assert np.max(np.abs(ref_val - sunk[key])) < 1e-13
+        else:
+            assert np.max(np.abs(ref_val - b1[key])) < 1e-13
+

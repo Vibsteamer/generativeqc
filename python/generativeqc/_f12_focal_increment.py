@@ -32,6 +32,8 @@ class FocalF12Sources:
     beta: float | None
     integrals: Mapping[str, np.ndarray]
     whitener: np.ndarray
+    ao_loader: Callable[[str], np.ndarray] | None = None
+    obs_coulomb: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -72,6 +74,7 @@ def reference_f12_increment(
     library: ctypes.CDLL | None = None,
     canonical_library: ctypes.CDLL | None = None,
     occupied_weights: SpinOccupied | None = None,
+    ao_bar_sink: Callable[[str, np.ndarray], None] | None = None,
 ) -> FocalF12Increment:
     """Calculate only the explicit fixed-cusp F12 pair energy and its relaxed AO weights.
 
@@ -163,7 +166,7 @@ def reference_f12_increment(
             f12_weights_full = occupied_weights
     terms, bars = unrestricted_mp2_f12_ao_response(
         space, ao, checked, frozen_occupied=frozen, jkfit=panel, component="f12",
-        occupied_f12_weights=f12_weights_full,
+        occupied_f12_weights=f12_weights_full, ao_bar_sink=ao_bar_sink,
     )
     weights = relaxed_f12_source_weights(
         request,
@@ -222,9 +225,18 @@ def relaxed_f12_source_weights(
     # then relax the remaining occupied/virtual torque through coupled HF.
     jkspace = (*occs, n, n, len(jk.whitener))
     fspace = (*occs, n, len(jk.whitener))
+    if "__obs_coulomb__" in panel:
+        obs_coulomb = panel["__obs_coulomb__"]
+    elif "ao_coulomb" in panel:
+        obs_coulomb = panel["ao_coulomb"][:, :n, :n]
+    else:
+        full_jk = panel["__ao_loader__"]("ao_coulomb")
+        obs_coulomb = full_jk[:, :n, :n].copy()
+        del full_jk
     obsao = {
-        **panel,
-        "ao_coulomb": panel["ao_coulomb"][:, :n, :n],
+        "metric/coulomb": panel["metric/coulomb"],
+        "metric_whitener": panel["metric_whitener"],
+        "ao_coulomb": obs_coulomb,
         "hcore_ao": reference.hcore,
         **{
             "coefficients_" + s: reference.coefficients[spin_indices[k]]

@@ -107,6 +107,7 @@ def unrestricted_mp2_f12_ao_response(
     jkfit: Mapping[str, np.ndarray] | None = None,
     component: Literal["all", "ordinary", "f12", "singles"] = "all",
     occupied_f12_weights: SpinOccupied | None = None,
+    ao_bar_sink: Callable[[str, np.ndarray], None] | None = None,
 ) -> tuple[UnrestrictedF12Energy, dict[str, np.ndarray]]:
     """Evaluate the correlation and singles energies and their common AO cotangents.
 
@@ -130,7 +131,13 @@ def unrestricted_mp2_f12_ao_response(
         checked_occupied_weights(occupied_f12_weights, space[:2])
     jk_data = None
     if jkfit is not None:
-        if set(jkfit) != {"ao_coulomb", "metric/coulomb", "metric_whitener"}:
+        jk_streaming = "__ao_loader__" in jkfit
+        req_keys = (
+            {"__ao_loader__", "metric/coulomb", "metric_whitener"}
+            if jk_streaming
+            else {"ao_coulomb", "metric/coulomb", "metric_whitener"}
+        )
+        if not req_keys.issubset(set(jkfit)) or (set(jkfit) - req_keys - {"__obs_coulomb__"}):
             raise ValueError(
                 "JKFit requires Coulomb three-center integrals, metric and whitener"
             )
@@ -138,13 +145,14 @@ def unrestricted_mp2_f12_ao_response(
         qjk = len(jkfit["metric/coulomb"])
         if (
             qjk < 1
-            or jkfit["ao_coulomb"].shape != (qjk, n_ao, n_ao)
+            or (not jk_streaming and jkfit["ao_coulomb"].shape != (qjk, n_ao, n_ao))
             or jkfit["metric/coulomb"].shape != (qjk, qjk)
             or jkfit["metric_whitener"].shape != (qjk, qjk)
         ):
             raise ValueError("JKFit dimensions disagree with the common AO basis")
         if any(
-            value.dtype != np.float64 or not np.isfinite(value).all()
+            isinstance(value, np.ndarray)
+            and (value.dtype != np.float64 or not np.isfinite(value).all())
             for value in jkfit.values()
         ):
             raise ValueError("JKFit sources must contain finite FP64 values")
@@ -171,7 +179,9 @@ def unrestricted_mp2_f12_ao_response(
         component=component,
         occupied_f12_weights=occupied_f12_weights,
     )
-    _, bars = _orbital_sources(space, ao, run, weights, projected=data, role=pair_role)
+    _, bars = _orbital_sources(
+        space, ao, run, weights, projected=data, role=pair_role, ao_bar_sink=ao_bar_sink
+    )
     assert terms is not None and bars is not None
     if jk_data is not None:
         _, jk_bars = _orbital_sources(

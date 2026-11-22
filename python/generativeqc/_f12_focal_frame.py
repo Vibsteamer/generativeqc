@@ -78,12 +78,19 @@ def canonical_pair_frame(
         ),
     ):
         q = len(panel.whitener)
-        fields = {}
-        for name in channels:
-            fields["ao_" + name] = (q, atomic, atomic)
-            fields["metric" if name == "coulomb" else "metric_" + name] = (q, q)
-        if set(panel.integrals) != set(fields) or any(
-            a.shape != fields[k] or a.dtype != np.float64 or not np.isfinite(a).all()
+        metric_fields = {
+            ("metric" if name == "coulomb" else "metric_" + name): (q, q)
+            for name in channels
+        }
+        if panel.ao_loader is not None:
+            expected_fields = metric_fields
+        else:
+            expected_fields = {
+                **metric_fields,
+                **{("ao_" + name): (q, atomic, atomic) for name in channels},
+            }
+        if set(panel.integrals) != set(expected_fields) or any(
+            a.shape != expected_fields[k] or a.dtype != np.float64 or not np.isfinite(a).all()
             for k, a in panel.integrals.items()
         ):
             raise ValueError(
@@ -111,22 +118,29 @@ def canonical_pair_frame(
     complement = proj.frame
     ext = n + proj.rank
     space = (*occs, n, ext, len(f12.whitener))
-    ao = {
+    ao: dict = {
         "overlap_ao": one.overlap,
         "hcore_ao": one.hcore,
         "metric_whitener": f12.whitener,
         **{k: v for k, v in f12.integrals.items() if k.startswith("ao_")},
         **{k: f12.integrals[v] for k, v in METRIC_NAMES.items()},
     }
+    if f12.ao_loader is not None:
+        ao["__ao_loader__"] = f12.ao_loader
     spins = ("alpha", "beta")
     for k, spin in enumerate(spins):
         frame = np.zeros((atomic, ext))
         frame[:n, :n] = reference.coefficients[spin_indices[k]]
         frame[:, n:] = complement
         ao["coefficients_" + spin] = frame
-    panel = {
-        "ao_coulomb": jk.integrals["ao_coulomb"],
+    panel: dict = {
         "metric/coulomb": jk.integrals["metric"],
         "metric_whitener": jk.whitener,
     }
+    if jk.ao_loader is not None:
+        panel["__ao_loader__"] = jk.ao_loader
+        if jk.obs_coulomb is not None:
+            panel["__obs_coulomb__"] = jk.obs_coulomb
+    else:
+        panel["ao_coulomb"] = jk.integrals["ao_coulomb"]
     return space, ao, panel, proj

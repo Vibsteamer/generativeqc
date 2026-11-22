@@ -10,14 +10,21 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from ._f12_focal_integral_kernel import _OPCODES
-from ._f12_focal_integral_sink import ShellProjection, contract_live_weights
+from ._f12_focal_integral_sink import (
+    ShellProjection,
+    contract_live_weights,
+    contract_single_channel,
+)
 from ._f12_focal_metric import metric_whitener
 from ._f12_focal_shells import focal_shell_layout
 
 __all__ = [
     "contract_live_weights",
+    "contract_single_channel",
     "focal_shell_layout",
     "forward_integrals",
+    "forward_metrics_only",
+    "forward_single_ao_operator",
     "metric_whitener",
 ]
 
@@ -158,3 +165,139 @@ def forward_integrals(
                 "device_bytes": 0 if host_reference else workspace.value,
             }
     return tensors, resources
+
+
+def _prepare_forward_common(layout: Mapping[str, np.ndarray], coulomb_only: bool):
+    common = {
+        k: layout[k]
+        for k in (
+            "angular",
+            "prim_offsets",
+            "exponents",
+            "radial",
+            "centers",
+            "metric_blocks",
+            "ao_blocks",
+            "ao_offsets",
+            "metric_offsets",
+            "manifest",
+            "spherical_rows",
+            "ao_sizes",
+            "orbital_shell_count",
+            "atom",
+        )
+    }
+    for angular in np.unique(common["angular"]):
+        key = f"transform_{angular}"
+        common[key] = layout[key]
+    manifest = json.loads(str(common["manifest"]))
+    beta = 0.0 if coulomb_only else manifest["options"]["f12_beta"]
+    geometry = np.asarray(manifest["geometry_bohr"])
+    if not np.array_equal(geometry[common["atom"]], common["centers"]):
+        raise ValueError("molecular and shell coordinates disagree")
+    return common, beta
+
+
+def forward_metrics_only(
+    layout: Mapping[str, np.ndarray],
+    library: Path,
+    *,
+    host_reference: bool = False,
+    coulomb_only: bool = False,
+    budget_mib: int = 512,
+) -> dict[str, np.ndarray]:
+    """Build only the tiny [Q, Q] metric matrices without allocating any [Q, ext, ext] AO panel."""
+    if not 0 < budget_mib <= (2**64 - 1) >> 20:
+        raise ValueError("invalid forward device-memory budget")
+    budget = budget_mib << 20
+    common, beta = _prepare_forward_common(layout, coulomb_only)
+    kinds = ("coulomb",) if coulomb_only else ("coulomb", "geminal")
+    funcs = {k: bind_forward(library, k, host_reference) for k in kinds}
+    ops = {"coulomb": _OPCODES["coulomb"]} if coulomb_only else _OPCODES
+    projection = ShellProjection(common, "metric")
+    offsets, blocks = projection.offsets, projection.blocks
+    nblocks, ncenters = blocks.shape
+    ncart = int(offsets[-1])
+    tensors = {}
+    for op, opcode in ops.items():
+        label = "metric" if op == "coulomb" else "metric_" + op
+        raw = np.full(ncart, np.nan)
+        workspace = ct.c_uint64()
+        result = funcs["coulomb" if op == "coulomb" else "geminal"](
+            ncenters,
+            opcode,
+            beta,
+            len(common["angular"]),
+            len(common["exponents"]),
+            nblocks,
+            ncart,
+            common["angular"],
+            common["prim_offsets"],
+            common["exponents"],
+            common["radial"],
+            common["centers"],
+            blocks,
+            offsets,
+            raw,
+            budget,
+            ct.byref(workspace),
+        )
+        if result:
+            raise RuntimeError(f"{label} native forward returned status {result}")
+        if not np.isfinite(raw).all() or not (0 < workspace.value <= budget):
+            raise ValueError(f"{label} incomplete native outputs or invalid workspace")
+        tensors[label] = projection.spherical_values(raw)
+        del raw
+    return tensors
+
+
+def forward_single_ao_operator(
+    layout: Mapping[str, np.ndarray],
+    library: Path,
+    op: str,
+    *,
+    host_reference: bool = False,
+    coulomb_only: bool = False,
+    budget_mib: int = 512,
+) -> np.ndarray:
+    """Build exactly ONE [Q, ext, ext] spherical AO operator tensor and immediately release its Cartesian scratch."""
+    if not 0 < budget_mib <= (2**64 - 1) >> 20:
+        raise ValueError("invalid forward device-memory budget")
+    if op not in _OPCODES:
+        raise ValueError(f"unknown F12 operator {op!r}")
+    budget = budget_mib << 20
+    common, beta = _prepare_forward_common(layout, coulomb_only or op == "coulomb")
+    func = bind_forward(library, "coulomb" if op == "coulomb" else "geminal", host_reference)
+    projection = ShellProjection(common, "ao")
+    offsets, blocks = projection.offsets, projection.blocks
+    nblocks, ncenters = blocks.shape
+    ncart = int(offsets[-1])
+    raw = np.full(ncart, np.nan)
+    workspace = ct.c_uint64()
+    result = func(
+        ncenters,
+        _OPCODES[op],
+        beta,
+        len(common["angular"]),
+        len(common["exponents"]),
+        nblocks,
+        ncart,
+        common["angular"],
+        common["prim_offsets"],
+        common["exponents"],
+        common["radial"],
+        common["centers"],
+        blocks,
+        offsets,
+        raw,
+        budget,
+        ct.byref(workspace),
+    )
+    label = "ao_" + op
+    if result:
+        raise RuntimeError(f"{label} native forward returned status {result}")
+    if not np.isfinite(raw).all() or not (0 < workspace.value <= budget):
+        raise ValueError(f"{label} incomplete native outputs or invalid workspace")
+    values = projection.spherical_values(raw)
+    del raw
+    return values

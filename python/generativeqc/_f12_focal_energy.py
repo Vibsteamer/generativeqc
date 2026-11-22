@@ -250,9 +250,14 @@ def molecular_low_order_energy(
     singles = None
     if include_hf_cabs:
         frames = (ao["coefficients_alpha"], ao["coefficients_beta"])
+        jk_ao_coul = (
+            jkfit["__ao_loader__"]("ao_coulomb")
+            if "__ao_loader__" in jkfit
+            else jkfit["ao_coulomb"]
+        )
         singles_focks, _ = physical_fock(
             one.hcore,
-            jkfit["ao_coulomb"],
+            jk_ao_coul,
             jk.whitener,
             frames,
             (oa, ob),
@@ -260,6 +265,7 @@ def molecular_low_order_energy(
             cuda,
             provider.response_library,
         )
+        del jk_ao_coul
         singles = tuple(
             _singles_from_fock(
                 singles_fock,

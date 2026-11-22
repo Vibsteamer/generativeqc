@@ -158,11 +158,11 @@ def molecular_ucc_sources(
         derivatives=False,
         budget_mib=provider.budget_mib,
     )
-    corr = provider._panel(request, "f12_fit")
+    corr = provider._panel(request, "f12_fit", allow_streaming=True)
     jk = (
         corr
-        if corr.fit_id == request.basis.jk_fit.identity
-        else provider._panel(request, "jk_fit")
+        if (corr.fit_id == request.basis.jk_fit.identity and not corr.streaming)
+        else provider._panel(request, "jk_fit", allow_streaming=False)
     )
     space, ao, panel, proj = canonical_pair_frame(
         request,

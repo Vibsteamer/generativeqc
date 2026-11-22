@@ -49,6 +49,7 @@ def _orbital_sources(
     *,
     projected: dict[str, np.ndarray] | None,
     role: Literal["shared", "pairs", "fock", "ordinary_jk", "ordinary_fock"] = "shared",
+    ao_bar_sink: Callable[[str, np.ndarray], None] | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray] | None]:
     # A combined energy/response evaluation owns the forward buffers through
     # the reverse pass. Standalone evaluations build their own projections.
@@ -58,6 +59,7 @@ def _orbital_sources(
         raise ValueError("Invalid UHF occupied, OBS, or extended dimensions")
     nc = len(ao["coefficients_alpha"])
     occupied = {"alpha": oa, "beta": ob}
+    ao_loader = ao.get("__ao_loader__")
     needs_cross = role in ("shared", "pairs")
     if needs_cross:
         cross = unrestricted_cross_frame_overlap(nc, ext)
@@ -72,8 +74,11 @@ def _orbital_sources(
         data = projected
     bars = None
     if orbital_weights is not None:
+        skip_keys = {"metric_whitener", "__ao_loader__", "__obs_coulomb__"}
         bars = {
-            k: np.zeros_like(v) for k, v in ao.items() if k not in ("metric_whitener",)
+            k: np.zeros_like(v)
+            for k, v in ao.items()
+            if k not in skip_keys and not (ao_bar_sink is not None and k.startswith("ao_"))
         }
         if needs_cross:
             cross_rev = transpose_program(cross, ("cross_overlap",)).program
@@ -96,23 +101,35 @@ def _orbital_sources(
             data[name] = ao[name]
             if bars is not None:
                 bars[name] += orbital_weights[name]
-    for spin, occ in occupied.items():
-        co = "coefficients_" + spin
-        frame = molecular_orbital_sources(nc, ext, occ, aux)
-        for op in operators:
-            field = _OPERATORS[op]
+    frames = {
+        spin: molecular_orbital_sources(nc, ext, occ, aux)
+        for spin, occ in occupied.items()
+    }
+    # Iterate operators outermost so streaming mode holds at most ONE [Q, ext, ext] AO panel
+    # (and at most ONE [Q, ext, ext] cotangent) in host RAM across both spin channels.
+    for op in operators:
+        field = _OPERATORS[op]
+        ao_name = "hcore_ao" if op == "hcore" else "ao_" + field.removeprefix("raw_")
+        if not any(field in frames[spin].outputs for spin in occupied):
+            continue
+        stream_this = op != "hcore" and ao_loader is not None and ao_name not in ao
+        ao_mat = ao_loader(ao_name) if stream_this else ao[ao_name]
+        sink_this = bars is not None and op != "hcore" and ao_bar_sink is not None
+        bar_ao_mat = None
+        if bars is not None and op != "hcore" and not sink_this and ao_name not in bars:
+            bars[ao_name] = np.zeros_like(ao_mat)
+        for spin, occ in occupied.items():
+            frame = frames[spin]
             if field not in frame.outputs:
                 continue
-            ao_name = (
-                "hcore_ao" if op == "hcore" else "ao_" + field.removeprefix("raw_")
-            )
+            co = "coefficients_" + spin
             key = (
                 "source/" + field + "_" + spin
                 if op in ("coulomb", "hcore")
                 else "raw/" + op + "/" + spin
             )
             graph = Program({field: frame.outputs[field]})
-            item = {"coefficients": ao[co], ao_name: ao[ao_name]}
+            item = {"coefficients": ao[co], ao_name: ao_mat}
             if projected is None:
                 data[key] = run(graph, item).outputs[field]
             seed = None if bars is None else orbital_weights[key].copy()
@@ -146,5 +163,19 @@ def _orbital_sources(
                 rev = transpose_program(graph, (field,)).program
                 weights = run(rev, {**item, "bar_" + field: seed}).outputs
                 bars[co] += weights["bar_coefficients"]
-                bars[ao_name] += weights["bar_" + ao_name]
+                if sink_this:
+                    contrib = weights["bar_" + ao_name]
+                    if bar_ao_mat is None:
+                        bar_ao_mat = np.array(contrib, copy=True) if not contrib.flags.writeable else contrib
+                    else:
+                        bar_ao_mat += contrib
+                    del contrib
+                else:
+                    bars[ao_name] += weights["bar_" + ao_name]
+                del weights
+        del ao_mat
+        if sink_this:
+            assert bar_ao_mat is not None
+            ao_bar_sink(ao_name, bar_ao_mat)
+            del bar_ao_mat
     return data, bars

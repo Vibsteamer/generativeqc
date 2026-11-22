@@ -273,3 +273,52 @@ def contract_live_weights(
         if references is not None
         else None,
     }
+
+
+def contract_single_channel(
+    layout: Mapping[str, np.ndarray],
+    group: str,
+    operator: str,
+    weight: np.ndarray,
+    library: Path,
+    *,
+    host_reference: bool = False,
+    budget_mib: int = 512,
+    coulomb_library: Path | None = None,
+) -> np.ndarray:
+    """Contract ONE single (group, operator) spherical adjoint directly into its [natoms, 3] nuclear gradient."""
+    if not 0 < budget_mib <= (2**64 - 1) >> 20:
+        raise ValueError("invalid molecular sink budget")
+    if group not in ("metric", "ao") or operator not in _OPCODES:
+        raise ValueError(f"invalid channel ({group!r}, {operator!r})")
+    metadata = json.loads(str(layout["manifest"]))
+    kind = "coulomb" if operator == "coulomb" else "geminal"
+    functions = {
+        kind: bind(
+            (coulomb_library or library) if kind == "coulomb" else library,
+            kind,
+            host_reference,
+        )
+    }
+    topology = {k: layout[k] for k in layout if not k.startswith("weights_")}
+    projection = ShellProjection(topology, group)
+    label = channel_name(group, operator)
+    packed = projection.pack(weight)
+    _, row = contract_geometry(
+        {**topology, "weights_" + label: packed},
+        metadata,
+        functions,
+        group,
+        operator,
+        budget_mib << 20,
+        host_reference,
+    )
+    del packed
+    if not row["contraction_checks_passed"]:
+        raise ArithmeticError(
+            f"The molecular shell nuclear derivative failed contraction checks for {label}"
+        )
+    grad = np.asarray(row["gradient_Eh_per_bohr"], dtype=np.float64)
+    if not np.isfinite(grad).all():
+        raise ValueError(f"non-finite explicit integral gradient for {label}")
+    return grad
