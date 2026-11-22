@@ -233,26 +233,24 @@ def df_reference(
     cuda = request.backend == "cuda"
     calculator = Calculator
     nuclei = tuple(atom.atomic_number for atom in request.atoms)
-    rhf_values = (
-        request.root_id == "rhf"
-        and (request.charge, tuple(sorted(nuclei)))
-        in {(0, (1, 1, 8)), (-1, (1, 8)), (-1, (1, 1, 1, 8, 8))}
+    unique_nuclei = sorted(set(nuclei))
+    all_electron_obs = all(
+        not orb.by_element[z].ecp_core_electrons and not orb.by_element[z].ecp_data
+        for z in unique_nuclei
     )
+    rhf_values = request.root_id == "rhf" and all_electron_obs
     oh_values = (
         request.root_id == "uhf"
         and request.charge == 0
         and request.multiplicity == 2
         and nuclei == (8, 1)
+        and all_electron_obs
     )
     if (
         cuda
         and not forces
         and (rhf_values or oh_values)
-        and all(
-            not orb.by_element[z].ecp_core_electrons and not orb.by_element[z].ecp_data
-            for z in (8, 1)
-        )
-        and max(shell.angular_momentum for z in (8, 1) for shell in orb.by_element[z].shells) == 4
+        and max(shell.angular_momentum for z in unique_nuclei for shell in orb.by_element[z].shells) == 4
     ):
         class FittedValueCalculator(Calculator):
             def _full_df_basis_consumer(self, operator, derivative_order=0, *, atoms=None):
