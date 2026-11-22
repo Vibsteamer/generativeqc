@@ -33,6 +33,9 @@ explicitly correlated triples term.
 Matched conventional scalar differences were about 1.05e-12 Eh for water and
 1.08e-13 Eh for methane in the common-fit L20 calibration. Those jobs compared
 the prior owners and did not exercise the new retained spatial entry. The
-CUDA opt-in signed LiH regression checks the independent central energy,
-the center analytic increment, two finite-difference steps, and a native
-trace event for the retained spatial solve.
+CUDA opt-in signed LiH regression checks the independent central energy and
+the center analytic increment at both finite-difference steps. The forward
+center and each signed point record whether the spatial ABI published its
+scalar and whether the spin-resolved ABI returned. The early retained-root
+trace inside the solver records entry before the triples calculation, so it
+does not establish which result the caller received.

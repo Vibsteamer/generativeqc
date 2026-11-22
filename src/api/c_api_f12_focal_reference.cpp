@@ -14,6 +14,7 @@
 #include "molecule/basis.hpp"
 #include "posthf/capacity.hpp"
 #include "runtime/bounded_workspace.hpp"
+#include "runtime/df_progress_trace.hpp"
 #include "runtime/execution_context.hpp"
 #include "scf/mean_field.hpp"
 
@@ -243,6 +244,9 @@ extern "C" generativeqc_status generativeqc_focal_ucc_triples_v1(
   auto* context = calculation->context;
   std::lock_guard lock(context->mutex);
   try {
+    using namespace generativeqc;
+    runtime::df_progress::Scope trace(
+        "focal_ucc_triples", context->state.executed_backend == core::kCudaBackend ? "cuda" : "host");
     if (owner->backend != context->state.executed_backend ||
         owner->device != context->state.device_id ||
         count != 1 + (forces ? 3 * calculation->plan->atom_count() : 0))
@@ -255,6 +259,7 @@ extern "C" generativeqc_status generativeqc_focal_ucc_triples_v1(
       throw std::runtime_error("invalid focal triples result");
     output[0] = result.energy;
     std::copy(result.forces.begin(), result.forces.end(), output + 1);
+    trace.finish();
     return GENERATIVEQC_STATUS_SUCCESS;
   } catch (...) {
     return generativeqc::api::map_exception(&context->last_detail);
@@ -270,6 +275,7 @@ extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_e
   std::lock_guard lock(context->mutex);
   try {
     using namespace generativeqc;
+    runtime::df_progress::Scope trace("focal_rcc_triples_energy", "cuda");
     if (!owner->uhf || !owner->uhf->source_identity ||
         owner->backend != core::kCudaBackend || owner->backend != context->state.executed_backend ||
         owner->device != context->state.device_id)
@@ -294,6 +300,7 @@ extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_e
         *calculation->plan, owner->rhf, *expanded.source_identity, owner->jk, retained);
     if (!std::isfinite(energy)) throw std::runtime_error("nonfinite focal spatial triples energy");
     *output = energy;
+    trace.finish();
     return GENERATIVEQC_STATUS_SUCCESS;
   } catch (const std::length_error& error) {
     context->last_detail = error.what();

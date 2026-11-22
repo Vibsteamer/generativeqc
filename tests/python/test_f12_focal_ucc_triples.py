@@ -19,6 +19,7 @@ from generativeqc.experimental.f12_focal import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from generativeqc.experimental.f12_focal import (
@@ -209,10 +210,16 @@ def test_triples_from_retained_uhf_and_rhf_references() -> None:
     reason="requires an allocated CUDA native library",
 )
 def test_retained_common_fit_rhf_cuda_signed_triples(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    record_property: Callable[[str, object], None],
 ) -> None:
     from generativeqc._f12_focal_ucc_triples import molecular_triples_on_reference
-    from generativeqc.experimental.f12_focal import FocalReferenceSeed, df_reference
+    from generativeqc.experimental.f12_focal import (
+        FocalReference,
+        FocalReferenceSeed,
+        df_reference,
+    )
 
     basis = FocalBasis(
         2, "common-fit", "sto-3g", jk_fit="def2-svp", mp2_fit="def2-svp",
@@ -235,23 +242,51 @@ def test_retained_common_fit_rhf_cuda_signed_triples(
         center, reference, budget_mib=1024, forces=True
     )
     assert center_force is not None
-    assert center_energy == pytest.approx(-7.4691686931e-6, abs=8e-12)
-    trace = tmp_path / "retained-rhf.jsonl"
-    monkeypatch.setenv("GENERATIVEQC_DF_PROGRESS_TRACE", str(trace))
+    independent = -7.4691686931e-6
+    assert center_energy == pytest.approx(independent, abs=8e-12, rel=0)
+
+    routes = {}
+
+    def forward(label: str, req: FocalRequest, ref: FocalReference) -> float:
+        trace = tmp_path / f"retained-rhf-{label}.jsonl"
+        with monkeypatch.context() as env:
+            env.setenv("GENERATIVEQC_DF_PROGRESS_TRACE", str(trace))
+            energy, forces = molecular_triples_on_reference(
+                req, ref, budget_mib=1024, forces=False
+            )
+        assert forces is None
+        events = (json.loads(line) for line in trace.read_text().splitlines())
+        returned = {
+            event["name"]
+            for event in events
+            if event["event"] == "END"
+            and event["status"] == "returned"
+            and event["execution"] == "cuda"
+        }
+        routes[label] = {
+            "spatial_returned": "focal_rcc_triples_energy" in returned,
+            "spin_resolved_fallback": "focal_ucc_triples" in returned,
+        }
+        return energy
+
+    forward_center = forward("center", center, reference)
     displaced = {}
-    for dz in (-4e-4, -2e-4, 2e-4, 4e-4):
+    signed_points = (("m0004", -4e-4), ("m0002", -2e-4), ("p0002", 2e-4), ("p0004", 4e-4))
+    for label, dz in signed_points:
         req = request(3.0 + dz)
         ref = df_reference(req, seed=seed, forces=False)
         assert ref.occupied_overlaps is not None and min(ref.occupied_overlaps) > 0.99999
-        energy, forces = molecular_triples_on_reference(req, ref, budget_mib=1024, forces=False)
-        assert forces is None
-        displaced[dz] = energy
+        displaced[dz] = forward(label, req, ref)
+    record_property("retained_rhf_triples_routes", json.dumps(routes))
+    assert all(
+        route["spatial_returned"] and not route["spin_resolved_fallback"]
+        for route in routes.values()
+    ), routes
+    assert forward_center == pytest.approx(independent, abs=8e-12, rel=0)
+    assert forward_center == pytest.approx(center_energy, abs=8e-12, rel=0)
     for h in (4e-4, 2e-4):
         force = (displaced[-h] - displaced[h]) / (2 * h)
         assert force == pytest.approx(center_force[1, 2], abs=2e-9, rel=0)
-    events = (json.loads(line) for line in trace.read_text().splitlines())
-    assert any(event.get("key") == "retained_focal_rhf_reference" and event["value"] == 1
-               for event in events)
 
 
 def test_public_split_fit_triples_share_the_reference_at_center_and_displacement(
