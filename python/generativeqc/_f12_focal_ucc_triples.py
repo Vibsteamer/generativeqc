@@ -177,8 +177,9 @@ def relax_spatial_rhf_force_sources(
             raise RuntimeError("Spatial triples CPHF program ran on another backend")
         return out
 
+    pair_request = replace(request, role="mp2_f12_correlation")
     one = one_electron_sources(
-        request,
+        pair_request,
         library=provider.one_electron_library or provider.shell_library,
         orbital_only=True,
         derivatives=True,
@@ -189,7 +190,7 @@ def relax_spatial_rhf_force_sources(
         and np.allclose(one.hcore, reference.hcore, atol=2e-8, rtol=0)
     ):
         raise ValueError("Spatial triples one-electron integrals differ from root")
-    jk = provider._panel(request, "jk_fit", orbital_only=True)
+    jk = provider._panel(pair_request, "jk_fit", orbital_only=True)
     n = one.obs_ao_count
     o_full = reference.occupied[0]
     eps = reference.orbital_energies[0]
@@ -275,7 +276,7 @@ def relax_spatial_rhf_force_sources(
     )
     grad = one.nuclear_gradient(relaxed["overlap"], relaxed["hcore"], run=run)
     jk_bars = {"ao_coulomb": relaxed["three_center"], "metric": relaxed["metric"]}
-    grad += provider._gradient(request, jk, jk_bars, coulomb_only=True)
+    grad += provider._gradient(pair_request, jk, jk_bars, coulomb_only=True)
     grad += corr_gradient.reshape(-1, 3)
     return -grad
 
