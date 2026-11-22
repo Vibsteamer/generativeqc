@@ -7,13 +7,14 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 from generativeqc_compiler.cc.uccsd_f12_sources import unrestricted_f12_pair_sources
-from generativeqc_compiler.mp2.f12_density_fitting import (
-    coulomb_fit_response,
-    molecular_orbital_sources,
-)
+from generativeqc_compiler.mp2.f12_density_fitting import coulomb_fit_response
 from generativeqc_compiler.mp2.f12_unrestricted import unrestricted_cross_frame_overlap
 from generativeqc_compiler.tensor import Program, transpose_program
 
+from generativeqc._f12_spin_ao import (
+    project_ao_operator_pullback_tiled,
+    project_ao_operator_tiled,
+)
 from generativeqc._f12_spin_pairs import occupied_pair_blocks
 
 if TYPE_CHECKING:
@@ -27,8 +28,8 @@ _OPERATOR_FIELDS = {
 
 
 class _Frame(NamedTuple):
-    projection: Program
-    inputs: dict[str, np.ndarray]
+    occupied: int
+    coefficients: np.ndarray
     sources: Mapping[str, np.ndarray]
     seeds: dict[str, np.ndarray]
     fit_inputs: dict[str, np.ndarray]
@@ -122,27 +123,29 @@ def unrestricted_cc_w_ao_weights(
     fit_reverse = Program(
         {k: solve.outputs[k] for k in ("three_center_bar", "metric_bar")}
     )
+    op_pairs = (
+        ("raw_coulomb", "ao_coulomb"),
+        ("raw_f12", "ao_f12"),
+        ("raw_f12_over_coulomb", "ao_f12_over_coulomb"),
+    )
     frames = {}
     for spin in ("alpha", "beta"):
         occupied = occ[spin[0]]
         if occupied <= frozen[spin[0]]:
             continue
-        frame = molecular_orbital_sources(n, ext, occupied, aux)
-        graph = Program(
-            {
-                key: frame.outputs[key]
-                for key in ("raw_coulomb", "raw_f12", "raw_f12_over_coulomb")
-            }
-        )
-        inputs = {name: ao[name] for name in ao_names}
-        inputs["coefficients"] = ao["coefficients_" + spin]
-        sources = run(graph, inputs).outputs
+        coeffs = ao["coefficients_" + spin]
+        sources = {
+            field: project_ao_operator_tiled(
+                n, ext, occupied, aux, field, ao_name, coeffs, ao[ao_name], run
+            )
+            for field, ao_name in op_pairs
+        }
         rhs = np.ascontiguousarray(sources["raw_coulomb"][:, :obs]).reshape(aux, -1)
         fit_fields = {"metric_whitener": whitener, "three_center": rhs}
         fit = run(fit_forward, fit_fields).outputs["fit"].reshape(aux, obs, ext)
         seeds = {k: np.zeros_like(v) for k, v in sources.items()}
         frames[spin] = _Frame(
-            graph, inputs, sources, seeds, fit_fields, fit, np.zeros_like(fit)
+            occupied, coeffs, sources, seeds, fit_fields, fit, np.zeros_like(fit)
         )
 
     for left, right, nl, nr, _, pairs in occupied_pair_blocks(
@@ -190,7 +193,7 @@ def unrestricted_cc_w_ao_weights(
                 sr.seeds["raw_" + raw][:, j] += result[f"bar_raw_{op}_right"]
                 bars["metric/" + op] += result["bar_metric_" + op]
 
-    for spin, (graph, inputs, _, seeds, fit_fields, _, fit_bar) in frames.items():
+    for spin, (occupied, coeffs, _, seeds, fit_fields, _, fit_bar) in frames.items():
         fit_response = run(
             fit_reverse, {**fit_fields, "fit_bar": fit_bar.reshape(aux, -1)}
         ).outputs
@@ -198,13 +201,21 @@ def unrestricted_cc_w_ao_weights(
         seeds["raw_coulomb"][:, :obs] += fit_response["three_center_bar"].reshape(
             aux, obs, ext
         )
-        reverse = transpose_program(graph, tuple(graph.outputs)).program
-        response = run(
-            reverse, {**inputs, **{"bar_" + k: x for k, x in seeds.items()}}
-        ).outputs
-        bars["coefficients_" + spin] += response["bar_coefficients"]
-        for key in ao_names:
-            bars[key] += response["bar_" + key]
+        for field, ao_name in op_pairs:
+            project_ao_operator_pullback_tiled(
+                n,
+                ext,
+                occupied,
+                aux,
+                field,
+                ao_name,
+                coeffs,
+                ao[ao_name],
+                seeds[field],
+                run,
+                bar_coefficients=bars["coefficients_" + spin],
+                bar_ao=bars[ao_name],
+            )
 
     reverse = transpose_program(cross, ("cross_overlap",)).program
     response = run(reverse, {**cross_inputs, "bar_cross_overlap": cross_bar}).outputs

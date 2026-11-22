@@ -11,6 +11,9 @@ from generativeqc_compiler.mp2.f12_density_fitting import (
 from generativeqc_compiler.mp2.f12_unrestricted import unrestricted_cross_frame_overlap
 from generativeqc_compiler.tensor import Program, transpose_program
 
+from ._f12_spin_fock import _tile_groups, default_auxiliary_batch_size
+from ._f12_spin_pairs import batch_execute
+
 _OPERATORS = {
     "hcore": "hcore",
     "coulomb": "raw_coulomb",
@@ -19,6 +22,86 @@ _OPERATORS = {
     "geminal_coulomb": "raw_f12_over_coulomb",
     "double_commutator": "raw_double_commutator",
 }
+
+
+def project_ao_operator_tiled(
+    nc: int,
+    ext: int,
+    occ: int,
+    aux: int,
+    field: str,
+    ao_name: str,
+    coefficients: np.ndarray,
+    ao_mat: np.ndarray,
+    run: Callable,
+    *,
+    batch_size: int | None = None,
+) -> np.ndarray:
+    """Transform one 3-center AO operator [aux, nc, nc] into the MO frame in bounded auxiliary tiles."""
+    width = (
+        default_auxiliary_batch_size(aux, max(nc, ext))
+        if batch_size is None
+        else batch_size
+    )
+    left_dim = ext if field == "raw_coulomb" else occ
+    coeffs = np.ascontiguousarray(coefficients)
+    if width >= aux:
+        frame = molecular_orbital_sources(nc, ext, occ, aux)
+        graph = Program({field: frame.outputs[field]})
+        return run(graph, {"coefficients": coeffs, ao_name: np.ascontiguousarray(ao_mat)}).outputs[field]
+    out = np.empty((aux, left_dim, ext), dtype=np.float64)
+    for tile_len, slices in _tile_groups(aux, width):
+        frame = molecular_orbital_sources(nc, ext, occ, tile_len)
+        graph = Program({field: frame.outputs[field]})
+        with batch_execute(run, graph) as exec_one:
+            for rows in slices:
+                out[rows] = exec_one(
+                    {"coefficients": coeffs, ao_name: np.ascontiguousarray(ao_mat[rows])}
+                ).outputs[field]
+    return out
+
+
+def project_ao_operator_pullback_tiled(
+    nc: int,
+    ext: int,
+    occ: int,
+    aux: int,
+    field: str,
+    ao_name: str,
+    coefficients: np.ndarray,
+    ao_mat: np.ndarray,
+    seed: np.ndarray,
+    run: Callable,
+    *,
+    bar_coefficients: np.ndarray,
+    bar_ao: np.ndarray | None = None,
+    batch_size: int | None = None,
+) -> np.ndarray:
+    """Pull MO operator cotangents [aux, *, ext] back to AO [aux, nc, nc] and coefficients in bounded tiles."""
+    width = (
+        default_auxiliary_batch_size(aux, max(nc, ext))
+        if batch_size is None
+        else batch_size
+    )
+    coeffs = np.ascontiguousarray(coefficients)
+    if bar_ao is None:
+        bar_ao = np.zeros_like(ao_mat)
+    for tile_len, slices in _tile_groups(aux, width):
+        frame = molecular_orbital_sources(nc, ext, occ, tile_len)
+        graph = Program({field: frame.outputs[field]})
+        rev = transpose_program(graph, (field,)).program
+        with batch_execute(run, rev) as exec_one:
+            for rows in slices:
+                weights = exec_one(
+                    {
+                        "coefficients": coeffs,
+                        ao_name: np.ascontiguousarray(ao_mat[rows]),
+                        "bar_" + field: np.ascontiguousarray(seed[rows]),
+                    }
+                ).outputs
+                bar_coefficients += weights["bar_coefficients"]
+                bar_ao[rows] += weights["bar_" + ao_name]
+    return bar_ao
 
 
 def unrestricted_orbital_sources(
@@ -101,8 +184,8 @@ def _orbital_sources(
             data[name] = ao[name]
             if bars is not None:
                 bars[name] += orbital_weights[name]
-    frames = {
-        spin: molecular_orbital_sources(nc, ext, occ, aux)
+    hcore_frames = {
+        spin: molecular_orbital_sources(nc, ext, occ, 1)
         for spin, occ in occupied.items()
     }
     # Iterate operators outermost so streaming mode holds at most ONE [Q, ext, ext] AO panel
@@ -110,17 +193,16 @@ def _orbital_sources(
     for op in operators:
         field = _OPERATORS[op]
         ao_name = "hcore_ao" if op == "hcore" else "ao_" + field.removeprefix("raw_")
-        if not any(field in frames[spin].outputs for spin in occupied):
+        if not any(field in hcore_frames[spin].outputs for spin in occupied):
             continue
         stream_this = op != "hcore" and ao_loader is not None and ao_name not in ao
         ao_mat = ao_loader(ao_name) if stream_this else ao[ao_name]
         sink_this = bars is not None and op != "hcore" and ao_bar_sink is not None
-        bar_ao_mat = None
+        bar_ao_mat = np.zeros_like(ao_mat) if sink_this else None
         if bars is not None and op != "hcore" and not sink_this and ao_name not in bars:
             bars[ao_name] = np.zeros_like(ao_mat)
         for spin, occ in occupied.items():
-            frame = frames[spin]
-            if field not in frame.outputs:
+            if field not in hcore_frames[spin].outputs:
                 continue
             co = "coefficients_" + spin
             key = (
@@ -128,10 +210,23 @@ def _orbital_sources(
                 if op in ("coulomb", "hcore")
                 else "raw/" + op + "/" + spin
             )
-            graph = Program({field: frame.outputs[field]})
-            item = {"coefficients": ao[co], ao_name: ao_mat}
+            if op == "hcore":
+                graph = Program({field: hcore_frames[spin].outputs[field]})
+                item = {"coefficients": ao[co], ao_name: ao_mat}
+                if projected is None:
+                    data[key] = run(graph, item).outputs[field]
+                seed = None if bars is None else orbital_weights[key].copy()
+                if bars is not None:
+                    rev = transpose_program(graph, (field,)).program
+                    weights = run(rev, {**item, "bar_" + field: seed}).outputs
+                    bars[co] += weights["bar_coefficients"]
+                    bars[ao_name] += weights["bar_" + ao_name]
+                    del weights
+                continue
             if projected is None:
-                data[key] = run(graph, item).outputs[field]
+                data[key] = project_ao_operator_tiled(
+                    nc, ext, occ, aux, field, ao_name, ao[co], ao_mat, run
+                )
             seed = None if bars is None else orbital_weights[key].copy()
             if op == "coulomb" and occ:
                 solve = coulomb_fit_response(aux, occ * ext)
@@ -160,19 +255,22 @@ def _orbital_sources(
                 if projected is None:
                     data[fit_key] = solved["fit"].reshape(aux, occ, ext)
             if bars is not None:
-                rev = transpose_program(graph, (field,)).program
-                weights = run(rev, {**item, "bar_" + field: seed}).outputs
-                bars[co] += weights["bar_coefficients"]
-                if sink_this:
-                    contrib = weights["bar_" + ao_name]
-                    if bar_ao_mat is None:
-                        bar_ao_mat = np.array(contrib, copy=True) if not contrib.flags.writeable else contrib
-                    else:
-                        bar_ao_mat += contrib
-                    del contrib
-                else:
-                    bars[ao_name] += weights["bar_" + ao_name]
-                del weights
+                assert seed is not None
+                target_bar_ao = bar_ao_mat if sink_this else bars[ao_name]
+                project_ao_operator_pullback_tiled(
+                    nc,
+                    ext,
+                    occ,
+                    aux,
+                    field,
+                    ao_name,
+                    ao[co],
+                    ao_mat,
+                    seed,
+                    run,
+                    bar_coefficients=bars[co],
+                    bar_ao=target_bar_ao,
+                )
         del ao_mat
         if sink_this:
             assert bar_ao_mat is not None

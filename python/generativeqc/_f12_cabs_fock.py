@@ -143,14 +143,19 @@ def physical_spin_operators(
             raise ValueError("physical AO three-center Coulomb integral is asymmetric")
     n, ext = frames[0].shape
     q = len(whitener)
+    from ._f12_spin_fock import _tile_groups, default_auxiliary_batch_size
+    from ._f12_spin_pairs import batch_execute
+
+    width = default_auxiliary_batch_size(q, n)
+    groups = _tile_groups(q, width)
     ao = IndexSpace("joint_atomic", "ao", n)
     aux = IndexSpace("jk_fit", "auxiliary", q)
     mo = IndexSpace("extended_orbital", "orbital", ext)
     m, v = Index("m", ao), Index("n", ao)
     a, b = Index("a", aux), Index("b", aux)
     p = Index("p", mo)
-    A, H, W = _field("panel", a, m, v), _field("core", m, v), _field("whitener", a, b)
-    inputs = {"core": h, "panel": raw, "whitener": whitener}
+    W = _field("whitener", a, b)
+    inputs = {"whitener": whitener}
     charges, exchange, mixed, records = [], {}, {}, {}
     for spin, (c, o) in enumerate(zip(frames, occupied, strict=True)):
         if not o:
@@ -160,9 +165,18 @@ def physical_spin_operators(
         O = _field(name, m, i)
         rname, dname = f"raw{spin}", f"fit{spin}"
         R, D = _field(rname, b, i, m), _field(dname, b, i, m)
-        half = Program({rname: einsum("amn,ni->aim", A, O)})
-        inputs[name] = np.ascontiguousarray(c[:, :o])
-        inputs[rname] = _run(run, half, inputs)[rname]
+        occ_mat = np.ascontiguousarray(c[:, :o])
+        inputs[name] = occ_mat
+        raw_s = np.empty((q, o, n), dtype=np.float64)
+        for tile_len, slices in groups:
+            a_t = Index("a", IndexSpace("jk_fit", "auxiliary", tile_len))
+            half_t = Program({rname: einsum("amn,ni->aim", _field("panel", a_t, m, v), O)})
+            with batch_execute(run, half_t) as exec_one:
+                for rows in slices:
+                    raw_s[rows] = exec_one(
+                        {"panel": np.ascontiguousarray(raw[rows]), name: occ_mat}
+                    ).outputs[rname]
+        inputs[rname] = raw_s
         fit = coulomb_fit_response(q, o * n)
         solve_inputs = {
             "metric_whitener": whitener,
@@ -175,28 +189,42 @@ def physical_spin_operators(
         exchange[spin] = einsum("aim,ain->mn", B, B)
         mixed[spin] = einsum("aim,ain->mn", D, R)
         charges.append(einsum("aim,mi->a", D, O))
-        records[spin] = half, fit, solve_inputs, name, rname, dname
+        records[spin] = (o, occ_mat, fit, solve_inputs, name, rname, dname)
     rho = charges[0] if len(charges) == 1 else add(*charges)
-    g = add(H, einsum("a,amn->mn", rho, A))
 
     spins = ("alpha", "beta")
     slots = [(f"fock_{name}", s) for s, name in enumerate(spins)]
     if include_exchange:
         slots.extend((f"exchange_{name}", s) for s, name in enumerate(spins))
 
-    def expressions(k: dict[int, Node]) -> dict[str, Node]:
-        operators = {}
-        for s, name in enumerate(spins):
-            operators["fock_" + name] = (
-                add(g, k[s], coefficients=(1, -1)) if s in k else g
+    core_fwd = _run(
+        run,
+        Program({"rho": rho, **{f"k{s}": exchange[s] for s in exchange}}),
+        inputs,
+    )
+    rho_val = core_fwd["rho"]
+    j_mat = np.zeros((n, n), dtype=np.float64)
+    for tile_len, slices in groups:
+        a_t = Index("a", IndexSpace("jk_fit", "auxiliary", tile_len))
+        j_prog = Program(
+            {"j": einsum("a,amn->mn", _field("rho", a_t), _field("panel", a_t, m, v))}
+        )
+        with batch_execute(run, j_prog) as exec_one:
+            for rows in slices:
+                j_mat += exec_one(
+                    {
+                        "rho": np.ascontiguousarray(rho_val[rows]),
+                        "panel": np.ascontiguousarray(raw[rows]),
+                    }
+                ).outputs["j"]
+    g_val = h + j_mat
+    primal = {}
+    for s, name in enumerate(spins):
+        primal["fock_" + name] = g_val - core_fwd[f"k{s}"] if s in exchange else g_val
+        if include_exchange:
+            primal["exchange_" + name] = (
+                core_fwd[f"k{s}"] if s in exchange else np.zeros_like(h)
             )
-            if include_exchange:
-                operators["exchange_" + name] = (
-                    k[s] if s in k else add(H, coefficients=(0,))
-                )
-        return operators
-
-    primal = _run(run, Program(expressions(exchange)), inputs)
     matrices = {
         name: _project(primal[name], frames[s], cuda, library) for name, s in slots
     }
@@ -223,10 +251,43 @@ def physical_spin_operators(
             )
             ao_seeds[name] = (bar["bar_matrix"] + bar["bar_matrix"].T) * 0.5
             coeff_bars[s] += bar["bar_coeff"]
-        bars = _transpose(run, Program(expressions(mixed)), inputs, ao_seeds)
+        bar_g = ao_seeds["fock_alpha"] + ao_seeds["fock_beta"]
+        bar_core = bar_g.copy()
+        bar_rho = np.zeros(q, dtype=np.float64)
+        raw_bar = np.zeros_like(raw)
+        bar_g_c = np.ascontiguousarray(bar_g)
+        for tile_len, slices in groups:
+            a_t = Index("a", IndexSpace("jk_fit", "auxiliary", tile_len))
+            j_prog = Program(
+                {"j": einsum("a,amn->mn", _field("rho", a_t), _field("panel", a_t, m, v))}
+            )
+            j_rev = transpose_program(j_prog, ("j",)).program
+            with batch_execute(run, j_rev) as exec_one:
+                for rows in slices:
+                    jr = exec_one(
+                        {
+                            "rho": np.ascontiguousarray(rho_val[rows]),
+                            "panel": np.ascontiguousarray(raw[rows]),
+                            "bar_j": bar_g_c,
+                        }
+                    ).outputs
+                    bar_rho[rows] += jr["bar_rho"]
+                    raw_bar[rows] += jr["bar_panel"]
+        core_seeds = {"rho": bar_rho}
+        for s, name in enumerate(spins):
+            if s in mixed:
+                k_seed = -ao_seeds["fock_" + name]
+                if include_exchange:
+                    k_seed = k_seed + ao_seeds["exchange_" + name]
+                core_seeds[f"k{s}"] = k_seed
+        bars = _transpose(
+            run,
+            Program({"rho": rho, **{f"k{s}": mixed[s] for s in mixed}}),
+            inputs,
+            core_seeds,
+        )
         metric_bar = np.zeros_like(whitener)
-        raw_bar = bars["bar_panel"]
-        for s, (half, fit, solve_inputs, name, rname, dname) in records.items():
+        for s, (o, occ_mat, fit, solve_inputs, name, rname, dname) in records.items():
             solved = _run(
                 run,
                 Program(
@@ -238,12 +299,27 @@ def physical_spin_operators(
             seed = bars["bar_" + rname] + solved["three_center_bar"].reshape(
                 inputs[rname].shape
             )
-            half_bars = _transpose(run, half, inputs, {rname: seed})
-            raw_bar += half_bars["bar_panel"]
-            coeff_bars[s][:, : occupied[s]] += (
-                bars["bar_" + name] + half_bars["bar_" + name]
-            )
-        return coeff_bars, bars["bar_core"], raw_bar, metric_bar
+            coeff_bars[s][:, :o] += bars["bar_" + name]
+            i_idx = Index("i", IndexSpace(f"occ{s}", "orbital", o))
+            O_node = _field(name, m, i_idx)
+            for tile_len, slices in groups:
+                a_t = Index("a", IndexSpace("jk_fit", "auxiliary", tile_len))
+                half_t = Program(
+                    {rname: einsum("amn,ni->aim", _field("panel", a_t, m, v), O_node)}
+                )
+                half_rev = transpose_program(half_t, (rname,)).program
+                with batch_execute(run, half_rev) as exec_one:
+                    for rows in slices:
+                        hb = exec_one(
+                            {
+                                "panel": np.ascontiguousarray(raw[rows]),
+                                name: occ_mat,
+                                "bar_" + rname: np.ascontiguousarray(seed[rows]),
+                            }
+                        ).outputs
+                        raw_bar[rows] += hb["bar_panel"]
+                        coeff_bars[s][:, :o] += hb["bar_" + name]
+        return coeff_bars, bar_core, raw_bar, metric_bar
 
     return matrices, pullback
 
@@ -252,16 +328,20 @@ def obs_sources(
     raw: np.ndarray, frames: Sequence[np.ndarray], obs: int, run: Runner
 ) -> dict[str, np.ndarray]:
     """Canonical OBS-only DF factors for the coupled occupied/virtual response."""
-    from generativeqc_compiler.mp2.f12_density_fitting import molecular_orbital_sources
+    from ._f12_spin_ao import project_ao_operator_tiled
 
-    program = molecular_orbital_sources(obs, obs, 0, len(raw))
-    graph = Program({"raw_coulomb": program.outputs["raw_coulomb"]})
     panel = np.ascontiguousarray(raw[:, :obs, :obs])
     return {
-        "raw_coulomb_" + name: _run(
+        "raw_coulomb_" + name: project_ao_operator_tiled(
+            obs,
+            obs,
+            0,
+            len(raw),
+            "raw_coulomb",
+            "ao_coulomb",
+            np.ascontiguousarray(c[:obs, :obs]),
+            panel,
             run,
-            graph,
-            {"ao_coulomb": panel, "coefficients": np.ascontiguousarray(c[:obs, :obs])},
-        )["raw_coulomb"]
+        )
         for name, c in zip(("alpha", "beta"), frames, strict=True)
     }

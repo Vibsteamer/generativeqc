@@ -468,3 +468,80 @@ def test_f12_panel_streaming_exact_parity(oa, ob, distinct_jk):
         else:
             assert np.max(np.abs(ref_val - b1[key])) < 1e-13
 
+
+def test_auxiliary_tiling_matches_untiled_low_order_and_cabs_fock(monkeypatch):
+    """Verify multi-chunk + remainder auxiliary tiling matches untiled AO/Fock/CABS pullbacks to <1e-13."""
+    from generativeqc import _f12_spin_fock as sf
+    from generativeqc._f12_cabs_fock import physical_spin_operators
+    from generativeqc._f12_unrestricted import unrestricted_mp2_f12_ao_response
+    from generativeqc_compiler.tensor import execute
+
+    rng = np.random.default_rng(20261122)
+    oa, ob, obs, ext, q = 2, 2, 4, 6, 7
+    space = (oa, ob, obs, ext, q)
+
+    def sym_panel(depth: int, dim: int) -> np.ndarray:
+        a = rng.normal(size=(depth, dim, dim)) * 0.02
+        return 0.5 * (a + a.swapaxes(1, 2))
+
+    def spd(dim: int) -> np.ndarray:
+        a = rng.normal(size=(dim, dim)) * 0.1
+        return a @ a.T + 2.0 * np.eye(dim)
+
+    m_c = spd(q)
+    w_c = np.linalg.inv(np.linalg.cholesky(m_c))
+    ca = np.linalg.qr(rng.normal(size=(ext, ext)))[0]
+    cb = np.linalg.qr(ca + 0.05 * rng.normal(size=(ext, ext)))[0]
+    hcore = ca @ np.diag([-3.0, -2.0, 0.5, 1.0, 1.5, 2.0]) @ ca.T
+    hcore = 0.5 * (hcore + hcore.T)
+    ao = {
+        "overlap_ao": np.eye(ext),
+        "hcore_ao": hcore,
+        "coefficients_alpha": ca,
+        "coefficients_beta": cb,
+        "metric_whitener": w_c,
+        "metric/coulomb": m_c,
+        "metric/geminal": spd(q),
+        "metric/squared_geminal": spd(q),
+        "metric/geminal_coulomb": spd(q),
+        "metric/double_commutator": spd(q),
+        "ao_coulomb": sym_panel(q, ext),
+        "ao_f12": sym_panel(q, ext),
+        "ao_f12_squared": sym_panel(q, ext),
+        "ao_f12_over_coulomb": sym_panel(q, ext),
+        "ao_double_commutator": sym_panel(q, ext),
+    }
+    run = lambda g, inp: execute(g, inp, max_bytes=1 << 29)
+    # Untiled baseline (target slab >> total bytes -> 1 chunk)
+    t_full, b_full = unrestricted_mp2_f12_ao_response(
+        space, ao, run, frozen_occupied=(1, 1), component="f12"
+    )
+    mats_full, pb_full = physical_spin_operators(
+        hcore, ao["ao_coulomb"], w_c, (ca, cb), (oa, ob), run, False, None, include_exchange=True
+    )
+    seeds = {k: sym_panel(1, ext)[0] for k in mats_full}
+    pb_res_full = pb_full(seeds)
+
+    # Force width=2 on q=7 (three full tiles of 2 + one remainder tile of 1)
+    monkeypatch.setattr(sf, "_TARGET_AUX_SLAB_BYTES", 2 * ext * ext * 8)
+    assert sf.default_auxiliary_batch_size(q, ext) == 2
+
+    t_tiled, b_tiled = unrestricted_mp2_f12_ao_response(
+        space, ao, run, frozen_occupied=(1, 1), component="f12"
+    )
+    assert abs(t_full.f12_increment - t_tiled.f12_increment) < 1e-13
+    for key, ref_val in b_full.items():
+        assert np.max(np.abs(ref_val - b_tiled[key])) < 1e-13, key
+
+    mats_tiled, pb_tiled = physical_spin_operators(
+        hcore, ao["ao_coulomb"], w_c, (ca, cb), (oa, ob), run, False, None, include_exchange=True
+    )
+    for k in mats_full:
+        assert np.max(np.abs(mats_full[k] - mats_tiled[k])) < 1e-13, k
+    pb_res_tiled = pb_tiled(seeds)
+    for c0, c1 in zip(pb_res_full[0], pb_res_tiled[0], strict=True):
+        assert np.max(np.abs(c0 - c1)) < 1e-13
+    for a0, a1 in zip(pb_res_full[1:], pb_res_tiled[1:], strict=True):
+        assert np.max(np.abs(a0 - a1)) < 1e-13
+
+

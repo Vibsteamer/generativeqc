@@ -6,12 +6,15 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from generativeqc_compiler.cc.uccsd_f12_sources import unrestricted_f12_pair_sources
-from generativeqc_compiler.mp2.f12_density_fitting import molecular_orbital_sources
 from generativeqc_compiler.mp2.f12_unrestricted import unrestricted_cross_frame_overlap
 from generativeqc_compiler.tensor import Program, transpose_program
 
 from generativeqc._f12_cc_fock_pullback import FockResponse, extended_fock_response
-from generativeqc._f12_spin_ao import _orbital_sources
+from generativeqc._f12_spin_ao import (
+    _orbital_sources,
+    project_ao_operator_pullback_tiled,
+    project_ao_operator_tiled,
+)
 from generativeqc._f12_spin_pairs import occupied_pair_blocks
 
 if TYPE_CHECKING:
@@ -102,11 +105,18 @@ def unrestricted_cc_c_ao_weights(
         n = occ[spin[0]]
         if n == frozen[spin[0]]:
             continue
-        proj = molecular_orbital_sources(combined, ext, n, aux)
-        g = Program({"raw_f12": proj.outputs["raw_f12"]})
-        inputs = {"coefficients": ao["coefficients_" + spin], "ao_f12": ao["ao_f12"]}
-        ray = run(g, inputs).outputs["raw_f12"]
-        frames[spin] = (g, inputs, ray, np.zeros_like(ray))
+        ray = project_ao_operator_tiled(
+            combined,
+            ext,
+            n,
+            aux,
+            "raw_f12",
+            "ao_f12",
+            ao["coefficients_" + spin],
+            ao["ao_f12"],
+            run,
+        )
+        frames[spin] = (n, ao["coefficients_" + spin], ray, np.zeros_like(ray))
     for left, right, nl, nr, _, pairs in occupied_pair_blocks(
         space, frozen_occupied=frozen_occupied
     ):
@@ -161,11 +171,21 @@ def unrestricted_cc_c_ao_weights(
     )
     assert bars is not None
     fock_pullback(fseeds, bars)
-    for spin, (graph, inputs, _, seed) in frames.items():
-        rev = transpose_program(graph, ("raw_f12",)).program
-        res = run(rev, {**inputs, "bar_raw_f12": seed}).outputs
-        bars["coefficients_" + spin] += res["bar_coefficients"]
-        gbar += res["bar_ao_f12"]
+    for spin, (n_occ, coeffs, _, seed) in frames.items():
+        project_ao_operator_pullback_tiled(
+            combined,
+            ext,
+            n_occ,
+            aux,
+            "raw_f12",
+            "ao_f12",
+            coeffs,
+            ao["ao_f12"],
+            seed,
+            run,
+            bar_coefficients=bars["coefficients_" + spin],
+            bar_ao=gbar,
+        )
     cv = transpose_program(cross, ("cross_overlap",)).program
     cg = run(cv, {**cross_inputs, "bar_cross_overlap": obar}).outputs
     for k in spins:
