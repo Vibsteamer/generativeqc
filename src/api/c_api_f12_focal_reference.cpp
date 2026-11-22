@@ -16,6 +16,7 @@
 #include "runtime/bounded_workspace.hpp"
 #include "runtime/df_progress_trace.hpp"
 #include "runtime/execution_context.hpp"
+#include "scf/fock_prepared.hpp"
 #include "scf/mean_field.hpp"
 
 struct generativeqc_focal_reference {
@@ -80,7 +81,7 @@ generativeqc_status focal_df_reference(generativeqc_context* context,
       throw std::invalid_argument("focal reference requires an explicit CPU or CUDA context");
     const bool cuda = backend == core::kCudaBackend;
     scf::ScfOptions options;
-    options.stabilize_focal_rhf_convergence = cuda && spins == 1 && initial_density && !forces;
+    options.stabilize_focal_rhf_convergence = cuda;
     auto capacity = spins == 1 ? posthf::rhf_reference_capacity(sys, options.diis_history, false)
                                : posthf::uhf_reference_capacity(sys, options.diis_history, false);
     if (options.stabilize_focal_rhf_convergence)
@@ -89,7 +90,7 @@ generativeqc_status focal_df_reference(generativeqc_context* context,
       context->last_detail = "DF-HF physical reference exceeds its numeric capacity budget";
       return GENERATIVEQC_STATUS_OUT_OF_MEMORY;
     }
-    options.max_iterations = 240;
+    options.max_iterations = 140;
     options.energy_tolerance = 1e-13;
     options.density_tolerance = 1e-11;
     options.screening_tolerance = 0;
@@ -124,9 +125,72 @@ generativeqc_status focal_df_reference(generativeqc_context* context,
       options.strict_initial_density = true;
     }
     const auto* start = initial_density ? &seed : nullptr;
-    const auto state = cuda ? scf::run_cuda_independent_fock_strategy(
-                                  physical, &aux, options, context->state.device_id, start)
-                            : scf::run_cpu_fock_strategy(physical, &aux, options, start);
+    auto run_ladder = [&](const scf::PreparedFockPlan& plan) {
+      auto st = scf::run_prepared_fock_strategy(plan, options, start);
+      if (st.converged) return st;
+
+      // Multi-stage recovery on the SAME prepared Fock plan (no integral rebuild):
+      // Stage 2a: virtual level-shift + density damping + DIIS to escape oscillations;
+      // Stage 2b: stronger pure damped level-shifted descent if 2a still oscillates;
+      // Stage 3a/3b: unshifted FP64 tight polish to full canonical stationarity.
+      auto value_spec = spec;
+      value_spec.derivative_order = 0;
+      const auto value_build = scf::resolve_fock_build(
+          value_spec, cuda ? scf::FockBackend::Cuda : scf::FockBackend::Cpu,
+          options.screening_tolerance, options.density_fitting_relative_threshold);
+
+      auto stage2 = options;
+      stage2.compute_forces = false;
+      stage2.export_physical_reference = false;
+      stage2.strict_initial_density = false;
+      stage2.resolved_fock_build = value_build;
+      stage2.energy_tolerance = 1e-7;
+      stage2.density_tolerance = 1e-4;
+      stage2.max_iterations = 160;
+      stage2.diis_history = 8;
+      stage2.level_shift = 0.5;
+      stage2.density_damping = 0.4;
+      stage2.enable_diis = true;
+      auto rec = scf::run_prepared_fock_strategy(plan, stage2, start);
+      if (!rec.converged) {
+        auto stage2b = stage2;
+        stage2b.level_shift = 1.5;
+        stage2b.density_damping = 0.25;
+        stage2b.enable_diis = false;
+        stage2b.max_iterations = 200;
+        const bool rec_valid = rec.density.size() == runtime::size_mul(spins, nn) &&
+                               std::all_of(rec.density.begin(), rec.density.end(),
+                                           [](double x) { return std::isfinite(x); });
+        rec = scf::run_prepared_fock_strategy(plan, stage2b, rec_valid ? &rec.density : start);
+      }
+      const bool have_seed = rec.density.size() == runtime::size_mul(spins, nn) &&
+                             std::all_of(rec.density.begin(), rec.density.end(),
+                                         [](double x) { return std::isfinite(x); });
+      if (!have_seed) return st;
+
+      auto polish = options;
+      polish.strict_initial_density = false;
+      polish.level_shift = 0.0;
+      polish.density_damping = 1.0;
+      polish.enable_diis = true;
+      polish.max_iterations = 200;
+      st = scf::run_prepared_fock_strategy(plan, polish, &rec.density);
+      if (!st.converged) {
+        // Unshifted damped DIIS preserves the exact unshifted stationary fixed point.
+        polish.density_damping = 0.55;
+        polish.max_iterations = 240;
+        const bool st_valid = st.density.size() == runtime::size_mul(spins, nn) &&
+                              std::all_of(st.density.begin(), st.density.end(),
+                                          [](double x) { return std::isfinite(x); });
+        st = scf::run_prepared_fock_strategy(plan, polish, st_valid ? &st.density : &rec.density);
+      }
+      return st;
+    };
+    const auto strategy = scf::fock_strategy_for_execution(options);
+    const scf::PreparedFockPlan plan(physical, &aux, strategy,
+                                     cuda ? context->state.device_id : -1,
+                                     options.density_fitting_memory_budget_bytes);
+    const auto state = run_ladder(plan);
     if (start && !state.initial_density_used)
       throw std::runtime_error("DF-HF did not use the requested initial density");
     if (!state.converged) {
