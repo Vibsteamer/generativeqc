@@ -186,16 +186,30 @@ def molecular_low_order_energy(
             raise RuntimeError("low-order energy graph executed on another backend")
         return result
 
+    if hasattr(runner, "batch"):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def run_batch(graph: Program):
+            with runner.batch(graph) as exec_one:
+                def wrapped(inputs: Mapping[str, np.ndarray]) -> Execution:
+                    result = exec_one(inputs)
+                    if result.backend != (
+                        "cuda-fp64-ordinary-stream" if cuda else "numpy-cpu-interpreter"
+                    ):
+                        raise RuntimeError("low-order energy graph executed on another backend")
+                    return result
+
+                yield wrapped
+
+        run.batch = run_batch  # type: ignore[attr-defined]
+
     ref = df_reference(
         request, forces=False, budget_mib=budget, **provider._seed_options(request)
     )
-    one = one_electron_sources(
-        request,
-        library=provider.one_electron_library or provider.shell_library,
-        derivatives=False,
-        budget_mib=budget,
+    one, (jk, mp2, f12) = provider._cached_pair_sources(
+        request, derivatives=False, budget=budget
     )
-    jk, mp2, f12 = provider._pair_panels(request)
     space, ao, jkfit, projector = canonical_pair_frame(
         request,
         ref,

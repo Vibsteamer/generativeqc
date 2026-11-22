@@ -32,26 +32,40 @@ def focal_cuda_runner(
     record: Callable[[dict], None] | None = None,
 ) -> Callable:
     """Create an FP64 executor for the GPU assigned to this process."""
+    from contextlib import contextmanager
     from generativeqc_compiler.tensor.cuda_execute import PreparedCuda, compile_cuda
     from generativeqc_compiler.tensor.cuda_plan import plan_cuda
 
     compiler = focal_cuda_compiler(arch)
     compiled = {}
 
-    def run(program: Program, inputs: Mapping[str, np.ndarray]) -> Execution:
+    def _compile(program: Program):
         key = program.logical_hash
         if key not in compiled:
             plan = plan_cuda(program, compiler.target, max_bytes=max_bytes)
             compiled[key] = (plan, compile_cuda(plan, compiler, cache))
-        plan, artifact = compiled[key]
-        with PreparedCuda(plan, artifact, device=0) as prepared:
-            result = prepared.execute(inputs)
-        if result.backend != "cuda-fp64-ordinary-stream":
-            raise RuntimeError(f"unqualified F12 backend {result.backend}")
-        if record is not None:
-            record(
-                {"program": key, "backend": result.backend, "metrics": result.metrics}
-            )
-        return result
+        return key, compiled[key]
 
+    @contextmanager
+    def batch(program: Program):
+        """Hold one PreparedCuda instance open across a batch of identical-graph executions."""
+        key, (plan, artifact) = _compile(program)
+        with PreparedCuda(plan, artifact, device=0) as prepared:
+            def execute_one(inputs: Mapping[str, np.ndarray]) -> Execution:
+                result = prepared.execute(inputs)
+                if result.backend != "cuda-fp64-ordinary-stream":
+                    raise RuntimeError(f"unqualified F12 backend {result.backend}")
+                if record is not None:
+                    record(
+                        {"program": key, "backend": result.backend, "metrics": result.metrics}
+                    )
+                return result
+
+            yield execute_one
+
+    def run(program: Program, inputs: Mapping[str, np.ndarray]) -> Execution:
+        with batch(program) as execute_one:
+            return execute_one(inputs)
+
+    run.batch = batch  # type: ignore[attr-defined]
     return run

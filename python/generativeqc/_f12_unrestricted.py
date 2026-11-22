@@ -11,7 +11,13 @@ from ._f12_cabs import cabs_singles
 from ._f12_focal_tplus_sources import SpinOccupied, checked_occupied_weights
 from ._f12_spin_ao import _orbital_sources
 from ._f12_spin_fock import spin_fock, spin_fock_pullback
-from ._f12_spin_pairs import occupied_pair_blocks, pair_operands
+from ._f12_spin_pairs import (
+    _shared_contiguous_operands,
+    batch_execute,
+    is_spin_symmetric_pair_data,
+    occupied_pair_blocks,
+    pair_operands,
+)
 
 
 class UnrestrictedCabsSingles(NamedTuple):
@@ -240,34 +246,57 @@ def _projected_response(
     blocks = (
         occupied_pair_blocks(space, frozen_occupied=frozen_occupied) if selected else ()
     )
+    spin_sym = is_spin_symmetric_pair_data(
+        space, data, sources, fock, frozen_occupied, occupied_f12_weights
+    )
     count = 0
     for sl, sr, nl, nr, graph, pairs in blocks:
+        if spin_sym and sl == "beta" and sr == "beta":
+            continue
         primal_graph = Program({name: graph.outputs[name] for name in selected})
         rev = transpose_program(primal_graph, selected).program
         kernel = Program({**rev.outputs, **primal_graph.outputs}) if energies else rev
-        for i, j in pairs:
-            primal = pair_operands(data, sources, fock, sl, sr, nl, nr, ext, i, j)
-            feeds = {k: np.ascontiguousarray(v) for k, v in primal.items()}
-            weight = (
-                1.0
-                if occupied_f12_weights is None
-                else (occupied_f12_weights[sl == "beta"][i] + occupied_f12_weights[sr == "beta"][j]) * 0.5
-            )
-            feeds.update({"bar_" + name: np.array(weight) for name in selected})
-            result = run(kernel, feeds).outputs
-            if energies:
-                count += 1
-                if "ordinary_pair_energy" in selected:
-                    mp2_terms.append(float(result["ordinary_pair_energy"]))
-                if "pair_energy" in selected:
-                    f12_terms.append(float(result["pair_energy"]) * weight)
-            # Pair operands are views into the molecular arrays. Shared metric,
-            # Fock, and repeated occupied-leg entries accumulate independently.
-            buffers = pair_operands(
-                raw_bars, source_bars, fock_bars, sl, sr, nl, nr, ext, i, j
-            )
-            for key in rev.outputs:
-                buffers[key.removeprefix("bar_")] += result[key]
+        shared = _shared_contiguous_operands(data, fock, sl, sr)
+        mirror_bb = spin_sym and sl == "alpha" and sr == "alpha"
+        with batch_execute(run, kernel) as exec_one:
+            for i, j in pairs:
+                primal = pair_operands(data, sources, fock, sl, sr, nl, nr, ext, i, j)
+                feeds = dict(shared)
+                for k, v in primal.items():
+                    if k not in shared:
+                        feeds[k] = np.ascontiguousarray(v)
+                weight = (
+                    1.0
+                    if occupied_f12_weights is None
+                    else (occupied_f12_weights[sl == "beta"][i] + occupied_f12_weights[sr == "beta"][j]) * 0.5
+                )
+                feeds.update({"bar_" + name: np.array(weight) for name in selected})
+                result = exec_one(feeds).outputs
+                if energies:
+                    count += 2 if mirror_bb else 1
+                    if "ordinary_pair_energy" in selected:
+                        val = float(result["ordinary_pair_energy"])
+                        mp2_terms.append(val)
+                        if mirror_bb:
+                            mp2_terms.append(val)
+                    if "pair_energy" in selected:
+                        val = float(result["pair_energy"]) * weight
+                        f12_terms.append(val)
+                        if mirror_bb:
+                            f12_terms.append(val)
+                # Pair operands are views into the molecular arrays. Shared metric,
+                # Fock, and repeated occupied-leg entries accumulate independently.
+                buffers = pair_operands(
+                    raw_bars, source_bars, fock_bars, sl, sr, nl, nr, ext, i, j
+                )
+                for key in rev.outputs:
+                    buffers[key.removeprefix("bar_")] += result[key]
+                if mirror_bb:
+                    bb_buffers = pair_operands(
+                        raw_bars, source_bars, fock_bars, "beta", "beta", nl, nr, ext, i, j
+                    )
+                    for key in rev.outputs:
+                        bb_buffers[key.removeprefix("bar_")] += result[key]
     fock_weights = spin_fock_pullback(
         fock_space,
         fock_sources,

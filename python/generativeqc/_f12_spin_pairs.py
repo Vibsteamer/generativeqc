@@ -1,6 +1,7 @@
 """Enumerate the occupied pairs of a canonical unrestricted 3C(FIX) reference."""
 
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from itertools import combinations, product
 from typing import NamedTuple
 
@@ -132,6 +133,75 @@ class PairEnergy(NamedTuple):
     f12: float
 
 
+@contextmanager
+def batch_execute(run: Callable, program: Program):
+    """Reuse one prepared CUDA executor across repeated calls on the same program."""
+    batch_fn = getattr(run, "batch", None)
+    if callable(batch_fn):
+        with batch_fn(program) as execute_one:
+            yield execute_one
+    else:
+        yield lambda inputs: run(program, inputs)
+
+
+def is_spin_symmetric_pair_data(
+    space: tuple[int, int, int, int, int],
+    data: dict,
+    sources: dict,
+    fock: dict,
+    frozen_occupied: tuple[int, int],
+    occupied_weights: tuple[np.ndarray, np.ndarray] | None = None,
+) -> bool:
+    """Verify from actual numerical arrays whether alpha and beta pair inputs are identical."""
+    oa, ob = space[0], space[1]
+    if oa != ob or frozen_occupied[0] != frozen_occupied[1]:
+        return False
+    if occupied_weights is not None and not np.array_equal(
+        occupied_weights[0], occupied_weights[1]
+    ):
+        return False
+    if not (
+        np.array_equal(fock["fock_alpha"], fock["fock_beta"])
+        and np.array_equal(fock["exchange_alpha"], fock["exchange_beta"])
+        and np.array_equal(sources["fit_alpha"], sources["fit_beta"])
+        and np.array_equal(sources["raw_coulomb_alpha"], sources["raw_coulomb_beta"])
+    ):
+        return False
+    cross = data.get("cross_overlap")
+    if cross is not None and not np.array_equal(cross, cross.T):
+        return False
+    for op in ("geminal", "squared_geminal", "geminal_coulomb", "double_commutator"):
+        if not np.array_equal(
+            data["raw/" + op + "/alpha"], data["raw/" + op + "/beta"]
+        ):
+            return False
+    return True
+
+
+def _shared_contiguous_operands(data: dict, fock: dict, sl: str, sr: str) -> dict[str, np.ndarray]:
+    """Pre-materialize contiguous shared matrices once per spin block instead of per pair."""
+    if sl == sr:
+        shared = {
+            "fock": np.ascontiguousarray(fock["fock_" + sl]),
+            "exchange": np.ascontiguousarray(fock["exchange_" + sl]),
+        }
+        for op, rel in (
+            ("geminal", "f12"),
+            ("squared_geminal", "f12_squared"),
+            ("geminal_coulomb", "f12_over_coulomb"),
+            ("double_commutator", "double_commutator"),
+        ):
+            shared["metric_" + rel] = np.ascontiguousarray(data["metric/" + op])
+    else:
+        shared = {
+            "cross_overlap": np.ascontiguousarray(data["cross_overlap"]),
+            **{k: np.ascontiguousarray(v) for k, v in fock.items()},
+        }
+        for op in ("geminal", "squared_geminal", "geminal_coulomb", "double_commutator"):
+            shared["metric_" + op] = np.ascontiguousarray(data["metric/" + op])
+    return shared
+
+
 def molecular_pair_energies(
     space: tuple[int, int, int, int, int],
     data: dict,
@@ -149,27 +219,46 @@ def molecular_pair_energies(
     physical OBS/CABS integrals and the selected TensorIR execution backend.
     Set include_ordinary=False when a separate MP2Fit supplies ordinary MP2.
     """
+    spin_sym = is_spin_symmetric_pair_data(space, data, sources, fock, frozen_occupied)
+    aa_cache: list[tuple[tuple[int, int], float | None, float]] = []
     for left, right, nl, nr, graph, pairs in occupied_pair_blocks(
         space, frozen_occupied=frozen_occupied
     ):
+        if spin_sym and left == "beta" and right == "beta":
+            for (i, j), ordinary, increment in aa_cache:
+                yield PairEnergy(("beta", "beta"), (i, j), ordinary, increment)
+            continue
         selected = (
             graph
             if include_ordinary
             else Program({"pair_energy": graph.outputs["pair_energy"]})
         )
-        for i, j in pairs:
-            values = pair_operands(
-                data, sources, fock, left, right, nl, nr, space[3], i, j
-            )
-            result = run(
-                selected, {key: np.ascontiguousarray(v) for key, v in values.items()}
-            ).outputs
-            ordinary = (
-                float(result["ordinary_pair_energy"]) if include_ordinary else None
-            )
-            increment = float(result["pair_energy"])
-            if (ordinary is not None and not np.isfinite(ordinary)) or not np.isfinite(
-                increment
-            ):
-                raise ValueError(f"Nonfinite energy for {left}/{right} pair ({i}, {j})")
-            yield PairEnergy((left, right), (i, j), ordinary, increment)
+        shared = _shared_contiguous_operands(data, fock, left, right)
+        ab_cache: dict[tuple[int, int], tuple[float | None, float]] = {}
+        with batch_execute(run, selected) as exec_one:
+            for i, j in pairs:
+                if spin_sym and left == "alpha" and right == "beta" and i > j:
+                    ordinary, increment = ab_cache[(j, i)]
+                    yield PairEnergy((left, right), (i, j), ordinary, increment)
+                    continue
+                values = pair_operands(
+                    data, sources, fock, left, right, nl, nr, space[3], i, j
+                )
+                feeds = dict(shared)
+                for key, v in values.items():
+                    if key not in shared:
+                        feeds[key] = np.ascontiguousarray(v)
+                result = exec_one(feeds).outputs
+                ordinary = (
+                    float(result["ordinary_pair_energy"]) if include_ordinary else None
+                )
+                increment = float(result["pair_energy"])
+                if (ordinary is not None and not np.isfinite(ordinary)) or not np.isfinite(
+                    increment
+                ):
+                    raise ValueError(f"Nonfinite energy for {left}/{right} pair ({i}, {j})")
+                if spin_sym and left == "alpha" and right == "alpha":
+                    aa_cache.append(((i, j), ordinary, increment))
+                elif spin_sym and left == "alpha" and right == "beta" and i < j:
+                    ab_cache[(i, j)] = (ordinary, increment)
+                yield PairEnergy((left, right), (i, j), ordinary, increment)

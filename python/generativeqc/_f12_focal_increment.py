@@ -115,6 +115,26 @@ def reference_f12_increment(
             )
         return out
 
+    if hasattr(executor, "batch"):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def checked_batch(g: Program):
+            with executor.batch(g) as exec_one:
+                def wrapped(inputs: Mapping[str, np.ndarray]) -> Execution:
+                    out = exec_one(inputs)
+                    if out.backend != (
+                        "cuda-fp64-ordinary-stream" if cuda else "numpy-cpu-interpreter"
+                    ):
+                        raise RuntimeError(
+                            "F12 electronic graph differs from its requested backend"
+                        )
+                    return out
+
+                yield wrapped
+
+        checked.batch = checked_batch  # type: ignore[attr-defined]
+
     space, ao, panel, proj = canonical_pair_frame(
         request,
         reference,

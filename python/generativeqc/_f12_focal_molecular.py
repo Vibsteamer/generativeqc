@@ -166,6 +166,9 @@ class MolecularFocalProvider:
     _cuda_cc_target: tuple[str, Path, Callable[[dict], None] | None] | None = field(
         default=None, repr=False, compare=False
     )
+    _pair_source_cache: dict = field(
+        default_factory=dict, repr=False, compare=False
+    )
     lambda_options: UCCSDLambdaOptions | None = None
     rhf_df_ladder: RHFDFLadderOptions | None = None
     uhf_df_ladder: UHFDFLadderOptions | None = None
@@ -272,6 +275,43 @@ class MolecularFocalProvider:
             include_occupied_partitions=include_occupied_partitions,
         )
 
+    def _cached_pair_sources(
+        self, request: FocalRequest, *, derivatives: bool, budget: int
+    ) -> tuple[FocalOneElectron, tuple[_Panel, _Panel, _Panel]]:
+        """Bounded 1-entry reuse of read-only 1e and 3-center pair panels on identical geometry+basis."""
+        b = request.basis
+        geom_key = tuple(
+            (a.atomic_number, tuple((v if v else 0.0).hex() for v in a.position))
+            for a in request.atoms
+        )
+        key = (
+            geom_key,
+            request.charge,
+            request.multiplicity,
+            request.backend,
+            b.basis_id,
+            b.orbital.identity,
+            b.jk_fit.identity,
+            b.mp2_fit.identity if b.mp2_fit is not None else None,
+            b.f12_fit.identity if b.f12_fit is not None else None,
+            b.cabs.identity if b.cabs is not None else None,
+            b.beta,
+        )
+        entry = self._pair_source_cache.get("entry")
+        if entry is not None and entry[0] == key:
+            cached_deriv, cached_one, cached_panels = entry[1], entry[2], entry[3]
+            if not derivatives or cached_deriv:
+                return cached_one, cached_panels
+        one = one_electron_sources(
+            request,
+            library=self.one_electron_library or self.shell_library,
+            derivatives=derivatives,
+            budget_mib=budget,
+        )
+        panels = self._pair_panels(request)
+        self._pair_source_cache["entry"] = (key, derivatives, one, panels)
+        return one, panels
+
     def tplus_scaling_forces(
         self,
         request: FocalRequest,
@@ -283,17 +323,12 @@ class MolecularFocalProvider:
     ) -> np.ndarray:
         """Relax the MP2 and F12 orbital energy seeds supplied by a (T+) owner."""
         budget = _check_request(self, request)
-        one = one_electron_sources(
-            request,
-            library=self.one_electron_library or self.shell_library,
-            derivatives=True,
-            budget_mib=budget,
-        )
+        one, panels = self._cached_pair_sources(request, derivatives=True, budget=budget)
         return self._pair_components(
             request,
             reference,
             one,
-            self._pair_panels(request),
+            panels,
             expected_cabs_rank=expected_cabs_rank,
             mp2_weights=mp2_weights,
             f12_weights=f12_weights,
@@ -531,13 +566,7 @@ class MolecularFocalProvider:
             budget_mib=budget,
             **self._seed_options(request),
         )
-        one = one_electron_sources(
-            request,
-            library=self.one_electron_library or self.shell_library,
-            derivatives=True,
-            budget_mib=budget,
-        )
-        panels = self._pair_panels(request)
+        one, panels = self._cached_pair_sources(request, derivatives=True, budget=budget)
         spin_mp2, increment, rank, correlation_forces = self._pair_components(
             request, reference, one, panels, expected_cabs_rank=None
         )
