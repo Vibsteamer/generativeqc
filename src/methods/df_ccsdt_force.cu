@@ -377,6 +377,8 @@ static DFCCSDTResult run_df_ccsdt_native_attempt(
     lambda_options.lambda_tolerance = state.convergence.lambda_residual();
     const auto lambda_external = checked_add(tbytes, fbytes);
     lambda_options.max_bytes = difference(budget, lambda_external);
+    if (lambda_options.max_bytes > (24ULL << 30))
+      lambda_options.df_max_device_bytes = 24ULL << 30;
     lambda_options.gmres.max_workspace_bytes = lambda_options.max_bytes;
     lambda_options.gmres.absolute_tolerance = state.convergence.response_solve();
     // Acceptance still uses a freshly evaluated FP64 residual and the separate

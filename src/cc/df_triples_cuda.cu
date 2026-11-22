@@ -1311,14 +1311,33 @@ DFCudaCombinedResponseResult pullback_and_fock_df_cuda(
     }
     return candidate;
   };
+  // Cap triples device arena cleanly below GPU physical VRAM so 7-heavy-atom Br/Cl
+  // molecules shrink page_capacity gracefully instead of pegging 45+ GiB on L20.
+  std::size_t triples_device_cap = max_bytes;
+  {
+    runtime::CudaDeviceScope query_scope(device);
+    std::size_t avail = 0, total = 0;
+    if (cudaMemGetInfo(&avail, &total) == cudaSuccess && avail > 0) {
+      const std::size_t safe_avail =
+          avail > (6ULL << 30) ? (avail - (6ULL << 30)) : (avail * 3 / 4);
+      const std::size_t hard_cap = (total >= (32ULL << 30)) ? (24ULL << 30) : safe_avail;
+      triples_device_cap = std::min({max_bytes, safe_avail, hard_cap});
+    }
+  }
   auto plan = admitted_layout(page_capacity, max_panel_buffers);
-  while (plan.complete > max_bytes) {
+  auto plan_exceeds = [&](const auto& cand) {
+    return cand.complete > max_bytes ||
+           checked_add(cand.fock.value.total, prepared_storage) > triples_device_cap;
+  };
+  while (plan_exceeds(plan)) {
     if (plan.fock.value.panel_capacity > 1) {
       plan = admitted_layout(page_capacity, 1);
-      if (plan.complete <= max_bytes) break;
+      if (!plan_exceeds(plan)) break;
     }
-    if (page_capacity == 1)
+    if (page_capacity == 1) {
+      if (plan.complete <= max_bytes) break;  // Minimum 1-row page still fits total budget.
       throw std::length_error("joint DF triples response exceeds complete numeric budget");
+    }
     --page_capacity;
     plan = admitted_layout(page_capacity, max_panel_buffers);
   }

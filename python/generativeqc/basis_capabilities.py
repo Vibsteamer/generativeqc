@@ -59,7 +59,7 @@ def basis_capability(
     does not imply a GPU is present, an AOT schedule is promoted, a particular
     SCF state converges, or the chemical model has been validated for an element.
     ``consumer="correlation_df"`` selects the native CUDA correlation source
-    and nuclear sink's auxiliary-through-g contract for DF-MP2/DF-CCSD(T).
+    and nuclear sink's auxiliary-through-h contract for DF-MP2/DF-CCSD(T)/DF-UCCSD(T).
     ``consumer="wb97mv_df_values"`` admits only the CUDA KS source's auxiliary
     values through g; native Hessian derivatives require their own linked closure.
     ``consumer="scf_df"`` admits full-range CUDA HF/KS fitting auxiliaries through h for
@@ -125,7 +125,7 @@ def basis_capability(
                 "source-only consumer requires CUDA auxiliary DF values or qualified first derivatives"
             )
         else:
-            maximum = 5 if consumer == "scf_df" else 4
+            maximum = 5 if consumer in ("scf_df", "correlation_df") else 4
     if maximum is None:
         reasons.append(
             f"{backend}/{operator}: derivative order {derivative_order} has no registered execution route"

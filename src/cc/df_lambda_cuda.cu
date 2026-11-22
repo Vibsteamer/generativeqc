@@ -214,7 +214,12 @@ struct DFLambdaActions::Impl {
       std::lock_guard<std::mutex> lock(runtime::allocation_measurement_mutex);
       cuda_check(cudaMemGetInfo(&available_device_bytes, &total_device_bytes));
     }
-    const auto device_limit = std::min(available_device_bytes, options.df_max_device_bytes);
+    const std::size_t safe_avail =
+        available_device_bytes > (6ULL << 30) ? (available_device_bytes - (6ULL << 30))
+                                              : (available_device_bytes * 3 / 4);
+    const std::size_t hard_cap =
+        (total_device_bytes >= (32ULL << 30)) ? (24ULL << 30) : safe_avail;
+    const auto device_limit = std::min({safe_avail, hard_cap, options.df_max_device_bytes});
     metrics.df_available_device_bytes = available_device_bytes;
     metrics.df_device_limit_bytes = device_limit;
     const auto device_fits = [&](std::size_t candidate, std::size_t allowance,
