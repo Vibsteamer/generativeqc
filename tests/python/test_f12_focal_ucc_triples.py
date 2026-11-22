@@ -230,7 +230,7 @@ def test_retained_common_fit_rhf_cuda_signed_triples(
     def request(z: float) -> FocalRequest:
         plan = plan_singlepoint(
             [("Li", (0.0, 0.0, 0.0)), ("H", (0.1, 0.2, z))],
-            series, series, None, triples=basis, root_id="rhf",
+            series, series, None, triples=basis, f12_doubles=basis, root_id="rhf",
             correlation_space_id="all-active", backend="cuda",
         )
         return next(req for req, _ in plan.steps if req.role == "triples")
