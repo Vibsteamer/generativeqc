@@ -146,7 +146,8 @@ static DFCCSDTResult run_df_ccsdt_native_attempt(
   runtime::df_progress::Scope trace(replay_state ? "df_ccsdt_response_replay" : "df_ccsdt_native");
   using Trace = runtime::df_progress::Scope;
   if (trace.enabled())
-    Trace::label("phase", replay_state ? "same_primal_response" : "cold_rhf_df_ccsd");
+    Trace::label("phase", replay_state ? "same_primal_response" :
+                        demand.retained_reference ? "retained_rhf_df_ccsd" : "cold_rhf_df_ccsd");
   if (!execution.cuda_requested()) throw std::invalid_argument("DF force endpoint requires CUDA");
   // Both sources are normalized views of the same immutable nuclear geometry.
   if (system.atoms.size() != auxiliary.atoms.size())
@@ -168,11 +169,12 @@ static DFCCSDTResult run_df_ccsdt_native_attempt(
                          execution, system, descriptor, nullptr, reference_seed,
                          reference_experiment ? &reference_experiment->seed_fallback : nullptr,
                          df_retry::attempt_reservation(
-                             seed_bytes, recycle_bytes,
+                             checked_add(seed_bytes, demand.retained_reference_bytes), recycle_bytes,
                              physical_replay ? physical_replay->output_bytes : 0, checked_add),
                          &auxiliary, forces, qualification, nullptr, ccsd_batch_limit,
                          derived_denominators, packed_diis, ccsd_mixed_precision,
-                         ccsd_mixed_switch_residual, demand.mp2, demand.df_reference, convergence);
+                         ccsd_mixed_switch_residual, demand.mp2, demand.df_reference, convergence,
+                         demand.retained_reference);
   if (retained_host_bytes >= state.budget)
     throw std::length_error("DF correlation retained caller state exhausts complete budget");
   if (demand.mp2 && !state.df_mp2_mode) {
@@ -233,9 +235,11 @@ static DFCCSDTResult run_df_ccsdt_native_attempt(
                 &state.df_mp2.eps_o, &state.df_mp2.eps_v, &state.df_mp2.foo, &state.df_mp2.fvv});
   base = checked_add(base, mp2_response_bytes);
   if (trace.enabled()) {
-    Trace::label("reference_integral_model", state.df_reference ? "ri-jk" : "four-center");
+    Trace::label("reference_integral_model",
+                 state.df_reference || demand.retained_reference ? "ri-jk" : "four-center");
     Trace::number("df_source_identity", p.df_source_identity);
     Trace::number("df_source_builds", replay_state ? 0 : 1);
+    if (demand.retained_reference) Trace::number("retained_focal_rhf_reference", 1);
   }
   if (trace.enabled() && demand.mp2) {
     Trace::number("df_mp2_reference_reused", replay_state ? 1 : 0);
@@ -867,6 +871,10 @@ DFCCSDTResult run_df_ccsdt_native(
   if (demand.mp2 && with_triples) throw std::invalid_argument("DF-MP2 cannot request CC triples");
   if (demand.triples_occupied_partition && (forces || !with_triples))
     throw std::invalid_argument("occupied triples partition requires a DF-RCCSD(T) energy request");
+  if (demand.retained_reference &&
+      (forces || !with_triples || demand.mp2 || demand.companions || !demand.df_reference ||
+       reference_experiment))
+    throw std::invalid_argument("retained focal RHF requires an independent triples energy-only demand");
   if (reference_experiment && reference_experiment->reference)
     throw std::invalid_argument("clear the previous experiment reference before reuse");
   // Resolve endpoint policy before passing a positive limit to the solver.

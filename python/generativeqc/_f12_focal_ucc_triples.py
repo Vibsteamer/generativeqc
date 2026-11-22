@@ -1,4 +1,4 @@
-"""Molecular conventional (T) increment for an unrestricted focal request."""
+"""Molecular conventional (T) increments on focal references."""
 
 from __future__ import annotations
 
@@ -156,57 +156,103 @@ def molecular_triples_on_reference(
         raise RuntimeError(
             "Nonempty focal triples requires the native retained DF reference ABI"
         )
-    calc = Calculator(
-        method="uccsd(t)",
-        device="cuda" if request.backend == "cuda" else "cpu",
-        basis=basis.orbital,
-        auxiliary_basis=basis.mp2_fit,
-        density_fitting="full_cuda",
-        initial_guess=None,
-        correlation_memory_budget_bytes=budget_mib << 20,
-    )
-    with ExitStack() as stack:
-        stack.callback(calc.clear_cache)
-        lib = calc._library
-        if lib._handle != owner.library._handle:
-            raise RuntimeError("The triples library must own the supplied reference")
-        ctx, plan = ct.c_void_p(), ct.c_void_p()
-        _native.check(
-            lib,
-            lib.generativeqc_context_create(
-                ct.byref(calc._context_descriptor()), ct.byref(ctx)
-            ),
+    split_fit = basis.jk_fit.identity != basis.mp2_fit.identity
+    spatial = None
+    if (
+        not forces
+        and request.backend == "cuda"
+        and request.root_id == "rhf"
+        and not split_fit
+        and not any(
+            basis.orbital.by_element[a.atomic_number].ecp_core_electrons
+            for a in request.atoms
         )
-        stack.callback(lib.generativeqc_context_destroy, ctx)
-        geometry = (ctx, request.atoms, request.charge, request.multiplicity)
-        system = calc._create_native_system(*geometry)
-        stack.callback(lib.generativeqc_system_destroy, system)
-        correlation_fit = calc._create_native_system(*geometry, basis.mp2_fit)
-        stack.callback(lib.generativeqc_system_destroy, correlation_fit)
-        descriptor = calc._method_descriptor(correlation_fit, systems=(request.atoms,))
-        if basis.jk_fit.identity != basis.mp2_fit.identity:
-            jk = calc._create_native_system(*geometry, basis.jk_fit)
-            stack.callback(lib.generativeqc_system_destroy, jk)
-            status = lib.generativeqc_calculation_prepare_ucc_df_fits_v1(
-                ctx, system, ct.byref(descriptor), jk, ct.byref(plan)
-            )
-        else:
-            status = lib.generativeqc_calculation_prepare(
-                ctx, system, ct.byref(descriptor), ct.byref(plan)
-            )
-        _native.check(lib, status, context=ctx)
-        stack.callback(lib.generativeqc_calculation_destroy, plan)
-        native = lib.generativeqc_focal_ucc_triples_v1
-        native.argtypes = [
-            ct.c_void_p,
-            ct.c_void_p,
-            ct.c_int,
-            np.ctypeslib.ndpointer(np.float64, ndim=1, flags="C_CONTIGUOUS"),
-            ct.c_size_t,
-        ]
-        native.restype = ct.c_int
-        output = np.empty(1 + (3 * len(request.atoms) if forces else 0))
-        _native.check(
-            lib, native(plan, owner.handle, forces, output, output.size), context=ctx
+    ):
+        spatial = getattr(
+            owner.library, "generativeqc_focal_rcc_triples_energy_v1", None
         )
-    return float(output[0]), output[1:].reshape(-1, 3) if forces else None
+
+    def evaluate(
+        spatial_energy: ct._CFuncPtr | None,
+    ) -> tuple[float, np.ndarray | None] | None:
+        calc = Calculator(
+            method="df-rccsd(t)" if spatial_energy is not None else "uccsd(t)",
+            device="cuda" if request.backend == "cuda" else "cpu",
+            basis=basis.orbital,
+            auxiliary_basis=basis.mp2_fit,
+            density_fitting="full_cuda",
+            initial_guess=None,
+            correlation_memory_budget_bytes=budget_mib << 20,
+        )
+        with ExitStack() as stack:
+            stack.callback(calc.clear_cache)
+            lib = calc._library
+            if lib._handle != owner.library._handle:
+                raise RuntimeError("The triples library must own the supplied reference")
+            ctx, plan = ct.c_void_p(), ct.c_void_p()
+            _native.check(
+                lib,
+                lib.generativeqc_context_create(
+                    ct.byref(calc._context_descriptor()), ct.byref(ctx)
+                ),
+            )
+            stack.callback(lib.generativeqc_context_destroy, ctx)
+            geometry = (ctx, request.atoms, request.charge, request.multiplicity)
+            system = calc._create_native_system(*geometry)
+            stack.callback(lib.generativeqc_system_destroy, system)
+            correlation_fit = calc._create_native_system(*geometry, basis.mp2_fit)
+            stack.callback(lib.generativeqc_system_destroy, correlation_fit)
+            descriptor = calc._method_descriptor(
+                correlation_fit, systems=(request.atoms,)
+            )
+            if split_fit:
+                jk = calc._create_native_system(*geometry, basis.jk_fit)
+                stack.callback(lib.generativeqc_system_destroy, jk)
+                status = lib.generativeqc_calculation_prepare_ucc_df_fits_v1(
+                    ctx, system, ct.byref(descriptor), jk, ct.byref(plan)
+                )
+            else:
+                status = lib.generativeqc_calculation_prepare(
+                    ctx, system, ct.byref(descriptor), ct.byref(plan)
+                )
+            fallback = (
+                _native.STATUS_NOT_IMPLEMENTED,
+                _native.STATUS_OUT_OF_MEMORY,
+                _native.STATUS_RESOURCE_LIMIT,
+            )
+            if spatial_energy is not None and status in fallback:
+                return None
+            _native.check(lib, status, context=ctx)
+            stack.callback(lib.generativeqc_calculation_destroy, plan)
+            if spatial_energy is not None:
+                spatial_energy.argtypes = [
+                    ct.c_void_p, ct.c_void_p, ct.POINTER(ct.c_double),
+                ]
+                spatial_energy.restype = ct.c_int
+                energy = ct.c_double()
+                status = spatial_energy(plan, owner.handle, ct.byref(energy))
+                if status in fallback:
+                    return None
+                _native.check(lib, status, context=ctx)
+                return energy.value, None
+
+            native = lib.generativeqc_focal_ucc_triples_v1
+            native.argtypes = [
+                ct.c_void_p,
+                ct.c_void_p,
+                ct.c_int,
+                np.ctypeslib.ndpointer(np.float64, ndim=1, flags="C_CONTIGUOUS"),
+                ct.c_size_t,
+            ]
+            native.restype = ct.c_int
+            output = np.empty(1 + (3 * len(request.atoms) if forces else 0))
+            _native.check(
+                lib, native(plan, owner.handle, forces, output, output.size), context=ctx
+            )
+        return float(output[0]), output[1:].reshape(-1, 3) if forces else None
+
+    result = evaluate(spatial)
+    if result is None:
+        result = evaluate(None)
+        assert result is not None
+    return result

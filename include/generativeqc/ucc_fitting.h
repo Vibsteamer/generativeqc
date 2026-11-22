@@ -34,6 +34,13 @@ GENERATIVEQC_API generativeqc_status generativeqc_focal_ucc_triples_v1(
     generativeqc_calculation* calculation, const generativeqc_focal_reference* owner, int forces,
     double* output, size_t count);
 
+/** Return the spatial DF-RCCSD(T) increment on the retained canonical RHF root.
+ * Requires CUDA, an all-electron full-DF plan and one common JK/correlation fit.
+ * This entry computes only the scalar conventional (T) energy. */
+GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_energy_v1(
+    generativeqc_calculation* calculation, const generativeqc_focal_reference* owner,
+    double* output);
+
 #ifdef __cplusplus
 }
 #endif

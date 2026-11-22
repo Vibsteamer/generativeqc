@@ -8,6 +8,7 @@
 #include "api/error.hpp"
 #include "api/handles.hpp"
 #include "generativeqc/ucc_fitting.h"
+#include "methods/df_rccsdt_method.hpp"
 #include "methods/hf_ecp_df.hpp"
 #include "methods/uccsd_method.hpp"
 #include "molecule/basis.hpp"
@@ -22,6 +23,7 @@ struct generativeqc_focal_reference {
   generativeqc_backend backend;
   int device;
   bool refine_ecp_quadrature;
+  std::shared_ptr<const generativeqc::hf::PhysicalReference> rhf;
 };
 
 namespace {
@@ -185,10 +187,13 @@ generativeqc_status focal_df_reference(generativeqc_context* context,
         expanded->source_multiplicity = physical.multiplicity;
         ref = std::move(expanded);
       }
+      const bool spatial = spins == 1 && cuda && !forces && physical.ecp_terms.empty() &&
+          std::none_of(physical.atoms.begin(), physical.atoms.end(),
+                       [](const auto& atom) { return atom.ecp_core != 0; });
       *owner = new generativeqc_focal_reference{
           std::move(ref), molecule::ScalarHamiltonianIdentity(aux),
           static_cast<generativeqc_backend>(backend), context->state.device_id,
-          physical.refine_ecp_quadrature};
+          physical.refine_ecp_quadrature, spatial ? state.reference : nullptr};
     }
     return GENERATIVEQC_STATUS_SUCCESS;
   } catch (...) {
@@ -251,6 +256,48 @@ extern "C" generativeqc_status generativeqc_focal_ucc_triples_v1(
     output[0] = result.energy;
     std::copy(result.forces.begin(), result.forces.end(), output + 1);
     return GENERATIVEQC_STATUS_SUCCESS;
+  } catch (...) {
+    return generativeqc::api::map_exception(&context->last_detail);
+  }
+}
+
+extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_energy_v1(
+    generativeqc_calculation* calculation, const generativeqc_focal_reference* owner,
+    double* output) {
+  if (!calculation || !calculation->context || !owner || !output)
+    return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
+  auto* context = calculation->context;
+  std::lock_guard lock(context->mutex);
+  try {
+    using namespace generativeqc;
+    if (!owner->uhf || !owner->uhf->source_identity ||
+        owner->backend != core::kCudaBackend || owner->backend != context->state.executed_backend ||
+        owner->device != context->state.device_id)
+      throw std::invalid_argument("focal spatial triples requires a retained CUDA RHF owner");
+    // The spatial source accounts for the RHF frame itself. Its existing
+    // spin-expanded focal view and identity records also remain live.
+    const auto& expanded = *owner->uhf;
+    auto retained = runtime::size_add(owner->jk.storage_bytes(),
+                                     expanded.source_identity->storage_bytes());
+    auto charge = [&](const std::vector<double>& values) {
+      retained = runtime::size_add(retained, runtime::size_mul(values.capacity(), sizeof(double)));
+    };
+    charge(expanded.overlap);
+    charge(expanded.hcore);
+    for (std::size_t spin = 0; spin < 2; ++spin) {
+      charge(expanded.coefficients[spin]);
+      charge(expanded.density[spin]);
+      charge(expanded.fock[spin]);
+      charge(expanded.orbital_energies[spin]);
+    }
+    const auto energy = methods::detail::focal_rcc_triples_energy(
+        *calculation->plan, owner->rhf, *expanded.source_identity, owner->jk, retained);
+    if (!std::isfinite(energy)) throw std::runtime_error("nonfinite focal spatial triples energy");
+    *output = energy;
+    return GENERATIVEQC_STATUS_SUCCESS;
+  } catch (const std::length_error& error) {
+    context->last_detail = error.what();
+    return GENERATIVEQC_STATUS_OUT_OF_MEMORY;
   } catch (...) {
     return generativeqc::api::map_exception(&context->last_detail);
   }

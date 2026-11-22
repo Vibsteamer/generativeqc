@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -200,6 +202,56 @@ def test_triples_from_retained_uhf_and_rhf_references() -> None:
     e, f = molecular_triples_on_reference(rhf, r, budget_mib=1024, forces=True)
     assert e == pytest.approx(-7.4691686931e-6, abs=8e-12)
     assert f[1, 2] == pytest.approx(5.63559527e-6, abs=1e-11)
+
+
+@pytest.mark.skipif(
+    os.environ.get("GENERATIVEQC_RCCSDT_CUDA_TEST") != "1",
+    reason="requires an allocated CUDA native library",
+)
+def test_retained_common_fit_rhf_cuda_signed_triples(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from generativeqc._f12_focal_ucc_triples import molecular_triples_on_reference
+    from generativeqc.experimental.f12_focal import FocalReferenceSeed, df_reference
+
+    basis = FocalBasis(
+        2, "common-fit", "sto-3g", jk_fit="def2-svp", mp2_fit="def2-svp",
+        f12_fit="def2-svp", cabs="def2-svp", beta=1.0,
+    )
+    series = FocalSeries(basis)
+
+    def request(z: float) -> FocalRequest:
+        plan = plan_singlepoint(
+            [("Li", (0.0, 0.0, 0.0)), ("H", (0.1, 0.2, z))],
+            series, series, None, triples=basis, root_id="rhf",
+            correlation_space_id="all-active", backend="cuda",
+        )
+        return next(req for req, _ in plan.steps if req.role == "triples")
+
+    center = request(3.0)
+    reference = df_reference(center, forces=False)
+    seed = FocalReferenceSeed(center, reference)
+    center_energy, center_force = molecular_triples_on_reference(
+        center, reference, budget_mib=1024, forces=True
+    )
+    assert center_force is not None
+    assert center_energy == pytest.approx(-7.4691686931e-6, abs=8e-12)
+    trace = tmp_path / "retained-rhf.jsonl"
+    monkeypatch.setenv("GENERATIVEQC_DF_PROGRESS_TRACE", str(trace))
+    displaced = {}
+    for dz in (-4e-4, -2e-4, 2e-4, 4e-4):
+        req = request(3.0 + dz)
+        ref = df_reference(req, seed=seed, forces=False)
+        assert ref.occupied_overlaps is not None and min(ref.occupied_overlaps) > 0.99999
+        energy, forces = molecular_triples_on_reference(req, ref, budget_mib=1024, forces=False)
+        assert forces is None
+        displaced[dz] = energy
+    for h in (4e-4, 2e-4):
+        force = (displaced[-h] - displaced[h]) / (2 * h)
+        assert force == pytest.approx(center_force[1, 2], abs=2e-9, rel=0)
+    events = (json.loads(line) for line in trace.read_text().splitlines())
+    assert any(event.get("key") == "retained_focal_rhf_reference" and event["value"] == 1
+               for event in events)
 
 
 def test_public_split_fit_triples_share_the_reference_at_center_and_displacement(

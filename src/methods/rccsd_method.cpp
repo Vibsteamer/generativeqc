@@ -374,7 +374,8 @@ RccsdNativeState execute_rccsd_prepared(
     const core::System* correlation_auxiliary = nullptr, bool retain_df_response = false,
     const scf::cuda_execution::CudaDfSourcePolicy* correlation_policy = nullptr,
     scf::CudaRhfBucketPlan** cuda_reference_plan = nullptr, bool df_mp2_mode = false,
-    bool df_reference = false) {
+    bool df_reference = false,
+    const std::shared_ptr<const hf::PhysicalReference>& retained_reference = {}) {
   const char* allocation_stage = "HF reference";
   try {
     const bool cuda = execution.cuda_requested();
@@ -432,9 +433,21 @@ RccsdNativeState execute_rccsd_prepared(
       reference_plan_reused = false;
       return result;
     };
-    auto hf = warm_reference::solve_reference(initial_density, scf::FockSpin::Restricted,
-                                              warm_start_fallback, run_reference,
-                                              "HF did not converge; no RCCSD energy evaluated");
+    scf::ScfResult hf;
+    if (retained_reference) {
+      if (!cuda || !df_reference || !correlation_auxiliary || retain_df_response ||
+          prepared_exact || cuda_reference_plan || df_mp2_mode || initial_density ||
+          retained_reference->nbf != molecule::ao_count(system) ||
+          retained_reference->nocc != static_cast<std::size_t>(system.electron_count / 2))
+        throw std::invalid_argument(
+            "retained RHF requires a matching value-only spatial DF-CC target");
+      hf.reference = retained_reference;
+      hf.converged = true;
+    } else {
+      hf = warm_reference::solve_reference(initial_density, scf::FockSpin::Restricted,
+                                           warm_start_fallback, run_reference,
+                                           "HF did not converge; no RCCSD energy evaluated");
+    }
     const double reference_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - reference_started).count();
     const auto reference = hf.reference;
@@ -975,7 +988,8 @@ RccsdNativeState run_rccsd_native_state(
     scf::CudaRhfBucketPlan** cuda_reference_plan, std::size_t df_auxiliary_batch_limit,
     bool derived_denominators, bool packed_diis, std::optional<bool> df_mixed_precision,
     double df_mixed_precision_switch_residual, bool df_mp2_mode, bool df_reference,
-    core::CorrelationConvergence convergence) {
+    core::CorrelationConvergence convergence,
+    const std::shared_ptr<const hf::PhysicalReference>& retained_reference) {
   validate_descriptor(descriptor, execution);
   if (retain_df_response && !correlation_auxiliary)
     throw MethodError(GENERATIVEQC_STATUS_INVALID_ARGUMENT,
@@ -1063,7 +1077,7 @@ RccsdNativeState run_rccsd_native_state(
       execution, system, reference, solver_options, reference_capacity, prepared_exact,
       initial_density, warm_start_fallback, prepared_exact_cache, correlation_auxiliary,
       retain_df_response, correlation_auxiliary ? &correlation_policy : nullptr,
-      cuda_reference_plan, df_mp2_mode, df_reference);
+      cuda_reference_plan, df_mp2_mode, df_reference, retained_reference);
   state.external_reservation_bytes = external_reservation_bytes;
   state.diagnostic.numeric_capacity_bytes =
       posthf::checked_add(state.diagnostic.numeric_capacity_bytes, external_reservation_bytes);

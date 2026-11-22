@@ -70,7 +70,8 @@ RccsdNativeState run_rccsd_native_state(
     double df_mixed_precision_switch_residual =
         cc::SolverOptions{}.df_mixed_precision_switch_residual,
     bool df_mp2_mode = false, bool df_reference = false,
-    core::CorrelationConvergence convergence = {});
+    core::CorrelationConvergence convergence = {},
+    const std::shared_ptr<const hf::PhysicalReference>& retained_reference = {});
 generativeqc_status validate_rccsd_system(generativeqc_method, const core::System&, std::string&);
 std::unique_ptr<PreparedCalculation> prepare_rccsd_calculation(
     const Capabilities&, core::ContextState&, const core::System&,

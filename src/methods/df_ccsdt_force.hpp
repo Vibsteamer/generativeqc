@@ -65,6 +65,10 @@ struct DFCorrelationDemand {
   bool df_reference{};
   /** Supplement the energy-only physical triples result with its occupied partition. */
   bool triples_occupied_partition{};
+  /** Already selected canonical RHF root for the focal value-only route. */
+  std::shared_ptr<const hf::PhysicalReference> retained_reference;
+  /** Extra live focal-owner bytes, excluding the RHF frame charged by the solver. */
+  std::size_t retained_reference_bytes{};
 };
 
 /** Cold normalized geometry -> selected native CUDA RHF -> DF source -> CCSD(T)

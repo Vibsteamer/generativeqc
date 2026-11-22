@@ -1,5 +1,6 @@
 #include "methods/df_rccsdt_method.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <memory>
 #include <mutex>
@@ -13,6 +14,7 @@
 #include "methods/df_ccsdt_force.hpp"
 #endif
 #include "methods/rccsd_method.hpp"
+#include "molecule/scalar_hamiltonian_identity.hpp"
 
 namespace generativeqc::methods::detail {
 namespace {
@@ -115,7 +117,28 @@ class DfRccsdtPrepared final : public PreparedCalculation {
                         "unsupported DF correlation companions");
     return execute_group(compute_forces, companions);
   }
-  Result execute_group(bool compute_forces, unsigned companions) {
+
+  double triples_on_reference(const std::shared_ptr<const hf::PhysicalReference>& retained,
+                              const molecule::ScalarHamiltonianIdentity& orbital,
+                              const molecule::ScalarHamiltonianIdentity& jk,
+                              std::size_t retained_bytes) {
+    if (!full_df_reference_ || descriptor_.method != GENERATIVEQC_METHOD_DF_RCCSD_T ||
+        !orbital.matches(system_) || !jk.matches(auxiliary_) || !system_.ecp_terms.empty() ||
+        std::any_of(system_.atoms.begin(), system_.atoms.end(),
+                    [](const auto& atom) { return atom.ecp_core != 0; }))
+      throw std::invalid_argument(
+          "focal spatial triples requires the same all-electron RHF determinant and common fit");
+    if (!retained)
+      throw MethodError(GENERATIVEQC_STATUS_NOT_IMPLEMENTED,
+                        "focal spatial triples requires a value-only RHF snapshot");
+    double triples{};
+    execute_group(false, 0, retained, retained_bytes, &triples);
+    return triples;
+  }
+
+  Result execute_group(bool compute_forces, unsigned companions,
+                       const std::shared_ptr<const hf::PhysicalReference>& retained = {},
+                       std::size_t retained_bytes = 0, double* triples = nullptr) {
     std::lock_guard<std::mutex> lock(mutex_);
     last_correlation_.reset();
     last_performance_.reset();
@@ -125,7 +148,11 @@ class DfRccsdtPrepared final : public PreparedCalculation {
                 convergence_.relaxed() || preconvergence_ != core::DfPreconvergence::Legacy
             ? run_df_correlation_group_native(
                   execution_, system_, auxiliary_, descriptor_, compute_forces,
-                  {descriptor_.method == GENERATIVEQC_METHOD_MP2, companions, full_df_reference_},
+                  {.mp2 = descriptor_.method == GENERATIVEQC_METHOD_MP2,
+                   .companions = companions,
+                   .df_reference = full_df_reference_,
+                   .retained_reference = retained,
+                   .retained_reference_bytes = retained_bytes},
                   convergence_, preconvergence_)
             : run_df_ccsdt_native(execution_, system_, auxiliary_, descriptor_, compute_forces);
     native.primal.triples_seconds = native.triples_seconds;
@@ -153,8 +180,12 @@ class DfRccsdtPrepared final : public PreparedCalculation {
     }
     last_correlation_ = native.correlation;
     last_performance_ = native.primal;
+    if (triples) *triples = native.correlation.ccsd_t_triples_energy;
     return std::move(native.method_result);
 #else
+    (void)retained;
+    (void)retained_bytes;
+    (void)triples;
     throw MethodError(GENERATIVEQC_STATUS_NOT_IMPLEMENTED,
                       "public DF-RCCSD(T) requires a CUDA-enabled build");
 #endif
@@ -175,6 +206,15 @@ class DfRccsdtPrepared final : public PreparedCalculation {
 };
 
 }  // namespace
+
+double focal_rcc_triples_energy(
+    PreparedCalculation& plan, const std::shared_ptr<const hf::PhysicalReference>& retained,
+    const molecule::ScalarHamiltonianIdentity& orbital,
+    const molecule::ScalarHamiltonianIdentity& jk, std::size_t retained_reference_bytes) {
+  auto* cc = dynamic_cast<DfRccsdtPrepared*>(&plan);
+  if (!cc) throw std::invalid_argument("focal spatial triples requires a native DF-RCCSD(T) plan");
+  return cc->triples_on_reference(retained, orbital, jk, retained_reference_bytes);
+}
 
 generativeqc_status validate_df_rccsdt_system(generativeqc_method method,
                                               const core::System& system, std::string& detail) {
