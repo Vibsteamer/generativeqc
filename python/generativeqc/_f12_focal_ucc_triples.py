@@ -3,15 +3,34 @@
 from __future__ import annotations
 
 import math
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 if TYPE_CHECKING:
+    from ._f12_focal_molecular import MolecularFocalProvider
     from ._f12_focal_reference import FocalReference
     from ._f12_focal_tplus_sources import FocalOccupiedTriples
     from .experimental.f12_focal import FocalEvaluation, FocalRequest
+
+
+PRECONVERGENCE_CODES: dict[str, int] = {
+    "legacy": 0,
+    "fp64": 1,
+    "mixed": 2,
+    "auto": 3,
+}
+
+
+@dataclass(frozen=True)
+class SpatialTriplesResult:
+    """Result and execution telemetry from native spatial DF-RCCSD(T) / (T+)."""
+
+    energy: float
+    occupied: np.ndarray | None
+    forces: np.ndarray | None
+    telemetry: dict[str, float | bool | int]
 
 
 def conventional_df_ucc_triples(
@@ -118,21 +137,360 @@ def conventional_df_ucc_triples(
     return FocalEvaluation(term, request.backend, converged=True)
 
 
+def relax_spatial_rhf_force_sources(
+    provider: MolecularFocalProvider,
+    request: FocalRequest,
+    reference: FocalReference,
+    bar_f: np.ndarray,
+    bar_c: np.ndarray,
+    corr_gradient: np.ndarray,
+) -> np.ndarray:
+    """Pull spatial RHF triples (bar_f, bar_c, corr_gradient) through split-fit/ECP CPHF.
+
+    Returns Cartesian nuclear forces (shape (natoms, 3), minus energy derivative in Eh/bohr).
+    """
+    from functools import partial
+
+    from generativeqc_compiler.method.canonical_frame_response import (
+        orbital_rotation_cotangent,
+    )
+    from generativeqc_compiler.tensor import execute
+
+    from ._canonical_frame import canonical_frame_seed
+    from ._f12_focal_increment import _canonical_occupied_virtual_blocks
+    from ._f12_focal_one_electron import one_electron_sources
+    from ._f12_focal_singles_response import relaxed_reference_weights
+    from ._f12_spin_ao import _orbital_sources
+    from ._f12_spin_fock import spin_fock, spin_fock_pullback
+
+    cuda = request.backend == "cuda"
+    runner = (
+        provider.run if cuda else partial(execute, max_bytes=provider.budget_mib << 20)
+    )
+    assert runner is not None
+
+    def run(program, inputs):
+        out = runner(program, inputs)
+        if out.backend != (
+            "cuda-fp64-ordinary-stream" if cuda else "numpy-cpu-interpreter"
+        ):
+            raise RuntimeError("Spatial triples CPHF program ran on another backend")
+        return out
+
+    one = one_electron_sources(
+        request,
+        library=provider.one_electron_library or provider.shell_library,
+        orbital_only=True,
+        derivatives=True,
+        budget_mib=provider.budget_mib,
+    )
+    if not (
+        np.allclose(one.overlap, reference.overlap, atol=2e-8, rtol=0)
+        and np.allclose(one.hcore, reference.hcore, atol=2e-8, rtol=0)
+    ):
+        raise ValueError("Spatial triples one-electron integrals differ from root")
+    jk = provider._panel(request, "jk_fit", orbital_only=True)
+    n = one.obs_ao_count
+    o_full = reference.occupied[0]
+    eps = reference.orbital_energies[0]
+    c_mat = reference.coefficients[0]
+    spins = ("alpha", "beta")
+    ao = {
+        "coefficients_alpha": c_mat,
+        "coefficients_beta": c_mat,
+        "hcore_ao": reference.hcore,
+        "ao_coulomb": jk.data["ao_coulomb"],
+        "metric/coulomb": jk.data["metric"],
+        "metric_whitener": jk.whitener,
+    }
+    space = (o_full, o_full, n, n, len(jk.whitener))
+    fspace = (o_full, o_full, n, len(jk.whitener))
+    projected, _ = _orbital_sources(
+        space, ao, run, None, projected=None, role="ordinary_fock"
+    )
+    values = {
+        k.removeprefix("source/"): v
+        for k, v in projected.items()
+        if k.startswith("source/")
+    }
+    focks = spin_fock(fspace, values, run)
+    for s in spins:
+        if not np.allclose(focks["fock_" + s], np.diag(eps), atol=2e-8, rtol=0):
+            raise ValueError("JKFit Fock differs from stationary canonical RHF frame")
+
+    def fock_pullback(seeds: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        seed = spin_fock_pullback(fspace, values, seeds, run)
+        _, bars = _orbital_sources(
+            space,
+            ao,
+            run,
+            {"source/" + k: v for k, v in seed.items()},
+            projected=projected,
+            role="ordinary_fock",
+        )
+        assert bars is not None
+        return bars
+
+    half_f = 0.5 * bar_f
+    half_c = 0.5 * bar_c
+    direct = fock_pullback({"fock_alpha": half_f, "fock_beta": half_f})
+    rotation = orbital_rotation_cotangent(n, n)
+    seeds = {}
+    for spin in spins:
+        key = "coefficients_" + spin
+        direct[key] += half_c
+        rot = run(
+            rotation, {"coefficients": c_mat, "frame_bar": direct[key]}
+        ).outputs["rotation_gradient"]
+        seeds["fock_" + spin] = (
+            canonical_frame_seed(
+                rot,
+                eps,
+                o_full,
+                library=provider.canonical_library,
+                maximum_bytes=provider.budget_mib << 20,
+            )[0]
+            if cuda
+            else _canonical_occupied_virtual_blocks(rot, eps, o_full)
+        )
+    canonical = fock_pullback(seeds)
+    for key in direct:
+        direct[key] += canonical[key]
+    coefficient_bar = np.zeros_like(reference.coefficients)
+    coefficient_bar[0] = direct["coefficients_alpha"] + direct["coefficients_beta"]
+    relaxed = relaxed_reference_weights(
+        reference,
+        values,
+        jk.whitener,
+        {
+            "hcore": direct["hcore_ao"],
+            "three_center": direct["ao_coulomb"],
+            "metric": direct["metric/coulomb"],
+            "obs_coefficients": coefficient_bar,
+        },
+        np.zeros_like(reference.overlap),
+        run,
+        provider.response_library,
+        provider.budget_mib,
+    )
+    grad = one.nuclear_gradient(relaxed["overlap"], relaxed["hcore"], run=run)
+    jk_bars = {"ao_coulomb": relaxed["three_center"], "metric": relaxed["metric"]}
+    grad += provider._gradient(request, jk, jk_bars, coulomb_only=True)
+    grad += corr_gradient.reshape(-1, 3)
+    return -grad
+
+
+def spatial_rhf_triples_v2(
+    request: FocalRequest,
+    reference: FocalReference,
+    *,
+    budget_mib: int,
+    forces: bool = False,
+    occupied_partition: bool = False,
+    occupied_weights: np.ndarray | None = None,
+    preconvergence: str = "auto",
+    triples_fp32_w: bool = False,
+    provider: MolecularFocalProvider | None = None,
+) -> SpatialTriplesResult:
+    """Invoke generativeqc_focal_rcc_triples_v2 for fast spatial CUDA RHF (T) / (T+)."""
+    import ctypes as ct
+    from contextlib import ExitStack
+
+    from . import _native
+    from ._f12_frozen_core import resolve_frozen_occupied
+    from .calculator import Calculator
+
+    if preconvergence not in PRECONVERGENCE_CODES:
+        raise ValueError(
+            f"Unsupported preconvergence {preconvergence!r}; expected one of {tuple(PRECONVERGENCE_CODES)}"
+        )
+    basis = request.basis
+    if (
+        request.root_id != "rhf"
+        or request.backend != "cuda"
+        or basis.mp2_fit is None
+        or reference.surface_id != request.surface_id
+        or reference.executed_backend != request.backend
+        or reference.orbital_id != basis.orbital.identity
+        or reference.jk_fit_id != basis.jk_fit.identity
+    ):
+        raise ValueError(
+            "Spatial RHF triples v2 requires matching CUDA RHF reference and correlation fit"
+        )
+    if forces and provider is None:
+        raise ValueError("Spatial RHF triples forces require the owning MolecularFocalProvider")
+    o_full = reference.occupied[0]
+    n = len(reference.overlap)
+    frozen = resolve_frozen_occupied(request, (o_full, o_full))[0]
+    o_act = o_full - frozen
+    n_vir = n - o_full
+    if o_act < 2 or n_vir < 2:
+        occ_out = np.zeros(o_act, dtype=np.float64) if occupied_partition else None
+        frc_out = np.zeros((len(request.atoms), 3), dtype=np.float64) if forces else None
+        return SpatialTriplesResult(0.0, occ_out, frc_out, {})
+
+    owner = reference._native_owner
+    if owner is None:
+        raise RuntimeError("Spatial RHF triples v2 requires the native retained DF reference ABI")
+    fn = getattr(owner.library, "generativeqc_focal_rcc_triples_v2", None)
+    if fn is None:
+        raise NotImplementedError("Native generativeqc_focal_rcc_triples_v2 ABI is unavailable")
+
+    weights_arr = None
+    if occupied_weights is not None:
+        weights_arr = np.ascontiguousarray(occupied_weights, dtype=np.float64)
+        if weights_arr.shape != (o_act,) or not np.isfinite(weights_arr).all():
+            raise ValueError(f"occupied_weights must be finite float64 of length {o_act}")
+
+    calc = Calculator(
+        method="df-rccsd(t)",
+        device="cuda",
+        basis=basis.orbital,
+        auxiliary_basis=basis.mp2_fit,
+        density_fitting="full_cuda",
+        initial_guess=None,
+        correlation_memory_budget_bytes=budget_mib << 20,
+    )
+    with ExitStack() as stack:
+        stack.callback(calc.clear_cache)
+        lib = calc._library
+        if lib._handle != owner.library._handle:
+            raise RuntimeError("The triples library must own the supplied reference")
+        ctx, plan = ct.c_void_p(), ct.c_void_p()
+        _native.check(
+            lib,
+            lib.generativeqc_context_create(
+                ct.byref(calc._context_descriptor()), ct.byref(ctx)
+            ),
+        )
+        stack.callback(lib.generativeqc_context_destroy, ctx)
+        geometry = (ctx, request.atoms, request.charge, request.multiplicity)
+        system = calc._create_native_system(*geometry)
+        stack.callback(lib.generativeqc_system_destroy, system)
+        correlation_fit = calc._create_native_system(*geometry, basis.mp2_fit)
+        stack.callback(lib.generativeqc_system_destroy, correlation_fit)
+        descriptor = calc._method_descriptor(correlation_fit, systems=(request.atoms,))
+        status = lib.generativeqc_calculation_prepare(
+            ctx, system, ct.byref(descriptor), ct.byref(plan)
+        )
+        _native.check(lib, status, context=ctx)
+        stack.callback(lib.generativeqc_calculation_destroy, plan)
+
+        fn.restype = ct.c_int
+        fn.argtypes = [
+            ct.c_void_p, ct.c_void_p,
+            ct.c_int, ct.c_int, ct.c_size_t,
+            ct.POINTER(ct.c_double), ct.c_size_t,
+            ct.c_uint32, ct.c_int,
+            ct.POINTER(ct.c_double),
+            ct.POINTER(ct.c_double), ct.c_size_t,
+            ct.POINTER(ct.c_double), ct.c_size_t,
+            ct.POINTER(ct.c_double), ct.c_size_t,
+            ct.POINTER(ct.c_double), ct.c_size_t,
+            ct.POINTER(ct.c_double), ct.c_size_t,
+        ]
+        energy_out = ct.c_double()
+        occ_buf = np.empty(o_act, dtype=np.float64) if occupied_partition else None
+        grad_buf = np.empty(3 * len(request.atoms), dtype=np.float64) if forces else None
+        bar_f_buf = np.empty(n * n, dtype=np.float64) if forces else None
+        bar_c_buf = np.empty(n * n, dtype=np.float64) if forces else None
+        tel_buf = np.zeros(8, dtype=np.float64)
+
+        def ptr(arr: np.ndarray | None):
+            return arr.ctypes.data_as(ct.POINTER(ct.c_double)) if arr is not None else None
+
+        status = fn(
+            plan,
+            owner.handle,
+            1 if forces else 0,
+            1 if occupied_partition else 0,
+            frozen,
+            ptr(weights_arr),
+            0 if weights_arr is None else weights_arr.size,
+            PRECONVERGENCE_CODES[preconvergence],
+            1 if triples_fp32_w else 0,
+            ct.byref(energy_out),
+            ptr(occ_buf),
+            0 if occ_buf is None else occ_buf.size,
+            ptr(grad_buf),
+            0 if grad_buf is None else grad_buf.size,
+            ptr(bar_f_buf),
+            0 if bar_f_buf is None else bar_f_buf.size,
+            ptr(bar_c_buf),
+            0 if bar_c_buf is None else bar_c_buf.size,
+            ptr(tel_buf),
+            tel_buf.size,
+        )
+        _native.check(lib, status, context=ctx)
+
+    telemetry: dict[str, float | bool | int] = {
+        "ccsd_fp32_executed": bool(tel_buf[0] != 0.0),
+        "lambda_fp32_executed": bool(tel_buf[1] != 0.0),
+        "triples_fp32_gemms": int(tel_buf[2]),
+        "triples_fp64_gemms": int(tel_buf[3]),
+        "ccsd_seconds": float(tel_buf[4]),
+        "triples_seconds": float(tel_buf[5]),
+        "lambda_seconds": float(tel_buf[6]),
+        "source_response_seconds": float(tel_buf[7]),
+        "frozen_occupied": frozen,
+        "preconvergence": preconvergence,
+        "triples_fp32_w": triples_fp32_w,
+    }
+    forces_out = None
+    if forces:
+        assert provider is not None and grad_buf is not None and bar_f_buf is not None and bar_c_buf is not None
+        forces_out = relax_spatial_rhf_force_sources(
+            provider,
+            request,
+            reference,
+            bar_f_buf.reshape(n, n),
+            bar_c_buf.reshape(n, n),
+            grad_buf,
+        )
+    return SpatialTriplesResult(float(energy_out.value), occ_buf, forces_out, telemetry)
+
+
 def molecular_triples_on_reference(
     request: FocalRequest,
     reference: FocalReference,
     *,
     budget_mib: int,
     forces: bool,
+    provider: MolecularFocalProvider | None = None,
+    preconvergence: str = "auto",
+    triples_fp32_w: bool = False,
 ) -> tuple[float, np.ndarray | None]:
     """Use the native conventional CCSD and triples owner on a retained determinant."""
+    if (
+        request.backend == "cuda"
+        and request.root_id == "rhf"
+        and reference._native_owner is not None
+        and getattr(reference._native_owner.library, "generativeqc_focal_rcc_triples_v2", None) is not None
+        and (not forces or provider is not None)
+    ):
+        res = spatial_rhf_triples_v2(
+            request,
+            reference,
+            budget_mib=budget_mib,
+            forces=forces,
+            occupied_partition=False,
+            preconvergence=preconvergence,
+            triples_fp32_w=triples_fp32_w,
+            provider=provider,
+        )
+        return res.energy, res.forces
     return _retained_conventional_triples(
         request, reference, budget_mib=budget_mib, forces=forces, occupied_partition=False
     )
 
 
 def molecular_occupied_triples_on_reference(
-    request: FocalRequest, reference: FocalReference, *, budget_mib: int
+    request: FocalRequest,
+    reference: FocalReference,
+    *,
+    budget_mib: int,
+    preconvergence: str = "auto",
+    triples_fp32_w: bool = False,
 ) -> tuple[float, FocalOccupiedTriples]:
     """Return the conventional scalar and its spatial occupied partition on the (T+) frame."""
     from ._f12_focal_tplus_sources import FocalOccupiedTriples
@@ -143,6 +501,25 @@ def molecular_occupied_triples_on_reference(
         or request.basis.mp2_fit is None
     ):
         raise ValueError("Occupied triples requires the matching (T+) basis and reference")
+    if (
+        request.backend == "cuda"
+        and request.root_id == "rhf"
+        and reference._native_owner is not None
+        and getattr(reference._native_owner.library, "generativeqc_focal_rcc_triples_v2", None) is not None
+    ):
+        res = spatial_rhf_triples_v2(
+            replace(request, role="triples"),
+            reference,
+            budget_mib=budget_mib,
+            forces=False,
+            occupied_partition=True,
+            preconvergence=preconvergence,
+            triples_fp32_w=triples_fp32_w,
+        )
+        assert res.occupied is not None
+        return res.energy, FocalOccupiedTriples(
+            reference, request.correlation_space_id, request.basis.mp2_fit.identity, res.occupied
+        )
     scalar, values = _retained_conventional_triples(
         replace(request, role="triples"), reference,
         budget_mib=budget_mib, forces=False, occupied_partition=True,

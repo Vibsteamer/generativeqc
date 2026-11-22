@@ -73,6 +73,7 @@ def _ordinary_energies(
     source: FocalCoulombSource,
     run: Callable,
     occupied_mp2: SpinOccupied | None = None,
+    frozen_occupied: tuple[int, int] = (0, 0),
 ) -> tuple[float, float, float]:
     from generativeqc_compiler.mp2.ordinary_df_factors import ordinary_df_factors
     from generativeqc_compiler.mp2.unrestricted_df_response import df_ump2_pair_response
@@ -82,9 +83,10 @@ def _ordinary_energies(
     controls = {}
     spins = ("alpha", "beta")
     occs = tuple(reference.occupied[k] for k in spin_indices)
-    for name, k, occ in zip(spins, spin_indices, occs, strict=True):
-        if occ:
-            factor = ordinary_df_factors(n, occ, q)
+    active_occs = tuple(o - f for o, f in zip(occs, frozen_occupied, strict=True))
+    for name, k, occ, f in zip(spins, spin_indices, occs, frozen_occupied, strict=True):
+        if occ - f:
+            factor = ordinary_df_factors(n, occ, q, frozen=f)
             values = {
                 "coefficients": reference.coefficients[k],
                 "ao_coulomb": source.three_center,
@@ -94,18 +96,19 @@ def _ordinary_energies(
             eps = reference.orbital_energies[k]
             controls[name] = {
                 "B_" + name: b,
-                "eo_" + name: eps[:occ],
+                "eo_" + name: eps[f:occ],
                 "ev_" + name: eps[occ:],
             }
     energies = []
     for i, j in ((0, 0), (0, 1), (1, 1)):
-        ni, nj = occs[i], occs[j]
+        ni, nj = active_occs[i], active_occs[j]
+        oi, oj = occs[i], occs[j]
         if not ni or not nj or (i == j and ni < 2):
             energies.append(0.0)
             continue
         left, right = spins[i], spins[j]
         pair = df_ump2_pair_response(
-            left + "_" + right, q, ni, n - ni, nj, n - nj, 1,
+            left + "_" + right, q, ni, n - oi, nj, n - oj, 1,
             occupied_partition=occupied_mp2 is not None,
         )
         output = "energy" if occupied_mp2 is None else "pair_energies"
@@ -123,7 +126,6 @@ def _check_request(provider: MolecularFocalProvider, request: FocalRequest) -> i
     basis = request.basis
     if (
         request.role != "mp2_f12_correlation"
-        or request.correlation_space_id != "all-active"
         or request.root_id not in ("rhf", "uhf")
         or (request.root_id == "rhf" and request.multiplicity != 1)
         or any(
@@ -131,7 +133,7 @@ def _check_request(provider: MolecularFocalProvider, request: FocalRequest) -> i
         )
     ):
         raise ValueError(
-            "low-order energies require an all-active RHF/UHF MP2-F12 request with its three fitting roles and OptRI"
+            "low-order energies require an RHF/UHF MP2-F12 request with its three fitting roles and OptRI"
         )
     cuda = request.backend == "cuda"
     if request.backend not in ("cuda", "cpu_reference") or (
@@ -255,10 +257,15 @@ def molecular_low_order_energy(
             )[1]
             for singles_fock, k in zip(singles_focks, indices, strict=True)
         )
+    from ._f12_frozen_core import active_occupied_counts, resolve_frozen_occupied
+
+    frozen = resolve_frozen_occupied(request, (oa, ob))
+    act_a, act_b = active_occupied_counts((oa, ob), frozen)
+    frozen_by_spin = {"alpha": frozen[0], "beta": frozen[1]}
     channels = {("alpha", "alpha"): [], ("alpha", "beta"): [], ("beta", "beta"): []}
     increments = []
     occupied = (
-        OccupiedMP2F12((np.zeros(oa), np.zeros(ob)), (np.zeros(oa), np.zeros(ob)))
+        OccupiedMP2F12((np.zeros(act_a), np.zeros(act_b)), (np.zeros(act_a), np.zeros(act_b)))
         if include_occupied_partitions
         else None
     )
@@ -266,19 +273,24 @@ def molecular_low_order_energy(
     # partition and its relaxed reverse, even when the fitted panels coincide.
     shared_pairs = mp2 is f12 and occupied is None
     for item in molecular_pair_energies(
-        space, data, sources(data), fock, run, include_ordinary=shared_pairs
+        space, data, sources(data), fock, run, frozen_occupied=frozen, include_ordinary=shared_pairs
     ):
         if item.mp2 is not None:
             channels[item.spins].append(item.mp2)
         increments.append(item.f12)
         if occupied is not None:
-            add_distinct_pair(occupied.f12_increment, item.spins, item.occupied_indices, item.f12)
+            shifted = (
+                item.occupied_indices[0] - frozen_by_spin[item.spins[0]],
+                item.occupied_indices[1] - frozen_by_spin[item.spins[1]],
+            )
+            add_distinct_pair(occupied.f12_increment, item.spins, shifted, item.f12)
     ordinary = (
         tuple(fsum(values) for values in channels.values())
         if shared_pairs
         else _ordinary_energies(
             ref, indices, mp2.obs(request, obs), run,
             None if occupied is None else occupied.mp2,
+            frozen_occupied=frozen,
         )
     )
     result = FocalLowOrderEnergy(

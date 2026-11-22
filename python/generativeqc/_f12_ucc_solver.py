@@ -55,7 +55,8 @@ def _prepare_focal_ucc(
             raise ValueError(
                 "The bounded spatial ladder requires an actual RHF reference"
             )
-    layout = UCCSDLayout(oa, ob, len(ea) - oa, len(eb) - ob)
+    fa, fb = sources.fixed.frozen_occupied
+    layout = UCCSDLayout(oa - fa, ob - fb, len(ea) - oa, len(eb) - ob)
     hamiltonian_id = canonical_hash(
         {
             "surface": ref.surface_id,
@@ -63,14 +64,15 @@ def _prepare_focal_ucc(
             "jk_fit": ref.jk_fit_id,
             "mp2_fit": sources.mp2_fit_id,
             "f12_fit": sources.fixed.f12_fit_id,
+            "frozen_occupied": [fa, fb],
         }
     )
     return _PreparedFixedSourceUCCSD(
         layout,
         sources.ordinary,
         sources.fixed.feeds,
-        orbital_energies_alpha=ea,
-        orbital_energies_beta=eb,
+        orbital_energies_alpha=ea[fa:],
+        orbital_energies_beta=eb[fb:],
         reference_id=ref.surface_id,
         hamiltonian_id=hamiltonian_id,
         reference_energy=ref.energy,

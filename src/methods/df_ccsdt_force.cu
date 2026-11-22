@@ -174,7 +174,7 @@ static DFCCSDTResult run_df_ccsdt_native_attempt(
                          &auxiliary, forces, qualification, nullptr, ccsd_batch_limit,
                          derived_denominators, packed_diis, ccsd_mixed_precision,
                          ccsd_mixed_switch_residual, demand.mp2, demand.df_reference, convergence,
-                         demand.retained_reference);
+                         demand.retained_reference, demand.frozen_occupied);
   if (retained_host_bytes >= state.budget)
     throw std::length_error("DF correlation retained caller state exhausts complete budget");
   if (demand.mp2 && !state.df_mp2_mode) {
@@ -225,7 +225,8 @@ static DFCCSDTResult run_df_ccsdt_native_attempt(
   const auto budget = state.budget - retained_host_bytes;
   const auto device = execution.device_id();
   auto& p = state.problem;
-  const auto o = p.nocc, v = p.nvir, n = o + v, q = p.naux, nn = checked_mul(n, n);
+  const auto o = p.nocc, v = p.nvir, frozen = demand.frozen_occupied, o_full = o + frozen,
+             n = o_full + v, q = p.naux, nn = checked_mul(n, n);
   const auto coords = checked_mul(system.atoms.size(), 3);
   auto base = checked_add(
       p.reference_retained_bytes,
@@ -256,12 +257,20 @@ static DFCCSDTResult run_df_ccsdt_native_attempt(
   auto phase = Clock::now();
   if (trace.enabled()) Trace::label("phase", "triples");
   if (with_triples) {
+    const auto effective_triples_w =
+        (admitted_triples_w.is_strict_fp64() && demand.triples_fp32_w)
+            ? runtime::PrecisionDirective{runtime::PrecisionDtype::Fp32,
+                                          runtime::PrecisionDtype::Fp32,
+                                          runtime::PrecisionDtype::Fp32,
+                                          "issue1764/df-triples-w-fp32-candidate-v1"}
+            : admitted_triples_w;
     if (forces) {
       auto response = cc::triples::pullback_and_fock_df_cuda(
           o, v, q, p.df_bov.data(), p.df_bvv.data(), p.ovoo.data(), p.ovov.data(), p.fov.data(),
           state.solved.t1.data(), state.solved.t2.data(), state.eps_o.data(), state.eps_v.data(),
           1e-10, budget, device, difference(base, borrowed), 0, 3, parallel_gap_reduction,
-          request_triples_gap_cotangents, fused_triples_scalar_response, admitted_triples_w);
+          request_triples_gap_cotangents, fused_triples_scalar_response, effective_triples_w,
+          demand.triples_occupied_weights, demand.triples_occupied_partition);
       t = std::move(response.pullback);
       result.triples_fock = std::move(response.fock);
       result.triples = t.diagnostic;
@@ -281,7 +290,7 @@ static DFCCSDTResult run_df_ccsdt_native_attempt(
       result.triples = cc::triples::evaluate_df_cuda(
           o, v, q, p.df_bov.data(), p.df_bvv.data(), p.ovoo.data(), p.ovov.data(), p.fov.data(),
           state.solved.t1.data(), state.solved.t2.data(), state.eps_o.data(), state.eps_v.data(),
-          1e-10, difference(budget, base), device, 3, admitted_triples_w,
+          1e-10, difference(budget, base), device, 3, effective_triples_w,
           demand.triples_occupied_partition);
       result.numeric_capacity_bytes = std::max(result.numeric_capacity_bytes,
                                                checked_add(base, result.triples.workspace_bytes));
@@ -354,6 +363,7 @@ static DFCCSDTResult run_df_ccsdt_native_attempt(
     if (trace.enabled()) Trace::label("phase", "corrected_lambda");
     cc::LambdaOptions lambda_options;
     lambda_options.cuda_resident_krylov = lambda_resident_krylov;
+    lambda_options.energy_source_only = demand.focal_triples_sources;
     lambda_options.serial_scratch_reuse = lambda_serial_scratch_reuse;
     lambda_options.df_auxiliary_reduction = df_auxiliary_reduction;
     lambda_options.qualification = qualification;
@@ -418,11 +428,14 @@ static DFCCSDTResult run_df_ccsdt_native_attempt(
     bar_f.assign(nn, 0.0);
     bar_c.resize(nn);
     for (std::size_t i = 0; i < o; ++i) {
-      for (std::size_t j = 0; j < o; ++j) bar_f[i * n + j] = parameters.foo[i * o + j];
-      for (std::size_t a = 0; a < v; ++a) bar_f[i * n + o + a] = parameters.fov[i * v + a];
+      for (std::size_t j = 0; j < o; ++j)
+        bar_f[(frozen + i) * n + (frozen + j)] = parameters.foo[i * o + j];
+      for (std::size_t a = 0; a < v; ++a)
+        bar_f[(frozen + i) * n + o_full + a] = parameters.fov[i * v + a];
     }
     for (std::size_t a = 0; a < v; ++a)
-      for (std::size_t b = 0; b < v; ++b) bar_f[(o + a) * n + o + b] = parameters.fvv[a * v + b];
+      for (std::size_t b = 0; b < v; ++b)
+        bar_f[(o_full + a) * n + o_full + b] = parameters.fvv[a * v + b];
     auto live = checked_add(base, checked_add(parameter_bytes, capacity({&bar_f, &bar_c})));
     const cc::DFFactorResponseView view{p.df_boo,
                                         p.df_bov,
@@ -537,6 +550,21 @@ static DFCCSDTResult run_df_ccsdt_native_attempt(
   if (fingerprints) record_fingerprints(*fingerprints, 25, {bar_c, correlation_gradient});
   factors = {};
   result.source_response_seconds = elapsed(phase);
+  if (demand.focal_triples_sources) {
+    state.df_source = {};
+    state.problem = {};
+    state.solved = {};
+    state.result = {};
+    std::vector<double>().swap(state.eps_o);
+    std::vector<double>().swap(state.eps_v);
+    result.correlation_gradient = std::move(correlation_gradient);
+    result.bar_f = std::move(bar_f);
+    result.bar_c = std::move(bar_c);
+    result.numeric_capacity_bytes = checked_add(result.numeric_capacity_bytes, external_bytes);
+    result.correlation.numeric_capacity_bytes = result.numeric_capacity_bytes;
+    result.total_seconds = elapsed(started);
+    return result;
+  }
   phase = Clock::now();
   if (trace.enabled())
     Trace::label("phase", state.df_reference ? "df_orbital_and_nuclear_response"
@@ -869,12 +897,17 @@ DFCCSDTResult run_df_ccsdt_native(
     bool lambda_resident_krylov, double ccsd_mixed_switch_residual, DFCorrelationDemand demand,
     core::CorrelationConvergence convergence) {
   if (demand.mp2 && with_triples) throw std::invalid_argument("DF-MP2 cannot request CC triples");
-  if (demand.triples_occupied_partition && (forces || !with_triples))
-    throw std::invalid_argument("occupied triples partition requires a DF-RCCSD(T) energy request");
+  if (demand.triples_occupied_partition && !with_triples)
+    throw std::invalid_argument("occupied triples partition requires a DF-RCCSD(T) request");
+  if (!demand.triples_occupied_weights.empty() && (!forces || !with_triples))
+    throw std::invalid_argument("weighted triples pullback requires a DF-RCCSD(T) force request");
+  if (demand.focal_triples_sources && (!forces || !with_triples || !demand.retained_reference))
+    throw std::invalid_argument(
+        "focal triples force sources require a retained RHF DF-RCCSD(T) force demand");
   if (demand.retained_reference &&
-      (forces || !with_triples || demand.mp2 || demand.companions || !demand.df_reference ||
-       reference_experiment))
-    throw std::invalid_argument("retained focal RHF requires an independent triples energy-only demand");
+      ((forces && !demand.focal_triples_sources) || !with_triples || demand.mp2 ||
+       demand.companions || !demand.df_reference || reference_experiment))
+    throw std::invalid_argument("retained focal RHF requires an independent triples demand");
   if (reference_experiment && reference_experiment->reference)
     throw std::invalid_argument("clear the previous experiment reference before reuse");
   // Resolve endpoint policy before passing a positive limit to the solver.
@@ -925,9 +958,13 @@ DFCCSDTResult run_df_correlation_group_native(
   // Strict mixed warmup costs a fresh FP64 iteration/history. Lambda's shared
   // transpose contractions amortize that work earlier than energy-only CCSD.
   // Small strict endpoints retain FP64; explicit Mixed remains an ablation.
+  const int active_electrons =
+      system.electron_count > static_cast<int>(2 * demand.frozen_occupied)
+          ? system.electron_count - static_cast<int>(2 * demand.frozen_occupied)
+          : 0;
   const auto selection = df_retry::select_group_schedule(
-      forces, demand.mp2, molecule::ao_count(system), system.electron_count, preconvergence,
-      convergence, cc::SolverOptions{}.df_mixed_precision_switch_residual,
+      forces, demand.mp2, molecule::ao_count(system) - demand.frozen_occupied, active_electrons,
+      preconvergence, convergence, cc::SolverOptions{}.df_mixed_precision_switch_residual,
       [](std::size_t occupied, std::size_t virtuals) {
         return cc::default_df_ccsd_mixed_precision(occupied, virtuals);
       });

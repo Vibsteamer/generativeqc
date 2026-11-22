@@ -452,14 +452,16 @@ class CudaLambdaActions {
     if (df_) df_->finish_mixed_precision();
   }
 
-  void set_parameter_seeds(std::span<const double> lambda1, std::span<const double> lambda2) {
+  void set_parameter_seeds(std::span<const double> lambda1, std::span<const double> lambda2,
+                           double energy_seed = 1.0) {
     if (df_) {
-      df_->seeds(lambda1, lambda2);
+      df_->seeds(lambda1, lambda2, energy_seed);
       return;
     }
     if (lambda1.size() != layout_.n1 || lambda2.size() != layout_.n2)
       throw std::invalid_argument("RCCSD CUDA parameter-response seed shape mismatch");
-    const double energy_seed = 1.0;
+    if (!std::isfinite(energy_seed))
+      throw std::invalid_argument("RCCSD CUDA parameter-response energy seed must be finite");
     HostTransferFence transfers(stream_);
     cuda_check(cudaMemcpyAsync(state_.bar_correlation_energy, &energy_seed, sizeof(double),
                                cudaMemcpyHostToDevice, stream_));
@@ -762,6 +764,8 @@ LambdaResult solve_impl(const Problem& p, const SolverResult& cc, std::span<cons
     throw std::invalid_argument("nonfinite RCCSD CUDA Lambda primal energy");
 
   const bool with_source = !t1_source.empty() || !t2_source.empty();
+  if (options.energy_source_only && !with_source)
+    throw std::invalid_argument("RCCSD CUDA energy_source_only Lambda requires an energy source");
   AmplitudeLayout validation_layout(p.nocc, p.nvir);
   validation_layout.initialize();
   if (with_source &&
@@ -816,9 +820,11 @@ LambdaResult solve_impl(const Problem& p, const SolverResult& cc, std::span<cons
   primal_replay.finish();
   Trace rhs_trace("cc_lambda_rhs");
   phase_work = work_snapshot();
-  owner.rhs(false, dense_one, dense_two);
-  std::vector<double> rhs(layout.dimension());
-  layout.pack_weighted(dense_one, dense_two, rhs);
+  std::vector<double> rhs(layout.dimension(), 0.0);
+  if (!options.energy_source_only) {
+    owner.rhs(false, dense_one, dense_two);
+    layout.pack_weighted(dense_one, dense_two, rhs);
+  }
 
   std::vector<double> packed_source;
   if (with_source) {
@@ -942,9 +948,11 @@ LambdaResult solve_impl(const Problem& p, const SolverResult& cc, std::span<cons
   owner.transpose(true, seed_one, seed_two, action_one, action_two);
   layout.pack_weighted(action_one, action_two, independent);
 
-  owner.rhs(true, dense_one, dense_two);
-  std::vector<double> independent_rhs(layout.dimension());
-  layout.pack_weighted(dense_one, dense_two, independent_rhs);
+  std::vector<double> independent_rhs(layout.dimension(), 0.0);
+  if (!options.energy_source_only) {
+    owner.rhs(true, dense_one, dense_two);
+    layout.pack_weighted(dense_one, dense_two, independent_rhs);
+  }
   if (!packed_source.empty())
     for (std::size_t index = 0; index < independent_rhs.size(); ++index)
       independent_rhs[index] -= packed_source[index];
@@ -997,7 +1005,8 @@ LambdaResult solve_impl(const Problem& p, const SolverResult& cc, std::span<cons
   result.diagnostic.krylov_d2h_bytes = krylov_d2h;
   result.diagnostic.krylov_synchronizations = krylov_fences;
   if (fixed_orbital) {
-    owner.set_parameter_seeds(result.lambda1, result.lambda2);
+    owner.set_parameter_seeds(result.lambda1, result.lambda2,
+                              options.energy_source_only ? 0.0 : 1.0);
     fixed_orbital->foo =
         owner.parameter("foo", generated::run_parameter_foo_cuda, checked_mul(p.nocc, p.nocc));
     fixed_orbital->fov =

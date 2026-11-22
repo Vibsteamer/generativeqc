@@ -465,10 +465,9 @@ std::unique_ptr<PreparedCalculation> prepare_uccsd_with_reference_fit(
   auto fitting = unrestricted_fitting(descriptor, auxiliary, options.max_bytes);
   if (std::any_of(system.shells.begin(), system.shells.end(),
                   [](const auto& shell) { return shell.angular_momentum == 3; }) &&
-      (!fitting.full_reference || !system.ecp_terms.empty() ||
-       system.basis_representation != core::kSphericalBasis)) {
+      (!fitting.full_reference || system.basis_representation != core::kSphericalBasis)) {
     throw MethodError(GENERATIVEQC_STATUS_NOT_IMPLEMENTED,
-                      "native unrestricted CC f orbitals require an all-electron "
+                      "native unrestricted CC f orbitals require a "
                       "real-spherical full density-fitted reference");
   }
   if (reference_auxiliary) {

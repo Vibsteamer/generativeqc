@@ -39,6 +39,7 @@ class FocalUCCFixedSources:
     cabs_rank: int
     f12_fit_id: str
     feeds: dict[str, np.ndarray]
+    frozen_occupied: tuple[int, int] = (0, 0)
 
 
 @dataclass(frozen=True)
@@ -91,15 +92,15 @@ def molecular_ucc_sources(
 
     from ._f12_focal_one_electron import one_electron_sources
     from ._f12_focal_reference import df_reference
+    from ._f12_frozen_core import resolve_frozen_occupied
 
     if (
         request.role != "mp2_f12_correlation"
         or request.root_id not in ("rhf", "uhf")
         or (request.root_id == "rhf" and request.multiplicity != 1)
-        or request.correlation_space_id != "all-active"
     ):
         raise ValueError(
-            "fixed-cusp UCC sources require an all-active UHF or singlet RHF molecular pair request"
+            "fixed-cusp UCC sources require a UHF or singlet RHF molecular pair request"
         )
     if (
         request.basis.f12_fit is None
@@ -189,10 +190,11 @@ def molecular_ucc_sources(
             raise ValueError(
                 "UCC extended Fock disagrees with the canonical DF reference"
             )
+    frozen = resolve_frozen_occupied(request, (oa, ob))
     feeds = unrestricted_cc_f12_fixed_source_feeds(
-        space, data, fock, corr.whitener, checked
+        space, data, fock, corr.whitener, checked, frozen_occupied=frozen
     )
-    fixed = FocalUCCFixedSources(ref, proj.rank, corr.fit_id, feeds)
+    fixed = FocalUCCFixedSources(ref, proj.rank, corr.fit_id, feeds, frozen)
     if not include_ordinary:
         return fixed
 
@@ -233,6 +235,7 @@ def molecular_ucc_sources(
         fock,
         whitener,
         checked,
+        frozen_occupied=frozen,
         max_output_bytes=(provider.budget_mib << 20)
         - sum(v.nbytes for v in feeds.values()),
         retain_rhf_virtual_factors=factors if ladder is not None else None,

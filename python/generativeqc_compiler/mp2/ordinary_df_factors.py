@@ -13,16 +13,18 @@ from ..tensor import (
 )
 
 
-def ordinary_df_factors(atomic: int, occupied: int, auxiliaries: int) -> Program:
+def ordinary_df_factors(
+    atomic: int, occupied: int, auxiliaries: int, *, frozen: int = 0
+) -> Program:
     """Build W A[C_occ,C_vir] and the full-rank auxiliary metric cotangent.
 
     W M W.T is the identity. With the factor energy cotangent G the symmetric
     metric derivative in an orthonormal fitting gauge is
     -sym(W.T G B.T W)/2. Gauge rotation terms cancel in the spin-pair energy.
     """
-    if not 0 < occupied < atomic or auxiliaries < 1:
+    if not 0 <= frozen < occupied < atomic or auxiliaries < 1:
         raise ValueError(
-            "ordinary DF factors need occupied, virtual and auxiliary orbitals"
+            "ordinary DF factors need valid frozen, occupied, virtual and auxiliary orbitals"
         )
     ao, aux = (
         IndexSpace("ao", "ao", atomic),
@@ -38,7 +40,7 @@ def ordinary_df_factors(atomic: int, occupied: int, auxiliaries: int) -> Program
         "ao_coulomb", TensorSpec((a, u, v), role="input", differentiable=True)
     )
     w = input_tensor("whitener", TensorSpec((a, b), role="input"))
-    co = slice_tensor(c, ((0, atomic), (0, occupied)))
+    co = slice_tensor(c, ((0, atomic), (frozen, occupied)))
     cv = slice_tensor(c, ((0, atomic), (occupied, atomic)))
     # Contract the shorter occupied leg first.
     mo_raw = einsum("Aiv,va->Aia", einsum("ui,Auv->Aiv", co, raw), cv)

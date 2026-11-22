@@ -161,6 +161,8 @@ class MolecularFocalProvider:
     qualified_tplus: Callable[[FocalRequest], bool] | None = None
     relative_cutoff: float = 1e-9
     budget_mib: int = 1536
+    preconvergence: str = "auto"
+    triples_fp32_w: bool = False
     _cuda_cc_target: tuple[str, Path, Callable[[dict], None] | None] | None = field(
         default=None, repr=False, compare=False
     )
@@ -314,6 +316,7 @@ class MolecularFocalProvider:
         from generativeqc_compiler.cc.tplus import evaluate_tplus
 
         from ._f12_focal_tplus_sources import FocalTPlusWeights, checked_occupied_weights
+        from ._f12_frozen_core import active_occupied_counts, resolve_frozen_occupied
 
         _check_request(self, request)
         ref, source = low_order.reference, low_order.occupied_mp2_f12
@@ -332,7 +335,9 @@ class MolecularFocalProvider:
         ):
             raise ValueError("(T+) sources require the same determinant, basis and correlation fit")
         spins = ref._pair_spin_indices(request)
-        counts = tuple(ref.occupied[index] for index in spins)
+        full_counts = tuple(ref.occupied[index] for index in spins)
+        frozen = resolve_frozen_occupied(request, full_counts)
+        counts = active_occupied_counts(full_counts, frozen)
         mp2 = checked_occupied_weights(source.mp2, counts)
         f12 = checked_occupied_weights(source.f12_increment, counts)
         if not np.allclose(
@@ -396,8 +401,8 @@ class MolecularFocalProvider:
 
         The caller supplies the retained low-order energies and occupied MP2-F12
         partitions. The two scalars share the native spatial CC solve and the
-        conventional occupied triples contraction. This component path requires
-        a common JK/correlation fit and does not install an analytic (T+) owner.
+        conventional occupied triples contraction. Supports common or split
+        JK/correlation fits, scalar ECP, frozen-core and mixed preconvergence.
         """
         from ._f12_focal_ucc_triples import molecular_occupied_triples_on_reference
 
@@ -411,11 +416,104 @@ class MolecularFocalProvider:
             raise ValueError("The displaced (T+) CABS rank differs from the center")
         if low_order.occupied_mp2_f12 is None:
             raise ValueError("Restricted (T+) requires the low-order occupied partitions")
+        extra: dict[str, object] = {}
+        if self.preconvergence != "auto":
+            extra["preconvergence"] = self.preconvergence
+        if self.triples_fp32_w:
+            extra["triples_fp32_w"] = self.triples_fp32_w
         conventional, occupied = molecular_occupied_triples_on_reference(
-            request, low_order.reference, budget_mib=self.budget_mib
+            request,
+            low_order.reference,
+            budget_mib=self.budget_mib,
+            **extra,
         )
         scaled = self.tplus_from_occupied(pair_request, low_order, occupied)
         return conventional, FocalTriplesEvaluation(scaled.energy, None, low_order.cabs_rank)
+
+    def restricted_tplus_energy_and_forces_on_reference(
+        self,
+        request: FocalRequest,
+        *,
+        low_order: FocalLowOrderEnergy,
+        expected_cabs_rank: int | None = None,
+        inactive: tuple[bool, ...] | None = None,
+    ) -> tuple[float, FocalTriplesEvaluation, dict[str, float | bool | int]]:
+        """Evaluate conventional (T) energy plus full analytic (T+) energy & 3N forces.
+
+        Uses one spatial CUDA DF-RCCSD + weighted DF-(T) pullback + Delta-Lambda solve
+        for sum_i w_i * d(e_i^(T))/dR, combined with tplus_scaling_forces for
+        sum_i e_i^(T) * dw_i/dR. Supports split-fit, scalar ECP, frozen-core and
+        mixed preconvergence.
+        """
+        from generativeqc_compiler.cc.tplus import evaluate_tplus
+
+        from ._f12_focal_tplus_sources import FocalOccupiedTriples
+        from ._f12_focal_ucc_triples import spatial_rhf_triples_v2
+        from ._f12_frozen_core import active_occupied_counts, resolve_frozen_occupied
+
+        if request.role != "triples_plus" or request.root_id != "rhf":
+            raise ValueError("Restricted (T+) forces require the RHF scaled triples role")
+        if request.backend != "cuda" or self.run is None:
+            raise NotImplementedError("Restricted (T+) forces require the CUDA executor")
+        pair_request = replace(request, role="mp2_f12_correlation")
+        _check_request(self, pair_request)
+        if expected_cabs_rank is not None and expected_cabs_rank != low_order.cabs_rank:
+            raise ValueError("The (T+) CABS rank differs from the center")
+        source = low_order.occupied_mp2_f12
+        if source is None:
+            raise ValueError("Restricted (T+) forces require low-order occupied partitions")
+        ref = low_order.reference
+        o_full = ref.occupied[0]
+        frozen = resolve_frozen_occupied(request, (o_full, o_full))
+        o_act = active_occupied_counts((o_full, o_full), frozen)[0]
+        mp2_spatial = source.mp2[0] + source.mp2[1]
+        f12_spatial = source.f12_increment[0] + source.f12_increment[1]
+        if mp2_spatial.shape != (o_act,) or f12_spatial.shape != (o_act,):
+            raise ValueError("Occupied MP2/F12 partition shape disagrees with active occupied count")
+        # Fixed (T+) weights depend only on occupied MP2 and F12 energies, independent of e_i^(T).
+        weight_probe = evaluate_tplus(
+            mp2_spatial, f12_spatial, np.ones(o_act, dtype=np.float64), inactive=inactive
+        )
+        occ_weights = np.asarray(weight_probe.triples_cotangent, dtype=np.float64)
+
+        spatial_res = spatial_rhf_triples_v2(
+            replace(request, role="triples"),
+            ref,
+            budget_mib=self.budget_mib,
+            forces=True,
+            occupied_partition=True,
+            occupied_weights=occ_weights,
+            preconvergence=self.preconvergence,
+            triples_fp32_w=self.triples_fp32_w,
+            provider=self,
+        )
+        assert spatial_res.occupied is not None and spatial_res.forces is not None
+        assert request.basis.mp2_fit is not None
+        occupied_obj = FocalOccupiedTriples(
+            ref, request.correlation_space_id, request.basis.mp2_fit.identity, spatial_res.occupied
+        )
+        scaled = self.tplus_from_occupied(
+            pair_request, low_order, occupied_obj, inactive=inactive
+        )
+        if abs(scaled.energy - spatial_res.energy) > 1e-10 * (1.0 + abs(scaled.energy)):
+            raise RuntimeError(
+                f"Weighted spatial (T+) energy {spatial_res.energy} disagrees with "
+                f"occupied partition sum {scaled.energy}"
+            )
+        scaling_forces = self.tplus_scaling_forces(
+            pair_request,
+            ref,
+            scaled.mp2,
+            scaled.f12_increment,
+            expected_cabs_rank=low_order.cabs_rank,
+        )
+        total_forces = spatial_res.forces + scaling_forces
+        conventional_energy = float(np.sum(spatial_res.occupied))
+        return (
+            conventional_energy,
+            FocalTriplesEvaluation(scaled.energy, total_forces, low_order.cabs_rank),
+            spatial_res.telemetry,
+        )
 
     def low_order_energy_and_forces(
         self, request: FocalRequest, *, include_hf_cabs: bool = True
@@ -645,11 +743,18 @@ class MolecularFocalProvider:
         """Conventional triples on the supplied canonical determinant in Eh."""
         from ._f12_focal_ucc_triples import molecular_triples_on_reference
 
+        extra: dict[str, object] = {}
+        if self.preconvergence != "auto":
+            extra["preconvergence"] = self.preconvergence
+        if self.triples_fp32_w:
+            extra["triples_fp32_w"] = self.triples_fp32_w
         return molecular_triples_on_reference(
             request,
             reference,
             budget_mib=self.budget_mib,
             forces=False,
+            provider=self,
+            **extra,
         )[0]
 
     def triples_energy_and_forces(
@@ -661,11 +766,18 @@ class MolecularFocalProvider:
         """Conventional triples and its analytic Cartesian forces on a shared root."""
         from ._f12_focal_ucc_triples import molecular_triples_on_reference
 
+        extra: dict[str, object] = {}
+        if self.preconvergence != "auto":
+            extra["preconvergence"] = self.preconvergence
+        if self.triples_fp32_w:
+            extra["triples_fp32_w"] = self.triples_fp32_w
         energy, forces = molecular_triples_on_reference(
             request,
             reference,
             budget_mib=self.budget_mib,
             forces=True,
+            provider=self,
+            **extra,
         )
         assert forces is not None
         return energy, forces
@@ -861,13 +973,12 @@ class MolecularFocalProvider:
         if pair and (
             request.root_id not in ("rhf", "uhf")
             or (request.root_id == "rhf" and request.multiplicity != 1)
-            or request.correlation_space_id != "all-active"
             or request.basis.mp2_fit is None
             or request.basis.f12_fit is None
             or request.basis.beta is None
         ):
             raise ValueError(
-                "The pair term requires all-active UHF or singlet RHF, MP2Fit, F12Fit and beta"
+                "The pair term requires UHF or singlet RHF, MP2Fit, F12Fit and beta"
             )
         solution = None
         calculation = request

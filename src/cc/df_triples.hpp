@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -180,7 +181,8 @@ DFCudaCombinedResponseResult pullback_and_fock_df_cuda(
     int device, std::size_t caller_bytes = 0, std::size_t max_page_rows = 0,
     std::size_t max_panel_buffers = 3, bool parallel_gap_reduction = true,
     bool include_gap_response = true, bool fused_scalar_response = false,
-    generativeqc::runtime::PrecisionDirective admitted_w = {});
+    generativeqc::runtime::PrecisionDirective admitted_w = {},
+    std::span<const double> occupied_weights = {}, bool occupied_partition = false);
 #endif
 
 }  // namespace generativeqc::cc::triples

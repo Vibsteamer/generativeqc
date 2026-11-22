@@ -86,6 +86,7 @@ def reference_f12_increment(
     from generativeqc_compiler.tensor import execute
 
     from ._f12_focal_frame import canonical_pair_frame
+    from ._f12_frozen_core import resolve_frozen_occupied
     from ._f12_unrestricted import unrestricted_mp2_f12_ao_response
     from .elements import checked_integer
 
@@ -93,12 +94,11 @@ def reference_f12_increment(
     if (
         request.role != "mp2_f12_correlation"
         or request.root_id not in ("rhf", "uhf")
-        or request.correlation_space_id != "all-active"
         or request.backend not in ("cuda", "cpu_reference")
         or (cuda and run is None)
     ):
         raise ValueError(
-            "selected F12 requires a canonical all-active RHF or UHF pair request with its backend runner"
+            "selected F12 requires a canonical RHF or UHF pair request with its backend runner"
         )
     budget = checked_integer(
         budget_mib, "F12 increment budget in MiB", low=1, high=(2**63 - 1) >> 20
@@ -125,9 +125,25 @@ def reference_f12_increment(
         relative_cutoff=relative_cutoff,
         library=library,
     )
+    frozen = resolve_frozen_occupied(request, (space[0], space[1]))
+    f12_weights_full = None
+    if occupied_weights is not None:
+        fa, fb = frozen
+        oa, ob = space[0], space[1]
+        if fa or fb:
+            wa, wb = occupied_weights
+            if len(wa) == oa - fa and len(wb) == ob - fb:
+                f12_weights_full = (
+                    np.concatenate((np.zeros(fa), wa)),
+                    np.concatenate((np.zeros(fb), wb)),
+                )
+            else:
+                f12_weights_full = occupied_weights
+        else:
+            f12_weights_full = occupied_weights
     terms, bars = unrestricted_mp2_f12_ao_response(
-        space, ao, checked, jkfit=panel, component="f12",
-        occupied_f12_weights=occupied_weights,
+        space, ao, checked, frozen_occupied=frozen, jkfit=panel, component="f12",
+        occupied_f12_weights=f12_weights_full,
     )
     weights = relaxed_f12_source_weights(
         request,

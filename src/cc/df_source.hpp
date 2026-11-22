@@ -69,7 +69,8 @@ DFSourceResult build_df_source_cuda(const core::System& orbital, const core::Sys
                                     bool retain_response_state = false,
                                     const scf::cuda_execution::CudaDfSourcePolicy* policy = nullptr,
                                     bool factors_only = false,
-                                    std::shared_ptr<hf::DFReference> shared_reference = {});
+                                    std::shared_ptr<hf::DFReference> shared_reference = {},
+                                    std::size_t frozen_occupied = 0);
 
 /** Borrowed physical factors and fixed-orbital Lagrangian cotangents.
  * All factors are Q-major. Boo/Bvv must be symmetric spatial-orbital pairs.

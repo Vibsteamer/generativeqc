@@ -49,6 +49,21 @@ GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_occupied_v1(
     generativeqc_calculation* calculation, const generativeqc_focal_reference* owner,
     double* output, size_t count);
 
+/** Extended spatial DF-RCCSD(T) / (T+) focal entry on the retained canonical RHF root.
+ * Supports split JK/correlation fits, scalar ECP, optional frozen_occupied orbitals,
+ * optional per-active-occupied weights for exact (T+) analytic force sources,
+ * preconvergence (0=Legacy/FP64, 1=FP64, 2=Mixed, 3=Automatic), and optional FP32 forward-W.
+ * When forces != 0, writes pure triples-increment (corr_gradient, bar_f, bar_c) for focal CPHF.
+ * Optional telemetry_out (count >= 8) receives [ccsd_fp32, lambda_fp32, t_fp32_gemms,
+ * t_fp64_gemms, ccsd_s, triples_s, lambda_s, source_response_s]. */
+GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_v2(
+    generativeqc_calculation* calculation, const generativeqc_focal_reference* owner, int forces,
+    int occupied_partition, size_t frozen_occupied, const double* occupied_weights,
+    size_t weights_count, uint32_t preconvergence, int triples_fp32_w, double* energy_out,
+    double* occupied_out, size_t occupied_count, double* corr_gradient_out,
+    size_t corr_gradient_count, double* bar_f_out, size_t bar_f_count, double* bar_c_out,
+    size_t bar_c_count, double* telemetry_out, size_t telemetry_count);
+
 #ifdef __cplusplus
 }
 #endif

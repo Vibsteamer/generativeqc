@@ -994,16 +994,18 @@ std::pair<const double*, const double*> DFLambdaActions::transpose_device(bool i
   return {s.sum1, s.sum2};
 }
 
-void DFLambdaActions::seeds(std::span<const double> one, std::span<const double> two) {
+void DFLambdaActions::seeds(std::span<const double> one, std::span<const double> two,
+                            double energy_weight) {
   auto& s = *impl_;
   if (s.mixed_active)
     throw std::logic_error("DF Lambda parameter seeds require a finished FP32 epoch");
-  const double energy = 1;
+  if (!std::isfinite(energy_weight))
+    throw std::invalid_argument("DF Lambda parameter energy weight must be finite");
   Fence fence{s.storage.stream};
   if (!s.parameters_admitted || one.size() != s.n1 || two.size() != s.n2)
     throw std::invalid_argument("DF parameter response not admitted or seed shape mismatch");
   s.clear_error();
-  s.upload(s.state.bar_correlation_energy, &energy, 1);
+  s.upload(s.state.bar_correlation_energy, &energy_weight, 1);
   s.upload(s.state.bar_singles_residual, one.data(), s.n1);
   s.upload(s.state.bar_doubles_residual, two.data(), s.n2);
   s.finish();

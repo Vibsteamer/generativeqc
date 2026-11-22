@@ -83,6 +83,33 @@ __global__ void audit_source_response(const double* values, std::size_t count, i
        i += std::size_t(gridDim.x) * blockDim.x)
     if (!isfinite(values[i])) atomicExch(error, 1);
 }
+
+__global__ void slice_active_bmo_kernel(const double* full_bmo, double* active_bmo, std::size_t n,
+                                        std::size_t n_act, std::size_t frozen, std::size_t q) {
+  const std::size_t total = n_act * n_act * q;
+  for (std::size_t flat = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x; flat < total;
+       flat += std::size_t(gridDim.x) * blockDim.x) {
+    const std::size_t aux = flat % q;
+    const std::size_t rem = flat / q;
+    const std::size_t col = rem % n_act;
+    const std::size_t row = rem / n_act;
+    active_bmo[flat] = full_bmo[((row + frozen) * n + (col + frozen)) * q + aux];
+  }
+}
+
+__global__ void embed_active_bmo_kernel(const double* active_bar_bmo, double* full_bar_bmo,
+                                        std::size_t n, std::size_t n_act, std::size_t frozen,
+                                        std::size_t q) {
+  const std::size_t total = n_act * n_act * q;
+  for (std::size_t flat = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x; flat < total;
+       flat += std::size_t(gridDim.x) * blockDim.x) {
+    const std::size_t aux = flat % q;
+    const std::size_t rem = flat / q;
+    const std::size_t col = rem % n_act;
+    const std::size_t row = rem / n_act;
+    full_bar_bmo[((row + frozen) * n + (col + frozen)) * q + aux] = active_bar_bmo[flat];
+  }
+}
 }  // namespace
 
 // Private immutable numerical frame. Declaration order ensures coefficients
@@ -93,7 +120,7 @@ class DFSourceState {
   std::unique_ptr<scf::CudaDensityFittingJkPlan, PlanDelete> owned_plan;
   scf::CudaDensityFittingJkPlan* plan{};  // Borrowed from one of the preceding owners.
   runtime::OwnedCudaBuffer<double> coefficients;
-  std::size_t nocc{}, numeric_bytes{};
+  std::size_t nocc{}, frozen_occupied{}, numeric_bytes{};
   std::mutex response_mutex;
 };
 
@@ -103,24 +130,29 @@ DFSourceResult build_df_source_cuda(const core::System& orbital, const core::Sys
                                     bool retain_response_state,
                                     const scf::cuda_execution::CudaDfSourcePolicy* policy,
                                     bool factors_only,
-                                    std::shared_ptr<hf::DFReference> shared_reference) {
+                                    std::shared_ptr<hf::DFReference> shared_reference,
+                                    std::size_t frozen_occupied) {
   runtime::df_progress::Scope trace("df_correlation_source");
   runtime::df_progress::Scope::number("factors_only", factors_only ? 1 : 0);
   const auto started = Clock::now();
-  const auto n = ref.nbf, o = ref.nocc, q = molecule::ao_count(auxiliary);
+  const auto n = ref.nbf, o_full = ref.nocc, q = molecule::ao_count(auxiliary);
   phase_observation::Scope observed_source(phase_observation::Site::source_inclusive, n, q);
-  if (!n || !o || o >= n || !q || molecule::ao_count(orbital) != n || device < 0 || !budget ||
+  if (!n || !o_full || o_full >= n || frozen_occupied >= o_full || !q ||
+      molecule::ao_count(orbital) != n || device < 0 || !budget ||
       !std::isfinite(relative_threshold) || relative_threshold <= 0 || relative_threshold >= 1 ||
       ref.coefficients.size() != checked_mul(n, n) ||
       !std::all_of(
           ref.coefficients.begin(), ref.coefficients.end(),
           [](double x) { return std::isfinite(x); }))
     throw std::invalid_argument("invalid native CUDA DF-CC source request");
-  const auto v = n - o;
+  const auto o = o_full - frozen_occupied;
+  const auto v = n - o_full;
+  const auto n_act = o + v;
+  const auto full_layout = generated::df_source::source_layout(o_full, v, q, true);
   const auto layout = generated::df_source::source_layout(o, v, q, factors_only);
   // Every packed BLAS dimension is checked before any source is generated.
   const auto int_limit = static_cast<std::size_t>(std::numeric_limits<int>::max());
-  if (std::max({n, q, layout.row_values, layout.matrix_values}) > int_limit)
+  if (std::max({n, q, full_layout.row_values, full_layout.matrix_values}) > int_limit)
     throw std::length_error("native CUDA DF-CC source exceeds BLAS indexing");
   const auto work = posthf::generated::df_mo_source_work(n, q);
   auto external = checked_add(caller_bytes, posthf::source_capacity(orbital));
@@ -128,10 +160,15 @@ DFSourceResult build_df_source_cuda(const core::System& orbital, const core::Sys
   for (const auto* values : {&ref.overlap, &ref.hcore, &ref.fock, &ref.coefficients,
                              &ref.orbital_energies, &ref.density, &ref.weighted_density})
     external = checked_add(external, bytes(values->capacity()));
-  const auto retained_c_bytes = retain_response_state ? bytes(layout.matrix_values) : 0;
+  const auto retained_c_bytes = retain_response_state ? bytes(full_layout.matrix_values) : 0;
+  const auto slice_bytes =
+      frozen_occupied ? checked_add(bytes(full_layout.source_values), bytes(layout.source_values))
+                      : 0;
   const auto packing_bytes = checked_add(layout.packing_bytes, retained_c_bytes);
   const auto blocks_bytes = checked_add(layout.blocks_bytes, retained_c_bytes);
-  const auto execution_payload = std::max({layout.transform_bytes, packing_bytes, blocks_bytes});
+  const auto execution_payload =
+      std::max({full_layout.transform_bytes, checked_add(slice_bytes, retained_c_bytes),
+                packing_bytes, blocks_bytes});
   admit(checked_add(external, execution_payload), budget);
   runtime::CudaDeviceScope device_scope(device);
   DFSourceResult result;
@@ -176,7 +213,8 @@ DFSourceResult build_df_source_cuda(const core::System& orbital, const core::Sys
     result.metric_condition_number = retained_diagnostic.condition_number;
     result.numeric_capacity_bytes = checked_add(external, execution_payload);
     result.device_capacity_bytes =
-        std::max({layout.transform_bytes, packing_bytes, blocks_bytes - result.host_output_bytes});
+        std::max({full_layout.transform_bytes, checked_add(slice_bytes, retained_c_bytes),
+                  packing_bytes, blocks_bytes - result.host_output_bytes});
     admit(result.numeric_capacity_bytes, budget);
     result.source_seconds = elapsed(stage);
   } else {
@@ -250,7 +288,8 @@ DFSourceResult build_df_source_cuda(const core::System& orbital, const core::Sys
     result.numeric_capacity_bytes =
         std::max({construction_peak, source_peak, setup_bound, execution_peak});
     const auto device_payload =
-        std::max({layout.transform_bytes, packing_bytes, blocks_bytes - result.host_output_bytes});
+        std::max({full_layout.transform_bytes, checked_add(slice_bytes, retained_c_bytes),
+                  packing_bytes, blocks_bytes - result.host_output_bytes});
     result.device_capacity_bytes =
         std::max({construction.device_bytes, source_device, diag.peak_device_bytes,
                   checked_add(diag.device_resident_bytes, device_payload)});
@@ -271,7 +310,7 @@ DFSourceResult build_df_source_cuda(const core::System& orbital, const core::Sys
   // Buffers are declared after the metric owner: all stream-dependent storage
   // drains and dies before its source/BLAS/stream owner, including exceptions.
   runtime::OwnedCudaBuffer<double> retained_coefficients;
-  runtime::OwnedCudaBuffer<double> bmo(device, layout.source_values, stream);
+  runtime::OwnedCudaBuffer<double> bmo(device, full_layout.source_values, stream);
   auto gemm = [&](char ta, char tb, std::size_t m, std::size_t columns, std::size_t k,
                   const double* a, const double* b, double* output) {
     // The compiler callback uses column-major operands. View the same bytes as
@@ -286,14 +325,14 @@ DFSourceResult build_df_source_cuda(const core::System& orbital, const core::Sys
   };
   stage = Clock::now();
   {
-    runtime::OwnedCudaBuffer<double> transformed(device, layout.source_values, stream);
-    runtime::OwnedCudaBuffer<double> coefficients(device, layout.matrix_values, stream);
-    runtime::OwnedCudaBuffer<double> row(device, layout.row_values, stream);
-    runtime::OwnedCudaBuffer<double> row_low(device, layout.row_values, stream);
+    runtime::OwnedCudaBuffer<double> transformed(device, full_layout.source_values, stream);
+    runtime::OwnedCudaBuffer<double> coefficients(device, full_layout.matrix_values, stream);
+    runtime::OwnedCudaBuffer<double> row(device, full_layout.row_values, stream);
+    runtime::OwnedCudaBuffer<double> row_low(device, full_layout.row_values, stream);
     runtime::cuda_resource_check(cudaMemcpyAsync(coefficients.get(), ref.coefficients.data(),
-                                                 bytes(layout.matrix_values),
+                                                 bytes(full_layout.matrix_values),
                                                  cudaMemcpyHostToDevice, stream));
-    result.coefficient_h2d_bytes = bytes(layout.matrix_values);
+    result.coefficient_h2d_bytes = bytes(full_layout.matrix_values);
     posthf::generated::transform_df_mo_source(
         n, q, coefficients.get(), plan.inverse_square_roots, bmo.get(), transformed.get(),
         [&](std::size_t mu) {
@@ -333,11 +372,21 @@ DFSourceResult build_df_source_cuda(const core::System& orbital, const core::Sys
     }
     if (retain_response_state) retained_coefficients = std::move(coefficients);
   }
-  result.source_values = checked_mul(result.source_rows, layout.row_values);
+  result.source_values = checked_mul(result.source_rows, full_layout.row_values);
   if (result.source_values != work.raw_values || result.transform_gemms != work.gemms ||
       result.transform_summands != work.contraction_summands)
     throw std::logic_error("native DF source execution differs from compiler work");
   result.transform_seconds = elapsed(stage);
+
+  if (frozen_occupied > 0) {
+    runtime::OwnedCudaBuffer<double> active_bmo(device, layout.source_values, stream);
+    const auto blocks =
+        static_cast<unsigned>(std::min<std::size_t>((layout.source_values + 255) / 256, 65535));
+    slice_active_bmo_kernel<<<blocks, 256, 0, stream>>>(bmo.get(), active_bmo.get(), n, n_act,
+                                                        frozen_occupied, q);
+    runtime::cuda_resource_check(cudaGetLastError());
+    bmo = std::move(active_bmo);
+  }
 
   stage = Clock::now();
   runtime::OwnedCudaBuffer<double> arena(device, layout.packing_values, stream);
@@ -409,6 +458,7 @@ DFSourceResult build_df_source_cuda(const core::System& orbital, const core::Sys
         retained_c_bytes);
     auto state = std::make_shared<DFSourceState>();
     state->nocc = o;
+    state->frozen_occupied = frozen_occupied;
     state->numeric_bytes = result.retained_source_bytes;
     state->plan = selected;
     state->owned_plan = std::move(owner);
@@ -645,7 +695,11 @@ DFSourceResponseDiagnostic pullback_df_source_cuda(std::shared_ptr<DFSourceState
   if (plan.metric_response_valid.size() != 1 || !plan.metric_response_valid[0])
     throw std::runtime_error(
         "DF metric rank crossing: retained/discarded subspaces are unresolved");
-  const auto n = plan.nbf, q = plan.naux, o = source->nocc, v = n - o;
+  const auto n = plan.nbf, q = plan.naux, o = source->nocc, frozen = source->frozen_occupied;
+  if (checked_add(o, frozen) >= n)
+    throw std::invalid_argument("DF source response frozen/occupied dimensions exceed AO count");
+  const auto v = n - o - frozen;
+  const auto n_act = o + v;
   const auto nn = checked_mul(n, n), qq = checked_mul(q, q), full = checked_mul(nn, q);
   const std::array<std::size_t, 3> sizes{checked_mul(q, checked_mul(o, o)),
                                          checked_mul(q, checked_mul(o, v)),
@@ -661,12 +715,14 @@ DFSourceResponseDiagnostic pullback_df_source_cuda(std::shared_ptr<DFSourceState
   }
   namespace gen = generated::df_source;
   const auto arena = gen::embedding_arena_elements(o, v, q);
+  const auto extra_full_bmo = frozen ? full : 0;
   const auto spectral = checked_mul(3, qq);
   const auto work = posthf::generated::df_mo_source_response_work(n, q);
   const auto transform_owned =
       checked_add(bytes(checked_add(work.scratch_values, checked_add(nn, qq))), sizeof(int));
-  const auto wrapper_owned =
-      checked_add(bytes(checked_add(seed_values, checked_add(arena, spectral))), sizeof(int));
+  const auto wrapper_owned = checked_add(
+      bytes(checked_add(seed_values, checked_add(arena, checked_add(extra_full_bmo, spectral)))),
+      sizeof(int));
   DFSourceResponseDiagnostic result;
   result.retained_source_bytes = source->numeric_bytes;
   result.h2d_bytes = bytes(seed_values);
@@ -692,7 +748,8 @@ DFSourceResponseDiagnostic pullback_df_source_cuda(std::shared_ptr<DFSourceState
   const auto stream = plan.stream;
   int failed = 0;
   runtime::OwnedCudaBuffer<double> storage(
-      plan.device_id, checked_add(seed_values, checked_add(arena, spectral)), stream);
+      plan.device_id,
+      checked_add(seed_values, checked_add(arena, checked_add(extra_full_bmo, spectral))), stream);
   runtime::OwnedCudaBuffer<int> error(plan.device_id, 1, stream);
   gen::EmbeddingCudaState state;
   state.o = o;
@@ -710,11 +767,23 @@ DFSourceResponseDiagnostic pullback_df_source_cuda(std::shared_ptr<DFSourceState
     cursor = checked_add(cursor, sizes[i]);
   }
   const auto embedded = gen::embed_cuda(state);
-  auto* scratch0 = state.response_arena + arena;
+  const double* full_bar_bmo_ptr = embedded.bar_bmo;
+  if (frozen > 0) {
+    double* full_bar_bmo = state.response_arena + arena;
+    runtime::cuda_resource_check(cudaMemsetAsync(full_bar_bmo, 0, bytes(full), stream));
+    const auto active_total = checked_mul(checked_mul(n_act, n_act), q);
+    const auto blocks =
+        static_cast<unsigned>(std::min<std::size_t>((active_total + 255) / 256, 65535));
+    embed_active_bmo_kernel<<<blocks, 256, 0, stream>>>(embedded.bar_bmo, full_bar_bmo, n, n_act,
+                                                        frozen, q);
+    runtime::cuda_resource_check(cudaGetLastError());
+    full_bar_bmo_ptr = full_bar_bmo;
+  }
+  auto* scratch0 = state.response_arena + arena + extra_full_bmo;
   auto* scratch1 = scratch0 + qq;
   auto* bar_metric = scratch1 + qq;
   result.transform = posthf::pullback_df_mo_source_cuda(
-      {n, q, source->coefficients.get(), plan.inverse_square_roots, embedded.bar_bmo},
+      {n, q, source->coefficients.get(), plan.inverse_square_roots, full_bar_bmo_ptr},
       plan.device_id, stream,
       [&](std::size_t mu, double* row, cudaStream_t source_stream) {
         std::string detail;

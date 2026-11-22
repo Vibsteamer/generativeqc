@@ -71,6 +71,7 @@ def reference_df_ump2(
         checked_occupied_weights,
         occupied_pair_energy_seed,
     )
+    from ._f12_frozen_core import active_occupied_counts, resolve_frozen_occupied
     from ._f12_spin_ao import _orbital_sources
     from ._f12_spin_fock import spin_fock, spin_fock_pullback
     from .elements import checked_integer
@@ -83,10 +84,9 @@ def reference_df_ump2(
     if (
         request.role != "mp2_f12_correlation"
         or request.root_id not in ("rhf", "uhf")
-        or request.correlation_space_id != "all-active"
     ):
         raise ValueError(
-            "ordinary focal DF-UMP2 requires an all-active RHF or UHF pair request"
+            "ordinary focal DF-UMP2 requires an RHF or UHF pair request"
         )
     if (
         reference.executed_backend,
@@ -109,8 +109,10 @@ def reference_df_ump2(
     occs = tuple(reference.occupied[k] for k in spin_indices)
     if len(occs) != 2 or any(not 0 <= o < n for o in occs) or not any(occs):
         raise ValueError("invalid HF occupations")
+    frozen = resolve_frozen_occupied(request, occs)
+    active_occs = active_occupied_counts(occs, frozen)
     if occupied_weights is not None:
-        checked_occupied_weights(occupied_weights, occs)
+        checked_occupied_weights(occupied_weights, active_occs)
     for source, fit in ((jk, request.basis.jk_fit), (mp2, request.basis.mp2_fit)):
         if fit is None or (
             source.executed_backend,
@@ -157,10 +159,11 @@ def reference_df_ump2(
     spins = ("alpha", "beta")
     q = len(mp2.metric)
     controls, seeds, graphs = {}, {}, {}
-    for k, (spin, o) in enumerate(zip(spins, occs, strict=True)):
-        if not o:
+    for k, (spin, o, f) in enumerate(zip(spins, occs, frozen, strict=True)):
+        o_act = o - f
+        if not o_act:
             continue
-        graph = ordinary_df_factors(n, o, q)
+        graph = ordinary_df_factors(n, o, q, frozen=f)
         inputs = {
             "coefficients": reference.coefficients[spin_indices[k]],
             "ao_coulomb": mp2.three_center,
@@ -170,20 +173,21 @@ def reference_df_ump2(
         graphs[spin] = (forward, graph, inputs)
         b = checked(forward, inputs).outputs["B"]
         eps = reference.orbital_energies[spin_indices[k]]
-        controls[spin] = {"B_" + spin: b, "eo_" + spin: eps[:o], "ev_" + spin: eps[o:]}
+        controls[spin] = {"B_" + spin: b, "eo_" + spin: eps[f:o], "ev_" + spin: eps[o:]}
         seeds[spin] = np.zeros_like(b)
     fock_seeds = {"fock_" + spin: np.zeros((n, n)) for spin in spins}
     energies = []
     for il, ir in ((0, 0), (0, 1), (1, 1)):
         left, right = spins[il], spins[ir]
+        ol_act, or_act = active_occs[il], active_occs[ir]
         ol, orr = occs[il], occs[ir]
-        if not ol or not orr or (il == ir and ol == 1):
+        if not ol_act or not or_act or (il == ir and ol_act == 1):
             energies.append(0.0)
             continue
         pair_inputs = {**controls[left], **controls[right]}
         if occupied_weights is None:
             graph = df_ump2_pair_response(
-                left + "_" + right, q, ol, n - ol, orr, n - orr, 1, source_weights=True
+                left + "_" + right, q, ol_act, n - ol, or_act, n - orr, 1, source_weights=True
             )
             result = checked(
                 graph, {**pair_inputs, "bar_force": np.array([-1.0])}
@@ -191,7 +195,7 @@ def reference_df_ump2(
             energies.append(float(result["energy"]))
         else:
             graph = df_ump2_pair_response(
-                left + "_" + right, q, ol, n - ol, orr, n - orr, 1, occupied_partition=True
+                left + "_" + right, q, ol_act, n - ol, or_act, n - orr, 1, occupied_partition=True
             )
             reverse = transpose_program(graph, ("pair_energies",)).program
             seed = occupied_pair_energy_seed(occupied_weights[il], occupied_weights[ir])
@@ -201,15 +205,16 @@ def reference_df_ump2(
             ).outputs
             energies.append(float(np.vdot(seed, result["pair_energies"])))
         for k in sorted({il, ir}):
-            spin, o = spins[k], occs[k]
+            spin, o, f = spins[k], occs[k], frozen[k]
             seeds[spin] += result["bar_B_" + spin]
             if occupied_weights is None:
-                fock_seeds["fock_" + spin][:o, :o] += result["bar_Fo_" + spin]
+                fock_seeds["fock_" + spin][f:o, f:o] += result["bar_Fo_" + spin]
                 fock_seeds["fock_" + spin][o:, o:] += result["bar_Fv_" + spin]
             else:
-                fock_seeds["fock_" + spin] += np.diag(
-                    np.concatenate((result["bar_eo_" + spin], result["bar_ev_" + spin]))
-                )
+                diag_vec = np.zeros(n)
+                diag_vec[f:o] = result["bar_eo_" + spin]
+                diag_vec[o:] = result["bar_ev_" + spin]
+                fock_seeds["fock_" + spin] += np.diag(diag_vec)
 
     mp2_raw_bar = np.zeros_like(mp2.three_center)
     mp2_metric_bar = np.zeros_like(mp2.metric)
@@ -254,7 +259,25 @@ def reference_df_ump2(
             atol=2e-8,
         ):
             raise ValueError("JKFit does not reproduce the canonical physical HF Fock")
-    if occupied_weights is not None:
+    def fock_pullback(seeds_map: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        fseed = spin_fock_pullback(fspace, values, seeds_map, checked)
+        _, fbars = _orbital_sources(
+            space,
+            ao,
+            checked,
+            {"source/" + k: v for k, v in fseed.items()},
+            projected=projected,
+            role="ordinary_fock",
+        )
+        assert fbars is not None
+        return fbars
+
+    direct_bars = fock_pullback(fock_seeds)
+    restricted = len(reference.occupied) == 1
+    for k, spin in enumerate(spins):
+        idx = spin_indices[k]
+        direct_bars["coefficients_" + spin] += cbar[idx] * (0.5 if restricted else 1.0)
+    if occupied_weights is not None or any(frozen):
         from generativeqc_compiler.method.canonical_frame_response import (
             orbital_rotation_cotangent,
         )
@@ -262,40 +285,36 @@ def reference_df_ump2(
         from ._canonical_frame import canonical_frame_seed
         from ._f12_focal_increment import _canonical_occupied_virtual_blocks
 
-        restricted = len(reference.occupied) == 1
+        canonical_seeds: dict[str, np.ndarray] = {}
         for k, spin in enumerate(spins):
             idx = spin_indices[k]
-            bar = cbar[idx] * (0.5 if restricted else 1.0)
             rotation = checked(
                 orbital_rotation_cotangent(n, n),
-                {"coefficients": reference.coefficients[idx], "frame_bar": bar},
+                {
+                    "coefficients": reference.coefficients[idx],
+                    "frame_bar": direct_bars["coefficients_" + spin],
+                },
             ).outputs["rotation_gradient"]
             eps, occupied = reference.orbital_energies[idx], occs[k]
-            canonical = (
+            canonical_seeds["fock_" + spin] = (
                 canonical_frame_seed(
                     rotation, eps, occupied, maximum_bytes=budget << 20, library=canonical_library
                 )[0]
                 if cuda
                 else _canonical_occupied_virtual_blocks(rotation, eps, occupied)
             )
-            fock_seeds["fock_" + spin] += canonical
-    fseed = spin_fock_pullback(fspace, values, fock_seeds, checked)
-    _, bars = _orbital_sources(
-        space,
-        ao,
-        checked,
-        {"source/" + k: v for k, v in fseed.items()},
-        projected=projected,
-        role="ordinary_fock",
-    )
-    assert bars is not None
+        canonical_bars = fock_pullback(canonical_seeds)
+        for key in direct_bars:
+            direct_bars[key] += canonical_bars[key]
+
+    total_cbar = np.zeros_like(reference.coefficients)
     for k, spin in enumerate(spins):
-        cbar[spin_indices[k]] += bars["coefficients_" + spin]
+        total_cbar[spin_indices[k]] += direct_bars["coefficients_" + spin]
     direct = {
-        "hcore": bars["hcore_ao"],
-        "three_center": bars["ao_coulomb"],
-        "metric": bars["metric/coulomb"],
-        "obs_coefficients": cbar,
+        "hcore": direct_bars["hcore_ao"],
+        "three_center": direct_bars["ao_coulomb"],
+        "metric": direct_bars["metric/coulomb"],
+        "obs_coefficients": total_cbar,
     }
     weights = relaxed_reference_weights(
         reference,

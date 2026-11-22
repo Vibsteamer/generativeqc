@@ -39,17 +39,17 @@ def fixed_ucc_source_forces(
     from ._f12_focal_frame import canonical_pair_frame
     from ._f12_focal_increment import relaxed_f12_source_weights
     from ._f12_focal_one_electron import one_electron_sources
+    from ._f12_frozen_core import resolve_frozen_occupied
 
     ref = sources.fixed.reference
     basis = request.basis
     if (
         request.role != "mp2_f12_correlation"
-        or request.correlation_space_id != "all-active"
         or basis.f12_fit is None
         or basis.mp2_fit is None
     ):
         raise ValueError(
-            "Fixed CC forces require all-active molecular equation sources"
+            "Fixed CC forces require molecular equation sources"
         )
     if (
         request.surface_id,
@@ -70,8 +70,12 @@ def fixed_ucc_source_forces(
             "Fixed UCC weights and molecular request must share the reference surface and all fitting roles"
         )
     oa, ob = (ref.occupied[i] for i in ref._pair_spin_indices(request))
+    frozen = resolve_frozen_occupied(request, (oa, ob))
+    if frozen != sources.fixed.frozen_occupied:
+        raise ValueError("Fixed UCC force frozen-core mismatch with stationary sources")
+    fa, fb = frozen
     n = ref.coefficients.shape[-1]
-    cc = build_f12_program(UCCSDLayout(oa, ob, n - oa, n - ob))
+    cc = build_f12_program(UCCSDLayout(oa - fa, ob - fb, n - oa, n - ob))
     required = {
         node.attrs["name"]
         for node in cc.live_nodes
@@ -145,6 +149,7 @@ def fixed_ucc_source_forces(
         ao,
         fixed_weights["fixed_geminal_energy"],
         checked,
+        frozen_occupied=frozen,
         jkfit=panel,
         fock_response=fock,
     )
@@ -153,11 +158,11 @@ def fixed_ucc_source_forces(
         raise ValueError("The molecular V+B-X energy differs from the fixed UCC state")
     bars = scalar.weights
     for prefix, pullback, kwargs in (
-        ("w_", unrestricted_cc_w_ao_weights, {}),
+        ("w_", unrestricted_cc_w_ao_weights, {"frozen_occupied": frozen}),
         (
             "c_f12_",
             unrestricted_cc_c_ao_weights,
-            {"jkfit": panel, "fock_response": fock},
+            {"frozen_occupied": frozen, "jkfit": panel, "fock_response": fock},
         ),
     ):
         selected = {k: v for k, v in fixed_weights.items() if k.startswith(prefix)}

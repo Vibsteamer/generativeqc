@@ -35,6 +35,7 @@ def ordinary_ucc_source_forces(
     from ._f12_focal_increment import _canonical_occupied_virtual_blocks
     from ._f12_focal_one_electron import one_electron_sources
     from ._f12_focal_singles_response import relaxed_reference_weights
+    from ._f12_frozen_core import resolve_frozen_occupied
     from ._f12_spin_ao import _orbital_sources
     from ._f12_spin_fock import spin_fock, spin_fock_pullback
     from ._uccsd_df_eri_response import unrestricted_cc_eri_pullback
@@ -44,12 +45,11 @@ def ordinary_ucc_source_forces(
     basis = request.basis
     if (
         request.role != "mp2_f12_correlation"
-        or request.correlation_space_id != "all-active"
         or basis.mp2_fit is None
         or basis.f12_fit is None
     ):
         raise ValueError(
-            "Ordinary CC source forces require an all-active molecular pair request"
+            "Ordinary CC source forces require a molecular pair request"
         )
     if (
         request.surface_id,
@@ -123,6 +123,9 @@ def ordinary_ucc_source_forces(
     spins = ("alpha", "beta")
     spin_indices = ref._pair_spin_indices(request)
     occupied = tuple(ref.occupied[i] for i in spin_indices)
+    frozen = resolve_frozen_occupied(request, occupied)
+    if frozen != sources.fixed.frozen_occupied:
+        raise ValueError("Ordinary UCC source forces frozen-core mismatch with stationary sources")
     energies = tuple(ref.orbital_energies[i] for i in spin_indices)
     c = {s: ref.coefficients[i] for s, i in zip(spins, spin_indices, strict=True)}
     eri = unrestricted_cc_eri_pullback(
@@ -133,6 +136,7 @@ def ordinary_ucc_source_forces(
         mp.data["metric"],
         mp.whitener,
         run,
+        frozen_occupied=frozen,
         virtual_factor_weights=virtual_factor_weights,
     )
 
@@ -176,8 +180,8 @@ def ordinary_ucc_source_forces(
 
     direct = fock_pullback(
         {
-            "fock_" + s: _spin_fock_weight(weights, s, n, o, 0)
-            for s, o in zip(spins, occupied, strict=True)
+            "fock_" + s: _spin_fock_weight(weights, s, n, o, f)
+            for s, o, f in zip(spins, occupied, frozen, strict=True)
         }
     )
     # The ordinary part alone can carry a same-spin, same-occupation torque.
