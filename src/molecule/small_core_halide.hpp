@@ -4,6 +4,7 @@ namespace generativeqc::molecule {
 
 struct SmallCoreHalideComposition {
   unsigned hydrogen = 0, carbon = 0, oxygen = 0, bromine = 0, iodine = 0, other = 0;
+  unsigned other_ecp = 0;
 
   void add(int atomic_number, int core) {
     if (atomic_number == 1 && core == 0) ++hydrogen;
@@ -11,7 +12,10 @@ struct SmallCoreHalideComposition {
     else if (atomic_number == 8 && core == 0) ++oxygen;
     else if (atomic_number == 35 && core == 10) ++bromine;
     else if (atomic_number == 53 && core == 28) ++iodine;
-    else ++other;
+    else {
+      ++other;
+      if (core != 0) ++other_ecp;
+    }
   }
 
   bool hydride() const { return carbon == 0 && oxygen == 0 && bromine + iodine == 1 && other == 0; }
@@ -31,9 +35,15 @@ struct SmallCoreHalideComposition {
   // Zero means the fitted electronic state is outside the scalar ECP domain.
   unsigned fitted_orbital_angular_limit(int charge, int multiplicity, long long electrons) const {
     if (molecular_halide_reference(charge, multiplicity, electrons)) return 4;
-    if (!hydride() || charge != 0) return 0;
-    if (multiplicity == 1 && hydrogen == 1 && electrons == 26) return 4;
-    if (multiplicity == 2) return hydrogen == 2 ? 4 : 3;
+    if (hydride() && charge == 0) {
+      if (multiplicity == 1 && hydrogen == 1 && electrons == 26) return 4;
+      if (multiplicity == 2) return hydrogen == 2 ? 4 : 3;
+    }
+    if (bromine + iodine >= 1 && other_ecp == 0 &&
+        (multiplicity == 1 || multiplicity == 2) &&
+        electrons > 0 && electrons % 2 == multiplicity - 1) {
+      return 3;
+    }
     return 0;
   }
 };

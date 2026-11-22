@@ -104,7 +104,9 @@ int generativeqc_posthf_df_create_v1(void* raw, int device, size_t capacity, siz
                                                     detail) != GENERATIVEQC_STATUS_SUCCESS)
       throw std::runtime_error(detail);
     const auto placement = cuda_density_fitting_integral_source_diagnostic(p->source);
-    if (std::strcmp(placement.value_backend, "generated_rys") != 0)
+    if (std::strcmp(placement.value_backend, "generated_rys") != 0 &&
+        std::strcmp(placement.value_backend, "generated_rys_auxiliary_g_polynomial") != 0 &&
+        std::strcmp(placement.value_backend, "generated_rys_auxiliary_h_polynomial") != 0)
       throw std::runtime_error("generated DF values required; source selected another backend");
     const size_t host =
         cuda_density_fitting_integral_source_host_peak_bytes(p->source) + p->metric.capacity() * 8;

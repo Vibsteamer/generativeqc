@@ -236,7 +236,8 @@ DFSourceResult build_df_source_cuda(const core::System& orbital, const core::Sys
       throw std::runtime_error("native CUDA DF-CC source dimensions changed");
     const auto placement = scf::cuda_density_fitting_integral_source_diagnostic(source.get());
     if ((std::strcmp(placement.value_backend, "generated_rys") != 0 &&
-         std::strcmp(placement.value_backend, "generated_rys_auxiliary_g_polynomial") != 0) ||
+         std::strcmp(placement.value_backend, "generated_rys_auxiliary_g_polynomial") != 0 &&
+         std::strcmp(placement.value_backend, "generated_rys_auxiliary_h_polynomial") != 0) ||
         !placement.public_transform_on_device)
       throw std::runtime_error("native CUDA DF-CC requires generated device DF integrals");
     const auto source_device = scf::cuda_density_fitting_integral_source_device_bytes(source.get());

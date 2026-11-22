@@ -29,7 +29,7 @@ inline void prepare_ecp_df_hf(core::System& system, const scf::ScfOptions& optio
                   [](const auto& s) { return s.angular_momentum > 5; }))
     throw MethodError(GENERATIVEQC_STATUS_NOT_IMPLEMENTED,
                       "ECP density-fitting execution is not yet validated for this reference domain");
-  system.refine_ecp_quadrature = composition.bromine == 1;
+  system.refine_ecp_quadrature = composition.bromine >= 1;
 }
 
 }  // namespace generativeqc::methods::detail

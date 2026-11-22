@@ -125,10 +125,13 @@ def fitted_hf_ecp_domain(
     """Admit the supported small-core halide states and orbital angular momenta."""
     if fitted_hf_hydride_domain(method, basis, atoms, charge, multiplicity):
         return True
-    if charge not in (0, 1) or not (
-        g_shell_carbon_halide(basis, atoms) or g_shell_halogen_water(basis, atoms)
-    ):
+    if not isinstance(basis, BasisSet) or basis.representation != "spherical":
         return False
+    if (method, multiplicity) not in (("rhf", 1), ("uhf", 2)):
+        return False
+    for atom in atoms:
+        if atom.atomic_number not in basis.by_element:
+            return False
     electrons = (
         sum(
             atom.atomic_number - basis.by_element[atom.atomic_number].ecp_core_electrons
@@ -136,14 +139,29 @@ def fitted_hf_ecp_domain(
         )
         - charge
     )
-    return (
-        (method, multiplicity) in (("rhf", 1), ("uhf", 2))
-        and electrons % 2 == multiplicity - 1
-        and all(
-            shell.angular_momentum <= 4
-            for z in {atom.atomic_number for atom in atoms}
-            for shell in basis.by_element[z].shells
-        )
+    if electrons <= 0 or electrons % 2 != multiplicity - 1:
+        return False
+    if charge in (0, 1) and (
+        g_shell_carbon_halide(basis, atoms) or g_shell_halogen_water(basis, atoms)
+    ):
+        shell_limit = 4
+    else:
+        has_halide = False
+        for atom in atoms:
+            eb = basis.by_element[atom.atomic_number]
+            if atom.atomic_number == 35 and eb.ecp_core_electrons == 10:
+                has_halide = True
+            elif atom.atomic_number == 53 and eb.ecp_core_electrons == 28:
+                has_halide = True
+            elif eb.ecp_core_electrons != 0:
+                return False
+        if not has_halide:
+            return False
+        shell_limit = 3
+    return all(
+        shell.angular_momentum <= shell_limit
+        for z in {atom.atomic_number for atom in atoms}
+        for shell in basis.by_element[z].shells
     )
 
 
