@@ -223,7 +223,13 @@ def molecular_low_order_energy(
     oa, ob, obs, ext, _ = space
     distinct_jk = jk is not f12
     data, _ = _orbital_sources(
-        space, ao, run, None, projected=None, role="pairs" if distinct_jk else "shared"
+        space,
+        ao,
+        run,
+        None,
+        projected=None,
+        role="pairs" if distinct_jk else "shared",
+        occupied_coulomb=distinct_jk,
     )
     fock_data = data
     if distinct_jk:

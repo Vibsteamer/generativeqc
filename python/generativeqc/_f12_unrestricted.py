@@ -166,7 +166,10 @@ def unrestricted_mp2_f12_ao_response(
             jk_space, jk_ao, run, None, projected=None, role="fock"
         )
     pair_role = "shared" if jk_data is None else "pairs"
-    data, _ = _orbital_sources(space, ao, run, None, projected=None, role=pair_role)
+    use_occ_coul = jk_data is not None
+    data, _ = _orbital_sources(
+        space, ao, run, None, projected=None, role=pair_role, occupied_coulomb=use_occ_coul
+    )
     weights, terms, jk_weights = _projected_response(
         space,
         data,
@@ -179,14 +182,30 @@ def unrestricted_mp2_f12_ao_response(
         component=component,
         occupied_f12_weights=occupied_f12_weights,
     )
+    if jk_data is not None:
+        # Reverse _orbital_sources only needs the occupied Coulomb rows [Q, occ, ext].
+        oa_c, ob_c = space[0], space[1]
+        for s_name, n_occ in (("alpha", oa_c), ("beta", ob_c)):
+            ck = "source/raw_coulomb_" + s_name
+            if ck in jk_data and jk_data[ck].shape[1] > n_occ:
+                jk_data[ck] = np.ascontiguousarray(jk_data[ck][:, :n_occ])
     _, bars = _orbital_sources(
-        space, ao, run, weights, projected=data, role=pair_role, ao_bar_sink=ao_bar_sink
+        space,
+        ao,
+        run,
+        weights,
+        projected=data,
+        role=pair_role,
+        ao_bar_sink=ao_bar_sink,
+        occupied_coulomb=use_occ_coul,
     )
+    del data, weights
     assert terms is not None and bars is not None
     if jk_data is not None:
         _, jk_bars = _orbital_sources(
             jk_space, jk_ao, run, jk_weights, projected=jk_data, role="fock"
         )
+        del jk_data, jk_weights
         for name in shared:
             bars[name] += jk_bars[name]
         for name in ("ao_coulomb", "metric/coulomb"):

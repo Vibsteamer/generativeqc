@@ -118,11 +118,40 @@ def spin_fock_pullback(
     """Accumulate the tiled Fock transpose into weights of the global molecular inputs."""
     oa, ob, orbitals, auxiliaries = space
     width = _validate_tiles(space, sources, batch_size)
-    bars = (
-        {key: np.zeros_like(value) for key, value in sources.items()}
-        if accumulate is None
-        else accumulate
+    share_beta_raw = (
+        accumulate is None
+        and oa == ob
+        and "raw_coulomb_alpha" in sources
+        and "raw_coulomb_beta" in sources
+        and (
+            sources["raw_coulomb_alpha"] is sources["raw_coulomb_beta"]
+            or np.array_equal(sources["raw_coulomb_alpha"], sources["raw_coulomb_beta"])
+        )
+        and (
+            "fit_alpha" not in sources
+            or sources["fit_alpha"] is sources["fit_beta"]
+            or np.array_equal(sources["fit_alpha"], sources["fit_beta"])
+        )
+        and (
+            "hcore_alpha" not in sources
+            or sources["hcore_alpha"] is sources["hcore_beta"]
+            or np.array_equal(sources["hcore_alpha"], sources["hcore_beta"])
+        )
+        and all(
+            (k.replace("_alpha", "_beta") in seeds and np.array_equal(seeds[k], seeds[k.replace("_alpha", "_beta")]))
+            for k in seeds
+            if k.endswith("_alpha")
+        )
+        and sum(1 for k in seeds if k.endswith("_alpha")) == sum(1 for k in seeds if k.endswith("_beta"))
     )
+    if accumulate is None:
+        bars = {
+            key: np.zeros_like(value)
+            for key, value in sources.items()
+            if not (share_beta_raw and key == "raw_coulomb_beta")
+        }
+    else:
+        bars = accumulate
     seed_inputs = {"bar_" + k: np.ascontiguousarray(v) for k, v in seeds.items()}
     for tile_len, slices in _tile_groups(auxiliaries, width):
         graph = unrestricted_extended_df_fock(oa, ob, orbitals, tile_len)
@@ -132,9 +161,13 @@ def spin_fock_pullback(
                 part = exec_one({**_tile_values(sources, rows), **seed_inputs})
                 for output, array in part.outputs.items():
                     key = output.removeprefix("bar_")
+                    if share_beta_raw and key == "raw_coulomb_beta":
+                        continue
                     if key.startswith("hcore_"):
                         if rows.start == 0:
                             bars[key] += array
                     else:
                         bars[key][rows] += array
+    if share_beta_raw:
+        bars["raw_coulomb_beta"] = bars["raw_coulomb_alpha"]
     return bars

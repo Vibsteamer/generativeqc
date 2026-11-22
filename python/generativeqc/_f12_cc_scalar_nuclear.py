@@ -59,7 +59,9 @@ def unrestricted_cc_scalar_ao_weights(
     occupied = dict(zip(("a", "b"), (oa, ob), strict=True))
     frozen = dict(zip(("a", "b"), frozen_occupied, strict=True))
     active = {s: slice(frozen[s], no) for s, no in occupied.items()}
-    data, _ = _orbital_sources(space, ao, run, None, projected=None, role="pairs")
+    data, _ = _orbital_sources(
+        space, ao, run, None, projected=None, role="pairs", occupied_coulomb=True
+    )
     fock, fock_pullback = fock_response or extended_fock_response(space, ao, jkfit, run)
     dbar = {k: np.zeros_like(v) for k, v in data.items() if k != "space"}
     fbar = {k: np.zeros_like(v) for k, v in fock.items()}
@@ -139,7 +141,9 @@ def unrestricted_cc_scalar_ao_weights(
             e_x += float(qr["x_fock_energy"])
             for k, target in qbars.items():
                 target[...] += qr["bar_" + k]
-    _, physical = _orbital_sources(space, ao, run, dbar, projected=data, role="pairs")
+    _, physical = _orbital_sources(
+        space, ao, run, dbar, projected=data, role="pairs", occupied_coulomb=True
+    )
     assert physical is not None
     fock_pullback(fbar, physical)
     return UnrestrictedCCScalarResponse(e_v, e_b, e_x, physical)

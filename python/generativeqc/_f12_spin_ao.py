@@ -76,6 +76,7 @@ def project_ao_operator_pullback_tiled(
     bar_coefficients: np.ndarray,
     bar_ao: np.ndarray | None = None,
     batch_size: int | None = None,
+    seed_scale: float = 1.0,
 ) -> np.ndarray:
     """Pull MO operator cotangents [aux, *, ext] back to AO [aux, nc, nc] and coefficients in bounded tiles."""
     width = (
@@ -92,11 +93,16 @@ def project_ao_operator_pullback_tiled(
         rev = transpose_program(graph, (field,)).program
         with batch_execute(run, rev) as exec_one:
             for rows in slices:
+                seed_tile = (
+                    np.ascontiguousarray(seed[rows])
+                    if seed_scale == 1.0
+                    else np.ascontiguousarray(seed[rows] * seed_scale)
+                )
                 weights = exec_one(
                     {
                         "coefficients": coeffs,
                         ao_name: np.ascontiguousarray(ao_mat[rows]),
-                        "bar_" + field: np.ascontiguousarray(seed[rows]),
+                        "bar_" + field: seed_tile,
                     }
                 ).outputs
                 bar_coefficients += weights["bar_coefficients"]
@@ -133,6 +139,7 @@ def _orbital_sources(
     projected: dict[str, np.ndarray] | None,
     role: Literal["shared", "pairs", "fock", "ordinary_jk", "ordinary_fock"] = "shared",
     ao_bar_sink: Callable[[str, np.ndarray], None] | None = None,
+    occupied_coulomb: bool = False,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray] | None]:
     # A combined energy/response evaluation owns the forward buffers through
     # the reverse pass. Standalone evaluations build their own projections.
@@ -142,6 +149,9 @@ def _orbital_sources(
         raise ValueError("Invalid UHF occupied, OBS, or extended dimensions")
     nc = len(ao["coefficients_alpha"])
     occupied = {"alpha": oa, "beta": ob}
+    same_spin = oa == ob and np.array_equal(
+        ao["coefficients_alpha"], ao["coefficients_beta"]
+    )
     ao_loader = ao.get("__ao_loader__")
     needs_cross = role in ("shared", "pairs")
     if needs_cross:
@@ -201,76 +211,159 @@ def _orbital_sources(
         bar_ao_mat = np.zeros_like(ao_mat) if sink_this else None
         if bars is not None and op != "hcore" and not sink_this and ao_name not in bars:
             bars[ao_name] = np.zeros_like(ao_mat)
-        for spin, occ in occupied.items():
-            if field not in hcore_frames[spin].outputs:
-                continue
-            co = "coefficients_" + spin
-            key = (
-                "source/" + field + "_" + spin
-                if op in ("coulomb", "hcore")
-                else "raw/" + op + "/" + spin
-            )
-            if op == "hcore":
+        if op == "hcore":
+            for spin, occ in occupied.items():
+                if field not in hcore_frames[spin].outputs:
+                    continue
+                co = "coefficients_" + spin
+                key = "source/hcore_" + spin
                 graph = Program({field: hcore_frames[spin].outputs[field]})
                 item = {"coefficients": ao[co], ao_name: ao_mat}
                 if projected is None:
                     data[key] = run(graph, item).outputs[field]
-                seed = None if bars is None else orbital_weights[key].copy()
                 if bars is not None:
                     rev = transpose_program(graph, (field,)).program
-                    weights = run(rev, {**item, "bar_" + field: seed}).outputs
+                    weights = run(rev, {**item, "bar_" + field: orbital_weights[key]}).outputs
                     bars[co] += weights["bar_coefficients"]
                     bars[ao_name] += weights["bar_" + ao_name]
                     del weights
-                continue
-            if projected is None:
-                data[key] = project_ao_operator_tiled(
-                    nc, ext, occ, aux, field, ao_name, ao[co], ao_mat, run
-                )
-            seed = None if bars is None else orbital_weights[key].copy()
-            if op == "coulomb" and occ:
-                solve = coulomb_fit_response(aux, occ * ext)
-                raw = np.ascontiguousarray(data[key][:, :occ]).reshape(aux, occ * ext)
-                fit_key = "source/fit_" + spin
-                fit_arg = {
-                    "metric_whitener": ao["metric_whitener"],
-                    "three_center": raw,
-                }
-                if bars is None:
-                    solved = run(
-                        Program({"fit": solve.outputs["fit"]}), fit_arg
-                    ).outputs
+            continue
+
+        use_occ_coul = occupied_coulomb and op == "coulomb"
+        graph_field = "raw_f12" if use_occ_coul else field
+        graph_ao_name = "ao_f12" if use_occ_coul else ao_name
+
+        def _op_key(spin_name: str) -> str:
+            return (
+                "source/" + field + "_" + spin_name
+                if op == "coulomb"
+                else "raw/" + op + "/" + spin_name
+            )
+
+        # Forward pass (and metric solve for Coulomb)
+        if projected is None:
+            for spin, occ in occupied.items():
+                if field not in hcore_frames[spin].outputs:
+                    continue
+                key = _op_key(spin)
+                if same_spin and spin == "beta":
+                    data[key] = data[_op_key("alpha")]
+                    if op == "coulomb" and occ:
+                        data["source/fit_beta"] = data["source/fit_alpha"]
+                    continue
+                if use_occ_coul and occ == 0:
+                    data[key] = np.empty((aux, 0, ext), dtype=np.float64)
                 else:
-                    fit_arg["fit_bar"] = orbital_weights[fit_key].reshape(aux, -1)
+                    data[key] = project_ao_operator_tiled(
+                        nc, ext, occ, aux, graph_field, graph_ao_name, ao["coefficients_" + spin], ao_mat, run
+                    )
+                if op == "coulomb" and occ:
+                    solve = coulomb_fit_response(aux, occ * ext)
+                    raw = np.ascontiguousarray(data[key][:, :occ]).reshape(aux, occ * ext)
+                    solved = run(
+                        Program({"fit": solve.outputs["fit"]}),
+                        {"metric_whitener": ao["metric_whitener"], "three_center": raw},
+                    ).outputs
+                    data["source/fit_" + spin] = solved["fit"].reshape(aux, occ, ext)
+
+        # Reverse pass
+        if bars is not None:
+            assert orbital_weights is not None
+            target_bar_ao = bar_ao_mat if sink_this else bars[ao_name]
+            # Fast spin-symmetric reverse when alpha and beta share frames and cotangents
+            can_share_rev = (
+                same_spin
+                and all(field in hcore_frames[s].outputs for s in ("alpha", "beta"))
+                and np.array_equal(orbital_weights[_op_key("alpha")], orbital_weights[_op_key("beta")])
+                and (
+                    op != "coulomb"
+                    or oa == 0
+                    or np.array_equal(orbital_weights["source/fit_alpha"], orbital_weights["source/fit_beta"])
+                )
+            )
+            if can_share_rev:
+                occ = oa
+                key = _op_key("alpha")
+                if op == "coulomb" and occ:
+                    seed = orbital_weights[key].copy()
+                    solve = coulomb_fit_response(aux, occ * ext)
+                    raw = np.ascontiguousarray(data[key][:, :occ]).reshape(aux, occ * ext)
+                    fit_arg = {
+                        "metric_whitener": ao["metric_whitener"],
+                        "three_center": raw,
+                        "fit_bar": orbital_weights["source/fit_alpha"].reshape(aux, -1),
+                    }
                     if projected is not None:
                         solve = Program(
-                            {
-                                k: solve.outputs[k]
-                                for k in ("three_center_bar", "metric_bar")
-                            }
+                            {k: solve.outputs[k] for k in ("three_center_bar", "metric_bar")}
                         )
                     solved = run(solve, fit_arg).outputs
                     seed[:, :occ] += solved["three_center_bar"].reshape(aux, occ, ext)
-                    bars["metric/coulomb"] += solved["metric_bar"]
-                if projected is None:
-                    data[fit_key] = solved["fit"].reshape(aux, occ, ext)
-            if bars is not None:
-                assert seed is not None
-                target_bar_ao = bar_ao_mat if sink_this else bars[ao_name]
-                project_ao_operator_pullback_tiled(
-                    nc,
-                    ext,
-                    occ,
-                    aux,
-                    field,
-                    ao_name,
-                    ao[co],
-                    ao_mat,
-                    seed,
-                    run,
-                    bar_coefficients=bars[co],
-                    bar_ao=target_bar_ao,
-                )
+                    bars["metric/coulomb"] += 2.0 * solved["metric_bar"]
+                else:
+                    seed = orbital_weights[key]
+                if not (use_occ_coul and occ == 0):
+                    bar_c_both = np.zeros_like(bars["coefficients_alpha"])
+                    project_ao_operator_pullback_tiled(
+                        nc,
+                        ext,
+                        occ,
+                        aux,
+                        graph_field,
+                        graph_ao_name,
+                        ao["coefficients_alpha"],
+                        ao_mat,
+                        seed,
+                        run,
+                        bar_coefficients=bar_c_both,
+                        bar_ao=target_bar_ao,
+                        seed_scale=2.0,
+                    )
+                    bars["coefficients_alpha"] += 0.5 * bar_c_both
+                    bars["coefficients_beta"] += 0.5 * bar_c_both
+                    del bar_c_both
+                del seed
+            else:
+                for spin, occ in occupied.items():
+                    if field not in hcore_frames[spin].outputs:
+                        continue
+                    co = "coefficients_" + spin
+                    key = _op_key(spin)
+                    if op == "coulomb" and occ:
+                        seed = orbital_weights[key].copy()
+                        solve = coulomb_fit_response(aux, occ * ext)
+                        raw = np.ascontiguousarray(data[key][:, :occ]).reshape(aux, occ * ext)
+                        fit_key = "source/fit_" + spin
+                        fit_arg = {
+                            "metric_whitener": ao["metric_whitener"],
+                            "three_center": raw,
+                            "fit_bar": orbital_weights[fit_key].reshape(aux, -1),
+                        }
+                        if projected is not None:
+                            solve = Program(
+                                {k: solve.outputs[k] for k in ("three_center_bar", "metric_bar")}
+                            )
+                        solved = run(solve, fit_arg).outputs
+                        seed[:, :occ] += solved["three_center_bar"].reshape(aux, occ, ext)
+                        bars["metric/coulomb"] += solved["metric_bar"]
+                    else:
+                        seed = orbital_weights[key]
+                    if not (use_occ_coul and occ == 0):
+                        project_ao_operator_pullback_tiled(
+                            nc,
+                            ext,
+                            occ,
+                            aux,
+                            graph_field,
+                            graph_ao_name,
+                            ao[co],
+                            ao_mat,
+                            seed,
+                            run,
+                            bar_coefficients=bars[co],
+                            bar_ao=target_bar_ao,
+                        )
+                    del seed
         del ao_mat
         if sink_this:
             assert bar_ao_mat is not None
