@@ -194,6 +194,241 @@ def unrestricted_nuclear_source_terms(
     return UnrestrictedNuclearSourceTerms(rhs, fixed)
 
 
+def _run_unrestricted_nuclear_weights_tiled(
+    space: tuple[int, int, int, int],
+    central: Mapping[str, np.ndarray],
+    z: np.ndarray,
+    run: Callable,
+    *,
+    direct_weights: Mapping[str, np.ndarray] | None = None,
+    frame_overlap: Mapping[str, np.ndarray] | None = None,
+) -> dict[str, np.ndarray]:
+    """Bounded-memory auxiliary-tiled execution of DF-UHF nuclear source weights on `run`."""
+    from generativeqc_compiler.tensor import Index, IndexSpace, Program, TensorSpec, einsum, input_tensor
+
+    from ._f12_spin_fock import _tile_groups, default_auxiliary_batch_size
+    from ._f12_spin_pairs import batch_execute
+
+    oa, ob, n, q = space
+    w = np.ascontiguousarray(central["whitener"])
+    nao = central["coefficients_alpha"].shape[0]
+    spins = (("alpha", oa), ("beta", ob))
+
+    # Build effective MO seeds P_s (for explicit and gmetric) and bar_sm_s (for overlap)
+    p_seeds: dict[str, np.ndarray] = {}
+    bar_sm: dict[str, np.ndarray] = {}
+    offset = 0
+    for spin, occ in spins:
+        p = np.array(central["fock_seed_" + spin], dtype=np.float64, copy=True)
+        sm = np.array(central["overlap_seed_" + spin], dtype=np.float64, copy=True)
+        if occ:
+            size = (n - occ) * occ
+            z_s = z[offset : offset + size].reshape(n - occ, occ)
+            offset += size
+            p[occ:, :occ] -= z_s
+            sm[occ:, :occ] += z_s * central["occupied_energies_" + spin][None, :]
+        p_seeds[spin] = p
+        bar_sm[spin] = sm
+
+    # Check if C_s is supported purely on the leading n OBS rows (standard OBS+CABS layout)
+    obs_only_ao = nao > n and all(
+        np.count_nonzero(central["coefficients_" + spin][n:, :]) == 0 for spin, _ in spins
+    )
+    n_eff = n if obs_only_ao else nao
+    c_eff = {
+        spin: np.ascontiguousarray(central["coefficients_" + spin][:n_eff, :])
+        for spin, _ in spins
+    }
+    same_spin = (
+        oa == ob
+        and np.array_equal(c_eff["alpha"], c_eff["beta"])
+        and (
+            central["df_alpha"] is central["df_beta"]
+            or np.array_equal(central["df_alpha"], central["df_beta"])
+        )
+        and np.array_equal(p_seeds["alpha"], p_seeds["beta"])
+    )
+
+    width = default_auxiliary_batch_size(q, max(n, n_eff))
+    groups = _tile_groups(q, width)
+
+    # 1) charge[a] and bar_dcharge[a] via tiled contractions on `run`
+    charge = np.zeros(q, dtype=np.float64)
+    bar_dcharge = np.zeros(q, dtype=np.float64)
+    mo_sp = IndexSpace("obs", "orbital", n)
+    p_i, q_i = Index("p", mo_sp), Index("q", mo_sp)
+    for tile_len, slices in groups:
+        aux_sp = IndexSpace("aux", "auxiliary", tile_len)
+        a_i = Index("a", aux_sp)
+        b_in = input_tensor("b", TensorSpec((a_i, p_i, q_i), role="input"))
+        p_in = input_tensor("p", TensorSpec((p_i, q_i), role="input"))
+        dot_prog = Program({"d": einsum("pq,apq->a", p_in, b_in)})
+        with batch_execute(run, dot_prog) as exec_dot:
+            for spin, occ in spins:
+                if same_spin and spin == "beta":
+                    continue
+                scale = 2.0 if same_spin else 1.0
+                b_s = central["df_" + spin]
+                p_c = np.ascontiguousarray(p_seeds[spin])
+                for rows in slices:
+                    b_tile = np.ascontiguousarray(b_s[rows])
+                    bar_dcharge[rows] += scale * exec_dot({"p": p_c, "b": b_tile}).outputs["d"]
+                    if occ:
+                        charge[rows] += scale * np.einsum("aii->a", b_tile[:, :occ, :occ])
+    bar_metric_charge = -bar_dcharge
+
+    # 2) Complete bar_sm_s (metric_charge and metric_exchange) and assemble 2D hcore/overlap weights
+    bar_dh = np.zeros((nao, nao), dtype=np.float64)
+    bar_ds = np.zeros((nao, nao), dtype=np.float64)
+    ao_sp = IndexSpace("ao_eff", "orbital", n_eff)
+    m_i, v_i = Index("m", ao_sp), Index("n", ao_sp)
+    c_in = input_tensor("c", TensorSpec((m_i, p_i), role="input"))
+    mat_in = input_tensor("m", TensorSpec((p_i, q_i), role="input"))
+    cong_prog = Program({"out": einsum("mp,np->mn", c_in, einsum("nq,pq->np", c_in, mat_in))})
+    for spin, occ in spins:
+        if occ:
+            b_s = central["df_" + spin]
+            p_s = p_seeds[spin]
+            occ_sp = IndexSpace("occ_" + spin, "occupied", occ)
+            i_i, j_i = Index("i", occ_sp), Index("j", occ_sp)
+            for tile_len, slices in groups:
+                aux_sp = IndexSpace("aux", "auxiliary", tile_len)
+                a_i = Index("a", aux_sp)
+                bo_in = input_tensor("bo", TensorSpec((a_i, p_i, i_i), role="input"))
+                oo_in = input_tensor("oo", TensorSpec((a_i, i_i, j_i), role="input"))
+                mc_in = input_tensor("mc", TensorSpec((a_i,), role="input"))
+                pm_in = input_tensor("pm", TensorSpec((p_i, q_i), role="input"))
+                pb = einsum("pq,api->aqi", pm_in, bo_in)
+                sm_prog = Program(
+                    {
+                        "s_mc": einsum("a,aij->ij", mc_in, oo_in),
+                        "s_ex": einsum("aqi,aqj->ij", pb, bo_in),
+                    }
+                )
+                p_c = np.ascontiguousarray(p_s)
+                with batch_execute(run, sm_prog) as exec_sm:
+                    for rows in slices:
+                        bo_tile = np.ascontiguousarray(b_s[rows, :, :occ])
+                        oo_tile = np.ascontiguousarray(b_s[rows, :occ, :occ])
+                        out = exec_sm(
+                            {
+                                "bo": bo_tile,
+                                "oo": oo_tile,
+                                "mc": np.ascontiguousarray(bar_metric_charge[rows]),
+                                "pm": p_c,
+                            }
+                        ).outputs
+                        bar_sm[spin][:occ, :occ] += out["s_mc"] + out["s_ex"]
+        c_s = c_eff[spin]
+        bar_dh[:n_eff, :n_eff] += run(
+            cong_prog, {"c": c_s, "m": np.ascontiguousarray(p_seeds[spin])}
+        ).outputs["out"]
+        bar_ds[:n_eff, :n_eff] += run(
+            cong_prog, {"c": c_s, "m": np.ascontiguousarray(bar_sm[spin])}
+        ).outputs["out"]
+
+    # 3) Tiled bar_dB -> bar_M (q x q) and bar_dr (q x nao x nao) on `run`
+    bar_m = np.zeros((q, q), dtype=np.float64)
+    if direct_weights is not None:
+        base_ao = direct_weights["ao_coulomb"]
+        bar_dr = np.array(base_ao, dtype=np.float64, copy=True)
+    else:
+        bar_dr = np.zeros((q, nao, nao), dtype=np.float64)
+
+    for tile_len, slices in groups:
+        aux_sp = IndexSpace("aux", "auxiliary", tile_len)
+        a_i = Index("a", aux_sp)
+        # AO back-projection per chunk: ao_db[a, m, n] = sum_p,q C[m, p] bar_db[a, p, q] C[n, q]
+        db_in = input_tensor("db", TensorSpec((a_i, p_i, q_i), role="input"))
+        proj_prog = Program(
+            {"ao": einsum("mp,apn->amn", c_in, einsum("apq,nq->apn", db_in, c_in))}
+        )
+        # Metric cross-contraction chunk (a_tile vs b_tile)
+        t_groups = _tile_groups(q, width)
+        # Prebuild per-spin exchange contraction programs for this tile_len
+        ex_progs = {}
+        for spin, occ in spins:
+            if occ:
+                occ_sp = IndexSpace("occ_" + spin, "occupied", occ)
+                i_i = Index("i", occ_sp)
+                bo_in = input_tensor("bo", TensorSpec((a_i, q_i, i_i), role="input"))
+                ps_in = input_tensor("ps", TensorSpec((p_i, q_i), role="input"))
+                ex_progs[spin] = Program({"ex": einsum("pq,aqi->api", ps_in, bo_in)})
+
+        # Open batch executors for projection and W-transform
+        with batch_execute(run, proj_prog) as exec_proj:
+            for rows in slices:
+                ao_db_chunk = np.zeros((tile_len, n_eff, n_eff), dtype=np.float64)
+                for spin, occ in spins:
+                    if same_spin and spin == "beta":
+                        continue
+                    scale = 2.0 if same_spin else 1.0
+                    b_s = central["df_" + spin]
+                    p_s = p_seeds[spin]
+                    bar_db = charge[rows, None, None] * p_s[None, :, :]
+                    if occ:
+                        idx = np.arange(occ)
+                        bar_db[:, idx, idx] += bar_dcharge[rows, None]
+                        psym = np.ascontiguousarray(p_s + p_s.T)
+                        ex_term = run(
+                            ex_progs[spin],
+                            {"ps": psym, "bo": np.ascontiguousarray(b_s[rows, :, :occ])},
+                        ).outputs["ex"]
+                        bar_db[:, :, :occ] -= ex_term
+                    # Accumulate bar_M[rows, b_rows] via tiled GPU contractions
+                    bar_db_c = np.ascontiguousarray(bar_db)
+                    for b_len, b_slices in t_groups:
+                        b_sp = IndexSpace("aux_b", "auxiliary", b_len)
+                        b_i = Index("b", b_sp)
+                        b_in = input_tensor("b", TensorSpec((b_i, p_i, q_i), role="input"))
+                        m_prog = Program({"m": einsum("apq,bpq->ab", db_in, b_in)})
+                        with batch_execute(run, m_prog) as exec_m:
+                            for b_rows in b_slices:
+                                bar_m[rows, b_rows] += (-0.5 * scale) * exec_m(
+                                    {"db": bar_db_c, "b": np.ascontiguousarray(b_s[b_rows])}
+                                ).outputs["m"]
+                    ao_part = exec_proj({"c": c_eff[spin], "db": bar_db_c}).outputs["ao"]
+                    ao_db_chunk += scale * ao_part
+                # Symmetrize ao_db_chunk before W^T accumulation (linear, identical to symmetrizing bar_dr)
+                ao_db_sym = np.ascontiguousarray(0.5 * (ao_db_chunk + ao_db_chunk.swapaxes(1, 2)))
+                ao_in = input_tensor("ao", TensorSpec((a_i, m_i, v_i), role="input"))
+                for t_len, t_slices in t_groups:
+                    t_sp = IndexSpace("aux_t", "auxiliary", t_len)
+                    t_i = Index("t", t_sp)
+                    w_in = input_tensor("w", TensorSpec((a_i, t_i), role="input"))
+                    wt_prog = Program({"dr": einsum("at,amn->tmn", w_in, ao_in)})
+                    with batch_execute(run, wt_prog) as exec_wt:
+                        for t_rows in t_slices:
+                            bar_dr[t_rows, :n_eff, :n_eff] += exec_wt(
+                                {"w": np.ascontiguousarray(w[rows, t_rows]), "ao": ao_db_sym}
+                            ).outputs["dr"]
+
+    # 4) bar_dj = W^T @ bar_M @ W and symmetrize 2D outputs
+    q_sp = IndexSpace("aux_full", "auxiliary", q)
+    a_f, b_f, t_f, u_f = Index("a", q_sp), Index("b", q_sp), Index("t", q_sp), Index("u", q_sp)
+    wf_in = input_tensor("w", TensorSpec((a_f, t_f), role="input"))
+    mf_in = input_tensor("m", TensorSpec((a_f, b_f), role="input"))
+    dj_prog = Program({"dj": einsum("at,au->tu", wf_in, einsum("ab,bu->au", mf_in, wf_in))})
+    bar_dj = run(dj_prog, {"w": w, "m": np.ascontiguousarray(bar_m)}).outputs["dj"]
+
+    bar_dj = 0.5 * (bar_dj + bar_dj.T)
+    bar_dh = 0.5 * (bar_dh + bar_dh.T)
+    bar_ds = 0.5 * (bar_ds + bar_ds.T)
+    if direct_weights is not None and frame_overlap is not None:
+        bar_ds = bar_ds + direct_weights["overlap_ao"] + frame_overlap["alpha"] + frame_overlap["beta"]
+        bar_dh = bar_dh + direct_weights["hcore_ao"]
+        bar_dj = bar_dj + direct_weights["metric/coulomb"]
+    weights = {
+        "overlap_ao": bar_ds,
+        "hcore_ao": bar_dh,
+        "ao_coulomb": bar_dr,
+        "metric/coulomb": bar_dj,
+    }
+    if any(not np.isfinite(val).all() for val in weights.values()):
+        raise ValueError("Nonfinite DF-UHF nuclear source weights")
+    return weights
+
+
 def unrestricted_nuclear_source_weights(
     space: tuple[int, int, int, int],
     central: Mapping[str, np.ndarray],
@@ -223,10 +458,20 @@ def unrestricted_nuclear_source_weights(
         raise ValueError(
             "Direct Gaussian and frame-overlap weights must be supplied together"
         )
-    graph = unrestricted_df_nuclear_weights(
-        oa, ob, n, q, coeff.shape[0], include_direct=include_direct
-    )
     z = _block(orbital_adjoint, (oa * (n - oa) + ob * (n - ob),), "orbital adjoint")
+    nao = coeff.shape[0]
+    if q * max(n, nao) * max(n, nao) * 8 > (64 << 20):
+        return _run_unrestricted_nuclear_weights_tiled(
+            space,
+            central,
+            z,
+            run,
+            direct_weights=direct_weights,
+            frame_overlap=frame_overlap,
+        )
+    graph = unrestricted_df_nuclear_weights(
+        oa, ob, n, q, nao, include_direct=include_direct
+    )
     fields = _nuclear_center(central, oa, ob)
     if direct_weights is not None and frame_overlap is not None:
         for name in ("overlap_ao", "hcore_ao", "ao_coulomb", "coulomb_metric"):
@@ -298,7 +543,9 @@ def unrestricted_source_orbital_adjoint(
     This solve does not consume nuclear RHS, forces or an external orbital adjoint.
     """
     oa, ob, n, q = space
-    graph = unrestricted_df_canonical_driver(*space)
+    from ._f12_spin_fock import _tile_groups, default_auxiliary_batch_size
+    from ._f12_spin_pairs import batch_execute
+
     values, factors = {}, {}
     for spin, occ in (("alpha", oa), ("beta", ob)):
         if not occ:
@@ -313,7 +560,24 @@ def unrestricted_source_orbital_adjoint(
         factors.update({key + "_" + spin: block for key, block in (
             ("vo", df[:, occ:, :occ]), ("oo", df[:, :occ, :occ]), ("vv", df[:, occ:, occ:]),
             ("gap", eps[occ:, None] - eps[None, :occ]))})
-    channels = run(graph, values).outputs
+    width = default_auxiliary_batch_size(q, n)
+    if width >= q:
+        channels = run(unrestricted_df_canonical_driver(*space), values).outputs
+    else:
+        channels = {}
+        for tile_len, slices in _tile_groups(q, width):
+            graph = unrestricted_df_canonical_driver(oa, ob, n, tile_len)
+            with batch_execute(run, graph) as exec_one:
+                for rows in slices:
+                    tile_vals = {}
+                    for spin, occ in (("alpha", oa), ("beta", ob)):
+                        if not occ:
+                            continue
+                        tile_vals["df_" + spin] = np.ascontiguousarray(values["df_" + spin][rows])
+                        tile_vals["fock_seed_" + spin] = values["fock_seed_" + spin]
+                    part = exec_one(tile_vals).outputs
+                    for k, arr in part.items():
+                        channels[k] = arr.copy() if k not in channels else channels[k] + arr
     driver = np.concatenate([_block(channels[spin], (n - occ, occ), "orbital driver")
                              for spin, occ in (("alpha", oa), ("beta", ob)) if occ])
     # Zero coordinates select the rotations-only ABI mode. No nuclear arrays are uploaded.

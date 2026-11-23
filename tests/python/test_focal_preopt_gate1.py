@@ -612,4 +612,86 @@ def test_shell_projection_chunking_matches_full_for_int32_and_int64():
     np.testing.assert_allclose(p_full, p_chunked, atol=1e-14, rtol=0)
 
 
+@pytest.mark.parametrize("oa,ob,obs_only,include_direct", [
+    (2, 2, True, False),
+    (2, 2, True, True),
+    (2, 1, False, False),
+    (2, 1, False, True),
+    (2, 0, True, True),
+])
+def test_tiled_nuclear_source_weights_matches_untiled_graph(
+    monkeypatch, oa, ob, obs_only, include_direct
+):
+    """Verify auxiliary-tiled unrestricted_nuclear_source_weights matches untiled graph to <1e-12."""
+    from generativeqc import _f12_spin_fock as sf
+    from generativeqc.f12_orbital_response import (
+        _run_unrestricted_nuclear_weights_tiled,
+        unrestricted_nuclear_source_weights,
+    )
+    from generativeqc_compiler.tensor import execute
+
+    rng = np.random.default_rng(1000 + 31 * oa + 7 * ob + int(obs_only) * 2 + int(include_direct))
+    n, nao, q = 4, 6, 7
+
+    def sym(x):
+        return 0.5 * (x + x.swapaxes(-1, -2))
+
+    raw = sym(rng.normal(size=(q, nao, nao)))
+    j0 = rng.normal(size=(q, q))
+    j0 = j0 @ j0.T + 2.0 * np.eye(q)
+    w = np.linalg.qr(rng.normal(size=(q, q)))[0] @ np.linalg.inv(np.linalg.cholesky(j0))
+    ca = np.zeros((nao, n))
+    ca[: (n if obs_only else nao), :] = np.linalg.qr(rng.normal(size=(n if obs_only else nao, n)))[0]
+    if oa == ob:
+        cb = ca.copy()
+    else:
+        cb = np.zeros((nao, n))
+        cb[: (n if obs_only else nao), :] = np.linalg.qr(rng.normal(size=(n if obs_only else nao, n)))[0]
+
+    central = {"whitener": w}
+    fseed_a = sym(rng.normal(size=(n, n)))
+    sseed_a = sym(rng.normal(size=(n, n)))
+    eps_a = np.sort(rng.normal(size=n))
+    for spin, occ, c in (("alpha", oa, ca), ("beta", ob, cb)):
+        r = np.einsum("mp,amn,nq->apq", c, raw, c)
+        df = np.einsum("ab,bpq->apq", w, r)
+        central["coefficients_" + spin] = c
+        central["df_" + spin] = df
+        central["fock_seed_" + spin] = fseed_a if oa == ob else sym(rng.normal(size=(n, n)))
+        central["overlap_seed_" + spin] = sseed_a if oa == ob else sym(rng.normal(size=(n, n)))
+        if occ:
+            central["occupied_energies_" + spin] = eps_a[:occ] if oa == ob else np.sort(rng.normal(size=n))[:occ]
+
+    za = rng.normal(size=oa * (n - oa))
+    zb = za.copy() if oa == ob else rng.normal(size=ob * (n - ob))
+    z = np.concatenate([za, zb])
+    direct = (
+        {
+            "overlap_ao": sym(rng.normal(size=(nao, nao))),
+            "hcore_ao": sym(rng.normal(size=(nao, nao))),
+            "ao_coulomb": sym(rng.normal(size=(q, nao, nao))),
+            "metric/coulomb": sym(rng.normal(size=(q, q))),
+        }
+        if include_direct
+        else None
+    )
+    frame_ov = (
+        {s: rng.normal(size=(nao, nao)) for s in ("alpha", "beta")}
+        if include_direct
+        else None
+    )
+    ref = unrestricted_nuclear_source_weights(
+        (oa, ob, n, q), central, z, execute, direct_weights=direct, frame_overlap=frame_ov
+    )
+    monkeypatch.setattr(sf, "_TARGET_AUX_SLAB_BYTES", 2 * nao * nao * 8)
+    assert sf.default_auxiliary_batch_size(q, nao) == 2
+    got = _run_unrestricted_nuclear_weights_tiled(
+        (oa, ob, n, q), central, z, execute, direct_weights=direct, frame_overlap=frame_ov
+    )
+    assert set(got) == set(ref)
+    for k in ref:
+        np.testing.assert_allclose(got[k], ref[k], atol=1e-12, rtol=0, err_msg=k)
+
+
+
 

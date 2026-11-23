@@ -94,37 +94,73 @@ def relaxed_reference_weights(
     occs = (
         reference.occupied if len(reference.occupied) == 2 else reference.occupied * 2
     )
+    from ._f12_spin_fock import _tile_groups, default_auxiliary_batch_size
+    from ._f12_spin_pairs import batch_execute
+
     obs = reference.overlap.shape[0]
     aux = len(whitener)
     space = (*occs, obs, aux)
     r = sum((obs - o) * o for o in occs)
     if reference.executed_backend == "cuda" and 8 * r * r > mb << 20:
         raise MemoryError("dense DF-HF orbital response exceeds the requested budget")
-    ss = IndexSpace("jkfit", "auxiliary", aux)
     mo = IndexSpace("obs", "orbital", obs)
-    a, b = Index("A", ss), Index("B", ss)
     i, j = Index("p", mo), Index("q", mo)
-    g = input_tensor("raw", TensorSpec((b, i, j), role="input"))
-    w = input_tensor("W", TensorSpec((a, b), role="input"))
-    whiten = Program({"df": einsum("AB,Bpq->Apq", w, g)})
+    b_full = Index("B", IndexSpace("jkfit_b", "auxiliary", aux))
+    whiten_width = default_auxiliary_batch_size(aux, obs)
+    whiten_groups = _tile_groups(aux, whiten_width)
+
+    def _whiten_tiled(raw_mo: np.ndarray) -> np.ndarray:
+        out = np.empty((aux, obs, obs), dtype=np.float64)
+        for t_len, t_slices in whiten_groups:
+            a_t = Index("A", IndexSpace("jkfit_a", "auxiliary", t_len))
+            for b_len, b_slices in whiten_groups:
+                b_t = Index("B", IndexSpace("jkfit_b", "auxiliary", b_len))
+                prog = Program(
+                    {
+                        "df": einsum(
+                            "AB,Bpq->Apq",
+                            input_tensor("W", TensorSpec((a_t, b_t), role="input")),
+                            input_tensor("raw", TensorSpec((b_t, i, j), role="input")),
+                        )
+                    }
+                )
+                with batch_execute(run, prog) as exec_w:
+                    for a_rows in t_slices:
+                        acc = np.zeros((t_len, obs, obs), dtype=np.float64)
+                        for b_rows in b_slices:
+                            acc += exec_w(
+                                {
+                                    "W": np.ascontiguousarray(whitener[a_rows, b_rows]),
+                                    "raw": np.ascontiguousarray(raw_mo[b_rows]),
+                                }
+                            ).outputs["df"]
+                        if b_slices[0].start == 0:
+                            out[a_rows] = acc
+                        else:
+                            out[a_rows] += acc
+        return out
+
     central = {"whitener": whitener}
     factors = {}
     drivers = []
     overlap = overlap_seed.copy()
+    is_rhf = len(reference.occupied) == 1
+    shared_df = None
     for k, (spin, o) in enumerate(zip(("alpha", "beta"), occs, strict=True)):
         index = k if len(reference.occupied) == 2 else 0
         coeff = reference.coefficients[index]
         eps = reference.orbital_energies[index]
         bar = weights["obs_coefficients"][index]
-        if len(reference.occupied) == 1:
+        if is_rhf:
             bar = bar * 0.5
-        df = run(
-            whiten,
-            {
-                "W": whitener,
-                "raw": np.ascontiguousarray(raw["raw_coulomb_" + spin][:, :obs, :obs]),
-            },
-        ).outputs["df"]
+        if is_rhf and shared_df is not None:
+            df = shared_df
+        else:
+            raw_obs = np.ascontiguousarray(raw["raw_coulomb_" + spin][:, :obs, :obs])
+            df = _whiten_tiled(raw_obs)
+            del raw_obs
+            if is_rhf:
+                shared_df = df
         central.update(
             {
                 key + "_" + spin: val
@@ -171,26 +207,42 @@ def relaxed_reference_weights(
                 }
             )
     driver = np.concatenate(drivers)
-    action = unrestricted_df_orbital_action(*space)
 
     def matvec(vector: np.ndarray) -> np.ndarray:
-        inputs = dict(factors)
+        trials = {}
         offset = 0
         for spin, o in zip(("alpha", "beta"), occs, strict=True):
             if o:
                 count = (obs - o) * o
-                inputs["trial_" + spin] = np.ascontiguousarray(
+                trials["trial_" + spin] = np.ascontiguousarray(
                     vector[offset : offset + count].reshape(obs - o, o)
                 )
                 offset += count
-        out = run(action, inputs).outputs
-        return np.concatenate(
-            [
-                out[spin].ravel()
-                for spin, o in zip(("alpha", "beta"), occs, strict=True)
-                if o
-            ]
-        )
+        acc = {
+            spin: np.zeros((obs - o, o), dtype=np.float64)
+            for spin, o in zip(("alpha", "beta"), occs, strict=True)
+            if o
+        }
+        for tile_len, slices in whiten_groups:
+            action = unrestricted_df_orbital_action(*occs, obs, tile_len)
+            with batch_execute(run, action) as exec_act:
+                for rows in slices:
+                    inputs = dict(trials)
+                    for spin, o in zip(("alpha", "beta"), occs, strict=True):
+                        if not o:
+                            continue
+                        inputs["vo_" + spin] = np.ascontiguousarray(factors["vo_" + spin][rows])
+                        inputs["oo_" + spin] = np.ascontiguousarray(factors["oo_" + spin][rows])
+                        inputs["vv_" + spin] = np.ascontiguousarray(factors["vv_" + spin][rows])
+                        inputs["gap_" + spin] = (
+                            factors["gap_" + spin]
+                            if rows.start == 0
+                            else np.zeros_like(factors["gap_" + spin])
+                        )
+                    out = exec_act(inputs).outputs
+                    for spin in acc:
+                        acc[spin] += out[spin]
+        return np.concatenate([acc[spin].ravel() for spin, o in zip(("alpha", "beta"), occs, strict=True) if o])
 
     if reference.executed_backend == "cuda":
         z = _solve_orbital_response(
@@ -231,6 +283,7 @@ def relaxed_reference_weights(
     # With the direct occupied/virtual torque as driver the electronic observable
     # has zero explicit canonical Fock/energy seeds in the nuclear equation.
     bars = unrestricted_nuclear_source_weights(space, central, z, run)
+    del central, factors, shared_df
     overlap[:obs, :obs] += bars["overlap_ao"]
     h = weights["hcore"].copy()
     h[:obs, :obs] += bars["hcore_ao"]
