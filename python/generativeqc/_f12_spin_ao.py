@@ -319,7 +319,7 @@ def _orbital_sources(
                 else:
                     tc_bars[spin] = None
 
-            split_ao = stream_this and not use_occ_coul and op == "coulomb"
+            split_ao = stream_this
             if split_ao:
                 # Phase 1: compute bar_coefficients using ao_mat + seed, then free ao_mat before allocating bar_ao
                 for spin, occ in rev_spins:
