@@ -982,7 +982,7 @@ class MolecularFocalProvider:
             and not ordinary
             and (
                 env_stream == "1"
-                or (env_stream != "0" and est_panel_bytes > (4 << 30))
+                or (env_stream != "0" and est_panel_bytes > (2 << 30))
             )
         )
         if streaming:

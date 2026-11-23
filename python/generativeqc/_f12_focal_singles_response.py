@@ -287,7 +287,11 @@ def relaxed_reference_weights(
     overlap[:obs, :obs] += bars["overlap_ao"]
     h = weights["hcore"].copy()
     h[:obs, :obs] += bars["hcore_ao"]
-    three = weights["three_center"].copy()
+    three = (
+        weights["three_center"]
+        if weights["three_center"].flags.writeable
+        else weights["three_center"].copy()
+    )
     three[:, :obs, :obs] += bars["ao_coulomb"]
     return {
         "overlap": overlap,
