@@ -583,3 +583,20 @@ def test_cc_like_scalar_fixture_builds_cpu_derivative_references() -> None:
     assert len(forward.program.live_nodes) > 0
     assert len(reverse.program.live_nodes) > 0
     assert all(sample["error"]["passed"] for sample in finite_differences)
+
+
+def test_slice_pullback_relabels_contraction_dummy_axes_before_scattering() -> None:
+    a, x = _axis("a", 3), _axis("x", 5)
+    matrix = _parameter("matrix", (a, x))
+    part = slice_tensor(matrix, ((0, 3), (1, 4)))
+    vector = _parameter("vector", (part.spec.indices[1],))
+    graph = Program({"row": einsum("ca,a->c", part, vector)})
+    reverse = transpose_program(graph, ("row",), inputs=("matrix",)).program
+    vector_values = np.array([1.5, 2.0, -1.0])
+    seed = np.array([0.7, -1.2, 2.1])
+    response = execute(
+        reverse, {"matrix": np.ones((3, 5)), "vector": vector_values, "bar_row": seed}
+    )
+    wanted = np.zeros((3, 5))
+    wanted[:, 1:4] = np.outer(seed, vector_values)
+    np.testing.assert_allclose(response.outputs["bar_matrix"], wanted)

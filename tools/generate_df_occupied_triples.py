@@ -13,6 +13,7 @@ if __package__ in (None, ""):
     sys.path[:0] = [str(ROOT), str(ROOT / "python")]
 
 from generativeqc_compiler.cc.occupied_triples import (
+    OCCUPIED_ORBITAL_SHARE,
     PERMUTATIONS,
     df_panel_program,
     energy_scalar_program,
@@ -1279,6 +1280,7 @@ def cuda_header() -> str:
 #include <cuda_runtime.h>
 #include "generated_df_occupied_triples.hpp"
 namespace generativeqc::cc::triples::generated_df {
+inline constexpr double occupied_orbital_share = @OCCUPIED_ORBITAL_SHARE@;
 void energy_tile(std::size_t o,std::size_t v,std::size_t i,std::size_t j,std::size_t k,
                  double degeneracy,double threshold,const Inputs& in,const double* moments,
                  unsigned blocks,double* partials,int* error,cudaStream_t stream);
@@ -1305,7 +1307,10 @@ void resolvent_tile(std::size_t o,std::size_t v,std::size_t i,std::size_t j,std:
                     double threshold,const Inputs& in,const double* moments,unsigned blocks,
                     double* x,double* y,int* error,cudaStream_t stream);
 }
-"""
+""".replace(
+        "@OCCUPIED_ORBITAL_SHARE@",
+        f"{OCCUPIED_ORBITAL_SHARE.numerator}.0 / {OCCUPIED_ORBITAL_SHARE.denominator}.0",
+    )
 
 
 def _energy_tile_kernel(name: str, *, remapped: bool = False) -> str:

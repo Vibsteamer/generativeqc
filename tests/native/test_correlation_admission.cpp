@@ -11,6 +11,7 @@
 #include "core/work_budget.hpp"
 #include "hf/df_reference_status.hpp"
 #include "hf/reference.hpp"
+#include "methods/uccsd_method.hpp"
 #include "scf/fock_symmetry.hpp"
 
 namespace {
@@ -79,6 +80,46 @@ void work_admission() {
   }
 }
 
+void cuda_fitted_cc_value_preparation() {
+  // This is a capacity-only test. No GPU is needed to prepare this plan
+  // or to refuse the force request before creating its integral providers.
+  WorkPolicy policy;
+  setenv(variable, "200000000000000", 1);
+  generativeqc::core::System orbital;
+  orbital.atoms = {{8, {0, 0, 0}}, {1, {1, 0, 0}}, {1, {0, 1, 0}},
+                   {8, {0, 0, 3}}, {1, {1, 0, 3}}};
+  orbital.charge = -1;
+  orbital.electron_count = 20;
+  orbital.basis_representation = generativeqc::core::kSphericalBasis;
+  auto jk = orbital;
+  const auto fill_shells = [](auto& system, unsigned count) {
+    for (unsigned index = 0; index < count; ++index)
+      system.shells.push_back({index % 5, 0, {{0.25 + 0.1 * index, 1}}});
+  };
+  fill_shells(orbital, 134);
+  fill_shells(jk, 400);
+  generativeqc_method_descriptor descriptor{};
+  descriptor.precision_mode = GENERATIVEQC_PRECISION_FP64;
+  descriptor.density_fitting_mode = GENERATIVEQC_DENSITY_FITTING_FULL_CUDA;
+  descriptor.correlation_memory_budget_bytes = 64ULL << 30;
+  descriptor.density_fitting_memory_budget_bytes = 2ULL << 30;
+  generativeqc::methods::Capabilities capabilities;
+  capabilities.method = GENERATIVEQC_METHOD_UCCSD_T;
+  generativeqc::core::ContextState context;
+  context.requested_backend = GENERATIVEQC_BACKEND_CUDA;
+  auto plan = generativeqc::methods::detail::prepare_uccsd_with_reference_fit(
+      capabilities, context, orbital, descriptor, &jk, &jk);
+  require(plan && plan->atom_count() == 5, "CUDA fitted energy plan was not admitted");
+  try {
+    plan->execute(true);
+    throw std::runtime_error("force request bypassed the derivative fitting cap");
+  } catch (const generativeqc::methods::MethodError& error) {
+    require(error.status() == GENERATIVEQC_STATUS_OUT_OF_MEMORY,
+            "expected the force request to exceed the derivative fitting cap");
+    require(!plan->correlation_diagnostic(), "a refused force request left a result");
+  }
+}
+
 void reference_status() {
   using generativeqc::hf::require_df_reference_result;
   std::vector<generativeqc::scf::RhfBucketItem> results(1);
@@ -144,6 +185,7 @@ void fock_symmetry() {
 int main() {
   try {
     work_admission();
+    cuda_fitted_cc_value_preparation();
     reference_status();
     fock_symmetry();
     std::cout << "correlation admission/status contracts passed\n";

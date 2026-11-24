@@ -23,6 +23,9 @@ Matrix physical_weighted_density(const Matrix& density, const Matrix& fock, std:
                                  double occupation_weight = 2.0);
 /** Restricted electronic energy, excluding nuclear repulsion. */
 double electronic_energy(const Matrix& density, const Matrix& hcore, const Matrix& fock);
+/** Restricted electronic energy with compensated accumulation of the existing FP64 terms. */
+double compensated_electronic_energy(const Matrix& density, const Matrix& hcore,
+                                    const Matrix& fock);
 /** Unrestricted electronic energy with separate unit-occupation spin densities. */
 double uhf_electronic_energy(const Matrix& alpha_density, const Matrix& beta_density,
                              const Matrix& hcore, const Matrix& alpha_fock,

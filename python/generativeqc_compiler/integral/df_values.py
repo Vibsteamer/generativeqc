@@ -286,6 +286,7 @@ def build_df_axis_moment(
     auxiliary_g_derivative: bool = False,
     auxiliary_h: bool = False,
     auxiliary_h_derivative: bool = False,
+    auxiliary_i_derivative: bool = False,
     maximum_orbital: int = 3,
     states: set[tuple[int, int, int]] | None = None,
 ) -> tuple[Graph, Expr]:
@@ -308,18 +309,28 @@ def build_df_axis_moment(
     ``maximum_orbital=4`` explicitly extends only that h domain to g/g/h:
     values end at F13 and responses at F14. At most one orbital center can
     carry the internally raised h power; a metric's first center may reach i.
+    For the combined OBS/OptRI F12 space, maximum_orbital=5 opts the axis
+    polynomial into h/h/h (F15 for values, F16 for one raised center).
+    The separate molecular i domain reaches i/i/i and one internal raise,
+    with no admission of an external k shell.
+    Other consumers retain their own shell admission and storage bounds.
     An optional diagnostic set collects the nonconstant recurrence states visited
     by this same builder, before expression simplification or backend CSE.
     """
     powers = (a, b, c)
-    if maximum_orbital not in (3, 4) or (
-        maximum_orbital == 4 and not (auxiliary_h or auxiliary_h_derivative)
-    ):
+    if maximum_orbital not in (3, 4, 5, 6):
+        raise ValueError("maximum orbital angular momentum must lie between f and i")
+    if (maximum_orbital == 6) != auxiliary_i_derivative:
+        raise ValueError("combined orbital i requires the explicit molecular i domain")
+    if maximum_orbital in (4, 5) and not (auxiliary_h or auxiliary_h_derivative):
+        shell = "g" if maximum_orbital == 4 else "h"
         raise ValueError(
-            "orbital g requires the explicit auxiliary-through-h moment domain"
+            f"orbital {shell} requires the explicit auxiliary-through-h moment domain"
         )
     maximum = (
-        6
+        7
+        if auxiliary_i_derivative
+        else 6
         if auxiliary_h_derivative
         else 5
         if auxiliary_h or auxiliary_g_derivative
@@ -328,7 +339,18 @@ def build_df_axis_moment(
         else 3
     )
     invalid = any(type(n) is not int or not 0 <= n <= maximum for n in powers)
-    if auxiliary_h or auxiliary_h_derivative:
+    if auxiliary_i_derivative:
+        invalid = (
+            invalid
+            or internal_derivative
+            or auxiliary_g
+            or auxiliary_g_derivative
+            or auxiliary_h
+            or auxiliary_h_derivative
+            or c > 6
+            or a == b == 7
+        )
+    elif auxiliary_h or auxiliary_h_derivative:
         invalid = (
             invalid
             or internal_derivative
@@ -355,6 +377,8 @@ def build_df_axis_moment(
     else:
         invalid = invalid or c > 3 or sum(n == 4 for n in powers) > 1
     if invalid:
+        if auxiliary_i_derivative:
+            raise ValueError("DF axis powers exceed the molecular i domain")
         if auxiliary_h or auxiliary_h_derivative:
             raise ValueError("DF axis powers exceed the auxiliary-h domain")
         if auxiliary_g_derivative:

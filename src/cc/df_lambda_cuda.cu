@@ -214,7 +214,12 @@ struct DFLambdaActions::Impl {
       std::lock_guard<std::mutex> lock(runtime::allocation_measurement_mutex);
       cuda_check(cudaMemGetInfo(&available_device_bytes, &total_device_bytes));
     }
-    const auto device_limit = std::min(available_device_bytes, options.df_max_device_bytes);
+    const std::size_t safe_avail =
+        available_device_bytes > (6ULL << 30) ? (available_device_bytes - (6ULL << 30))
+                                              : (available_device_bytes * 3 / 4);
+    const std::size_t hard_cap =
+        (total_device_bytes >= (32ULL << 30)) ? (24ULL << 30) : safe_avail;
+    const auto device_limit = std::min({safe_avail, hard_cap, options.df_max_device_bytes});
     metrics.df_available_device_bytes = available_device_bytes;
     metrics.df_device_limit_bytes = device_limit;
     const auto device_fits = [&](std::size_t candidate, std::size_t allowance,
@@ -994,16 +999,18 @@ std::pair<const double*, const double*> DFLambdaActions::transpose_device(bool i
   return {s.sum1, s.sum2};
 }
 
-void DFLambdaActions::seeds(std::span<const double> one, std::span<const double> two) {
+void DFLambdaActions::seeds(std::span<const double> one, std::span<const double> two,
+                            double energy_weight) {
   auto& s = *impl_;
   if (s.mixed_active)
     throw std::logic_error("DF Lambda parameter seeds require a finished FP32 epoch");
-  const double energy = 1;
+  if (!std::isfinite(energy_weight))
+    throw std::invalid_argument("DF Lambda parameter energy weight must be finite");
   Fence fence{s.storage.stream};
   if (!s.parameters_admitted || one.size() != s.n1 || two.size() != s.n2)
     throw std::invalid_argument("DF parameter response not admitted or seed shape mismatch");
   s.clear_error();
-  s.upload(s.state.bar_correlation_energy, &energy, 1);
+  s.upload(s.state.bar_correlation_energy, &energy_weight, 1);
   s.upload(s.state.bar_singles_residual, one.data(), s.n1);
   s.upload(s.state.bar_doubles_residual, two.data(), s.n2);
   s.finish();

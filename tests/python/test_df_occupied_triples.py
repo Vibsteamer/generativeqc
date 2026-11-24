@@ -21,7 +21,16 @@ from generativeqc_compiler.cc.occupied_triples import (
     moment_program,
     w_fp32_candidate_program,
 )
-from generativeqc_compiler.cc.triples import _LABELS, VP, triples_energy
+from generativeqc_compiler.cc.occupied_triples_response import energy_scalar_vjp
+from generativeqc_compiler.cc.triples import (
+    _LABELS,
+    VP,
+    _v,
+    _views,
+    _w,
+    r3,
+    triples_energy,
+)
 from generativeqc_compiler.common.cuda_target import cuda_target_info
 from generativeqc_compiler.tensor import describe_precision, execute
 from generativeqc_compiler.tensor.cuda_plan import plan_cuda
@@ -78,7 +87,11 @@ def scalar_probe(tmp_path_factory: pytest.TempPathFactory) -> typing.Any:
     source.write_text(
         '#include "generated.hpp"\nextern "C" double point(const double* p) {'
         f"double result=0; generativeqc::cc::triples::generated_df::energy_element({args},result);"
-        "return result;}\n"
+        'return result;}\n#include "cc/df_triples_traversal.hpp"\n'
+        'extern "C" std::size_t share(std::size_t orbital, std::size_t hi, std::size_t lo, '
+        'std::size_t* count) {'
+        'auto tile=generativeqc::cc::triples::detail::occupied_tile_share(orbital,hi,lo);'
+        '*count=tile.count; return tile.index;}\n'
     )
     obj, library = directory / "probe.o", directory / "probe.so"
     subprocess.run(
@@ -107,20 +120,23 @@ def scalar_probe(tmp_path_factory: pytest.TempPathFactory) -> typing.Any:
     dll = ct.CDLL(str(library))
     call = dll.point
     call.argtypes, call.restype = [ct.POINTER(ct.c_double)], ct.c_double
-    return call, names
+    share = dll.share
+    share.argtypes = [ct.c_size_t, ct.c_size_t, ct.c_size_t, ct.POINTER(ct.c_size_t)]
+    share.restype = ct.c_size_t
+    return call, names, share
 
 
-@pytest.mark.parametrize("o,v", [(1, 3), (2, 3), (3, 2), (3, 4)])
-def test_occupied_domain_preserves_all_permutations_and_multiplicities(
-    scalar_probe: typing.Any, o: int, v: int
-) -> None:
-    inputs, ovvv = case(o, v)
+def spatial_occupied_tiles(
+    scalar_probe: typing.Any, inputs: list[np.ndarray], ovvv: np.ndarray
+) -> list[float]:
     _, _, ovoo, ovov, fov, t1, t2, eo, ev = inputs
-    call, names = scalar_probe
-    energy = 0.0
+    o, v = len(eo), len(ev)
+    call, names, _ = scalar_probe
+    energies = []
     for i in range(o):
         for j in range(i + 1):
             for k in range(j + 1):
+                energy = 0.0
                 occupied = i, j, k
                 moments = {}
                 for label, order in zip(_LABELS, PERMUTATIONS, strict=True):
@@ -145,7 +161,109 @@ def test_occupied_domain_preserves_all_permutations_and_multiplicities(
                             feeds[f"w_{occ}_{vir}"] = w[tuple(abc[x] for x in VP[vir])]
                     values = np.array([feeds[name] for name in names])
                     energy += call(values.ctypes.data_as(ct.POINTER(ct.c_double)))
-    np.testing.assert_allclose(energy, reference(inputs, ovvv), atol=3e-12, rtol=3e-12)
+                energies.append(energy)
+    return energies
+
+
+def occupied_fullsum(inputs: list[np.ndarray], ovvv: np.ndarray) -> np.ndarray:
+    """Ordered virtual sum and independent simultaneous-permutation pairing."""
+    _, _, ovoo, ovov, fov, t1, t2, eo, ev = inputs
+    views = _views(ovvv, ovoo, ovov, fov, t1, t2)
+    eijk = eo[:, None, None] + eo[None, :, None] + eo[None, None, :]
+    permutations = tuple(itertools.permutations(range(3)))
+    occupied_cube = np.zeros((len(eo),) * 3)
+    for abc in itertools.product(range(len(ev)), repeat=3):
+        coordinates = {p: tuple(abc[i] for i in p) for p in permutations}
+        d3 = eijk - sum(ev[x] for x in abc)
+        ws = {p: _w(views, *coords) for p, coords in coordinates.items()}
+        for p, coords in coordinates.items():
+            projected = r3(ws[p] + 0.5 * _v(views, *coords)) / d3
+            for q, w in ws.items():
+                occupied_cube += w.transpose(tuple(q.index(i) for i in p)) * projected
+    return (
+        occupied_cube.sum(axis=(1, 2))
+        + occupied_cube.sum(axis=(0, 2))
+        + occupied_cube.sum(axis=(0, 1))
+    ) / 9
+
+
+def gather_occupied(tiles: list[float], orbitals: int, share: typing.Any) -> np.ndarray:
+    result = np.zeros(orbitals)
+    for i in range(orbitals):
+        for first in range(orbitals):
+            for second in range(first + 1):
+                count = ct.c_size_t()
+                flat = share(i, first, second, ct.byref(count))
+                result[i] += count.value * tiles[flat] / 3
+    return result
+
+
+@pytest.mark.parametrize("o,v", [(1, 3), (2, 3), (3, 2), (3, 4)])
+def test_occupied_domain_preserves_all_permutations_and_multiplicities(
+    scalar_probe: typing.Any, o: int, v: int
+) -> None:
+    inputs, ovvv = case(o, v)
+    tiles = spatial_occupied_tiles(scalar_probe, inputs, ovvv)
+    np.testing.assert_allclose(sum(tiles), reference(inputs, ovvv), atol=3e-12, rtol=3e-12)
+    actual = gather_occupied(tiles, o, scalar_probe[2])
+    np.testing.assert_allclose(
+        actual, occupied_fullsum(inputs, ovvv), atol=3e-12, rtol=3e-12
+    )
+    np.testing.assert_allclose(actual.sum(), sum(tiles), atol=3e-12, rtol=3e-12)
+
+
+def test_occupied_scaling_adds_for_noninteracting_fragments(scalar_probe: typing.Any) -> None:
+    def direct_sum(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+        shape = tuple(a + b for a, b in zip(left.shape, right.shape, strict=True))
+        joined = np.zeros(shape)
+        joined[tuple(slice(0, extent) for extent in left.shape)] = left
+        joined[tuple(slice(extent, None) for extent in left.shape)] = right
+        return joined
+
+    a, ia = case(2, 2, 3)
+    b, ib = case(2, 3, 4)
+    joined = [direct_sum(x, y) for x, y in zip(a, b, strict=True)]
+    joined_eri = direct_sum(ia, ib)
+    direct = gather_occupied(spatial_occupied_tiles(scalar_probe, joined, joined_eri), 4, scalar_probe[2])
+    a_reference, b_reference = occupied_fullsum(a, ia), occupied_fullsum(b, ib)
+    np.testing.assert_allclose(direct, np.concatenate((a_reference, b_reference)), atol=3e-12)
+    q = np.array([1.2, 1.1, 0.94, 0.98])
+    np.testing.assert_allclose(q @ direct, q[:2] @ a_reference + q[2:] @ b_reference, atol=3e-12)
+
+
+def test_occupied_weighted_scalar_uses_exact_tile_mean_and_reverse() -> None:
+    weighted = energy_scalar_program(occupied_weighted=True)
+    plain = energy_scalar_program()
+    reverse = energy_scalar_vjp(occupied_weighted=True)
+    rng = np.random.default_rng(57426)
+    feeds = {
+        n.attrs["name"]: rng.uniform(-1.0, 1.0)
+        for n in weighted.live_nodes
+        if n.op == "input"
+    }
+    feeds["denominator"] = -3.5
+    q = (1.17, 1.17, 0.92)
+    feeds.update(zip(("weight_i", "weight_j", "weight_k"), q, strict=True))
+    unscaled_feeds = {
+        name: value for name, value in feeds.items() if not name.startswith("weight_")
+    }
+    raw = execute(plain, unscaled_feeds).outputs["energy"]
+    target = execute(weighted, feeds).outputs["energy"]
+    np.testing.assert_allclose(target, raw * np.mean(q), atol=2e-15)
+    bars = execute(reverse, {**feeds, "bar_energy": np.array(1.0)}).outputs
+    for axis in "ijk":
+        np.testing.assert_allclose(bars["bar_weight_" + axis], raw / 3, atol=2e-15)
+    tangent = {name: rng.uniform(-0.1, 0.1) for name in feeds}
+    projected = sum(value * bars["bar_" + name] for name, value in tangent.items())
+    for step in (4e-4, 2e-4):
+        minus, plus = (
+            execute(
+                weighted,
+                {name: x + sign * step * tangent[name] for name, x in feeds.items()},
+            ).outputs["energy"]
+            for sign in (-1, 1)
+        )
+        np.testing.assert_allclose(projected, (plus - minus) / (2 * step), atol=3e-9)
 
 
 @pytest.mark.parametrize("o,v,q", [(2, 3, 4), (3, 2, 1)])
@@ -312,6 +430,17 @@ def native_probe(tmp_path_factory: pytest.TempPathFactory) -> typing.Any:
         ct.c_size_t,
     ]
     call.restype = ct.c_int
+    occupied = dll.df_triples_occupied_probe_v1
+    occupied.argtypes = [
+        ct.c_size_t,
+        ct.c_size_t,
+        ct.c_size_t,
+        ct.POINTER(ct.POINTER(ct.c_double)),
+        ct.POINTER(ct.c_double),
+        ct.c_size_t,
+    ]
+    occupied.restype = ct.c_int
+    call.occupied_partition = occupied
     return call
 
 
@@ -374,6 +503,32 @@ def test_native_probe_rejects_short_diagnostic_buffer(native_probe: typing.Any) 
     )
     assert status != 0 and b"diagnostic buffer" in error.value
     assert np.isnan(values).all() and counts[0] == 17
+
+
+@pytest.mark.parametrize("o,v", [(1, 3), (2, 3), (3, 2), (4, 3)])
+def test_native_occupied_partition_reuses_standard_energy(
+    native_probe: typing.Any, o: int, v: int
+) -> None:
+    inputs, ovvv = case(o, v)
+    pointers = (ct.POINTER(ct.c_double) * len(inputs))(
+        *(array.ctypes.data_as(ct.POINTER(ct.c_double)) for array in inputs)
+    )
+    values = np.full(o + 1, np.nan)
+    status = native_probe.occupied_partition(
+        o,
+        v,
+        inputs[0].shape[0],
+        pointers,
+        values.ctypes.data_as(ct.POINTER(ct.c_double)),
+        len(values),
+    )
+    assert status == 0
+    expected = occupied_fullsum(inputs, ovvv)
+    np.testing.assert_allclose(values[1:], expected, atol=3e-12, rtol=3e-12)
+    np.testing.assert_allclose(values[0], values[1:].sum(), atol=3e-12, rtol=3e-12)
+    status, original, _, error = run(native_probe, inputs)
+    assert status == 0, error
+    np.testing.assert_array_equal(values[0], original[0])
 
 
 @pytest.mark.parametrize(

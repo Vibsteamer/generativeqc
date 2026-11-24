@@ -171,6 +171,9 @@ struct ScfOptions {
   ScfHooks* hooks{};
   /** Diagnostic proposal bridge rejects malformed seeds instead of normalizing them. */
   bool strict_initial_density{};
+  /** Seeded focal CUDA DF-RHF energy uses compensated energies and can test
+   * the physical density step in an orthonormal overlap metric. */
+  bool stabilize_focal_rhf_convergence{};
   /** False for an explicit energy-only endpoint. Backends must then omit
    * derivative evaluation and return an empty force vector. */
   bool compute_forces{true};
@@ -216,6 +219,13 @@ struct ScfOptions {
   bool retain_ks_state{};
   /** Explicit bounded cold-start preparation; absent preserves the core guess. */
   std::optional<initial_guess::PreliminaryOptions> preliminary_guess;
+  /** Optional virtual level shift (Eh) applied in the current occupied-complement
+   * projector S - S*D_spin*S during diagonalization; 0 disables shifting. */
+  double level_shift{0.0};
+  /** Optional linear density damping factor in (0, 1]; 1.0 disables damping. */
+  double density_damping{1.0};
+  /** Toggle CDIIS Fock extrapolation (false runs pure damped/shifted descent). */
+  bool enable_diis{true};
 };
 
 /** Lower-specific facts consumed by the shared incremental Direct-J/K policy.

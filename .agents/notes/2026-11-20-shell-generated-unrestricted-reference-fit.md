@@ -1,0 +1,7 @@
+# Build the unrestricted response fit in the Gaussian center
+
+The NH₂/D center previously received an inverse Cholesky factor and two arrays of orbital density-fitting factors from an archived reference. The orbital Hessian and nuclear response depend on products of these factors and must use one common auxiliary frame.
+
+The center now has a mode that generates the full-rank symmetric Coulomb whitener from the same metric used for the electronic energy. It transforms and whitens all orbital pairs for both spin channels through TensorIR. Both occupied spaces contribute to the Coulomb charge. Exchange uses the occupied orbitals of its own spin. The implementation compares the resulting two physical Focks with the native canonical energies before using either set of factors. This also tests the compatibility of the reference Hamiltonian with the fitting shells. The metric response equations accept either of these whitening conventions.
+
+An independent host replay used a fresh native CPU DF-UHF calculation for the distorted NH₂ doublet, numerical Gaussian integrals and derivatives, two independently constructed frames, and the 62ah L20 energy and force controls. The largest spin-Fock discrepancy was below 4e-11 hartree. All nine forces agreed with the 36 signed reference energies to 5.3e-8 hartree/bohr. Both new TensorIR programs compiled for sm_89. These controls establish host numerical behavior and compilation. Device execution requires the native CUDA reference solver, shell providers, full-rank metric and an independent L20 return from this source.

@@ -22,9 +22,157 @@ from generativeqc_compiler.integral.ecp_policy import (
 from .basis import BasisSet, validate_ecp_data
 from .elements import checked_integer
 
+if typing.TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from .calculator import Atom
+
+
+def g_shell_halogen_hydride(basis, atoms):
+    """Return whether orbital g quadrature was qualified for this atom/core topology."""
+    if not isinstance(basis, BasisSet) or basis.representation != "spherical":
+        return False
+    elements = sorted(a.atomic_number for a in atoms)
+    if elements not in ([1, 35], [1, 53], [1, 1, 35], [1, 1, 53]):
+        return False
+    hydrogen = basis.by_element.get(1)
+    heavy = basis.by_element.get(elements[-1])
+    return (
+        hydrogen is not None
+        and hydrogen.ecp_core_electrons == 0
+        and heavy is not None
+        and heavy.ecp_core_electrons == {35: 10, 53: 28}[elements[-1]]
+    )
+
+
+def g_shell_carbon_halide(basis: object, atoms: Sequence[Atom]) -> bool:
+    """One small-core Br or I, at least one all-electron C and optional H."""
+    if not isinstance(basis, BasisSet) or basis.representation != "spherical":
+        return False
+    elements = [a.atomic_number for a in atoms]
+    if 6 not in elements or sum(z in (35, 53) for z in elements) != 1:
+        return False
+    cores = {1: 0, 6: 0, 35: 10, 53: 28}
+    return all(
+        z in cores
+        and z in basis.by_element
+        and basis.by_element[z].nuclear_charge == z
+        and basis.by_element[z].ecp_core_electrons == cores[z]
+        for z in set(elements)
+    )
+
+
+def g_shell_halogen_water(basis: object, atoms: Sequence[Atom]) -> bool:
+    """One small-core Br or I with all-electron oxygen and two hydrogens."""
+    if not isinstance(basis, BasisSet) or basis.representation != "spherical":
+        return False
+    elements = sorted(a.atomic_number for a in atoms)
+    if elements not in ([1, 1, 8, 35], [1, 1, 8, 53]):
+        return False
+    return all(
+        z in basis.by_element
+        and basis.by_element[z].nuclear_charge == z
+        and basis.by_element[z].ecp_core_electrons == core
+        for z, core in ((1, 0), (8, 0), (elements[-1], {35: 10, 53: 28}[elements[-1]]))
+    )
+
+
+def g_shell_halogen_dihydride(basis, atoms):
+    return len(atoms) == 3 and g_shell_halogen_hydride(basis, atoms)
+
+
+def fitted_uhf_hydride_domain(basis, atoms, charge, multiplicity):
+    """Scalar small-core monohalogen hydrides covered by native CUDA DF-UHF."""
+    if (
+        charge != 0
+        or multiplicity != 2
+        or not isinstance(basis, BasisSet)
+        or basis.representation != "spherical"
+    ):
+        return False
+    shell_limit = 4 if g_shell_halogen_dihydride(basis, atoms) else 3
+    heavy = []
+    for atom in atoms:
+        entry = basis.by_element.get(atom.atomic_number)
+        if entry is None or any(s.angular_momentum > shell_limit for s in entry.shells):
+            return False
+        if atom.atomic_number != 1 or entry.ecp_core_electrons:
+            heavy.append((atom.atomic_number, entry.ecp_core_electrons))
+    return len(heavy) == 1 and heavy[0] in ((35, 10), (53, 28))
+
+
+def fitted_hf_hydride_domain(method, basis, atoms, charge, multiplicity):
+    """Qualified CUDA fitted spin and orbital domains for small-core hydrides."""
+    if method == "uhf":
+        return fitted_uhf_hydride_domain(basis, atoms, charge, multiplicity)
+    return (
+        method == "rhf"
+        and charge == 0
+        and multiplicity == 1
+        and len(atoms) == 2
+        and g_shell_halogen_hydride(basis, atoms)
+        and all(
+            shell.angular_momentum <= 4
+            for atom in atoms
+            for shell in basis.by_element[atom.atomic_number].shells
+        )
+    )
+
+
+def fitted_hf_ecp_domain(
+    method: str, basis: BasisSet, atoms: Sequence[Atom], charge: int, multiplicity: int
+) -> bool:
+    """Admit the supported small-core halide states and orbital angular momenta."""
+    if fitted_hf_hydride_domain(method, basis, atoms, charge, multiplicity):
+        return True
+    if not isinstance(basis, BasisSet) or basis.representation != "spherical":
+        return False
+    if (method, multiplicity) not in (("rhf", 1), ("uhf", 2)):
+        return False
+    for atom in atoms:
+        if atom.atomic_number not in basis.by_element:
+            return False
+    electrons = (
+        sum(
+            atom.atomic_number - basis.by_element[atom.atomic_number].ecp_core_electrons
+            for atom in atoms
+        )
+        - charge
+    )
+    if electrons <= 0 or electrons % 2 != multiplicity - 1:
+        return False
+    if charge in (0, 1) and (
+        g_shell_carbon_halide(basis, atoms) or g_shell_halogen_water(basis, atoms)
+    ):
+        shell_limit = 4
+    else:
+        has_halide = False
+        for atom in atoms:
+            eb = basis.by_element[atom.atomic_number]
+            if atom.atomic_number == 35 and eb.ecp_core_electrons == 10:
+                has_halide = True
+            elif atom.atomic_number == 53 and eb.ecp_core_electrons == 28:
+                has_halide = True
+            elif eb.ecp_core_electrons != 0:
+                return False
+        if not has_halide:
+            return False
+        shell_limit = 3
+    return all(
+        shell.angular_momentum <= shell_limit
+        for z in {atom.atomic_number for atom in atoms}
+        for shell in basis.by_element[z].shells
+    )
+
 
 def resolve_ecp(basis: typing.Any, atoms: typing.Any) -> typing.Any:
     """Resolve immutable source records to atom-mapped scalar residual terms."""
+    orbital_g = (
+        g_shell_halogen_hydride(basis, atoms)
+        or g_shell_carbon_halide(basis, atoms)
+        or g_shell_halogen_water(basis, atoms)
+    )
+    shell_limit = 4 if orbital_g else 3
     cores, terms = [], []
     metadata = basis.by_element if isinstance(basis, BasisSet) else {}
     for atom_index, atom in enumerate(atoms):
@@ -47,8 +195,12 @@ def resolve_ecp(basis: typing.Any, atoms: typing.Any) -> typing.Any:
             raise NotImplementedError(
                 "ECP local channel must be s/p/d/f/g; projectors at most f"
             )
-        if any(s.angular_momentum > 3 for s in element.shells):
-            raise NotImplementedError("ECP execution supports orbital s/p/d/f shells")
+        if any(s.angular_momentum > shell_limit for s in element.shells):
+            raise NotImplementedError(
+                "ECP execution supports orbital s/p/d/f shells"
+                if shell_limit == 3
+                else "scalar-ECP orbital shells in this domain extend through g"
+            )
         for potential in potentials:
             if set(potential) - {
                 "ecp_type",
@@ -87,9 +239,14 @@ def resolve_ecp(basis: typing.Any, atoms: typing.Any) -> typing.Any:
     if terms:
         # Applies to mixed all-electron/ECP atoms too.
         for atom in atoms:
-            if any(s.angular_momentum > 3 for s in metadata[atom.atomic_number].shells):
+            if any(
+                s.angular_momentum > shell_limit
+                for s in metadata[atom.atomic_number].shells
+            ):
                 raise NotImplementedError(
                     "ECP execution supports orbital s/p/d/f shells"
+                    if shell_limit == 3
+                    else "scalar-ECP orbital shells in this domain extend through g"
                 )
     return tuple(cores), tuple(terms)
 
@@ -140,18 +297,169 @@ class ECPIntegrals:
     def matrix(self) -> typing.Any:
         return self.local + self.nonlocal_
 
-    def contract(self, weights: typing.Any) -> typing.Any:
-        """Contract fixed arbitrary real AO weights, including nonsymmetric ones."""
-        if self.local_derivative is None:
+    def contract(
+        self,
+        weights: typing.Any,
+        *,
+        orbital_coefficients: np.ndarray | None = None,
+        coefficient_derivatives: np.ndarray | None = None,
+        device: str = "cpu",
+    ) -> np.ndarray:
+        """Differentiate a fixed real weight contracted with V or C.T @ V @ C.
+
+        C uses the same AO row order as the matrices and can be rectangular.
+        Supply dC[atom, xyz] for a moving orbital frame. Alpha and beta frames
+        can be contracted independently and their gradients added. The result
+        uses the positive energy-derivative sign. CUDA evaluates and returns
+        the whole Cartesian panel in one call.
+        """
+        if self.local_derivative is None or self.nonlocal_derivative is None:
             raise ValueError("ECP derivatives were not requested")
+        if device not in {"cpu", "cuda"}:
+            raise ValueError("ECP gradient device must be cpu or cuda")
         if np.iscomplexobj(weights):
             raise TypeError("ECP weights must be real")
         weights = np.asarray(weights, dtype=np.float64)
-        if weights.shape != self.local.shape or not np.isfinite(weights).all():
-            raise ValueError("ECP weights must be finite and match the full AO matrix")
-        return np.einsum(
-            "axij,ij->ax", self.local_derivative + self.nonlocal_derivative, weights
+        if not np.isfinite(weights).all():
+            raise ValueError("ECP weights must be finite")
+        if orbital_coefficients is None:
+            if coefficient_derivatives is not None:
+                raise ValueError("orbital coefficient derivatives require their frame")
+            if weights.shape != self.local.shape:
+                raise ValueError("ECP weights must match the full AO matrix")
+            frame = None
+        else:
+            frame = np.asarray(orbital_coefficients)
+            if (
+                frame.ndim != 2
+                or frame.dtype != np.float64
+                or frame.shape[0] != self.local.shape[0]
+                or not frame.shape[1]
+                or weights.shape != (frame.shape[1], frame.shape[1])
+                or not np.isfinite(frame).all()
+            ):
+                raise ValueError(
+                    "ECP orbital frame and weights require matching finite dimensions"
+                )
+        motion = None
+        if coefficient_derivatives is not None:
+            motion = np.asarray(coefficient_derivatives)
+            if (
+                motion.dtype != np.float64
+                or motion.shape != (*self.local_derivative.shape[:2], *frame.shape)
+                or not np.isfinite(motion).all()
+            ):
+                raise ValueError(
+                    "ECP frame derivatives must match atom, Cartesian and orbital dimensions"
+                )
+        if device == "cuda":
+            from ._ecp_cuda import prepare, projected_inputs
+
+            program, feeds = projected_inputs(self, weights, frame, motion)
+            with prepare(program) as owner:
+                return owner.execute(feeds).outputs["gradient"]
+        ao_weights = weights if frame is None else frame @ weights @ frame.T
+        gradient = np.einsum("axij,ij->ax", self.local_derivative, ao_weights)
+        gradient += np.einsum("axij,ij->ax", self.nonlocal_derivative, ao_weights)
+        if motion is not None:
+            # The scalar residual ECP is real and symmetric; W need not be.
+            frame_weights = self.matrix @ frame @ (weights + weights.T)
+            gradient += np.einsum("axij,ij->ax", motion, frame_weights)
+        return gradient
+
+    def occupied_expectation_gradient(
+        self,
+        occupied: np.ndarray | tuple[np.ndarray, np.ndarray],
+        virtual: np.ndarray | tuple[np.ndarray, np.ndarray],
+        overlap_derivatives: np.ndarray,
+        virtual_occupied_response: np.ndarray | tuple[np.ndarray, np.ndarray],
+        *,
+        occupation: int = 1,
+        device: str = "cpu",
+    ) -> np.ndarray:
+        """Nuclear derivative of the scalar ECP expectation in occupied orbitals.
+
+        The two real coefficient matrices have AO rows and S-orthonormal
+        columns at the reference geometry. Supply dS in the same AO basis and
+        the solved virtual-occupied coefficient response Uvo, both ordered by
+        atom and Cartesian component. Use occupation 2 for a restricted
+        determinant. For UHF, pass pairs of alpha/beta occupied, virtual and
+        response arrays with occupation 1 to receive (2, atom, xyz). On CUDA
+        both spins share the AO inputs and all Cartesian components are returned
+        in one host transfer.
+        """
+        occupation = checked_integer(occupation, "orbital occupation", low=1, high=2)
+        if device not in {"cpu", "cuda"}:
+            raise ValueError("ECP expectation device must be cpu or cuda")
+        pair = (
+            isinstance(occupied, tuple)
+            and len(occupied) == 2
+            and all(np.ndim(c) == 2 for c in occupied)
         )
+        if pair:
+            if occupation != 1 or not all(
+                isinstance(x, tuple) and len(x) == 2
+                for x in (virtual, virtual_occupied_response)
+            ):
+                raise ValueError(
+                    "a spin pair requires paired frames and responses with occupation 1"
+                )
+            frames = tuple(zip(occupied, virtual, virtual_occupied_response, strict=True))
+        else:
+            frames = ((occupied, virtual, virtual_occupied_response),)
+        ds = np.asarray(overlap_derivatives)
+        nao = self.local.shape[0]
+        if self.local_derivative is None or self.nonlocal_derivative is None:
+            raise ValueError("ECP derivatives were not requested")
+        directions = self.local_derivative.shape[:2]
+        if (
+            ds.shape != (*directions, nao, nao)
+            or ds.dtype != np.float64
+            or not np.isfinite(ds).all()
+        ):
+            raise ValueError("ECP overlap derivatives must be finite with matching AO dimensions")
+        blocks = []
+        for frame in frames:
+            co, cv, uvo = map(np.asarray, frame)
+            if (
+                co.ndim != 2
+                or cv.ndim != 2
+                or co.shape[0] != nao
+                or cv.shape[0] != nao
+                or uvo.shape != (*directions, cv.shape[1], co.shape[1])
+            ):
+                raise ValueError(
+                    "ECP orbitals and response require matching AO and orbital dimensions"
+                )
+            if any(
+                a.dtype != np.float64 or not np.isfinite(a).all() for a in (co, cv, uvo)
+            ):
+                raise ValueError("ECP orbitals and response must be finite real double precision")
+            blocks.append((co, cv, uvo))
+        if device == "cuda":
+            from ._ecp_occupied_cuda import inputs, prepare
+
+            program, feeds = inputs(self, ds, blocks, occupation)
+            with prepare(program) as owner:
+                gradients = owner.execute(feeds).outputs["gradient"]
+            return gradients if pair else gradients[0]
+        results = [
+            self._occupied_spin_gradient(co, cv, ds, uvo, occupation)
+            for co, cv, uvo in blocks
+        ]
+        return np.stack(results) if pair else results[0]
+
+    def _occupied_spin_gradient(
+        self, co: np.ndarray, cv: np.ndarray, ds: np.ndarray, uvo: np.ndarray, occupation: int
+    ) -> np.ndarray:
+        vco = self.matrix @ co
+        gradient = self.contract(co @ co.T)
+        # The symmetric occupied rotation follows from d(Co.T @ S @ Co) = 0.
+        # Its antisymmetric gauge drops out of this trace with equal occupations.
+        normalization_weight = co @ (co.T @ vco) @ co.T
+        gradient -= np.einsum("axij,ij->ax", ds, normalization_weight)
+        gradient += 2 * np.einsum("axvi,vi->ax", uvo, cv.T @ vco)
+        return occupation * gradient
 
 
 def ecp_integrals(

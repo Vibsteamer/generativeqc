@@ -51,7 +51,8 @@ class DFLambdaActions {
    * This entry point neither stages dimension-sized data nor fences success.
    */
   [[nodiscard]] std::pair<const double*, const double*> transpose_device(bool independent);
-  void seeds(std::span<const double> one, std::span<const double> two);
+  void seeds(std::span<const double> one, std::span<const double> two,
+             double energy_weight = 1.0);
   std::vector<double> parameter(std::string_view name, std::size_t count);
   std::pair<std::vector<double>, std::vector<double>> virtual_factors();
   const LambdaDiagnostic& diagnostic() const noexcept;

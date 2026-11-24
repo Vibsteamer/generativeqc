@@ -24,7 +24,7 @@ struct Component {
 struct AO {
   int atom, primitive_offset, primitive_count, term_count;
   double x, y, z;
-  Component components[3];
+  Component components[molecule::kMaximumAuxiliaryAoExpansionTerms];
 };
 struct Four {
   double v[4];
@@ -163,6 +163,8 @@ void run(const core::System& system, unsigned radial, unsigned polar, bool deriv
   std::vector<AO> aos;
   std::vector<Primitive> primitives;
   for (const auto& shell : system.shells) {
+    if (shell.angular_momentum > generated::ecp_max_orbital_angular)
+      throw std::invalid_argument("ECP AO shell exceeds the generated quadrature domain");
     const auto& atom = system.atoms[shell.atom_index];
     const auto offset = primitives.size();
     if (shell.primitives.size() > limit || offset > limit - shell.primitives.size())
@@ -170,7 +172,7 @@ void run(const core::System& system, unsigned radial, unsigned polar, bool deriv
     for (const auto& p : shell.primitives) primitives.push_back({p.exponent, p.coefficient});
     for (const auto& expansion :
          molecule::ao_expansions(shell.angular_momentum, system.basis_representation)) {
-      if (expansion.size() > 3)
+      if (expansion.size() > molecule::kMaximumAuxiliaryAoExpansionTerms)
         throw std::invalid_argument("ECP AO expansion exceeds validated domain");
       AO ao{static_cast<int>(shell.atom_index),
             static_cast<int>(offset),
@@ -249,13 +251,31 @@ void run(const core::System& system, unsigned radial, unsigned polar, bool deriv
     evaluate_grid(generated::ecp_refined_radial_points, generated::ecp_refined_polar_points,
                   output);
     auto failed = arena.allocate<int>(1);
-    check(cudaMemsetAsync(failed, 0, sizeof(int), stream));
-    check_grid<<<(2 * stride + 127) / 128, 128, 0, stream>>>(coarse, output, size, stride, failed);
-    check(cudaPeekAtLastError());
-    int host_failed = 0;
-    check(cudaMemcpyAsync(&host_failed, failed, sizeof(int), cudaMemcpyDeviceToHost, stream));
-    check(cudaStreamSynchronize(stream));
-    if (host_failed)
+    auto accepted = [&]() {
+      check(cudaMemsetAsync(failed, 0, sizeof(int), stream));
+      check_grid<<<(2 * stride + 127) / 128, 128, 0, stream>>>(coarse, output, size, stride, failed);
+      check(cudaPeekAtLastError());
+      int host_failed = 0;
+      check(cudaMemcpyAsync(&host_failed, failed, sizeof(int), cudaMemcpyDeviceToHost, stream));
+      check(cudaStreamSynchronize(stream));
+      return host_failed == 0;
+    };
+    bool passed = accepted();
+    if (!passed && system.refine_ecp_quadrature) {
+      const auto limit = checked_ecp_grid_limit(system);
+      const EcpGridShape levels[]{
+          {generated::ecp_extended_radial_points, generated::ecp_extended_polar_points},
+          {generated::ecp_max_cuda_radial_points, generated::ecp_max_cuda_polar_points},
+          {generated::ecp_orbital_g_radial_points, generated::ecp_orbital_g_polar_points}};
+      for (const auto grid : levels) {
+        if (passed || grid.radial > limit.radial) break;
+        check(cudaMemcpyAsync(coarse, output, 2 * stride * sizeof(double),
+                              cudaMemcpyDeviceToDevice, stream));
+        evaluate_grid(grid.radial, grid.polar, output);
+        passed = accepted();
+      }
+    }
+    if (!passed)
       throw std::runtime_error(
           "ECP quadrature convergence gate failed; input outside validated execution domain");
   } else {

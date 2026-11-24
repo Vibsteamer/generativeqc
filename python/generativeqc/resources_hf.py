@@ -178,6 +178,7 @@ def _basis_record(
     *,
     derivative_order: typing.Any = 1,
     library: typing.Any = None,
+    fitted_consumer: str | None = None,
 ) -> typing.Any:
     selected = _snapshot_basis(basis, representation)
     mode = (
@@ -185,16 +186,30 @@ def _basis_record(
         if isinstance(selected, BasisSet)
         else representation or "cartesian"
     )
+    operator = "df_three_center" if fitted_consumer else "eri"
     require_basis(
         selected,
         atoms,
         backend=backend,
-        operator="eri",
+        operator=operator,
+        consumer=fitted_consumer,
         derivative_order=derivative_order,
         representation=mode,
         role=role,
     )
-    shells = selected.shells_for(atoms) if isinstance(selected, BasisSet) else selected
+    if isinstance(selected, BasisSet) and fitted_consumer:
+        shells = selected.shells_for(
+            atoms,
+            backend=backend,
+            operator=operator,
+            derivative_order=derivative_order,
+            role=role,
+            consumer=fitted_consumer,
+        )
+    else:
+        shells = (
+            selected.shells_for(atoms) if isinstance(selected, BasisSet) else selected
+        )
     metadata = resolved_basis_metadata(
         selected,
         shells,
@@ -248,7 +263,9 @@ def _ecp_workspace(
     orbital = item["orbital"]
     if not orbital.get("ecp_terms"):
         return 0
-    query = getattr(library, "generativeqc_resource_ecp_workspace_v1", None)
+    refine = bool(cuda and item.get("refine_ecp_quadrature"))
+    version = "v2" if refine else "v1"
+    query = getattr(library, "generativeqc_resource_ecp_workspace_" + version, None)
     if query is None:
         return _portable_ecp_workspace(item, cuda=cuda)
     dimensions = (
@@ -263,13 +280,11 @@ def _ecp_workspace(
         value > 2 ** (8 * ctypes.sizeof(ctypes.c_size_t)) - 1 for value in dimensions
     ):
         raise ValueError("ECP resource shape exceeds the host size_t ABI")
-    query.argtypes = [ctypes.c_size_t] * 5 + [
-        ctypes.c_int,
-        ctypes.POINTER(ctypes.c_uint64),
-    ]
+    modes = (int(bool(cuda)), 1) if refine else (int(bool(cuda)),)
+    query.argtypes = [ctypes.c_size_t] * 5 + [ctypes.c_int] * len(modes) + [ctypes.POINTER(ctypes.c_uint64)]
     query.restype = ctypes.c_int
     output = ctypes.c_uint64()
-    if query(*dimensions, int(bool(cuda)), ctypes.byref(output)):
+    if query(*dimensions, *modes, ctypes.byref(output)):
         raise ValueError("native ECP workspace inventory rejected shape or capacity")
     return checked_bytes(output.value, "ECP workspace")
 
@@ -284,6 +299,8 @@ def _portable_ecp_workspace(item: typing.Any, *, cuda: typing.Any = False) -> in
     """
     from generativeqc_compiler.integral.ecp_policy import (
         GAUSSIAN_MAX_SCRATCH_DOUBLES,
+        MAX_CUDA_POLAR_POINTS,
+        MAX_CUDA_RADIAL_POINTS,
         REFINED_POLAR_POINTS,
         REFINED_RADIAL_POINTS,
     )
@@ -293,15 +310,18 @@ def _portable_ecp_workspace(item: typing.Any, *, cuda: typing.Any = False) -> in
     if not orbital.get("ecp_terms"):
         return 0
     n, d = orbital["cartesian_nbf"], 3 * item["atoms"]
-    points = 2 * REFINED_POLAR_POINTS * REFINED_POLAR_POINTS
-    tile = cuda_radial_tile(orbital["nbf"], REFINED_POLAR_POINTS) if cuda else 1
+    refine = bool(cuda and item.get("refine_ecp_quadrature"))
+    polar = MAX_CUDA_POLAR_POINTS if refine else REFINED_POLAR_POINTS
+    radial = MAX_CUDA_RADIAL_POINTS if refine else REFINED_RADIAL_POINTS
+    points = 2 * polar * polar
+    tile = cuda_radial_tile(orbital["nbf"], polar) if cuda else 1
     grid = (
         32 * n * n * (1 + d)
         + 32 * tile * n * (points + 16)
         + 256
         * (
             points
-            + REFINED_RADIAL_POINTS
+            + radial
             + n
             + orbital["primitives"]
             + orbital["ecp_terms"]
@@ -764,6 +784,18 @@ def hf_resource_request(
         )
         if method == "rhf" and multiplicity != 1:
             raise ValueError("RHF requires a closed-shell singlet")
+        from .ecp import fitted_hf_ecp_domain
+
+        fitted_ecp = (
+            fitted
+            and backend == "cuda"
+            and density_fitting == "cuda"
+            and precision == "fp64"
+            and auxiliary_basis is not None
+            and fitted_hf_ecp_domain(
+                method, selected_basis, atoms, charge, multiplicity
+            )
+        )
         orbital = _basis_record(
             atoms,
             basis,
@@ -773,6 +805,7 @@ def hf_resource_request(
             multiplicity,
             "orbital",
             library=library,
+            fitted_consumer="full_df" if fitted_ecp else None,
         )
         if max(electrons.nalpha, electrons.nbeta) > orbital["nbf"]:
             raise ValueError(
@@ -780,7 +813,7 @@ def hf_resource_request(
             )
         auxiliary = None
         if fitted:
-            if orbital.get("ecp_terms"):
+            if orbital.get("ecp_terms") and not fitted_ecp:
                 raise NotImplementedError(
                     "ECP density-fitting execution is not yet validated"
                 )
@@ -802,6 +835,7 @@ def hf_resource_request(
                     multiplicity,
                     "auxiliary",
                     library=library,
+                    fitted_consumer="scf_df" if fitted_ecp else None,
                 )
             )
         items.append(
@@ -811,6 +845,11 @@ def hf_resource_request(
                 "auxiliary": auxiliary,
                 "electrons": asdict(electrons),
                 "spins": 1 if method == "rhf" else 2,
+                **(
+                    {"refine_ecp_quadrature": True}
+                    if fitted_ecp and 10 in orbital.get("ecp_core_electrons", ())
+                    else {}
+                ),
             }
         )
     controls = {
@@ -922,6 +961,26 @@ def hf_resource_request(
                     last_phase=last_phase,
                     requested_budget=density_fitting_memory_budget_bytes,
                 )
+                if has_ecp:
+                    workspace = max(
+                        _ecp_workspace(item, cuda=True, library=library) for item in items
+                    )
+                    ecp_estimates = tuple(
+                        ResourceEstimate(
+                            f"serialized scalar ECP {owner} workspace",
+                            workspace,
+                            space,
+                            first_phase,
+                            last_phase,
+                        )
+                        for owner, space in (
+                            ("host", "pageable"), ("device", f"device:{device_id}")
+                        )
+                    )
+                    candidates = tuple(
+                        replace(candidate, estimates=candidate.estimates + ecp_estimates)
+                        for candidate in candidates
+                    )
                 return ResourceRequest(
                     name,
                     identity,

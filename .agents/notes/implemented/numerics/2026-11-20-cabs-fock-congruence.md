@@ -1,0 +1,9 @@
+# Physical AO Fock and compensated CABS congruence
+
+The IH₂ UHF triple-zeta H(1) displacement has retained complementary columns with Euclidean norms near 24,000. Ordinary FP64 rotation of the separate Hamiltonian and three-center tensors gave an extended Fock skew of 3.55×10⁻⁷ Eh on an independent host at −0.0004 bohr. The physical AO spin Fock was Hermitian within 10⁻¹⁴ Eh. The public absolute limit is 2×10⁻⁸ Eh.
+
+Build each AO Coulomb field from the two occupied charges. Form exchange as a Gram matrix of whitened occupied AO factors. Check the AO source operators and the resulting spin Fock. Round the checked AO Fock to one physical symmetric representative, then accumulate both legs of the congruence with a wide accumulator. The CUDA implementation reuses the CABS projector's two-word FP64 arithmetic, including FMA product residuals. Both output triangles are evaluated independently and retain the absolute Hermiticity and canonical orbital checks. The existing response kernel uses the same complementary frame.
+
+Differentiate the spin-occupied DF fit with its defining metric equation. The identity between the Gram exchange and the product of the raw and fitted factors gives the full metric derivative for any full-rank whitener. The congruence transpose contributes to both the orbital-frame and physical AO source weights. This preserves the upstream orbital-relaxation and projector cotangents.
+
+The RHF/UHF H₃ physical singles tests check independent AO spin Focks, energies, and source and relaxed derivatives. A Decimal reference checks a deliberately ill-conditioned congruence. On the original IH₂ negative displacement, the repaired host singles energies agreed within 3×10⁻¹² Eh per spin with independent controls. The canonical orbital residuals were below 2×10⁻¹⁰ Eh. Host tests and CUDA compilation establish separate parts of the result. Molecular CUDA qualification requires the returned physical job.

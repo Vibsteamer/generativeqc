@@ -296,7 +296,7 @@ void cuda_channel_admission() {
                                                        generativeqc::posthf::AOTileDomain::Basis);
     const auto maximum = std::max(occupations[0], occupations[1]);
     const auto expected = provider.batch_bytes({maximum, maximum, maximum, maximum}, 1, true);
-    require(generativeqc::cc::unrestricted_cuda_solver_provider_capacity(reference, provider) ==
+    require(generativeqc::cc::unrestricted_solver_provider_capacity(reference, provider, true) ==
                 expected,
             "CUDA UCCSD admission charges an unexecuted full molecular MO block");
   }

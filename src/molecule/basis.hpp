@@ -58,6 +58,9 @@ inline constexpr std::size_t kMaximumAuxiliaryAoExpansionTerms = 6;
 [[nodiscard]] std::vector<AoExpansion> ao_expansions(
     unsigned l, generativeqc_basis_representation representation);
 
+/** Real spherical complementary functions through i for consumers with variable term storage. */
+[[nodiscard]] std::vector<AoExpansion> complementary_spherical_expansions(unsigned l);
+
 /** Total Cartesian AO count represented by a system's shells. */
 [[nodiscard]] std::size_t ao_count(const core::System& system) noexcept;
 

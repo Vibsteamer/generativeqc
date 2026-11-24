@@ -147,3 +147,75 @@ def test_mixed_all_electron_atom_obeys_the_same_orbital_boundary() -> None:
         else:
             with pytest.raises(NotImplementedError, match="orbital s/p/d/f"):
                 resolve_ecp(basis, atoms)
+
+
+@pytest.mark.parametrize(("z", "core_electrons"), ((35, 10), (53, 28)))
+def test_g_shell_df_uhf_halogen_dihydrides(z: int, core_electrons: int) -> None:
+    from generativeqc.ecp import fitted_uhf_hydride_domain
+
+    h = ElementBasis(1, (BasisShell(0, ("1",), (("1",),)),))
+    x = ElementBasis(
+        z,
+        (BasisShell(4, ("0.7",), (("1",),)),),
+        ecp_core_electrons=core_electrons,
+        ecp_data=json.dumps([potential()]),
+    )
+    basis = BasisSet(
+        "spherical g-shell ECP admission test",
+        (h, x),
+        BasisProvenance("synthetic", "1", "CC0", "0" * 64),
+        representation="spherical",
+    )
+    atoms = (
+        Atom(1, (0.0, 0.2, -1.0)),
+        Atom(z, (0.0, 0.0, 0.0)),
+        Atom(1, (0.0, 0.3, 1.0)),
+    )
+    assert fitted_uhf_hydride_domain(basis, atoms, 0, 2)
+    assert resolve_ecp(basis, atoms)[0] == (0, core_electrons, 0)
+    assert not fitted_uhf_hydride_domain(basis, atoms, 1, 2)
+    assert not fitted_uhf_hydride_domain(basis, atoms, 0, 1)
+    assert not fitted_uhf_hydride_domain(basis, atoms[:2], 0, 2)
+    assert not fitted_uhf_hydride_domain(
+        replace(basis, representation="cartesian"), atoms, 0, 2
+    )
+    angular_h = replace(x, shells=(BasisShell(5, ("0.7",), (("1",),)),))
+    assert not fitted_uhf_hydride_domain(
+        replace(basis, elements=(h, angular_h)), atoms, 0, 2
+    )
+
+
+@pytest.mark.parametrize(("z", "core_electrons"), ((35, 10), (53, 28)))
+def test_restricted_fitted_scalar_hydride_domain(z, core_electrons):
+    from generativeqc.ecp import fitted_hf_hydride_domain
+
+    hydrogen = ElementBasis(1, (BasisShell(0, ("1",), (("1",),)),))
+    halogen = ElementBasis(
+        z,
+        (BasisShell(4, ("0.7",), (("1",),)),),
+        ecp_core_electrons=core_electrons,
+        ecp_data=json.dumps([potential()]),
+    )
+    orbital = BasisSet(
+        "spherical hydrogen halide",
+        (hydrogen, halogen),
+        BasisProvenance("synthetic", "1", "CC0", "0" * 64),
+        representation="spherical",
+    )
+    atoms = (Atom(1, (0.0, 0.0, 1.0)), Atom(z, (0.0, 0.0, 0.0)))
+    assert fitted_hf_hydride_domain("rhf", orbital, atoms, 0, 1)
+    assert fitted_hf_hydride_domain("rhf", orbital, atoms[::-1], 0, 1)
+    assert resolve_ecp(orbital, atoms)[0] == (0, core_electrons)
+    for method, charge, spin in (("uhf", 0, 1), ("rhf", 1, 1), ("rhf", 0, 3)):
+        assert not fitted_hf_hydride_domain(method, orbital, atoms, charge, spin)
+    assert not fitted_hf_hydride_domain("rhf", orbital, atoms + atoms[:1], 0, 1)
+    assert not fitted_hf_hydride_domain(
+        "rhf", replace(orbital, representation="cartesian"), atoms, 0, 1
+    )
+    for invalid in (
+        replace(halogen, ecp_core_electrons=core_electrons - 2),
+        replace(halogen, shells=(BasisShell(5, ("0.7",), (("1",),)),)),
+    ):
+        assert not fitted_hf_hydride_domain(
+            "rhf", replace(orbital, elements=(hydrogen, invalid)), atoms, 0, 1
+        )

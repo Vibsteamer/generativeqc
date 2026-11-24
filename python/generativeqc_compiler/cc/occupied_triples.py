@@ -33,6 +33,7 @@ if typing.TYPE_CHECKING:
 
 PERMUTATIONS = tuple(VP[label] for label in _LABELS)
 DF_TRIPLES_W_FP32_QUALIFICATION = "issue1764/df-triples-w-fp32-candidate-v1"
+OCCUPIED_ORBITAL_SHARE = Fraction(1, 3)
 
 
 def inverse(permutation: tuple[int, ...]) -> tuple[int, ...]:
@@ -146,7 +147,7 @@ def v_scalar_program() -> Program:
     )
 
 
-def energy_scalar_program() -> Program:
+def energy_scalar_program(*, occupied_weighted: bool = False) -> Program:
     """Fused contribution at (a,b,c) for one triangular occupied tile.
 
     ``w_OCC_VIR`` selects a stored occupied seed and a virtual permutation;
@@ -155,6 +156,10 @@ def energy_scalar_program() -> Program:
     retained, including repeats: division by that multiplicity counts each
     ordered occupied triple exactly once. The virtual sum covers the entire
     cube and is never independently folded to a triangle here.
+
+    The optional occupied weights are differentiable canonical orbital inputs
+    in the physical tile order (i,j,k). Their average multiplies all six
+    permutations equally, including repeated orbital indices.
     """
     ws = {(occ, vir): _input(f"w_{occ}_{vir}") for occ in _LABELS for vir in _LABELS}
     vs = {occ: _input(f"v_{occ}") for occ in _LABELS}
@@ -181,11 +186,19 @@ def energy_scalar_program() -> Program:
     energy = divide(
         add(*products, coefficients=(2,) * len(products)), _input("denominator")
     )
+    provenance = {
+        "inventory": INVENTORY_HASH,
+        "domain": "occupied triangle, all six occupied permutations, full virtual cube",
+        "virtual_row_reduction": "equal full-domain sums by dummy-index relabeling",
+    }
+    if occupied_weighted:
+        weight = add(
+            *(_input(f"weight_{orbital}") for orbital in "ijk"),
+            coefficients=(OCCUPIED_ORBITAL_SHARE,) * 3,
+        )
+        energy = multiply(weight, energy)
+        provenance["occupied_weight"] = "symmetric spatial-orbital average (Kállay Eq. 13)"
     return Program(
         {"energy": energy},
-        provenance={
-            "inventory": INVENTORY_HASH,
-            "domain": "occupied triangle, all six occupied permutations, full virtual cube",
-            "virtual_row_reduction": "equal full-domain sums by dummy-index relabeling",
-        },
+        provenance=provenance,
     )

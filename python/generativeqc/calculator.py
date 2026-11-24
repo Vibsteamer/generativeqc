@@ -1955,7 +1955,7 @@ class Calculator:
             "df_metric"
             if auxiliary
             else "df_three_center"
-            if self._full_df_basis_consumer("df_three_center")
+            if self._full_df_basis_consumer("df_three_center", atoms=atoms)
             else "eri"
         )
         require_basis(
@@ -1970,7 +1970,7 @@ class Calculator:
             else self._representation_name,
             consumer=self._auxiliary_basis_consumer(selected_operator, derivative_order)
             if auxiliary
-            else self._full_df_basis_consumer(selected_operator, derivative_order),
+            else self._full_df_basis_consumer(selected_operator, derivative_order, atoms=atoms),
         )
         return selected_basis
 
@@ -1991,7 +1991,7 @@ class Calculator:
             "df_metric"
             if auxiliary
             else "df_three_center"
-            if self._full_df_basis_consumer("df_three_center")
+            if self._full_df_basis_consumer("df_three_center", atoms=atoms)
             else "eri"
         )
         return (
@@ -2007,7 +2007,7 @@ class Calculator:
                     selected_operator, derivative_order
                 )
                 if auxiliary
-                else self._full_df_basis_consumer(selected_operator, derivative_order),
+                else self._full_df_basis_consumer(selected_operator, derivative_order, atoms=atoms),
             )
             if isinstance(selected_basis, BasisSet)
             else tuple(selected_basis)
@@ -2021,9 +2021,36 @@ class Calculator:
         return self._device_name
 
     def _full_df_basis_consumer(
-        self, operator: str, derivative_order: int = 0
+        self,
+        operator: str,
+        derivative_order: int = 0,
+        *,
+        atoms: Sequence[Atom] | None = None,
     ) -> str | None:
-        """Admit only the closed-shell Coulomb full-DF operator closure, not ERIs."""
+        """Select value and gradient operators provided by the CUDA fitted Fock source."""
+        if (
+            atoms is not None
+            and derivative_order in (0, 1)
+            and operator
+            in ("overlap", "kinetic", "nuclear_attraction", "df_three_center")
+        ):
+            from .ecp import (
+                g_shell_carbon_halide,
+                g_shell_halogen_hydride,
+                g_shell_halogen_water,
+            )
+
+            molecular_halide = g_shell_carbon_halide(
+                self._basis, atoms
+            ) or g_shell_halogen_water(self._basis, atoms)
+            multiplicity = 2 if self._method == _native.METHOD_UHF else 1
+            if (
+                molecular_halide or g_shell_halogen_hydride(self._basis, atoms)
+            ) and any(
+                self._fitted_ecp_hf(self._basis, atoms, charge, multiplicity)
+                for charge in ((0, 1) if molecular_halide else (0,))
+            ):
+                return "full_df"
         if (
             self._device_name == "cuda"
             and self._density_fitting_mode == _native.DENSITY_FITTING_FULL_CUDA
@@ -2377,7 +2404,7 @@ class Calculator:
         derivative_orders = (0, 1) if compute_forces else (0,)
         auxiliary_backend = self._density_fitting_backend()
         orbital_operators = ["overlap", "kinetic", "nuclear_attraction"]
-        if not self._full_df_basis_consumer("df_three_center"):
+        if not self._full_df_basis_consumer("df_three_center", atoms=atoms):
             orbital_operators.append("eri")
         if self._auxiliary_basis is not None:
             orbital_operators.append("df_three_center")
@@ -2416,7 +2443,7 @@ class Calculator:
                             else self._representation_name,
                             consumer=self._auxiliary_basis_consumer(operator, order)
                             if role == "auxiliary"
-                            else self._full_df_basis_consumer(operator, order),
+                            else self._full_df_basis_consumer(operator, order, atoms=atoms),
                         )
                     )
         reasons = [reason for check in checks for reason in check["reasons"]]
@@ -2445,6 +2472,20 @@ class Calculator:
         if not report["eligible"]:
             raise NotImplementedError("; ".join(report["reasons"]))
 
+    def _fitted_ecp_hf(self, basis, atoms, charge, multiplicity):
+        from .ecp import fitted_hf_ecp_domain
+
+        return (
+            self._method in (_native.METHOD_RHF, _native.METHOD_UHF)
+            and self._device_name == "cuda"
+            and self._density_fitting_mode == _native.DENSITY_FITTING_CUDA
+            and self._precision_mode == _native.PRECISION_FP64
+            and self._auxiliary_basis is not None
+            and fitted_hf_ecp_domain(
+                self._method_name, basis, atoms, charge, multiplicity
+            )
+        )
+
     def _create_native_system(
         self,
         context: ctypes.c_void_p,
@@ -2452,6 +2493,9 @@ class Calculator:
         charge: int,
         multiplicity: int,
         basis: str | Sequence[Shell] | None = None,
+        *,
+        operator: str | None = None,
+        derivative_order: int = 0,
     ) -> ctypes.c_void_p:
         if self._method == _native.METHOD_GFN2_XTB:
             if basis is not None:
@@ -2487,7 +2531,9 @@ class Calculator:
                 context=context,
             )
             return system
-        selected_basis = self._basis_for_atoms(atoms, basis)
+        selected_basis = self._basis_for_atoms(
+            atoms, basis, operator=operator, derivative_order=derivative_order
+        )
         checked_integer(charge, "ionic charge", low=-(2**31), high=2**31 - 1)
         checked_integer(multiplicity, "multiplicity", low=1, high=2**31 - 1)
         checked_integer(len(atoms), "atom count", low=1, high=2**32 - 1)
@@ -2586,6 +2632,7 @@ class Calculator:
                     and self._density_fitting_mode != _native.DENSITY_FITTING_NONE
                     and not self._composite_rks_second_order
                     and self._method not in _CORRELATED_METHODS
+                    and not self._fitted_ecp_hf(selected_basis, atoms, charge, multiplicity)
                 ):
                     raise NotImplementedError(
                         "ECP density-fitting execution is not yet validated"
@@ -2598,7 +2645,9 @@ class Calculator:
                 )
             _native.check(self._library, status, context=context)
             return system
-        shells = self._shells_for_atoms(atoms, basis)
+        shells = self._shells_for_atoms(
+            atoms, basis, operator=operator, derivative_order=derivative_order
+        )
         checked_integer(len(shells), "shell count", low=1, high=2**32 - 1)
         checked_integer(
             sum(len(s.primitives) for s in shells),
@@ -2656,6 +2705,7 @@ class Calculator:
                 self._density_fitting_mode != _native.DENSITY_FITTING_NONE
                 and not self._composite_rks_second_order
                 and self._method not in _CORRELATED_METHODS
+                and not self._fitted_ecp_hf(selected_basis, atoms, charge, multiplicity)
             ):
                 raise NotImplementedError(
                     "ECP density-fitting execution is not yet validated"
@@ -3552,6 +3602,7 @@ class Calculator:
         charge: int = 0,
         multiplicity: int = 1,
         properties: Iterable[str] | None = None,
+        reference_auxiliary_basis: BasisSet | None = None,
     ) -> Result:
         """Compute energy, optional analytic forces and mean-field electronic properties.
 
@@ -3580,12 +3631,19 @@ class Calculator:
         Invalid inputs raise TypeError/ValueError; unsupported combinations,
         native failures or nonconvergence raise without publishing a partial
         Result. Resource-aware failures can carry allocation diagnostics.
+        Full-DF UCCSD and UCCSD(T) accept a separate JK fitting
+        record through ``reference_auxiliary_basis``. The calculator's
+        ``auxiliary_basis`` remains the correlation fit.
         Returned force storage outlives the synchronous call.
         See :ref:`python-calculation-errors` and :ref:`python-calculation-ownership`."""
         owner = self._singlepoint_context
         with owner.lock if owner is not None else nullcontext():
             return self._singlepoint(
-                atoms, charge=charge, multiplicity=multiplicity, properties=properties
+                atoms,
+                charge=charge,
+                multiplicity=multiplicity,
+                properties=properties,
+                reference_auxiliary_basis=reference_auxiliary_basis,
             )
 
     def singlepoint_components(
@@ -3669,6 +3727,7 @@ class Calculator:
         properties: Iterable[str] | None = None,
         component_methods: tuple[str, ...] = (),
         component_outputs: dict[str, Result] | None = None,
+        reference_auxiliary_basis: BasisSet | None = None,
     ) -> Result:
         """Execute under the retained context's transaction lock, when present."""
         intent = getattr(self, "_provider_initialization_intent", None)
@@ -3676,6 +3735,30 @@ class Calculator:
             from ._provider_initialization_lifetime import require_no_pending_owner
 
             require_no_pending_owner()
+        if reference_auxiliary_basis is not None:
+            if not isinstance(reference_auxiliary_basis, BasisSet):
+                raise TypeError(
+                    "reference_auxiliary_basis requires a canonical basis record"
+                )
+            if (
+                self._method_name not in ("uccsd", "uccsd(t)")
+                or self._density_fitting_mode != _native.DENSITY_FITTING_FULL_CUDA
+                or self._auxiliary_basis is None
+                or component_methods
+            ):
+                raise ValueError(
+                    "independent JK fitting requires a full-DF UCCSD or UCCSD(T) singlepoint"
+                )
+            if intent is not None or self._resource_budget is not None:
+                raise NotImplementedError(
+                    "independent UCC fitting requires the ordinary native prepare path"
+                )
+            if not hasattr(
+                self._library, "generativeqc_calculation_prepare_ucc_df_fits_v1"
+            ):
+                raise NotImplementedError(
+                    "native library lacks independent UCC JK and correlation fits"
+                )
         default_properties = properties is None
         if default_properties:
             properties = self._default_properties()
@@ -3819,6 +3902,7 @@ class Calculator:
             )
         system = ctypes.c_void_p()
         auxiliary_system = ctypes.c_void_p()
+        jk_system = ctypes.c_void_p()
         calculation = ctypes.c_void_p()
         ledger = None
         resource_prepare = None
@@ -3857,6 +3941,14 @@ class Calculator:
                 )
                 if provider_transaction is not None:
                     provider_transaction.auxiliary_system = auxiliary_system
+            if reference_auxiliary_basis is not None:
+                jk_system = self._create_native_system(
+                    context,
+                    native_atoms,
+                    charge,
+                    multiplicity,
+                    reference_auxiliary_basis,
+                )
             method_descriptor = self._method_descriptor(
                 auxiliary_system if auxiliary_system.value else None,
                 resource_plan=resource_plan,
@@ -3878,6 +3970,16 @@ class Calculator:
                         ctypes.byref(method_descriptor),
                         ctypes.byref(calculation),
                         intent,
+                    )
+                if jk_system.value:
+                    return (
+                        self._library.generativeqc_calculation_prepare_ucc_df_fits_v1(
+                            context,
+                            system,
+                            ctypes.byref(method_descriptor),
+                            jk_system,
+                            ctypes.byref(calculation),
+                        )
                     )
                 if resource_prepare is not None:
                     return resource_prepare(
@@ -4042,6 +4144,25 @@ class Calculator:
                 ks_transport_diagnostic = read_ks_transport_diagnostic(
                     self._library, calculation
                 )
+            metadata = self.basis_metadata(
+                native_atoms, charge=charge, multiplicity=multiplicity
+            )
+            if reference_auxiliary_basis is not None:
+                metadata["reference_auxiliary"] = resolved_basis_metadata(
+                    reference_auxiliary_basis,
+                    self._shells_for_atoms(native_atoms, reference_auxiliary_basis),
+                    native_atoms,
+                    representation=reference_auxiliary_basis.representation,
+                    charge=charge,
+                    multiplicity=multiplicity,
+                    role="reference_auxiliary",
+                )
+                metadata["model_identity"] = canonical_hash(
+                    {
+                        "correlation_model": metadata["model_identity"],
+                        "reference_auxiliary": metadata["reference_auxiliary"],
+                    }
+                )
             native_result = Result(
                 **(
                     density_capture.analyze(context, system)
@@ -4060,9 +4181,7 @@ class Calculator:
                 incremental_direct_jk=self._incremental_direct_jk_diagnostic(
                     calculation
                 ),
-                basis_metadata=self.basis_metadata(
-                    native_atoms, charge=charge, multiplicity=multiplicity
-                ),
+                basis_metadata=metadata,
                 accuracy=self._accuracy_assessment(
                     native_atoms,
                     charge,
@@ -4115,6 +4234,8 @@ class Calculator:
                     self._library.generativeqc_calculation_destroy(calculation)
                 if system.value:
                     self._library.generativeqc_system_destroy(system)
+                if jk_system.value:
+                    self._library.generativeqc_system_destroy(jk_system)
                 if auxiliary_system.value:
                     self._library.generativeqc_system_destroy(auxiliary_system)
                 if self._singlepoint_context is None:

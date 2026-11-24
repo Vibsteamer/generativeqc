@@ -694,3 +694,313 @@ srun --partition=main --gres=gpu:5090:1 --nodes=1 --ntasks=1 \
   --device cuda --case h2-dz-tz --oracle --work --repeats 1 \
   --output .artifacts/ccsdt-cbs-h2.json
 ```
+
+### Explicitly correlated component assembly
+
+`generativeqc.experimental.f12_focal.combine` accepts independently evaluated
+energy and Cartesian force contributions from a single geometry. Pass a
+`FocalSeries` for HF plus CABS singles, a second series for ordinary MP2
+correlation plus the explicit F12 pair correction, and a high-level correction.
+For an MP2-F12 energy and force, explicitly pass `post_mp2=None` to `combine`,
+`plan_singlepoint`, or `singlepoint`. This evaluates just the first two series.
+To add the explicitly correlated doubles increment, pass `post_mp2=None` and
+`f12_doubles=FocalSeries(upper, lower, power)` with the desired bases or terms.
+The `ccsd_f12b_minus_mp2_f12` step takes the difference of CCSD-F12b and MP2-F12
+correlation energies and forces at each cardinal, using the same determinant,
+orbital basis, three fitting roles, CABS and geminal exponent. The molecular
+provider solves the spin-orbital equations on an all-active UHF or singlet RHF
+determinant. Both spin lines use the same spatial orbitals on RHF, and their
+derivatives add to the single RHF orbital response. A separate `triples` term
+can add the conventional perturbative triples contribution.
+Use the role `post_mp2` for a combined correction. To treat conventional
+(T) separately, use `ccsd_minus_mp2` for the matched CCSD minus MP2 increment
+and pass the `triples` term or series by keyword. Each correction accepts
+a single term or its own cardinal pair. Difference CCSD and MP2 using the same
+orbital basis, fitted auxiliary policy and correlated space at each cardinal.
+
+A triples mapping selects independent recipes in one call. The keys
+`conventional`, `tplus` and `f12` refer to the conventional correction, the
+Kállay occupied-orbital scaling and the explicitly correlated triples equation.
+For example, `triples={"tplus": basis, "f12": basis}` returns
+`FocalTriplesAlternatives` with one result per method under `.variants`.
+Each energy and force includes its own triples correction exactly once. A
+molecular model owner receives all requested variants on a shared determinant
+and matching basis together. Pass the same alternatives to `singlepoint_energy`
+with their analytic center for signed energy checks.
+
+The built-in molecular provider still evaluates conventional triples. A
+provider must supply the new molecular models before either explicit selection
+can run. For an unpinned recipe with a single triples basis, automatic
+`tplus` selection requires a provider that qualifies both energy and full
+analytic force for every requested cardinal. An existing `protocol_id` and
+explicit method mappings keep the selected recipe fixed.
+
+A single upper term selects a finite endpoint. Giving a lower term and a
+positive exponent selects an inverse-power limit. For an exponential HF plus
+CABS limit use `FocalSeries(upper, lower, alpha, extrapolation="exponential")`.
+Each series can have its own family and cardinal pair, including parent,
+heavy-augmented and fully augmented basis sets. Use the same
+surface identity for all terms, including ordered coordinates, electronic root,
+ECP and frozen-core convention, and distinct basis identities for different
+cardinals. Returned weights apply to both energy (Eh) and force (Eh/bohr).
+
+Use `generativeqc.experimental.f12_focal.singlepoint` to dispatch components
+from one ordered geometry in Bohr. Supply `FocalBasis` records (or series of
+records) and an explicit component provider. Each basis snapshots its orbital,
+JKFit, and applicable MP2Fit, F12 fitting and CABS data from canonical local
+basis records. Give the F12 exponent in inverse Bohr for pair correlation.
+The caller also supplies charge, multiplicity, root and correlated-space
+identities. All orbital records must describe the same scalar Hamiltonian.
+
+Each of the five basis roles also accepts an element mapping. For example,
+`orbital={"H": "sto-3g", "He": "def2-svp"}` selects only the H record from
+STO-3G and the He record from def2-SVP. Use an element symbol or its atomic
+number as the key. Each value can be a bundled name, a `BasisSet`, or a local
+canonical basis file. Provide every element in the geometry for each required
+role. A role has one AO representation across all its elements. Selections
+preserve the source shells, scalar ECPs and provenance, and use the same
+resolved basis identity for equivalent symbol and atomic-number mappings.
+A cardinal pair must change the orbital basis on at least one element in the
+geometry.
+
+For each requested role and cardinal, the provider receives the resolved basis
+and geometry and returns a converged `FocalEvaluation`. The result must echo
+the request's surface and basis identity and report its executed backend.
+The requested backend is CUDA by default. Set `backend="cpu_reference"` to
+request that backend explicitly. A backend mismatch raises before numerical
+assembly. The completed components are returned alongside the combined energy,
+forces and weights.
+
+For the built-in molecular recipe, use `MolecularFocalProvider.cuda(...)` and
+pass `post_mp2=None`, `f12_doubles` and `triples` to `singlepoint`. For example,
+choose separate fully augmented D/T and heavy-augmented D/T bases with their
+matching fits and CABS.
+
+```python
+from generativeqc.experimental.f12_focal import FocalSeries, singlepoint, singlepoint_energy
+
+recipe = dict(
+    hf_cabs=FocalSeries(a_t, a_d, hf_alpha, extrapolation="exponential"),
+    correlation=FocalSeries(a_t, a_d, mp2_power),
+    post_mp2=None,
+    f12_doubles=FocalSeries(ha_t, ha_d, cc_power),
+    triples=FocalSeries(ha_t, ha_d, triples_power),
+    provider=provider,
+    root_id="rhf",
+    correlation_space_id="all-active",
+    protocol_id=recipe_id,
+)
+center = singlepoint(atoms_bohr, **recipe)
+displacement = singlepoint_energy(displaced_atoms_bohr, center=center, **recipe)
+```
+
+The center shares one determinant per distinct complete basis identity and
+returns a Cartesian force array with shape `(N, 3)`. The displacement evaluates energy
+only and checks the weighted recipe, ordered nuclei, occupied reference and
+CABS rank against the center. Use `root_id="uhf"` with the corresponding
+`multiplicity` for an unrestricted determinant. The same series interface
+accepts explicit T/Q or Q/5 basis records. Each electronic solve still has
+its native basis and memory limits. Supply the orbital, JKFit, MP2Fit,
+F12Fit and CABS for the elements and cardinals used in your recipe.
+
+For independent component jobs, call `plan_singlepoint` with the same geometry
+and basis arguments, execute the requests in `plan.steps`, then pass the
+outputs in any completion order to `plan.collect`. It matches each role and
+cardinal against the planned surface and basis. When archiving components for
+later collection, supply a fixed `protocol_id` that identifies the method
+and implementation version across all jobs.
+
+In a source checkout, the molecular integral benchmark accepts a planned
+`FocalRequest` directly in `forward_integrals` and `contract_live_weights`.
+Build its library with `benchmarks/build_f12_molecular_integral_sink.py`.
+The HF+CABS role evaluates the two Coulomb channels in JKFit. The MP2-F12
+role evaluates the Coulomb and four geminal operators over two and three
+centers in F12 fit. The first combined AO rows belong to the orbital basis,
+followed by the atom-centered OptRI rows, all in native real-spherical order.
+The reverse call returns the Cartesian gradient of the supplied integral
+weights. The SCF, CABS projector and correlated-state response supply the
+remaining contributions to a molecular force.
+
+Use `generativeqc.experimental.f12_focal.one_electron_sources` with the same
+request to obtain the all-electron overlap and core Hamiltonian. Give it the
+F12 integral library built for the request's backend. Both matrix axes use
+the same OBS-first order as the two- and three-center integrals.
+
+```python
+from generativeqc.experimental.f12_focal import one_electron_sources
+
+request = next(r for r, _ in plan.steps if r.role == "hf_cabs")
+data = one_electron_sources(request, library=integral_library)
+```
+
+`data.d_overlap[atom, axis]` and `data.d_hcore[atom, axis]` are positive
+Cartesian derivatives in bohr⁻¹ and Eh/bohr. They include movement of each
+atom's OBS and OptRI functions and the attraction to the moving nucleus.
+Set `derivatives=False` for energies that need only S and Hcore.
+
+Use `generativeqc.experimental.f12_focal.df_reference(request)` to solve the
+cold all-electron `rhf` or `uhf` root in the request's real-spherical orbital
+basis. Both Coulomb and exchange use its JKFit record and a relative metric
+cutoff of 1e-10. The result contains the DF-HF energy in Eh, its analytic
+Cartesian forces in Eh/bohr, the OBS overlap and core Hamiltonian, and the
+canonical coefficients, orbital energies, physical Fock and density of each
+spin channel. RHF returns one channel with a doubly occupied density. UHF
+returns alpha then beta. `forces=False` requests an energy and orbitals at a
+displaced geometry. The CUDA provider evaluates the DF operators with native
+host SCF control. CABS singles and their nuclear response are separate terms.
+
+The provider controls electronic execution and is responsible for the
+same-reference CCSD and MP2 differences, convergence and analytic gradients.
+The experimental dispatcher requires a provider for electronic work.
+Availability of electronic methods, elements and their molecular responses is
+established through independent endpoint tests of the provider.
+
+The explicit `conventional_df_post_mp2` provider supplies the combined
+DF-CCSD(T) minus DF-MP2 energy and analytic force from one native group. Route
+`post_mp2` to this provider and supply your F12 provider for the other roles.
+Use root identity `rhf` or `uhf`, correlation space `all-active` and an identical
+JKFit and MP2Fit record for the conventional increment. The restricted
+DF-CCSD(T) provider requires CUDA. The caller must match the selected cold
+reference with the rest of the focal calculation.
+
+For a finite-difference control, plan each displaced geometry and pass its
+`post_mp2` request to `conventional_df_post_mp2_energy`. This executes the
+same native group with energy as the sole requested property. Keep the
+request identity alongside the scalar result. At the central geometry use
+`conventional_df_post_mp2` to obtain the analytic forces.
+
+For the complementary orbital space, pass the returned one-electron result
+to `focal_cabs_projector(request, one)`. Its `frame` columns are orthogonal
+to the full orbital basis in the combined overlap metric. Record its `rank`
+and pass `expected_rank` when evaluating displacements. A matrix supplied as
+`cotangent` weights the invariant kernel `frame @ frame.T`. For a fixed
+weight, `einsum("ij,axij->ax", result.overlap_bar, one.d_overlap)` gives
+the positive nuclear derivative of the weighted kernel.
+
+
+For fixed-cusp unrestricted CC equations, call
+`provider.ucc_fixed_sources(pair_request)` on the all-active UHF pair step.
+The returned `FocalUCCFixedSources` contains the canonical DF reference,
+retained CABS rank, F12Fit identity and the `feeds` dictionary. Its six spin
+orders each have `w_vo_*`, `w_vv_*` and `c_f12_*` tensors in the reference's
+OBS frame. `fixed_geminal_energy` contains V+B−X in Eh. The extended Fock
+and positive exchange use JKFit, and the robust geminal projections use
+F12Fit. The CC amplitude and Lambda solvers consume these equation inputs.
+Call `provider.ucc_equation_sources(pair_request)` to generate both
+`result.fixed` and the ordinary Hamiltonian dictionary `result.ordinary`
+from one DF-UHF solve. JKFit defines the Fock matrices, MP2Fit the
+antisymmetrized ordinary two-electron blocks, and F12Fit the geminal
+projections. `result.mp2_fit_id` identifies the ordinary correlation fit.
+The coordinate geometry determines every input to these two dictionaries.
+
+Call `solution = provider.ucc_stationary(pair_request)` for a cold
+all-active UHF fixed-cusp UCCSD-F12b solution at that geometry.
+`solution.sources.fixed.reference` holds the DF-UHF determinant,
+`solution.primal` holds the correlation energy (Eh), physical amplitudes
+and convergence history, and `solution.dual` holds the qualified Lambda
+multipliers and stationarity residuals. The primal total adds the DF-UHF
+and stationary correlation energies. CABS singles is a separate contribution.
+A provider constructed with `MolecularFocalProvider.cuda(...)` uses its
+GPU architecture, cache and memory budget for the CC residual and adjoint
+equations. On CPU, the stationary equations use the native FP64 TensorIR
+executor. Optional `options` and `lambda_options` accept `SolverOptions`
+and `UCCSDLambdaOptions` from `generativeqc.experimental.uccsd_f12`.
+With `source_cotangents=True`, the solve also returns
+`solution.source_cotangents.ordinary_weights` and `fixed_source_weights`.
+These are the derivatives of the stationary CC Lagrangian with respect
+to the active canonical MO input tensors in `solution.sources`.
+`provider.ucc_ordinary_source_forces(pair_request, solution)` contracts the
+38 ordinary Hamiltonian weights with their nuclear derivatives in Eh/bohr.
+It uses the original stationary spin orbitals, JKFit for the Fock response,
+and MP2Fit for the 32 antisymmetrized Coulomb blocks. The returned array is
+the ordinary-input contribution to the stationary correlation force.
+
+Call `result = provider.uccsd_f12b(pair_request)` to obtain the complete
+single-basis all-active UHF fixed-cusp UCCSD-F12b molecular energy in Eh and
+Cartesian forces in Eh/bohr. This calculation uses one determinant for the
+DF-UHF reference, CABS singles, and both CC Hamiltonian source families.
+`result.hf_cabs_energy` and `result.stationary.primal.correlation_energy`
+sum to `result.energy`. The corresponding force sum is
+`result.hf_cabs_forces + result.ordinary_cc_forces + result.fixed_cc_forces`.
+The stationary record retains the surface and basis identities, spin
+occupations, orbital coefficients, separate fitting identities, amplitudes
+and multipliers. The CBS focal plan selects its post-MP2 and triples
+providers independently.
+
+Use the installed `MolecularFocalProvider` to evaluate a plan step directly
+from its geometry. A single-card CUDA setup looks like this:
+
+```python
+from generativeqc.experimental.f12_focal import MolecularFocalProvider
+
+provider = MolecularFocalProvider.cuda(
+    shell_library=shell_library,
+    response_library=response_library,
+    architecture="sm_89",
+    cache_directory=cache_directory,
+)
+hf = provider(next(req for req, _ in plan.steps if req.role == "hf_cabs"))
+pair = provider(next(req for req, _ in plan.steps if req.role == "mp2_f12_correlation"))
+```
+
+Pass filesystem paths as `pathlib.Path` objects. The HF+CABS term returns the
+DF-HF energy and forces plus the relaxed spin singles contribution for an
+an RHF or UHF reference. The CUDA fitted HF path accepts small-core Br and I in
+its hydride, C/H monohalide and one-water domains. Select the scalar ECP on the
+orbital record and use Coulomb-only fitting records. The pair term supports
+all-active singlet RHF and UHF and
+returns ordinary DF-MP2 correlation plus the explicit 3C(FIX) increment.
+For a singlet RHF request, both spin channels use the same restricted
+spatial orbitals. Their coefficient derivatives add before the restricted
+orbital response.
+Both contributions within that term share one physical determinant. The JK,
+ordinary correlation and explicit correlation fits follow their respective
+basis records. Matching identities share the fitted integrals and their
+nuclear derivatives. The returned forces are Cartesian and in Eh/bohr.
+Supply `high_order` for a custom conventional post-MP2 evaluator when
+dispatching component requests individually.
+
+For an existing reference and OBS-first integral set, call
+`reference_cabs_singles(request, reference, one, complement=frame,
+three_center=B, metric=M, whitener=W, relax=True)`. Here B has axes
+(JKFit, AO, AO), and W M Wᵀ is the identity. The result contains the total
+energy, both spin corrections and the four relaxed weights for S, Hcore,
+B and M. With `relax=False`, the returned coefficient and complementary
+kernel weights expose the separate electronic and overlap derivatives.
+
+For the ordinary MP2 part of an all-active singlet RHF or UHF pair request, use
+`benchmarks.f12_focal_ump2.molecular_df_ump2(request, ...)` from a source
+checkout. The shell and one-electron libraries take the same path arguments
+as the HF+CABS provider. On CUDA supply the CUDA metric and response
+libraries and an FP64 TensorIR runner. The result contains the HF energy and
+forces, the αα, αβ and ββ ordinary MP2 energies, and the relaxed correlation
+forces in Eh/bohr. It uses the request's JKFit for the determinant and its
+own MP2Fit for the pair integrals. The F12 correction must also be evaluated
+before returning the complete `mp2_f12_correlation` component.
+
+For precomputed OBS-only integral sources, pass a canonical
+`FocalReference` and two `FocalCoulombSource` values to
+`reference_df_ump2(request, reference, jk, mp2)`. Each source declares
+the surface, OBS identity, fitting identity and backend, and provides
+the raw three-center integrals, full-rank metric and matching whitener.
+The result contains the three spin energies and six relaxed weights for
+overlap, core, JKFit and MP2Fit. Contract these energy derivatives with
+their corresponding nuclear integral derivatives and negate the sum.
+
+For the explicit 3C(FIX) contribution from retained spin pairs, call
+`benchmarks.f12_focal_increment.molecular_f12_increment(request, ...)`.
+This source-checkout provider takes an all-active singlet RHF or UHF pair request and the
+same native library and runner arguments as the ordinary provider. It uses
+the full joint OBS/OptRI basis in both the JKFit Fock and the independently
+fitted Gaussian operators. Its result contains the explicit F12 increment,
+its relaxed force, the active-pair count and the fixed CABS rank. Add the
+ordinary DF-MP2 correlation once to assemble the `mp2_f12_correlation` term.
+Supply `expected_cabs_rank` for consistent displaced-geometry checks.
+
+For already computed sources, the public experimental function
+`reference_f12_increment` takes the request, canonical DF reference,
+one-electron result, and two `FocalF12Sources` records. Its three weight
+groups differentiate the one-electron, JKFit and F12Fit operators,
+respectively. The Coulomb, geminal, squared geminal, geminal-Coulomb and
+double-commutator operators in F12Fit each provide their own two- and
+three-center nuclear derivative.

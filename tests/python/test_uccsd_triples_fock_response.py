@@ -15,9 +15,11 @@ import pytest
 from generativeqc_compiler.cc.uccsd_layout import UCCSDLayout
 from generativeqc_compiler.cc.uccsd_triples import CHANNELS, channel_shape
 from generativeqc_compiler.cc.uccsd_triples_fock import (
+    build_axis_moment_panel_program,
     build_axis_moment_program,
     build_tile_resolvent_program,
 )
+from generativeqc_compiler.tensor import transpose_program
 from test_uccsd_equations import _amplitudes, _random_hamiltonian, _spin_amplitudes
 from test_uccsd_t_owner import (
     _ASYMMETRIC_H6,
@@ -228,6 +230,21 @@ def _check_native_vectors(executor: Any, degenerate: bool) -> None:
             )
             domain, spin = ("o" if axis < 3 else "v"), (channel * 2)[axis]
             name = f"f{domain * 2}_{spin * 2}"
+            lanes = 7
+            moment_panel = build_axis_moment_panel_program(layout, channel, axis, lanes)
+            x, y = (
+                np.moveaxis(resolved[key], axis, 0).reshape(shape[axis], -1)
+                for key in ("x", "y")
+            )
+            packed = np.zeros_like(outputs[name])
+            for first in range(0, x.shape[1], lanes):
+                count = min(lanes, x.shape[1] - first)
+                panel_x, panel_y = (
+                    np.pad(value[:, first : first + count], ((0, 0), (0, lanes - count)))
+                    for value in (x, y)
+                )
+                packed += executor.execute(moment_panel, {"x": panel_x, "y": panel_y})[name]
+            np.testing.assert_allclose(packed, outputs[name], atol=3e-13, rtol=0)
             target = positions[domain, spin]
             actual[axis // 3][np.ix_(target, target)] += outputs[name]
             if axis == 0:
@@ -275,6 +292,55 @@ def test_native_cpu_vectors_and_all_axis_moments_have_independent_resolvent_clos
     degenerate: bool,
 ) -> None:
     _check_native_vectors(NativeCCTensorExecutor(max_bytes=64 << 20), degenerate)
+
+
+@pytest.mark.parametrize("channel", CHANNELS)
+def test_packed_triples_reverse_has_independent_lanes_and_finite_padding(channel: str) -> None:
+    layout = UCCSDLayout(3, 3, 3, 3)
+    singleton = build_tile_resolvent_program(layout, channel, (1,) * 6)
+    panel = build_tile_resolvent_program(layout, channel, (1,) * 6, lanes=4)
+    assert singleton.operands == panel.operands
+    executor = NativeCCTensorExecutor(max_bytes=64 << 20)
+    derivatives = tuple(op.name for op in panel.operands if not op.source.startswith("eps_"))
+    solo_reverse = transpose_program(singleton.program, ("triples_energy",), inputs=derivatives)
+    panel_reverse = transpose_program(panel.program, ("triples_energy",), inputs=derivatives)
+    generator = np.random.default_rng(9011)
+    feeds = {}
+    for node in panel.program.live_nodes:
+        if node.op != "input":
+            continue
+        name = node.attrs["name"]
+        binding = next(op for op in panel.operands if op.name == name)
+        if binding.source.startswith("eps_"):
+            center = -1.0 if binding.source.startswith("eps_o") else 1.0
+            values = center + generator.normal(scale=0.1, size=4)
+            values[3] = values[0]
+        else:
+            values = generator.normal(scale=0.1, size=node.spec.shape)
+            values[3] = 0.0
+        feeds[name] = np.ascontiguousarray(values)
+    seeds = np.array([1.0, -0.6, 2.1, 0.0])
+    forward = executor.execute(panel.program, feeds)
+    reverse = executor.execute(panel_reverse.program, {**feeds, "bar_triples_energy": seeds})
+    singleton_inputs = {
+        node.attrs["name"]: node.spec.shape
+        for node in singleton.program.live_nodes
+        if node.op == "input"
+    }
+    for lane in range(4):
+        lane_feeds = {
+            name: np.ascontiguousarray(feeds[name][lane]).reshape(shape)
+            for name, shape in singleton_inputs.items()
+        }
+        lane_forward = executor.execute(singleton.program, lane_feeds)
+        lane_reverse = executor.execute(
+            solo_reverse.program,
+            {**lane_feeds, "bar_triples_energy": np.array(seeds[lane])},
+        )
+        for name, output in lane_forward.items():
+            np.testing.assert_allclose(forward[name][lane], output.item(), atol=2e-15, rtol=0)
+        for name, output in lane_reverse.items():
+            np.testing.assert_allclose(reverse[name][lane].ravel(), output.ravel(), atol=2e-15, rtol=0)
 
 
 @pytest.mark.parametrize("atom,spin,broken,tile_shape", _MOLECULAR_FOCK_CASES)

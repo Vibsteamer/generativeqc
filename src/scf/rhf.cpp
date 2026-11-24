@@ -1307,29 +1307,44 @@ ScfResult run_prepared_fock_strategy(const PreparedFockPlan& plan, const ScfOpti
     if (options.reference_memory_budget_bytes != 0 &&
         capacity > options.reference_memory_budget_bytes)
       throw std::length_error("bounded RHF reference exceeds numeric memory budget");
-    const auto jk = plan.build(result.density);
-    const auto matrices = assemble_fock(strategy, plan.one_electron().hcore, jk);
-    auto ref = std::make_shared<PhysicalReference>();
-    ref->nbf = n;
-    ref->nocc = occupied;
-    ref->overlap = plan.one_electron().overlap;
-    ref->hcore = plan.one_electron().hcore;
-    ref->fock = matrices.alpha;
-    ref->density = result.density;
-    host_trace::Reason export_reason(host_trace::EigenReason::reference_export);
-    host_trace::Region export_trace("reference_export", n);
-    const auto orthogonalizer = plan.overlap_orthogonalizer(overlap_cache);
-    const auto eigen = plan.eigen_operation(PreparedFockPlan::EigenUse::Finalization);
-    auto canonical = eigen ? eigen(ref->fock, &ref->overlap, &orthogonalizer, n)
-                           : generalized_eigen(ref->fock, orthogonalizer, n);
-    ref->coefficients = std::move(canonical.vectors);
-    ref->orbital_energies = std::move(canonical.values);
-    ref->energy = electronic_energy(ref->density, ref->hcore, ref->fock) +
-                  plan.one_electron().nuclear_repulsion;
-    ref->numeric_capacity_bytes = capacity;
-    validate_physical_reference(*ref);
-    result.energy = ref->energy;
-    result.reference = std::move(ref);
+    if (result.reference) {
+      auto ref = std::make_shared<PhysicalReference>(*result.reference);
+      ref->numeric_capacity_bytes = capacity;
+      validate_physical_reference(*ref);
+      result.energy = ref->energy;
+      result.reference = std::move(ref);
+    } else {
+      const auto jk = plan.build(result.density);
+      auto matrices = assemble_fock(strategy, plan.one_electron().hcore, jk);
+      if (strategy.backend == FockBackend::Cuda &&
+          strategy.spec.coulomb.approximation == FockApproximation::DensityFitted &&
+          strategy.spec.exchange.approximation == FockApproximation::DensityFitted) {
+        preserve_fock_symmetry(matrices.alpha, n);
+      }
+      auto ref = std::make_shared<PhysicalReference>();
+      ref->nbf = n;
+      ref->nocc = occupied;
+      ref->overlap = plan.one_electron().overlap;
+      ref->hcore = plan.one_electron().hcore;
+      ref->fock = matrices.alpha;
+      ref->density = result.density;
+      host_trace::Reason export_reason(host_trace::EigenReason::reference_export);
+      host_trace::Region export_trace("reference_export", n);
+      const auto orthogonalizer = plan.overlap_orthogonalizer(overlap_cache);
+      const auto eigen = plan.eigen_operation(PreparedFockPlan::EigenUse::Finalization);
+      auto canonical = eigen ? eigen(ref->fock, &ref->overlap, &orthogonalizer, n)
+                             : generalized_eigen(ref->fock, orthogonalizer, n);
+      ref->coefficients = std::move(canonical.vectors);
+      ref->orbital_energies = std::move(canonical.values);
+      const auto evaluate_energy = options.stabilize_focal_rhf_convergence
+                                       ? reference::compensated_electronic_energy : electronic_energy;
+      ref->energy = evaluate_energy(ref->density, ref->hcore, ref->fock) +
+                    plan.one_electron().nuclear_repulsion;
+      ref->numeric_capacity_bytes = capacity;
+      validate_physical_reference(*ref);
+      result.energy = ref->energy;
+      result.reference = std::move(ref);
+    }
   }
   return result;
 }
@@ -2304,7 +2319,8 @@ ScfResult run_uhf_density_fitting_cuda_impl(const core::System& system,
                                             const std::vector<double>* initial_density,
                                             initial_guess::OverlapOrthogonalizer* overlap_cache) {
   host_trace::Region endpoint_trace("run_uhf_density_fitting_cuda_impl");
-  cuda_execution::require_cuda_df_spin_domain(system, FockSpin::Unrestricted);
+  cuda_execution::require_cuda_df_spin_domain(system, FockSpin::Unrestricted,
+                                               !options.compute_forces);
   reject_cuda_df_preliminary_guess(options);
   if (options.hooks || options.strict_initial_density)
     throw std::invalid_argument("SCF proposal callbacks require the CPU reference backend");
@@ -3026,7 +3042,8 @@ std::vector<RhfBucketItem> run_uhf_density_fitting_cuda_bucket_impl(
     const std::vector<initial_guess::OverlapOrthogonalizer*>* overlap_caches) {
   host_trace::Region endpoint_trace("run_uhf_density_fitting_cuda_bucket_impl");
   for (const auto& system : systems)
-    cuda_execution::require_cuda_df_spin_domain(system, FockSpin::Unrestricted);
+    cuda_execution::require_cuda_df_spin_domain(system, FockSpin::Unrestricted,
+                                                 !options.compute_forces);
   reject_cuda_df_preliminary_guess(options);
   if (overlap_caches && (overlap_caches->size() != systems.size() ||
                          std::any_of(overlap_caches->begin(), overlap_caches->end(),

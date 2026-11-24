@@ -1,5 +1,7 @@
 #include "molecule/basis_template.hpp"
 
+#include "molecule/small_core_halide.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -93,12 +95,14 @@ CheckedBasisTemplate preflight(const generativeqc_basis_template_descriptor_v1& 
   count(atoms.size());
   CheckedBasisTemplate checked{validate(basis), {}};
   auto& capacity = checked.capacity;
+  SmallCoreHalideComposition composition;
   std::uint32_t maximum_orbital_angular_momentum = 0;
   for (const auto& atom : atoms) {
     require(
         atom.atomic_number > 0 && atom.atomic_number <= 118 && checked.elements[atom.atomic_number],
         "basis template is missing an input element");
     const auto& element = *checked.elements[atom.atomic_number];
+    composition.add(atom.atomic_number, element.ecp_core_electrons);
     for (std::uint32_t index = 0; index < element.shell_count; ++index) {
       const auto& shell = basis.shells[element.shell_offset + index];
       capacity.shell_count = count(std::uint64_t(capacity.shell_count) + shell.contraction_count);
@@ -121,8 +125,13 @@ CheckedBasisTemplate preflight(const generativeqc_basis_template_descriptor_v1& 
     capacity.ecp_term_count =
         count(std::uint64_t(capacity.ecp_term_count) + element.ecp_term_count);
   }
-  require(capacity.ecp_term_count == 0 || maximum_orbital_angular_momentum <= 3,
-          "ECP execution requires s/p/d/f orbital shells");
+  // Template creation lacks charge and multiplicity. The prepared method and spin solver
+  // check the electronic state separately when using the extended orbital space.
+  const bool halide = representation == GENERATIVEQC_BASIS_SPHERICAL &&
+                      (composition.molecular_halide() ||
+                       (composition.hydride() && (composition.hydrogen == 1 || composition.hydrogen == 2)));
+  require(capacity.ecp_term_count == 0 || maximum_orbital_angular_momentum <= (halide ? 4U : 3U),
+          "ECP orbital shell is outside the admitted template domain");
   const auto maximum = std::numeric_limits<std::size_t>::max();
   require(capacity.shell_count <= maximum / sizeof(generativeqc_shell) &&
               capacity.primitive_count <= maximum / sizeof(generativeqc_primitive),

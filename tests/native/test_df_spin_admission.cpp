@@ -118,10 +118,133 @@ void independent_source_limits() {
   require(!cuda_df_value_domain(orbital, auxiliary, policy, detail),
           "spin admission must not widen range-separated source qualification");
 }
+void fully_polarized_hydrogen_domain() {
+  using namespace generativeqc;
+  core::System dimer;
+  dimer.atoms = {{1, {0.1, 0.2, 0.3}}, {1, {-0.2, 1.4, 0.8}}};
+  dimer.basis_representation = core::kSphericalBasis;
+  dimer.multiplicity = 3;
+  dimer.shells = {{0, 4, {{1.0, 1.0}}}};
+  auto admitted = [](const core::System& sys) {
+    try {
+      scf::cuda_execution::require_cuda_df_spin_domain(sys, scf::FockSpin::Unrestricted);
+      return true;
+    } catch (const std::invalid_argument&) {
+      return false;
+    }
+  };
+  require(admitted(dimer), "orbital g in all-electron triplet hydrogen dimer");
+  auto other = dimer;
+  other.multiplicity = 1;
+  require(!admitted(other), "unqualified paired spin domain");
+  other = dimer;
+  other.charge = 1;
+  require(!admitted(other), "unqualified charged dimer");
+  other = dimer;
+  other.atoms[1].atomic_number = 2;
+  require(!admitted(other), "unqualified heteronuclear dimer");
+  other = dimer;
+  other.basis_representation = core::kCartesianBasis;
+  require(!admitted(other), "unqualified Cartesian orbital g");
+  other = dimer;
+  other.shells.front().angular_momentum = 5;
+  require(!admitted(other), "orbital h");
+  other = dimer;
+  other.ecp_terms.resize(1);
+  require(!admitted(other), "unqualified pseudopotential");
+}
+
+void neutral_oh_value_domain() {
+  using namespace generativeqc;
+  using namespace generativeqc::scf;
+  using namespace generativeqc::scf::cuda_execution;
+  core::System oh;
+  oh.atoms = {{8, {0, 0, 0}}, {1, {0, 0, 1.834281919177214}}};
+  oh.shells = {{0, 4, {{1.0, 1.0}}}};
+  oh.electron_count = 9;
+  oh.multiplicity = 2;
+  oh.basis_representation = core::kSphericalBasis;
+  auto admitted = [](const core::System& system, bool fitted_values_only) {
+    try {
+      require_cuda_df_spin_domain(system, FockSpin::Unrestricted, fitted_values_only);
+      return true;
+    } catch (const std::invalid_argument&) {
+      return false;
+    }
+  };
+  require(admitted(oh, true), "orbital g in neutral spherical all-electron OH fitted values");
+  require(!admitted(oh, false), "OH orbital g needs the fitted-values-only owner");
+  auto rejected = oh;
+  rejected.charge = -1;
+  rejected.electron_count = 10;
+  require(!admitted(rejected, true), "different OH charge is outside the orbital-g value domain");
+  rejected = oh;
+  rejected.atoms[1].atomic_number = 9;
+  require(!admitted(rejected, true), "different nuclei are outside the OH orbital-g value domain");
+  rejected = oh;
+  rejected.basis_representation = core::kCartesianBasis;
+  require(!admitted(rejected, true), "Cartesian OH orbital g is outside the value domain");
+  rejected = oh;
+  rejected.shells[0].angular_momentum = 5;
+  require(!admitted(rejected, true), "spherical OH orbital h is outside the value domain");
+  rejected = oh;
+  rejected.ecp_terms.resize(1);
+  require(!admitted(rejected, true), "ECP is outside the all-electron OH orbital-g value domain");
+
+  auto auxiliary = oh;
+  auxiliary.shells[0].angular_momentum = 5;
+  CudaDfSourcePolicy policy;
+  std::string detail;
+  require(cuda_df_value_domain(oh, auxiliary, policy, detail),
+          "the existing generic Coulomb value source supports OH orbital g");
+  policy.range_omega = 0.3;
+  require(!cuda_df_value_domain(oh, auxiliary, policy, detail),
+          "the OH spin-domain update retains the range-separated source guard");
+}
+
+void neutral_oh_public_plan_admission() {
+  generativeqc_context context;
+  context.state.executed_backend = GENERATIVEQC_BACKEND_CUDA;
+  context.state.device_id = -1;
+  generativeqc_system orbital;
+  orbital.data.atoms = {{8, {0, 0, 0}}, {1, {0, 0, 1.834281919177214}}};
+  orbital.data.shells = {{0, 4, {{1.0, 1.0}}}};
+  orbital.data.electron_count = 9;
+  orbital.data.multiplicity = 2;
+  orbital.data.basis_representation = GENERATIVEQC_BASIS_SPHERICAL;
+  auto auxiliary = orbital;
+  auxiliary.data.shells[0].angular_momentum = 0;
+  for (unsigned derivative : {0U, 1U}) {
+    for (bool fully_fitted : {false, true}) {
+      generativeqc_fock_spec spec{
+          sizeof(spec), GENERATIVEQC_ABI_VERSION, 1, GENERATIVEQC_FOCK_UNRESTRICTED, derivative,
+          {1, 1.0, GENERATIVEQC_FOCK_FULL_RANGE, 0.0, GENERATIVEQC_FOCK_DENSITY_FITTED},
+          {1, -1.0, GENERATIVEQC_FOCK_FULL_RANGE, 0.0,
+           fully_fitted ? GENERATIVEQC_FOCK_DENSITY_FITTED : GENERATIVEQC_FOCK_EXACT}};
+      generativeqc_fock_plan* plan = nullptr;
+      const auto status =
+          generativeqc_fock_plan_create(&context, &orbital, &auxiliary, &spec, nullptr, &plan);
+      require(plan == nullptr, "invalid device must not publish an OH plan");
+      if (derivative == 0 && fully_fitted) {
+        require(status == GENERATIVEQC_STATUS_NOT_IMPLEMENTED ||
+                    (status == GENERATIVEQC_STATUS_INVALID_ARGUMENT &&
+                     context.last_detail == "CUDA prepared Fock requires a device"),
+                "neutral spherical OH fully fitted values must reach device setup");
+      } else {
+        require(status == GENERATIVEQC_STATUS_INVALID_ARGUMENT &&
+                    context.last_detail.find("unrestricted CUDA DF") != std::string::npos,
+                "neutral OH g must reject derivatives and mixed exact/fitted plans");
+      }
+    }
+  }
+}
 }  // namespace
 
 int main() {
   try {
+    fully_polarized_hydrogen_domain();
+    neutral_oh_value_domain();
+    neutral_oh_public_plan_admission();
     public_plan_admission();
     independent_source_limits();
     resident_admission();

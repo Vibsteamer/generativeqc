@@ -92,7 +92,7 @@ generativeqc_status build_cuda_one_electron_integrals_impl(
     void* destination = nullptr;
     if (runtime::resource_cuda_malloc(&destination, bytes) != cudaSuccess) return nullptr;
     if (source != nullptr &&
-        cudaMemcpy(destination, source, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaMemcpyAsync(destination, source, bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) {
       (void)runtime::resource_cuda_free(destination);
       return nullptr;
     }

@@ -21,7 +21,7 @@ struct AO {
   const core::Shell* shell;
   int primitive_offset{}, primitive_count{}, term_count{};
   double x, y, z;
-  Component components[3];
+  Component components[molecule::kMaximumAuxiliaryAoExpansionTerms];
 };
 struct Jet {
   double v[4];
@@ -45,13 +45,17 @@ EcpData ecp_integrals(const core::System& system, unsigned radial, unsigned angu
   const auto derivative_elements = runtime::size_mul(ncoord, size);
   std::vector<AO> aos;
   for (const auto& shell : system.shells) {
+    if (shell.angular_momentum > generated::ecp_max_orbital_angular)
+      throw std::invalid_argument("ECP AO shell exceeds the generated quadrature domain");
     if (shell.primitives.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
       throw std::overflow_error("ECP primitive count exceeds the generated index type");
     const auto& position = system.atoms[shell.atom_index].position;
     const auto expansions =
         molecule::ao_expansions(shell.angular_momentum, system.basis_representation);
     if (std::any_of(expansions.begin(), expansions.end(),
-                    [](const auto& expansion) { return expansion.size() > 3; }))
+                    [](const auto& expansion) {
+                      return expansion.size() > molecule::kMaximumAuxiliaryAoExpansionTerms;
+                    }))
       throw std::invalid_argument("ECP AO expansion exceeds validated domain");
     for (const auto& expansion : expansions) {
       AO ao{&shell,
@@ -154,10 +158,20 @@ EcpData checked_ecp_integrals(const core::System& system, bool derivatives) {
   return fine;
 }
 
+EcpGridShape checked_ecp_grid_limit(const core::System& system) {
+  if (!system.refine_ecp_quadrature)
+    return {generated::ecp_refined_radial_points, generated::ecp_refined_polar_points};
+  const bool orbital_g = std::any_of(system.shells.begin(), system.shells.end(),
+                                     [](const auto& shell) { return shell.angular_momentum == 4; });
+  if (orbital_g)
+    return {generated::ecp_orbital_g_radial_points, generated::ecp_orbital_g_polar_points};
+  return {generated::ecp_max_cuda_radial_points, generated::ecp_max_cuda_polar_points};
+}
+
 std::size_t ecp_workspace_capacity(const core::System& system) {
   if (system.ecp_terms.empty()) return 0;
   const auto ao_count = molecule::ao_count(system);
-  const auto polar = generated::ecp_refined_polar_points;
+  const auto [radial, polar] = checked_ecp_grid_limit(system);
   const auto angular = runtime::size_mul(2 * polar, polar);
   const auto tile = generated::ecp_cuda_radial_tile(ao_count, polar);
   const auto coordinates = runtime::size_add(1, runtime::size_mul(3, system.atoms.size()));
@@ -173,8 +187,8 @@ std::size_t ecp_workspace_capacity(const core::System& system) {
   // Grid/metadata bounds include upload copies and geometric vector growth.
   bytes = runtime::size_add(bytes, runtime::size_mul(4 * sizeof(EcpSpherePoint), angular));
   bytes = runtime::size_add(
-      bytes, runtime::size_mul(4 * sizeof(EcpRadialPoint), generated::ecp_refined_radial_points));
-  bytes = runtime::size_add(bytes, runtime::size_mul(512, ao_count));
+      bytes, runtime::size_mul(4 * sizeof(EcpRadialPoint), radial));
+  bytes = runtime::size_add(bytes, runtime::size_mul(4 * sizeof(AO), ao_count));
   bytes = runtime::size_add(bytes,
                             runtime::size_mul(4 * sizeof(core::EcpTerm), system.ecp_terms.size()));
   for (const auto& shell : system.shells)

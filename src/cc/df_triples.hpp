@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -29,6 +30,8 @@ struct DFCudaResult {
   std::size_t fp64_gemms{}, fp32_gemms{}, precision_cast_elements{};
   std::size_t epilogue_kernels{}, reduction_kernels{}, epilogue_points{};
   std::size_t contraction_summands{}, h2d_bytes{}, d2h_bytes{};
+  /** Optional conventional triples energies by canonical spatial occupied orbital. */
+  std::vector<double> occupied_energies;
 };
 
 /** Actual gap-schedule launches and compiler-derived logical data/work counts. */
@@ -106,6 +109,9 @@ struct DFCudaCombinedResponseResult {
  * V, denominators, energy epilogue and final reductions remain FP64, and the
  * result records the actual contraction precision plus the generated code's
  * compiler precision-schedule identity.
+ * occupied_partition retains the contribution from each occupied orbital,
+ * using Eq. (13) of Kállay et al. (10.1063/5.0057426). It adds one on-device
+ * reduction and one returned vector. Standard (T) energy remains unchanged.
  */
 #if GENERATIVEQC_HAS_CUDA
 DFCudaResult evaluate_df_cuda(std::size_t o, std::size_t v, std::size_t q, const double* bov,
@@ -114,7 +120,8 @@ DFCudaResult evaluate_df_cuda(std::size_t o, std::size_t v, std::size_t q, const
                               const double* eps_o, const double* eps_v,
                               double denominator_threshold, std::size_t max_bytes, int device,
                               std::size_t max_panel_buffers = 3,
-                              generativeqc::runtime::PrecisionDirective admitted_w = {});
+                              generativeqc::runtime::PrecisionDirective admitted_w = {},
+                              bool occupied_partition = false);
 /** Differentiate the complete occupied-tile energy on CUDA.
  * Includes both the original energy and all nine input cotangents, staged once.
  * Complete admission charges borrowed host input values, detached outputs,
@@ -174,7 +181,8 @@ DFCudaCombinedResponseResult pullback_and_fock_df_cuda(
     int device, std::size_t caller_bytes = 0, std::size_t max_page_rows = 0,
     std::size_t max_panel_buffers = 3, bool parallel_gap_reduction = true,
     bool include_gap_response = true, bool fused_scalar_response = false,
-    generativeqc::runtime::PrecisionDirective admitted_w = {});
+    generativeqc::runtime::PrecisionDirective admitted_w = {},
+    std::span<const double> occupied_weights = {}, bool occupied_partition = false);
 #endif
 
 }  // namespace generativeqc::cc::triples

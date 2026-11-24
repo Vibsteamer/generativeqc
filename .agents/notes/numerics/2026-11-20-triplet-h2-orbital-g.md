@@ -1,0 +1,5 @@
+# Orbital g for all-electron triplet hydrogen dimers
+
+The full-range native CUDA DF source supplies spherical orbital g and auxiliary h value and force contractions. For a neutral all-electron H₂ triplet the alpha and beta occupations are two and zero. Both spin channels require the Coulomb matrix. Only alpha contributes an occupied exchange term. The candidate routes this spin domain through the existing independent CUDA DF-UHF implementation. Admission uses the physical system without assumptions about bond length, orientation or basis name.
+
+The candidate regression uses cc-pV5Z-F12 and the complete aug-cc-pwCV5Z-RI auxiliary space. Compare native center energy, both Fock matrices, the occupied projector, and all six analytic forces to independent PySCF results. Check two signed central-difference steps for both bond lengths. The qualification stage records physical GPU and runtime identity. An open-shell F12 correlated force also requires a separate orbital-response and molecular endpoint qualification.

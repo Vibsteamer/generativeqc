@@ -142,7 +142,7 @@ def test_ecp_center_and_versioned_roundtrip(weighted: typing.Any) -> None:
 
 def test_generated_center_derivatives_independent_finite_difference() -> None:
     rng = np.random.default_rng(171)
-    for l in range(4):
+    for l in range(5):
         for component in cartesian_components(l):
             graph, roots = gaussian_roots(component)
             for xyz in (np.zeros(3), rng.normal(size=3)):

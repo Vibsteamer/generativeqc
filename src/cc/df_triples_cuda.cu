@@ -57,7 +57,8 @@ std::size_t reserve(std::size_t& cursor, std::size_t n) {
 
 struct Layout {
   std::array<std::size_t, 9> sizes{}, inputs{};
-  std::size_t panels{}, moments{}, partials{}, energies{}, energy{}, error{}, library{};
+  std::size_t panels{}, moments{}, partials{}, energies{}, energy{}, occupied_energies{}, error{},
+      library{};
   std::size_t execution_storage{}, paired_pointers{}, paired_pointer_bytes{};
   std::size_t arena{}, total{}, panel_capacity{}, v3{}, tiles{};
   unsigned blocks{};
@@ -67,7 +68,7 @@ Layout layout(std::size_t o, std::size_t v, std::size_t q, std::size_t panels,
               std::size_t execution_bytes = 0, std::size_t host_binding_bytes = 0,
               std::size_t execution_provider_bytes = provider_allowance,
               std::size_t library_bytes = blas_workspace, bool external_inputs = false,
-              std::size_t paired_pointer_bytes = 0) {
+              std::size_t paired_pointer_bytes = 0, bool occupied_partition = false) {
   const auto oo = checked_mul(o, o), vv = checked_mul(v, v), ov = checked_mul(o, v);
   const auto ovv = checked_mul(o, vv);
   // Check every dimension and physical leading dimension before reading inputs
@@ -106,6 +107,7 @@ Layout layout(std::size_t o, std::size_t v, std::size_t q, std::size_t panels,
   p.partials = reserve(cursor, bytes(p.blocks));
   p.energies = reserve(cursor, bytes(p.tiles));
   p.energy = reserve(cursor, sizeof(double));
+  if (occupied_partition) p.occupied_energies = reserve(cursor, bytes(o));
   p.error = reserve(cursor, sizeof(int));
   p.library = reserve(cursor, library_bytes);
   p.arena = align256(cursor);
@@ -288,6 +290,7 @@ struct JointResponseLayout {
   FockLayout fock;
   std::array<std::size_t, 9> response_outputs{};
   std::size_t bar_w{}, bar_v{}, bar_panel{}, packed{}, gap{};
+  std::size_t unweighted_energies{}, occupied_energies{}, device_weights{};
   std::size_t response_output_bytes{}, complete{};
 };
 
@@ -295,7 +298,9 @@ JointResponseLayout joint_response_layout(std::size_t o, std::size_t v, std::siz
                                           std::size_t capacity, std::size_t panels,
                                           std::size_t caller_bytes, bool parallel_gap_reduction,
                                           bool include_gap_response,
-                                          bool fused_scalar_response = false) {
+                                          bool fused_scalar_response = false,
+                                          bool has_occupied_weights = false,
+                                          bool occupied_partition = false) {
   JointResponseLayout r;
   r.fock = fock_layout(o, v, q, capacity, panels, 0, true);
   auto& p = r.fock.value;
@@ -323,6 +328,12 @@ JointResponseLayout joint_response_layout(std::size_t o, std::size_t v, std::siz
   if (include_gap_response)
     r.gap = reserve(cursor,
                     bytes(generated_df::gap_response_arena_elements(o, v, parallel_gap_reduction)));
+  if (occupied_partition) {
+    if (has_occupied_weights) r.unweighted_energies = reserve(cursor, bytes(p.tiles));
+    r.occupied_energies = reserve(cursor, bytes(o));
+    values = checked_add(values, o);
+  }
+  if (has_occupied_weights) r.device_weights = reserve(cursor, bytes(o));
   p.arena = align256(cursor);
   p.total = checked_add(p.arena, provider_allowance);
   r.response_output_bytes = bytes(values);
@@ -346,6 +357,31 @@ __global__ void scatter_fock_block(std::size_t o, std::size_t capacity, std::siz
     if (left != right)
       foo[j * o + i] = generativeqc_tensor::finite(foo[j * o + i] + block[flat], error, 10);
   }
+}
+
+__global__ void scatter_weighted_degenerate_fock_block(std::size_t o, std::size_t capacity,
+                                                       std::size_t left, std::size_t right,
+                                                       std::size_t j_idx, std::size_t k_idx,
+                                                       const double* eps_o,
+                                                       const double* occupied_weights,
+                                                       const double* block, double* foo,
+                                                       int* error) {
+  const double wjk = occupied_weights[j_idx] + occupied_weights[k_idx];
+  for (std::size_t flat = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+       flat < capacity * capacity; flat += std::size_t(blockDim.x) * gridDim.x) {
+    const auto p = left + flat / capacity, r = right + flat % capacity;
+    if (p >= o || r >= o || p == r) continue;
+    if (fabs(eps_o[p] - eps_o[r]) >= 1e-6) continue;
+    const double scaled = block[flat] * ((occupied_weights[p] + wjk) / 3.0);
+    foo[p * o + r] = generativeqc_tensor::finite(foo[p * o + r] + scaled, error, 10);
+    if (left != right)
+      foo[r * o + p] = generativeqc_tensor::finite(foo[r * o + p] + scaled, error, 10);
+  }
+}
+
+__global__ void scale_scalar(const double* src, double factor, double* dst, int* error) {
+  if (blockIdx.x == 0 && threadIdx.x == 0)
+    *dst = generativeqc_tensor::finite((*src) * factor, error, 3);
 }
 
 // Audit only the logical output of a strided BLAS view. Padding can contain
@@ -416,10 +452,7 @@ __global__ void scatter_gap(std::size_t v, std::size_t i, std::size_t j, std::si
     virtuals[x] = generativeqc_tensor::finite(virtuals[x] + values.bar_eps_v[x], error, 9);
 }
 
-// Deterministic generic reduction, shared by each tile and final publication.
-__global__ void reduce(const double* values, std::size_t count, double* output, int* error) {
-  double sum = 0.0;
-  for (std::size_t x = threadIdx.x; x < count; x += blockDim.x) sum += values[x];
+__device__ void store_reduction(double sum, double* output, int* error) {
   __shared__ double sums[256];
   sums[threadIdx.x] = sum;
   __syncthreads();
@@ -429,6 +462,25 @@ __global__ void reduce(const double* values, std::size_t count, double* output, 
   }
   if (threadIdx.x == 0) *output = generativeqc_tensor::finite(sums[0], error, 3);
 }
+
+// Deterministic generic reduction, shared by each tile and final publication.
+__global__ void reduce(const double* values, std::size_t count, double* output, int* error) {
+  double sum = 0.0;
+  for (std::size_t x = threadIdx.x; x < count; x += blockDim.x) sum += values[x];
+  store_reduction(sum, output, error);
+}
+
+__global__ void reduce_occupied_energies(const double* tiles, std::size_t occupied,
+                                         double* output, int* error) {
+  const std::size_t orbital = blockIdx.x;
+  double sum = 0.0;
+  for (std::size_t first = threadIdx.x; first < occupied; first += blockDim.x)
+    for (std::size_t second = 0; second <= first; ++second) {
+      const auto share = detail::occupied_tile_share(orbital, first, second);
+      sum += static_cast<double>(share.count) * tiles[share.index];
+    }
+  store_reduction(sum * generated_df::occupied_orbital_share, output + orbital, error);
+}
 }  // namespace
 
 DFCudaResult evaluate_df_cuda(std::size_t o, std::size_t v, std::size_t q, const double* bov,
@@ -436,7 +488,7 @@ DFCudaResult evaluate_df_cuda(std::size_t o, std::size_t v, std::size_t q, const
                               const double* fov, const double* t1, const double* t2,
                               const double* eps_o, const double* eps_v, double threshold,
                               std::size_t max_bytes, int device, std::size_t max_panel_buffers,
-                              runtime::PrecisionDirective admitted_w) {
+                              runtime::PrecisionDirective admitted_w, bool occupied_partition) {
   const auto started = Clock::now();
   phase_observation::Scope observed_triples(phase_observation::Site::triples_inclusive, o, v);
   if (!o || !v || !q || !max_bytes || device < 0 || !std::isfinite(threshold) || threshold <= 0 ||
@@ -447,10 +499,14 @@ DFCudaResult evaluate_df_cuda(std::size_t o, std::size_t v, std::size_t q, const
   library_available = !reject_w_library_for_test;
 #endif
   auto execution_plan = generated_df::prepare_w_plan(admitted_w, library_available);
+  const auto occupied_result_bytes = occupied_partition ? bytes(o) : 0;
+  const auto host_bytes = [&](const auto& plan) {
+    return checked_add(generated_df::WExecution::host_bytes(plan), occupied_result_bytes);
+  };
   const auto planned_layout = [&](std::size_t panels) {
     return layout(o, v, q, panels, execution_plan.storage_bytes(o, v, std::min(o, panels)),
-                  generated_df::WExecution::host_bytes(execution_plan),
-                  execution_plan.provider_bytes(), 0);
+                  host_bytes(execution_plan), execution_plan.provider_bytes(), 0, false, 0,
+                  occupied_partition);
   };
   auto p = planned_layout(max_panel_buffers);
   if (p.total > max_bytes) p = planned_layout(1);
@@ -469,8 +525,8 @@ DFCudaResult evaluate_df_cuda(std::size_t o, std::size_t v, std::size_t q, const
   if (p.panel_capacity == 3 && execution_plan.pair_pointer_bytes()) {
     const auto paired =
         layout(o, v, q, p.panel_capacity, execution_plan.storage_bytes(o, v, p.panel_capacity),
-               generated_df::WExecution::host_bytes(execution_plan),
-               execution_plan.provider_bytes(), 0, false, execution_plan.pair_pointer_bytes());
+               host_bytes(execution_plan), execution_plan.provider_bytes(), 0, false,
+               execution_plan.pair_pointer_bytes(), occupied_partition);
     if (paired.total <= max_bytes) p = paired;
   }
   const std::array<const double*, 9> host{bov, bvv, ovoo, ovov, fov, t1, t2, eps_o, eps_v};
@@ -478,6 +534,7 @@ DFCudaResult evaluate_df_cuda(std::size_t o, std::size_t v, std::size_t q, const
 
   // Borrowed D2H destinations outlive Context's exception-path stream drain.
   DFCudaResult result;
+  if (occupied_partition) result.occupied_energies.resize(o);
   result.resource_fallback = resource_fallback;
   int failed = 0;
   {
@@ -510,7 +567,7 @@ DFCudaResult evaluate_df_cuda(std::size_t o, std::size_t v, std::size_t q, const
                                        result.fp64_gemms, result.fp32_gemms,
                                        result.contraction_summands, result.precision_cast_elements);
     const auto& selected = execution.plan();
-    result.host_binding_bytes = generated_df::WExecution::host_bytes(selected);
+    result.host_binding_bytes = host_bytes(selected);
     result.resource_fallback =
         result.resource_fallback || selected.selected != execution_plan.selected;
     result.precision = selected.precision.arithmetic;
@@ -685,13 +742,28 @@ DFCudaResult evaluate_df_cuda(std::size_t o, std::size_t v, std::size_t q, const
     generativeqc_tensor::cuda_check(cudaGetLastError());
     ++result.reduction_kernels;
     final_reduction.close();
+    auto* occupied_energies = reinterpret_cast<double*>(context.arena + p.occupied_energies);
+    if (occupied_partition) {
+      phase_observation::Scope occupied_reduction(
+          phase_observation::Site::triples_reduction_submission, p.tiles, o,
+          reinterpret_cast<std::uintptr_t>(context.stream));
+      reduce_occupied_energies<<<static_cast<unsigned>(o), 256, 0, context.stream>>>(
+          energies, o, occupied_energies, context.error);
+      generativeqc_tensor::cuda_check(cudaGetLastError());
+      ++result.reduction_kernels;
+    }
+    result.d2h_bytes = checked_add(sizeof(double) + sizeof(int), occupied_result_bytes);
     phase_observation::Scope download(phase_observation::Site::triples_download_submission, 0,
-                                      sizeof(double) + sizeof(int),
+                                      result.d2h_bytes,
                                       reinterpret_cast<std::uintptr_t>(context.stream));
     generativeqc_tensor::cuda_check(cudaMemcpyAsync(&result.energy, energy, sizeof(double),
                                                     cudaMemcpyDeviceToHost, context.stream));
     generativeqc_tensor::cuda_check(cudaMemcpyAsync(&failed, context.error, sizeof(int),
                                                     cudaMemcpyDeviceToHost, context.stream));
+    if (occupied_partition)
+      generativeqc_tensor::cuda_check(cudaMemcpyAsync(
+          result.occupied_energies.data(), occupied_energies, occupied_result_bytes,
+          cudaMemcpyDeviceToHost, context.stream));
     download.close();
     {
       phase_observation::Scope wait(phase_observation::Site::explicit_wait, 0, 0,
@@ -708,7 +780,6 @@ DFCudaResult evaluate_df_cuda(std::size_t o, std::size_t v, std::size_t q, const
     result.arena_bytes = p.arena;
     result.provider_retained_bytes = execution.provider_bytes();
     result.panel_capacity = p.panel_capacity;
-    result.d2h_bytes = sizeof(double) + sizeof(int);
   }  // Drain/destroy the stream, buffers and BLAS provider inside endpoint timing.
   result.seconds = std::chrono::duration<double>(Clock::now() - started).count();
   return result;
@@ -1171,11 +1242,21 @@ DFCudaCombinedResponseResult pullback_and_fock_df_cuda(
     const double* eps_o, const double* eps_v, double threshold, std::size_t max_bytes, int device,
     std::size_t caller_bytes, std::size_t max_page_rows, std::size_t max_panel_buffers,
     bool parallel_gap_reduction, bool include_gap_response, bool fused_scalar_response,
-    runtime::PrecisionDirective admitted_w) {
+    runtime::PrecisionDirective admitted_w, std::span<const double> occupied_weights,
+    bool occupied_partition) {
   const auto started = Clock::now();
   if (!o || !v || !q || !max_bytes || device < 0 || !std::isfinite(threshold) || threshold <= 0 ||
       !max_panel_buffers || max_panel_buffers > 3)
     throw std::invalid_argument("invalid combined DF triples response dimensions or controls");
+  const bool has_weights = !occupied_weights.empty();
+  if (has_weights) {
+    if (occupied_weights.size() != o ||
+        !std::all_of(occupied_weights.begin(), occupied_weights.end(),
+                     [](double value) { return std::isfinite(value); }))
+      throw std::invalid_argument("DF triples occupied weights must be finite with length nocc");
+    include_gap_response = true;
+    fused_scalar_response = false;
+  }
 
   const std::array<const double*, 9> host{bov, bvv, ovoo, ovov, fov, t1, t2, eps_o, eps_v};
   const auto staging_layout = layout(o, v, q, 1);
@@ -1198,13 +1279,15 @@ DFCudaCombinedResponseResult pullback_and_fock_df_cuda(
   auto admitted_layout = [&](std::size_t capacity, std::size_t panels) {
     auto candidate =
         joint_response_layout(o, v, q, capacity, panels, prepared_caller, parallel_gap_reduction,
-                              include_gap_response, fused_selected);
+                              include_gap_response, fused_selected, has_weights,
+                              occupied_partition);
     if (fused_selected && candidate.complete > max_bytes) {
       // Never sacrifice a previously admitted page/panel policy for optional
       // seed storage. The unchanged unfused schedule remains the bounded oracle.
       fused_selected = false;
       candidate = joint_response_layout(o, v, q, capacity, panels, prepared_caller,
-                                        parallel_gap_reduction, include_gap_response);
+                                        parallel_gap_reduction, include_gap_response, false,
+                                        has_weights, occupied_partition);
     }
     if (w_plan) {
       auto& value = candidate.fock.value;
@@ -1228,18 +1311,49 @@ DFCudaCombinedResponseResult pullback_and_fock_df_cuda(
     }
     return candidate;
   };
+  // Cap triples device arena cleanly below GPU physical VRAM so 7-heavy-atom Br/Cl
+  // molecules shrink page_capacity gracefully instead of pegging 45+ GiB on L20.
+  std::size_t triples_device_cap = max_bytes;
+  {
+    runtime::CudaDeviceScope query_scope(device);
+    std::size_t avail = 0, total = 0;
+    if (cudaMemGetInfo(&avail, &total) == cudaSuccess && avail > 0) {
+      const std::size_t safe_avail =
+          avail > (6ULL << 30) ? (avail - (6ULL << 30)) : (avail * 3 / 4);
+      const std::size_t hard_cap = (total >= (32ULL << 30)) ? (24ULL << 30) : safe_avail;
+      triples_device_cap = std::min({max_bytes, safe_avail, hard_cap});
+    }
+  }
   auto plan = admitted_layout(page_capacity, max_panel_buffers);
-  while (plan.complete > max_bytes) {
+  auto plan_exceeds = [&](const auto& cand) {
+    return cand.complete > max_bytes ||
+           checked_add(cand.fock.value.total, prepared_storage) > triples_device_cap;
+  };
+  while (plan_exceeds(plan)) {
     if (plan.fock.value.panel_capacity > 1) {
       plan = admitted_layout(page_capacity, 1);
-      if (plan.complete <= max_bytes) break;
+      if (!plan_exceeds(plan)) break;
     }
-    if (page_capacity == 1)
+    if (page_capacity == 1) {
+      if (plan.complete <= max_bytes) break;  // Minimum 1-row page still fits total budget.
       throw std::length_error("joint DF triples response exceeds complete numeric budget");
+    }
     --page_capacity;
     plan = admitted_layout(page_capacity, max_panel_buffers);
   }
   const double minimum = validate_inputs(o, v, q, staging_layout, host, threshold);
+  bool has_occupied_degeneracy = false;
+  if (has_weights) {
+    for (std::size_t a = 0; a < o; ++a)
+      for (std::size_t b = a + 1; b < o; ++b)
+        if (std::abs(eps_o[a] - eps_o[b]) < 1e-6) {
+          has_occupied_degeneracy = true;
+          if (std::abs(occupied_weights[a] - occupied_weights[b]) >
+              1e-8 * (1.0 + std::max(std::abs(occupied_weights[a]), std::abs(occupied_weights[b]))))
+            throw std::invalid_argument(
+                "weighted DF triples requires equal weights across degenerate occupied orbitals");
+        }
+  }
 
   runtime::CudaDeviceScope device_scope(device);
   if (fused_selected) {
@@ -1263,6 +1377,7 @@ DFCudaCombinedResponseResult pullback_and_fock_df_cuda(
       &response.bov, &response.bvv, &response.ovoo,  &response.ovov, &response.fov,
       &response.t1,  &response.t2,  &response.eps_o, &response.eps_v};
   for (std::size_t x = 0; x < requested_outputs; ++x) response_outputs[x]->resize(p.sizes[x]);
+  if (occupied_partition) d.occupied_energies.resize(o);
   fock.foo.resize(checked_mul(o, o));
   fock.fvv.resize(checked_mul(v, v));
 
@@ -1340,6 +1455,10 @@ DFCudaCombinedResponseResult pullback_and_fock_df_cuda(
         cudaMemsetAsync(pointer(plan.fock.foo), 0, bytes(checked_mul(o, o)), context.stream));
     generativeqc_tensor::cuda_check(
         cudaMemsetAsync(pointer(plan.fock.fvv), 0, bytes(checked_mul(v, v)), context.stream));
+    if (has_weights)
+      generativeqc_tensor::cuda_check(cudaMemcpyAsync(
+          pointer(plan.device_weights), occupied_weights.data(), bytes(o),
+          cudaMemcpyHostToDevice, context.stream));
 
     auto* panels = pointer(p.panels);
     auto* moments = pointer(p.moments);
@@ -1408,33 +1527,60 @@ DFCudaCombinedResponseResult pullback_and_fock_df_cuda(
     const auto run_pullback = [&](std::size_t i, std::size_t j, std::size_t k) {
       const std::array<std::size_t, 3> occupied{i, j, k};
       const double multiplicity = i == k ? 6.0 : (i == j || j == k ? 2.0 : 1.0);
+      const double tile_w =
+          has_weights ? (occupied_weights[i] + occupied_weights[j] + occupied_weights[k]) / 3.0
+                      : 1.0;
       const auto tile = response_index(i, j, k);
       if (tile >= p.tiles) throw std::logic_error("joint triples response tile index overflow");
 
+      if (has_weights && std::abs(tile_w) <= 1e-300) {
+        generativeqc_tensor::cuda_check(
+            cudaMemsetAsync(pointer(p.energies) + tile, 0, sizeof(double), context.stream));
+        if (occupied_partition) {
+          generated_df::energy_tile(o, v, i, j, k, multiplicity, threshold, in, moments, p.blocks,
+                                    pointer(p.partials), context.error, context.stream);
+          ++d.epilogue_kernels;
+          reduce<<<1, 256, 0, context.stream>>>(pointer(p.partials), p.blocks,
+                                                pointer(plan.unweighted_energies) + tile,
+                                                context.error);
+          generativeqc_tensor::cuda_check(cudaGetLastError());
+          ++d.reduction_kernels;
+        }
+        ++response_tiles;
+        return;
+      }
+
+      const double effective_multiplicity = has_weights ? multiplicity / tile_w : multiplicity;
       if (fused_selected)
-        generated_df::fused_response_tile(o, v, i, j, k, multiplicity, threshold, in, moments,
-                                          p.blocks, bar_w, bar_v, pointer(p.partials),
+        generated_df::fused_response_tile(o, v, i, j, k, effective_multiplicity, threshold, in,
+                                          moments, p.blocks, bar_w, bar_v, pointer(p.partials),
                                           context.error, context.stream);
       else
-        generated_df::energy_tile(o, v, i, j, k, multiplicity, threshold, in, moments, p.blocks,
-                                  pointer(p.partials), context.error, context.stream);
+        generated_df::energy_tile(o, v, i, j, k, effective_multiplicity, threshold, in, moments,
+                                  p.blocks, pointer(p.partials), context.error, context.stream);
       ++d.epilogue_kernels;
       reduce<<<1, 256, 0, context.stream>>>(pointer(p.partials), p.blocks,
                                             pointer(p.energies) + tile, context.error);
       generativeqc_tensor::cuda_check(cudaGetLastError());
       ++d.reduction_kernels;
+      if (occupied_partition && has_weights) {
+        scale_scalar<<<1, 1, 0, context.stream>>>(pointer(p.energies) + tile, 1.0 / tile_w,
+                                                  pointer(plan.unweighted_energies) + tile,
+                                                  context.error);
+        generativeqc_tensor::cuda_check(cudaGetLastError());
+      }
 
       if (!fused_selected) {
-        generated_df::response_w_tile(o, v, i, j, k, multiplicity, threshold, in, moments, p.blocks,
-                                      bar_w, context.error, context.stream);
+        generated_df::response_w_tile(o, v, i, j, k, effective_multiplicity, threshold, in,
+                                      moments, p.blocks, bar_w, context.error, context.stream);
         ++response.reverse_kernels;
       }
       for (unsigned perm = 0; perm < 6; ++perm) {
         const auto* order = generated_df::permutations[perm];
         const auto I = occupied[order[0]], J = occupied[order[1]], K = occupied[order[2]];
         if (!fused_selected)
-          generated_df::response_v_tile(o, v, i, j, k, perm, multiplicity, threshold, in, moments,
-                                        p.blocks, bar_v, context.error, context.stream);
+          generated_df::response_v_tile(o, v, i, j, k, perm, effective_multiplicity, threshold, in,
+                                        moments, p.blocks, bar_v, context.error, context.stream);
         ovov_view<false>
             <<<small_blocks, 256, 0, context.stream>>>(o, v, I, J, in.ovov, packed, context.error);
         generativeqc_tensor::cuda_check(cudaGetLastError());
@@ -1448,8 +1594,8 @@ DFCudaCombinedResponseResult pullback_and_fock_df_cuda(
       }
 
       if (include_gap_response) {
-        generated_df::response_gap_tile(o, v, i, j, k, multiplicity, threshold, in, moments,
-                                        p.blocks, bar_v, context.error, context.stream);
+        generated_df::response_gap_tile(o, v, i, j, k, effective_multiplicity, threshold, in,
+                                        moments, p.blocks, bar_v, context.error, context.stream);
         generated_df::GapCudaState gap{
             o, v, bar_v, pointer(plan.gap), context.error, context.stream, parallel_gap_reduction};
         const auto gaps = generated_df::gap_response_cuda(gap);
@@ -1545,25 +1691,38 @@ DFCudaCombinedResponseResult pullback_and_fock_df_cuda(
           // right-page replay below is purely a bounded Fock-storage fallback.
           page(left, j, k, pointer(plan.fock.xl), pointer(plan.fock.yl), true);
           for (std::size_t lane = 0; lane < page_capacity && left + lane < o; ++lane) {
+            const double lane_w =
+                has_weights ? (occupied_weights[left + lane] + occupied_weights[j] +
+                               occupied_weights[k]) / 3.0
+                            : 1.0;
+            if (has_weights && lane_w == 0.0) continue;
             generated_df::fock_vv(v, page_capacity, pointer(plan.fock.xl) + lane * p.v3,
-                                  pointer(plan.fock.yl) + lane * p.v3, weight,
+                                  pointer(plan.fock.yl) + lane * p.v3, weight * lane_w,
                                   pointer(plan.fock.fvv), forward_gemm);
             fock.fock_gemms += 2;
           }
-          for (std::size_t right = left; right < o; right += page_capacity) {
-            if (left != right)
-              page(right, j, k, pointer(plan.fock.xr), pointer(plan.fock.yr), false);
-            generated_df::fock_oo(v, page_capacity, pointer(plan.fock.xl),
-                                  pointer(left == right ? plan.fock.xl : plan.fock.xr),
-                                  pointer(plan.fock.yl),
-                                  pointer(left == right ? plan.fock.yl : plan.fock.yr), weight,
-                                  pointer(plan.fock.block), forward_gemm);
-            fock.fock_gemms += 2;
-            scatter_fock_block<<<scatter_blocks, 256, 0, context.stream>>>(
-                o, page_capacity, left, right, pointer(plan.fock.block), pointer(plan.fock.foo),
-                context.error);
-            generativeqc_tensor::cuda_check(cudaGetLastError());
-            ++fock.scatter_kernels;
+          if (!has_weights || has_occupied_degeneracy) {
+            for (std::size_t right = left; right < o; right += page_capacity) {
+              if (left != right)
+                page(right, j, k, pointer(plan.fock.xr), pointer(plan.fock.yr), false);
+              generated_df::fock_oo(v, page_capacity, pointer(plan.fock.xl),
+                                    pointer(left == right ? plan.fock.xl : plan.fock.xr),
+                                    pointer(plan.fock.yl),
+                                    pointer(left == right ? plan.fock.yl : plan.fock.yr), weight,
+                                    pointer(plan.fock.block), forward_gemm);
+              fock.fock_gemms += 2;
+              if (has_weights) {
+                scatter_weighted_degenerate_fock_block<<<scatter_blocks, 256, 0, context.stream>>>(
+                    o, page_capacity, left, right, j, k, in.eps_o, pointer(plan.device_weights),
+                    pointer(plan.fock.block), pointer(plan.fock.foo), context.error);
+              } else {
+                scatter_fock_block<<<scatter_blocks, 256, 0, context.stream>>>(
+                    o, page_capacity, left, right, pointer(plan.fock.block),
+                    pointer(plan.fock.foo), context.error);
+              }
+              generativeqc_tensor::cuda_check(cudaGetLastError());
+              ++fock.scatter_kernels;
+            }
           }
         }
       }
@@ -1587,7 +1746,8 @@ DFCudaCombinedResponseResult pullback_and_fock_df_cuda(
         checked_mul(points, fused_selected ? generated_df::scalar_fused_arithmetic_ops
                                            : generated_df::scalar_unfused_arithmetic_ops);
     fusion.value_writes = checked_add(checked_mul(12, points), checked_mul(p.tiles, p.blocks));
-    if (fock.vector_cubes != plan.fock.cubes || fock.page_builds != plan.fock.page_builds)
+    if ((!has_weights || has_occupied_degeneracy) &&
+        (fock.vector_cubes != plan.fock.cubes || fock.page_builds != plan.fock.page_builds))
       throw std::logic_error("joint DF triples Fock replay work mismatch");
 
     response.gap.requested = include_gap_response;
@@ -1615,10 +1775,22 @@ DFCudaCombinedResponseResult pullback_and_fock_df_cuda(
                                           context.error);
     generativeqc_tensor::cuda_check(cudaGetLastError());
     ++d.reduction_kernels;
+    if (occupied_partition) {
+      const auto* unweighted_tiles =
+          has_weights ? pointer(plan.unweighted_energies) : pointer(p.energies);
+      reduce_occupied_energies<<<static_cast<unsigned>(o), 256, 0, context.stream>>>(
+          unweighted_tiles, o, pointer(plan.occupied_energies), context.error);
+      generativeqc_tensor::cuda_check(cudaGetLastError());
+      ++d.reduction_kernels;
+    }
     for (std::size_t x = 0; x < requested_outputs; ++x)
       generativeqc_tensor::cuda_check(
           cudaMemcpyAsync(response_outputs[x]->data(), pointer(plan.response_outputs[x]),
                           bytes(p.sizes[x]), cudaMemcpyDeviceToHost, context.stream));
+    if (occupied_partition)
+      generativeqc_tensor::cuda_check(
+          cudaMemcpyAsync(d.occupied_energies.data(), pointer(plan.occupied_energies), bytes(o),
+                          cudaMemcpyDeviceToHost, context.stream));
     generativeqc_tensor::cuda_check(cudaMemcpyAsync(&d.energy, pointer(p.energy), sizeof(double),
                                                     cudaMemcpyDeviceToHost, context.stream));
     generativeqc_tensor::cuda_check(cudaMemcpyAsync(fock.foo.data(), pointer(plan.fock.foo),
@@ -1632,6 +1804,25 @@ DFCudaCombinedResponseResult pullback_and_fock_df_cuda(
     generativeqc_tensor::cuda_check(cudaStreamSynchronize(context.stream));
     if (failed || !std::isfinite(d.energy))
       throw std::runtime_error("nonfinite or unsafe joint DF triples response arithmetic");
+    if (has_weights) {
+      // Combine exact weighted diagonal gap derivatives with degenerate off-diagonals.
+      for (std::size_t idx = 0; idx < o; ++idx) fock.foo[idx * o + idx] = response.eps_o[idx];
+    }
+    if (occupied_partition) {
+      long double weighted_sum = 0.0L, magnitude = 0.0L;
+      for (std::size_t idx = 0; idx < o; ++idx) {
+        const double val = d.occupied_energies[idx];
+        if (!std::isfinite(val))
+          throw std::runtime_error("nonfinite occupied triples partition in combined response");
+        const long double term =
+            has_weights ? static_cast<long double>(occupied_weights[idx]) * val
+                        : static_cast<long double>(val);
+        weighted_sum += term;
+        magnitude += std::abs(term);
+      }
+      if (std::abs(weighted_sum - d.energy) > 1e-11L * (1.0L + magnitude))
+        throw std::runtime_error("combined DF triples occupied partition does not close to scalar");
+    }
 
     d.minimum_absolute_denominator = minimum;
     d.virtual_triples = checked_mul(checked_mul(v, checked_add(v, 1)), checked_add(v, 2)) / 6;

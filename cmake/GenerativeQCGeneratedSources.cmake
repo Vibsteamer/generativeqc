@@ -1020,6 +1020,18 @@ macro(generativeqc_register_cuda_generated_sources target)
     OUTPUTS "${GENERATIVEQC_MATRIX_FUNCTION_HEADER}"
     ARGS --output "${GENERATIVEQC_MATRIX_FUNCTION_HEADER}")
 
+  set(GENERATIVEQC_CANONICAL_FRAME_HEADER
+      "${CMAKE_CURRENT_BINARY_DIR}/generated/generated_canonical_frame.cuh")
+  generativeqc_register_generated_sources(
+    TARGET ${target}
+    ADD_TO_TARGET
+    GENERATOR "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_canonical_frame_cuda.py"
+    OUTPUTS "${GENERATIVEQC_CANONICAL_FRAME_HEADER}"
+    DEPENDS
+      "${CMAKE_CURRENT_SOURCE_DIR}/python/generativeqc_compiler/method/canonical_frame_response.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/python/generativeqc_compiler/tensor/scalar_cpp.py"
+    ARGS --output "${GENERATIVEQC_CANONICAL_FRAME_HEADER}")
+
   set(GENERATIVEQC_DF_HF_RESPONSE_CUDA_HEADER
       "${CMAKE_CURRENT_BINARY_DIR}/generated/generated_df_hf_response.cuh")
   generativeqc_register_generated_sources(

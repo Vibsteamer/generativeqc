@@ -73,6 +73,9 @@ struct LambdaOptions {
   // Unpromoted CUDA schedule. Budget/allocation refusal retains
   // the host-vector path with the same diagonal policy and physical audits.
   bool cuda_resident_krylov{false};
+  // Solve J^T DeltaLambda = -(t1_source, t2_source) with zero CCSD energy seed,
+  // isolating pure external-source (e.g. (T) or (T+)) parameter cotangents.
+  bool energy_source_only{false};
   core::CorrelationConvergence convergence;
 };
 

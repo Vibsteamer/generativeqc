@@ -1,0 +1,284 @@
+{
+  "series_id": "methyl-halide-ha-PP-F12/def2-universal-JKFit/element-RI",
+  "beta_bohr_inverse": 0.9,
+  "geometries": {
+    "Br": {
+      "symbols": [
+        "C",
+        "Br",
+        "H",
+        "H",
+        "H"
+      ],
+      "coordinates_bohr": [
+        [
+          0.0,
+          0.0,
+          -2.8646358322281773
+        ],
+        [
+          0.0,
+          0.0,
+          0.7900944926806525
+        ],
+        [
+          0.0,
+          1.9481186618141222,
+          -3.4874895628848215
+        ],
+        [
+          1.6871474840116873,
+          -0.9741538172132893,
+          -3.4874895628848215
+        ],
+        [
+          -1.6871474840116873,
+          -0.9741538172132893,
+          -3.4874895628848215
+        ]
+      ],
+      "coordinates_angstrom": [
+        [
+          0,
+          0,
+          -1.5159
+        ],
+        [
+          0,
+          0,
+          0.4181
+        ],
+        [
+          0,
+          1.0309,
+          -1.8455
+        ],
+        [
+          0.8928,
+          -0.5155,
+          -1.8455
+        ],
+        [
+          -0.8928,
+          -0.5155,
+          -1.8455
+        ]
+      ],
+      "geometry_source": "https://cccbdb.nist.gov/expgeom2x.asp?casno=74839",
+      "reference": "K. Kuchitsu (ed.), Structure of Free Polyatomic Molecules \u2013 Basic Data (1998)",
+      "reference_doi": "10.1007/978-3-642-45748-7"
+    },
+    "I": {
+      "symbols": [
+        "C",
+        "I",
+        "H",
+        "H",
+        "H"
+      ],
+      "coordinates_bohr": [
+        [
+          0.0,
+          0.0,
+          -3.4204042854627623
+        ],
+        [
+          0.0,
+          0.0,
+          0.6156727713832971
+        ],
+        [
+          0.0,
+          1.9539768128002741,
+          -4.035321166396233
+        ],
+        [
+          1.692249744548013,
+          -0.9769884064001371,
+          -4.035321166396233
+        ],
+        [
+          -1.692249744548013,
+          -0.9769884064001371,
+          -4.035321166396233
+        ]
+      ],
+      "coordinates_angstrom": [
+        [
+          0,
+          0,
+          -1.81
+        ],
+        [
+          0,
+          0,
+          0.3258
+        ],
+        [
+          0,
+          1.034,
+          -2.1354
+        ],
+        [
+          0.8955,
+          -0.517,
+          -2.1354
+        ],
+        [
+          -0.8955,
+          -0.517,
+          -2.1354
+        ]
+      ],
+      "geometry_source": "https://cccbdb.nist.gov/expgeom2x.asp?casno=74884",
+      "reference": "K. Kuchitsu (ed.), Structure of Free Polyatomic Molecules \u2013 Basic Data (1998)",
+      "reference_doi": "10.1007/978-3-642-45748-7"
+    }
+  },
+  "basis_sets": {
+    "br-d": {
+      "id": "ad673dbeff6a60597d20149f776def20ccce580a2d3e3d55ac67dfdb98db4ba6",
+      "roles": {
+        "halogen_orbital": "aug-cc-pVDZ-PP-F12",
+        "halogen_ecp": "ECP10MDF",
+        "core_electrons": 10,
+        "halogen_ri": "matched aug-cc-pVDZ-PP-F12/MP2Fit",
+        "halogen_cabs": "matched aug-cc-pVDZ-PP-F12/OptRI",
+        "hydrogen_orbital": "cc-pVDZ-F12",
+        "hydrogen_aux": "Matched parent MP2Fit/OptRI",
+        "carbon_cabs": "parent cc-pVDZ-F12-OptRI",
+        "carbon_ri": "aug-cc-pVTZ-RI",
+        "carbon_orbital": "aug-cc-pVDZ-F12",
+        "jk": "def2-universal-JKFit on every atom. Diagnostic SCF fit.",
+        "f12_fit": "Same element-specific RI basis as MP2"
+      },
+      "sha256": {
+        "orbital.json": "4f0b90c4c008f106173f7d579f4b4c1d2bcc914b135dabb1922859fb9eb09fa1",
+        "jkfit.json": "e7d278f99ad8a15931d24b0efea8204702e6f77e37de47927d6f237065842acb",
+        "ri.json": "d7013e236a8fd42b9c37faad158122a040069ca70e8dd5e4bce120b47f618e3d",
+        "cabs.json": "cdd5e8af1672e049ae9049210c93efadd9d34305bcb056867422022729fd4b8e"
+      },
+      "coefficient_sources": {
+        "halogen_basis_repository": "http://www.grant-hill.group.shef.ac.uk/ccrepo/bromine/brbasis.php",
+        "halogen_orbital_nwchem_sha256": "c0f9cf0f3404279d7a9f28706f713c2ed0e788437341cb83dfe0d5ce5dba39f2",
+        "halogen_OptRI_nwchem_sha256": "74037f506913138bc892a85359228c944bd94ad6a290a27b1c1469354806dd30",
+        "halogen_MP2Fit_nwchem_sha256": "1a96c964998f15d74e9d88008035aff30b81f0bc30c509882232c23597f06fae",
+        "pyscf_scalar_ecp_sha256": "7cfd3be0a2fb53cb7874b7423a7702e216e18858109e7af38e9ab8219316246a",
+        "hydrogen_MP2Fit_nwchem_sha256": "d711cff115eb7ffe477088e142f523b986c6f70407c6b2832f2f3251b257aec1",
+        "carbon_augmented_orbital_DOI": "10.1063/1.4998332",
+        "carbon_orbital_reconstruction_DOI": "10.1002/jcc.26970",
+        "carbon_parent_OptRI": "Psi4 basis library",
+        "carbon_ri": "Psi4 aug-cc-pVTZ-RI",
+        "def2_universal_JKFit": "PySCF basis library"
+      }
+    },
+    "br-t": {
+      "id": "36712b901811284abf8442778ffa1f2cd0b9d67c6507238b037afadf1ebadca5",
+      "roles": {
+        "halogen_orbital": "aug-cc-pVTZ-PP-F12",
+        "halogen_ecp": "ECP10MDF",
+        "core_electrons": 10,
+        "halogen_ri": "matched aug-cc-pVTZ-PP-F12/MP2Fit",
+        "halogen_cabs": "matched aug-cc-pVTZ-PP-F12/OptRI",
+        "hydrogen_orbital": "cc-pVTZ-F12",
+        "hydrogen_aux": "Matched parent MP2Fit/OptRI",
+        "carbon_cabs": "parent cc-pVTZ-F12-OptRI",
+        "carbon_ri": "aug-cc-pVTZ-RI",
+        "carbon_orbital": "aug-cc-pVTZ-F12",
+        "jk": "def2-universal-JKFit on every atom. Diagnostic SCF fit.",
+        "f12_fit": "Same element-specific RI basis as MP2"
+      },
+      "sha256": {
+        "orbital.json": "c71498287b4a15b7aaec63c94f4e7dcce9715da1702c7ba0fde4c2b0e879aca8",
+        "jkfit.json": "95a9a5eb94eda9c5f351330c7f758dd6b516656cb2e4937d8be132b5aa3da96c",
+        "ri.json": "4c48c0d48a6a40b107d538633d664d2c4727c3e37455d46f095bd8cf62a2aa21",
+        "cabs.json": "2af3db91eee6de10e4fcf9f904cd3e71de1b111b7c298e567866ef0aae411fc6"
+      },
+      "coefficient_sources": {
+        "halogen_basis_repository": "http://www.grant-hill.group.shef.ac.uk/ccrepo/bromine/brbasis.php",
+        "halogen_orbital_nwchem_sha256": "4b3e69582cbdbc8bd23a63c2c0c9c69bf2c708219cbece088840ac998786e274",
+        "halogen_OptRI_nwchem_sha256": "42a39e6817e60e3729b8431cd4b83dcc014f142e369b2a534e01555180b8f539",
+        "halogen_MP2Fit_nwchem_sha256": "3d520522768e068dda12b90c9b959a8bb0bdb962632e3a5922fc0911faa527c8",
+        "pyscf_scalar_ecp_sha256": "7cfd3be0a2fb53cb7874b7423a7702e216e18858109e7af38e9ab8219316246a",
+        "hydrogen_MP2Fit_nwchem_sha256": "ca0adf154be0ff78185827148821218780a3d87df14ff32e240bc12e0b133101",
+        "carbon_augmented_orbital_DOI": "10.1063/1.4998332",
+        "carbon_orbital_reconstruction_DOI": "10.1002/jcc.26970",
+        "carbon_parent_OptRI": "Psi4 basis library",
+        "carbon_ri": "Psi4 aug-cc-pVTZ-RI",
+        "def2_universal_JKFit": "PySCF basis library"
+      }
+    },
+    "i-d": {
+      "id": "d09384cc7ad904ff069194371bb36743d1701c623bb58c90d75e43b144e6bb36",
+      "roles": {
+        "halogen_orbital": "aug-cc-pVDZ-PP-F12",
+        "halogen_ecp": "ECP28MDF",
+        "core_electrons": 28,
+        "halogen_ri": "matched aug-cc-pVDZ-PP-F12/MP2Fit",
+        "halogen_cabs": "matched aug-cc-pVDZ-PP-F12/OptRI",
+        "hydrogen_orbital": "cc-pVDZ-F12",
+        "hydrogen_aux": "Matched parent MP2Fit/OptRI",
+        "carbon_cabs": "parent cc-pVDZ-F12-OptRI",
+        "carbon_ri": "aug-cc-pVTZ-RI",
+        "carbon_orbital": "aug-cc-pVDZ-F12",
+        "jk": "def2-universal-JKFit on every atom. Diagnostic SCF fit.",
+        "f12_fit": "Same element-specific RI basis as MP2"
+      },
+      "sha256": {
+        "orbital.json": "1442d0e9c269804494e6fa05995d3abd90d0aeb8cf1af9c03b70e181ced2e4bd",
+        "jkfit.json": "cf2a7898f4ba0789fc792c0903b59c0de36b983763770cabf93116642e2da8c9",
+        "ri.json": "f276bb957e229244fbfe9e842361e1453982da423a1920981723af06e89b6e97",
+        "cabs.json": "defab3875dad54f2898e89fd8d1f8db52beedaad7f907684739397b5ee6e7514"
+      },
+      "coefficient_sources": {
+        "halogen_basis_repository": "http://www.grant-hill.group.shef.ac.uk/ccrepo/iodine/ibasis.php",
+        "halogen_orbital_nwchem_sha256": "27a44f354e5e6dc1ac1295354ca8c50b3a52cf372a7144631dc9e66958938fd0",
+        "halogen_OptRI_nwchem_sha256": "7fb16c32138c8a3b5e5dd3f48547524c8de9f77b2101370ddc362a842b2aa757",
+        "halogen_MP2Fit_nwchem_sha256": "9987466366f49030417520e300482173e4b9a3c8b4b1c7cc4879835c76100547",
+        "pyscf_scalar_ecp_sha256": "c40e5d6308973ce3348bce4946399a0b4f593670f1f218b0e6dea9dfd86f2704",
+        "hydrogen_MP2Fit_nwchem_sha256": "d711cff115eb7ffe477088e142f523b986c6f70407c6b2832f2f3251b257aec1",
+        "carbon_augmented_orbital_DOI": "10.1063/1.4998332",
+        "carbon_orbital_reconstruction_DOI": "10.1002/jcc.26970",
+        "carbon_parent_OptRI": "Psi4 basis library",
+        "carbon_ri": "Psi4 aug-cc-pVTZ-RI",
+        "def2_universal_JKFit": "PySCF basis library"
+      }
+    },
+    "i-t": {
+      "id": "3e003a3aa9b7d4d27c0ad131880213ee8d95cb22eb5cb546afe8cdfc150b2aec",
+      "roles": {
+        "halogen_orbital": "aug-cc-pVTZ-PP-F12",
+        "halogen_ecp": "ECP28MDF",
+        "core_electrons": 28,
+        "halogen_ri": "matched aug-cc-pVTZ-PP-F12/MP2Fit",
+        "halogen_cabs": "matched aug-cc-pVTZ-PP-F12/OptRI",
+        "hydrogen_orbital": "cc-pVTZ-F12",
+        "hydrogen_aux": "Matched parent MP2Fit/OptRI",
+        "carbon_cabs": "parent cc-pVTZ-F12-OptRI",
+        "carbon_ri": "aug-cc-pVTZ-RI",
+        "carbon_orbital": "aug-cc-pVTZ-F12",
+        "jk": "def2-universal-JKFit on every atom. Diagnostic SCF fit.",
+        "f12_fit": "Same element-specific RI basis as MP2"
+      },
+      "sha256": {
+        "orbital.json": "059d4a8cef7db0257f7ff8c139fbfc0fb91002823d777d8042b4ce4e2c0b5179",
+        "jkfit.json": "82d5b4f3a5f508913968ed2594428d99f698231ae1e75288e8468fb9182ae51c",
+        "ri.json": "ffc603f2b6d074c13d3c61c9dec731fdac3c0883924f38dd4e7a069718ee0a0f",
+        "cabs.json": "6049d1fabdd4e7dd03339fb04c47997b06185709477e5c66b5316a915ea9e565"
+      },
+      "coefficient_sources": {
+        "halogen_basis_repository": "http://www.grant-hill.group.shef.ac.uk/ccrepo/iodine/ibasis.php",
+        "halogen_orbital_nwchem_sha256": "297a93fa530becddbe7442860824253efbc47fa9ceb3e4ef2cae931365725443",
+        "halogen_OptRI_nwchem_sha256": "d223a16e3f9aaacd7738c8f610a20bc17b4c5d89ae3f6d297310251739cd105f",
+        "halogen_MP2Fit_nwchem_sha256": "5e0b9e9a4e09f92e512e12f8f8e5fe4bbfd52ef2838d91743126675a80bbeaaf",
+        "pyscf_scalar_ecp_sha256": "c40e5d6308973ce3348bce4946399a0b4f593670f1f218b0e6dea9dfd86f2704",
+        "hydrogen_MP2Fit_nwchem_sha256": "ca0adf154be0ff78185827148821218780a3d87df14ff32e240bc12e0b133101",
+        "carbon_augmented_orbital_DOI": "10.1063/1.4998332",
+        "carbon_orbital_reconstruction_DOI": "10.1002/jcc.26970",
+        "carbon_parent_OptRI": "Psi4 basis library",
+        "carbon_ri": "Psi4 aug-cc-pVTZ-RI",
+        "def2_universal_JKFit": "PySCF basis library"
+      }
+    }
+  }
+}

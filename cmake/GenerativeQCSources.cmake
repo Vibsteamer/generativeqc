@@ -20,6 +20,7 @@ function(generativeqc_add_api_sources target)
     src/api/c_api_projection.cpp
     src/api/c_api_fleet_projection.cpp
     src/api/c_api_hf_physical_audit.cpp
+    src/api/c_api_f12_focal_reference.cpp
     src/api/c_api_response.cpp
     src/api/c_api_saddle.cpp
     src/api/c_api_df_gradient.cpp
@@ -143,6 +144,10 @@ function(generativeqc_add_posthf_cc_sources target)
       src/cc/triples_response_cuda.cu
       src/cc/triples_fock_response_cuda.cu
       src/posthf/df_bridge.cu
+      src/posthf/cabs_singles_cuda.cu
+      src/posthf/uhf_orbital_adjoint_cuda.cu
+      src/posthf/cabs_projector_cuda.cu
+      src/posthf/canonical_frame_cuda.cu
       src/posthf/cuda_transform.cu
       src/posthf/ri_mp2_cuda.cu)
   endif()

@@ -469,6 +469,15 @@ def _vjp_einsum(
 def _slice_vjp_node(node: Node, bar: Node, *, max_elements: int) -> Node:
     """Adjoint of a unit-step contiguous slice, one axis at a time."""
     del max_elements  # scatter_add is structural and allocates no incidence matrix.
+    # Incoming contractions choose their own dummy names. Restoring one source
+    # axis at a time can temporarily give two axes the same name.
+    target = node.inputs[0].spec.indices
+    if any(
+        index.name == other.name
+        for axis, index in enumerate(target)
+        for other in bar.spec.indices[axis + 1 :]
+    ):
+        bar = reshape(bar, node.spec.indices)
     result = bar
     for axis, (start, stop) in enumerate(node.attrs["ranges"]):
         result = scatter_add(

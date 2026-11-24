@@ -1,0 +1,44 @@
+# Restricted explicitly correlated CC residual components
+
+The bounded all-active molecular driver also returns the stationary weights
+of the Fock matrix, ordinary two-electron integrals and five geminal
+intermediates. Its Lambda uses the Frobenius inner product on the full
+symmetric doubles tensor. The projected derivative is half the sum of an
+entry and its electron-swapped partner. Validate this convention against
+the independent scalar Lagrangian for a nonzero dual and against fully
+reconverged energies under simultaneous perturbations of the inputs.
+Small-molecule Cartesian qualification uses each atom and component at two
+displacement steps. In this diagnostic both fixed-geminal CC amplitudes and
+the orbital reference relax. A root check at fixed integrals and a
+Cartesian nuclear-force check cover different stages.
+
+For multi-occupied restricted molecules the canonical Fock is diagonal, but
+its orbital derivative can be off diagonal. Retain the occupied-pair
+overlap between different bra and ket geminals for the corresponding Fock
+adjoint. The full strong-orthogonality projector subtracts OBS×OBS and the
+two occupied×complementary blocks. With Coulomb on the left, its companion
+V matrix can be nonsymmetric in the pair indices. The multi-occupied
+fixed-source diagnostic assembles singlet and triplet contributions for all
+ordered active pairs. It uses a combined residual during iteration and
+cross-checks the final residual using the separate pair programs. A matched
+PySCF conventional RCC residual and explicit cusp-spin sums can test this
+diagnostic independently on the same two-electron-integral sources.
+
+The bounded molecular H₂ driver builds all ordinary and geminal inputs from a
+single spherical AO geometry and carries stationary CC/Lambda weights through
+the robust three-center integrals, operator metrics, CABS and orbital response.
+The reference and its nuclear repulsion enter once, the self-consistent CC
+correlation and geminal energy replace the ordinary MP2 correlation, and CABS
+singles is added once. Its nuclear force uses the same one-electron and ten
+two-/three-center integral derivative channels as the MP2-F12 molecular driver.
+The benchmark CLI is `benchmarks/f12_h2_cc_molecular_force.py`. It checks the
+physical CUDA contraction, independent signed Cartesian energies, separately
+reconverged native directional derivatives and amplitudes and their adjoints.
+Only one occupied spatial orbital and up to 24 ordinary spatial orbitals are
+covered by this diagnostic, which includes a dense ordinary ERI tensor.
+
+For an ordered fixed geminal pair, the standard approximation to the unweighted two-electron matrix element uses the occupied **and** virtual ordinary orbitals in the two-electron projector. The direct matrix element contains the product of the Coulomb and correlation operators. In general that element cannot be recovered by multiplying the separately projected Coulomb and geminal matrices in the orbital basis. The Coulomb subtraction uses a raw three-center density on one electron line and its Coulomb-metric fit on the other. Contract each line with the pair matrix before summing the auxiliary index to avoid materializing four free orbital indices. A fully density-fitted alternative builds both the orbital geminal and geminal–Coulomb product from their three-center integrals and their distinct operator metrics. It shares the Coulomb-fitted densities and the same external OBS projection. Its occupied–occupied block follows this external approximation; the occupied Hylleraas energy separately retains the full strong-orthogonality projector. Reuse the existing robust operator and the implicit full-rank Coulomb-fit derivative so that all three-center, operator-metric and Coulomb-metric sources can contribute to an analytic force. In the diagnostic H₂, replacing the direct external geminal integrals by this robust fit shifts the re-solved composition by 0.000000813 Eh. The water occupied-pair comparison against an explicitly formed dense robust fit tests the algebra independently of the size of the fitting approximation.
+
+The extra F12b geminal residual uses ordered, spin-free spatial CC singles and connected doubles. It contains the disconnected singles product and both distinct occupied–virtual matrix elements. The latter cannot be obtained by transposing the former for a fixed off-diagonal ordered geminal pair. The projection convention for these input blocks belongs to their integral provider. Fixed singlet/triplet coefficients and spatial pair multiplicities enter when assembling the energy. The ordinary singles and doubles residual corrections use a third compiler graph. It folds the fixed singlet and triplet cusp coefficients (1/2 and 1/4) over both orderings of each spatial pair. Its off-diagonal doubles block scatters to the transposed occupied pair, and each occupied index receives a distinct singles contribution. A diagonal pair contributes once. The Fock-coupling tensor is a separate input computed from the CABS–orbital Fock block and mixed geminal integrals at the same geometry. The small restricted water source reference uses a conventional RHF Fock, direct mixed-basis Psi4 integrals, an explicitly orthogonalized cc-pVDZ-F12-OptRI space, and independently converged conventional CCSD amplitudes. The ordered-pair geminal energy graph adds the common F12a Hylleraas contribution and the extra F12b contribution to the ordinary CC correlation energy. It exposes both values separately. Fixed spin amplitudes weight the B and X rows. Contraction with the entire occupied Fock block preserves derivatives with respect to off-diagonal elements even at a canonical reference; replacing this block with orbital-energy sums in the graph would lose those derivative components. At the stationary first-order doubles limit, combining the ordinary correlation change with the F12a pair term reproduces independently evaluated Psi4 3C(FIX) pair and total corrections for He, H₂ and water. This limit checks the shared spin and functional structure. The bounded two-electron diagnostic solves the modified amplitude equations at the real H₂ geometry in the full 18-orbital cc-pVDZ-F12 space. Its independent reference acts with the two-electron Hamiltonian directly on the alpha/beta product-determinant wave function. Comparing both roots checks the residual normalization, the change from the ordinary CC amplitudes and the common/extra energy terms. The independent reference also builds the amplitude Jacobian from displaced determinant residuals and compares its Lambda solution to the matrix-free iterative transpose solve starting at zero. The resulting stationary Lagrangian supplies relaxed weights on conventional Fock and Coulomb blocks, the projected external V, and the common C, V, B and X sources. Re-solving the determinant problem after separate source perturbations checks the weights on a changing root. The input supplies independently prepared physical integrals. A general production endpoint must obtain those sources on the GPU, propagate their orbital, metric and nuclear-coordinate responses, and qualify complete electronic energies against an independent CCSD-F12b implementation.
+
+Adler, Knizia and Werner introduce the F12a approximation. Knizia, Adler and Werner distinguish the F12b variant. The explicit spatial-index equations for the common residuals, the additional F12b contribution and the projector appear in Knizia's dissertation, Eqs. (4.123)–(4.128), with the default simplification discussed after Eq. (4.134). [Original paper](https://doi.org/10.1063/1.2817618) [F12a and F12b comparison](https://doi.org/10.1063/1.3054300) [Derivation](https://elib.uni-stuttgart.de/bitstream/11682/1290/1/Dissertation.pdf)

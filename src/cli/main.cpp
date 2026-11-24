@@ -43,6 +43,9 @@
 #define GENERATIVEQC_CLI_VERSION "unknown"
 #endif
 
+extern "C" generativeqc_status generativeqc_scf_auxiliary_system_create_v1(
+    generativeqc_context*, const generativeqc_system_descriptor*, generativeqc_system**);
+
 namespace {
 
 constexpr double kBohrPerAngstrom = 1.8897261254578281;
@@ -416,7 +419,7 @@ std::string_view density_fitting_name(generativeqc_density_fitting_mode mode) {
 }
 
 generativeqc_method_descriptor method_descriptor(
-    const RunOptions& options, const generativeqc::System* auxiliary_basis = nullptr) {
+    const RunOptions& options, const generativeqc_system* auxiliary_basis) {
   generativeqc_method_descriptor descriptor{};
   descriptor.struct_size = sizeof(descriptor);
   descriptor.abi_version = GENERATIVEQC_ABI_VERSION;
@@ -432,8 +435,7 @@ generativeqc_method_descriptor method_descriptor(
   if (options.max_iterations) descriptor.max_iterations = *options.max_iterations;
   if (options.screening_tolerance) descriptor.screening_tolerance = *options.screening_tolerance;
   descriptor.density_fitting_mode = options.density_fitting;
-  descriptor.density_fitting_auxiliary_basis =
-      auxiliary_basis == nullptr ? nullptr : auxiliary_basis->get();
+  descriptor.density_fitting_auxiliary_basis = auxiliary_basis;
   descriptor.density_fitting_relative_threshold = options.density_fitting_threshold;
   descriptor.density_fitting_memory_budget_bytes = options.density_fitting_memory_bytes;
   descriptor.precision_mode = options.precision;
@@ -870,7 +872,8 @@ int run(RunOptions options) {
           : generativeqc::System(context, system_descriptor, basis.core_electrons, basis.ecp_terms);
 
   generativeqc::cli::NativeBasisData auxiliary_basis_data;
-  std::optional<generativeqc::System> auxiliary_basis;
+  std::unique_ptr<generativeqc_system, decltype(&generativeqc_system_destroy)> auxiliary_basis(
+      nullptr, generativeqc_system_destroy);
   if (!is_gfn2(options) && options.auxiliary_basis_explicit) {
     try {
       auxiliary_basis_data = generativeqc::cli::expand_basis_input(
@@ -895,11 +898,19 @@ int run(RunOptions options) {
         options.charge,
         options.multiplicity,
         auxiliary_basis_data.representation};
-    auxiliary_basis.emplace(context, auxiliary_descriptor);
+    const bool fitted_ecp_hf = options.backend == GENERATIVEQC_BACKEND_CUDA &&
+        options.density_fitting == GENERATIVEQC_DENSITY_FITTING_CUDA && !basis.ecp_terms.empty() &&
+        (options.method == GENERATIVEQC_METHOD_RHF || options.method == GENERATIVEQC_METHOD_UHF);
+    const auto create_auxiliary = fitted_ecp_hf ? generativeqc_scf_auxiliary_system_create_v1
+                                                : generativeqc_system_create;
+    generativeqc_system* handle = nullptr;
+    const auto status = create_auxiliary(context.get(), &auxiliary_descriptor, &handle);
+    if (status != GENERATIVEQC_STATUS_SUCCESS)
+      throw generativeqc::Error(status, generativeqc_context_get_last_detail(context.get()));
+    auxiliary_basis.reset(handle);
   }
 
-  const generativeqc_method_descriptor method =
-      method_descriptor(options, auxiliary_basis ? &*auxiliary_basis : nullptr);
+  const generativeqc_method_descriptor method = method_descriptor(options, auxiliary_basis.get());
   std::unique_ptr<generativeqc_device_resources, decltype(&generativeqc_device_resources_destroy)>
       resources(nullptr, generativeqc_device_resources_destroy);
   if (options.owned_device_bytes) {
