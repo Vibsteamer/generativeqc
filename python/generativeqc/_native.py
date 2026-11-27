@@ -1451,18 +1451,38 @@ def optional_response_sequence_library() -> ctypes.CDLL | None:
     return library
 
 
-def _installed_package_library() -> Path | None:
-    """Return the native library bundled beside the installed Python package."""
-    candidates: list[Path] = []
-    for runtime_dir in (
-        PACKAGE_DIR / "lib",
-        PACKAGE_DIR / "lib64",
-        PACKAGE_DIR / "bin",
-    ):
-        candidates.extend(sorted(runtime_dir.glob("libgenerativeqc.so*")))
-        candidates.extend(sorted(runtime_dir.glob("libgenerativeqc.dylib*")))
-        candidates.extend(sorted(runtime_dir.glob("generativeqc.dll")))
-    return candidates[0] if candidates else None
+def _installed_package_library(stem: str = "generativeqc") -> Path | None:
+    """Find a CMake shared-library target bundled beside the Python package."""
+    for directory in ("lib", "lib64", "bin"):
+        root = PACKAGE_DIR / directory
+        for name in (f"lib{stem}.so", f"lib{stem}.dylib", f"{stem}.dll"):
+            path = root / name
+            if path.is_file():
+                return path
+            # The main library can be installed with only its versioned SONAME.
+            if stem == "generativeqc" and not name.endswith(".dll"):
+                for versioned in sorted(root.glob(name + ".*")):
+                    if versioned.is_file():
+                        return versioned
+    return None
+
+
+def installed_f12_shell_library(*, host_reference: bool) -> Path | None:
+    """Select the installed through-i shell target for one execution backend."""
+    return _installed_package_library(
+        "focal_shell_i_host" if host_reference else "focal_shell_i"
+    )
+
+
+def require_f12_library(stem: str) -> Path:
+    """Find a required focal DSO in this package, with no checkout or build dependency."""
+    path = _installed_package_library(stem)
+    if path is None:
+        raise RuntimeError(
+            f"F12 library {stem!r} is missing from {PACKAGE_DIR}. "
+            "Install the F12 targets for the requested backend or supply explicit library paths."
+        )
+    return path
 
 
 def _candidate_paths() -> typing.Iterator[Path]:
