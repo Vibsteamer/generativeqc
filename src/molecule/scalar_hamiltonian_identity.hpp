@@ -62,6 +62,8 @@ class ScalarHamiltonianIdentity {
   static bool visit(const core::System& system, Sink&& sink) {
     if (!sink(1) || !sink(static_cast<std::uint64_t>(system.charge)) ||
         !sink(static_cast<std::uint64_t>(system.electron_count)) || !sink(system.multiplicity) ||
+        !sink(system.x2c1e_mode) ||
+        !sink(std::bit_cast<std::uint64_t>(system.x2c1e_speed_of_light)) ||
         !sink(system.ecp_terms.size()))
       return false;
     for (const auto& term : system.ecp_terms)

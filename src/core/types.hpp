@@ -57,6 +57,9 @@ struct System {
   std::vector<EcpTerm> ecp_terms;
   // Prepared CUDA DF-UHF can refine the ECP quadrature within its workspace bound.
   bool refine_ecp_quadrature{};
+  // Scalar-relativistic 1-electron X2C model (0=None, 1=Dlu1e, 2=Global1e, 3=DluLocalR).
+  std::uint32_t x2c1e_mode{0};
+  double x2c1e_speed_of_light{137.03599967994};
 };
 
 /** One context-owned execution workspace, independent of method interfaces.

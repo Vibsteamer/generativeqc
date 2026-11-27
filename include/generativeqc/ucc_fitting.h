@@ -115,6 +115,72 @@ GENERATIVEQC_API generativeqc_status generativeqc_rcc_f12b_cpu_solve_v1(
     double* t1_out, double* t2_out, double* lambda1_out, double* lambda2_out, double* bar_foo_out,
     double* bar_fov_out, double* bar_fvv_out);
 
+/** Configure scalar-relativistic 1-electron X2C model on a normalized system handle.
+ * mode: 0=None, 1=Dlu1e (atomic-block X on AE atoms only, molecular R, ECP untouched),
+ *       2=Global1e (full molecular X2C-1e, all-electron systems only),
+ *       3=DluLocalR (strict local atomic R_A comparator).
+ * speed_of_light is in atomic units: 0 (either sign) selects CODATA 137.03599967994 a.u.,
+ * other values must be finite and positive. Negative or non-finite values return
+ * INVALID_ARGUMENT and leave the system unchanged. */
+GENERATIVEQC_API generativeqc_status generativeqc_system_set_x2c1e_v1(
+    generativeqc_context* context, generativeqc_system* system, uint32_t mode,
+    double speed_of_light);
+
+/** Evaluate native public-AO S, T, V (ionic charges) and W = <nabla|V_nuc|nabla>.
+ * Any output pointer may be NULL to skip copying that matrix. */
+GENERATIVEQC_API generativeqc_status generativeqc_system_stvw_integrals_v1(
+    generativeqc_context* context, const generativeqc_system* system, double* overlap_out,
+    double* kinetic_out, double* attraction_out, double* small_potential_out, size_t matrix_count);
+
+/** Evaluate scalar-relativistic X2C-1e core Hamiltonian (without V_ECP) or its delta
+ * (h_X2C - T - V). speed_of_light follows generativeqc_system_set_x2c1e_v1; a rejected value
+ * writes no output. */
+GENERATIVEQC_API generativeqc_status generativeqc_system_x2c1e_hcore_v1(
+    generativeqc_context* context, const generativeqc_system* system, uint32_t mode,
+    double speed_of_light, int delta_only, double* hcore_out, size_t matrix_count);
+
+/** Evaluate coordinate-major analytic Jacobian d(h_X2C_no_ecp)/dR or d(Delta h_SR)/dR
+ * with shape (3 * natom, nbf, nbf). speed_of_light follows generativeqc_system_set_x2c1e_v1;
+ * a rejected value writes no output. */
+GENERATIVEQC_API generativeqc_status generativeqc_system_x2c1e_hcore_derivatives_v1(
+    generativeqc_context* context, const generativeqc_system* system, uint32_t mode,
+    double speed_of_light, int delta_only, double* dhcore_out, size_t count);
+
+/** Evaluate O(1)-Sylvester/adjoint analytic nuclear gradient +d/dR Tr(W_h * h_X2C)
+ * or +d/dR Tr(W_h * Delta h_SR) without materializing (3*natom, n, n) matrices.
+ * speed_of_light follows generativeqc_system_set_x2c1e_v1; a rejected value writes no output. */
+GENERATIVEQC_API generativeqc_status generativeqc_system_x2c1e_weighted_gradient_v1(
+    generativeqc_context* context, const generativeqc_system* system, uint32_t mode,
+    double speed_of_light, int delta_only, const double* hcore_weights, size_t matrix_count,
+    double* gradient_out, size_t gradient_count);
+
+/** Contract public-AO overlap and hcore weights against native CPU 1e + ECP + X2C-1e derivatives. */
+GENERATIVEQC_API generativeqc_status generativeqc_system_one_electron_gradient_cpu_v1(
+    generativeqc_context* context, const generativeqc_system* system, const double* overlap_weights,
+    const double* hcore_weights, size_t matrix_count, int include_nuclear_repulsion,
+    double* gradient_out, size_t gradient_count);
+
+/** Evaluate native CPU two-center metric (naux x naux) and three-center (nbf x nbf x naux)
+ * density-fitting integrals in public AO order. */
+GENERATIVEQC_API generativeqc_status generativeqc_system_df_integrals_cpu_v1(
+    generativeqc_context* context, const generativeqc_system* orbital,
+    const generativeqc_system* auxiliary, double* metric_out, size_t metric_count,
+    double* three_center_out, size_t three_center_count);
+
+/** Contract public-AO metric (naux x naux) and three-center (nbf x nbf x naux) weights against
+ * native CPU DF nuclear derivatives. */
+GENERATIVEQC_API generativeqc_status generativeqc_system_df_gradient_cpu_v1(
+    generativeqc_context* context, const generativeqc_system* orbital,
+    const generativeqc_system* auxiliary, const double* metric_weights, size_t metric_count,
+    const double* three_center_weights, size_t three_center_count, double* gradient_out,
+    size_t gradient_count);
+
+/** Evaluate native CPU public-AO overlap, hcore (including checked ECP and X2C-1e if enabled),
+ * and nuclear repulsion energy. */
+GENERATIVEQC_API generativeqc_status generativeqc_system_one_electron_integrals_cpu_v1(
+    generativeqc_context* context, const generativeqc_system* system, double* overlap_out,
+    double* hcore_out, size_t matrix_count, double* nuclear_repulsion_out);
+
 /** Native spin-blocked DF-UCCSD(T) / (T+) v2 focal entry on a retained canonical RHF or UHF root.
  * Runs on CPU (OpenBLAS) or CUDA without materializing 4-index ovvv/vvvv tensors.
  * Supports split JK/correlation fits, scalar ECP, independent frozen_alpha/frozen_beta,

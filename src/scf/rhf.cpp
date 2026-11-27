@@ -19,6 +19,7 @@
 #include "generated_df_hf_response_contract.hpp"
 #include "generativeqc/generativeqc.hpp"
 #include "integrals/s_integrals.hpp"
+#include "integrals/x2c1e.hpp"
 #include "molecule/basis.hpp"
 #include "posthf/capacity.hpp"
 #include "posthf/raw_source.hpp"
@@ -374,6 +375,7 @@ void bind_generated_df(DensityFittingScfData& data, const core::System& orbital,
                                    : one_electron_detail);
     }
     data.one_electron = integrals::transform_integrals(cartesian_one_electron, system);
+    integrals::apply_x2c1e_to_integrals(system, data.one_electron, include_derivatives);
 
     // A resolved CUDA value allowance uses the source-backed plan, which
     // regenerates all DF values and derivatives from compact device metadata.
@@ -2004,6 +2006,7 @@ std::vector<std::optional<DensityFittingScfData>> prepare_cuda_density_fitting_b
           try {
             integrals::IntegralData one_electron =
                 integrals::transform_integrals(one_electron_batch[local], systems[source]);
+            integrals::apply_x2c1e_to_integrals(systems[source], one_electron, include_derivatives);
             integrals::DensityFittingIntegralData raw;
             if (source_values) {
               raw.nbf = molecule::ao_count(systems[source]);
@@ -2068,6 +2071,8 @@ std::vector<std::optional<DensityFittingScfData>> prepare_cuda_density_fitting_b
                 (source_values || single_raw.size() == 1U) && single_one_electron.size() == 1U) {
               integrals::IntegralData one_electron =
                   integrals::transform_integrals(single_one_electron.front(), systems[source]);
+              integrals::apply_x2c1e_to_integrals(systems[source], one_electron,
+                                                  include_derivatives);
               integrals::DensityFittingIntegralData raw;
               if (source_values) {
                 raw.nbf = molecule::ao_count(systems[source]);
@@ -2118,6 +2123,7 @@ std::vector<std::optional<DensityFittingScfData>> prepare_cuda_density_fitting_b
           }
           integrals::IntegralData one_electron =
               integrals::transform_integrals(cartesian_one_electron, systems[source]);
+          integrals::apply_x2c1e_to_integrals(systems[source], one_electron, include_derivatives);
           integrals::DensityFittingIntegralData raw =
               integrals::transform_density_fitting_integrals(cartesian, systems[source],
                                                              auxiliaries[source]);

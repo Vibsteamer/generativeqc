@@ -101,6 +101,10 @@ endfunction()
 
 macro(generativeqc_add_native_tests)
   enable_testing()
+  generativeqc_native_test(generativeqc_f12_audit_tests tests/native/test_audit_fix2_main_cpp.cpp
+                           LIBRARIES Threads::Threads)
+  generativeqc_native_test(generativeqc_x2c1e_speed_of_light_abi_tests
+                           tests/native/test_x2c1e_speed_of_light_abi.cpp NO_SRC_INCLUDE)
   generativeqc_native_test(generativeqc_f12_fixed_cusp_host_oracle
                            tests/native/test_f12_fixed_cusp_oracle.cpp NO_GENERATIVEQC)
   target_include_directories(generativeqc_f12_fixed_cusp_host_oracle PRIVATE
@@ -621,6 +625,7 @@ macro(generativeqc_add_native_tests)
       $<TARGET_OBJECTS:generativeqc_dft_grid_test_objects>
       src/dft/cosx_reference.cpp
       src/integrals/s_integrals.cpp
+      src/integrals/x2c1e.cpp
       src/integrals/generated_df_cpu.cpp
       src/integrals/ecp.cpp
       $<TARGET_OBJECTS:generativeqc_ecp_gaussian_cpu>)

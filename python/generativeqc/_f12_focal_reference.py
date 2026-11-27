@@ -255,6 +255,8 @@ def df_reference(
     forces: bool = True,
     budget_mib: int = 512,
     seed: FocalReferenceSeed | None = None,
+    x2c1e_mode: str = "none",
+    x2c1e_speed_of_light: float = 0.0,
 ) -> FocalReference:
     """Solve canonical DF-RHF/DF-UHF using the declared OBS and JKFit.
 
@@ -272,6 +274,8 @@ def df_reference(
     budget limits detached output and native reference capacity separately and
     sets the CUDA DF provider workspace allowance.
     CPU DF integral scratch is additional. Results use public AO order.
+    ``x2c1e_speed_of_light`` is in atomic units; 0 selects CODATA
+    137.03599967994 and negative or non-finite values are rejected.
     """
     if seed is not None and not isinstance(seed, FocalReferenceSeed):
         raise TypeError("seed must be a FocalReferenceSeed")
@@ -376,6 +380,20 @@ def df_reference(
         geometry = (ctx, request.atoms, request.charge, request.multiplicity)
         system = calc._create_native_system(*geometry)
         owners.callback(lib.generativeqc_system_destroy, system)
+        if x2c1e_mode != "none":
+            mode_map = {"none": 0, "dlu1e": 1, "global1e": 2, "dlu_local_r": 3}
+            if x2c1e_mode not in mode_map:
+                raise ValueError(f"unsupported x2c1e_mode {x2c1e_mode!r}")
+            _native.check(
+                lib,
+                lib.generativeqc_system_set_x2c1e_v1(
+                    ctx,
+                    system,
+                    ct.c_uint32(mode_map[x2c1e_mode]),
+                    ct.c_double(float(x2c1e_speed_of_light)),
+                ),
+                context=ctx,
+            )
         auxiliary = calc._create_native_system(*geometry, jk)
         owners.callback(lib.generativeqc_system_destroy, auxiliary)
         handle = ct.c_void_p()

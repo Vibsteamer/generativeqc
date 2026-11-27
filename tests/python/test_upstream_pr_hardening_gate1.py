@@ -1,11 +1,17 @@
 """Gate 1 unit tests for Upstream-PR Hardening Track B (B1, H1, H5, M2, M7, M8)."""
 
 from __future__ import annotations
+
+import json
+import sys
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pytest
 from generativeqc._f12_focal_ecp_cuda import add_cuda_projector_residual
+from generativeqc._x2c1e import build_aux_basis_from_bse, build_unc_x2c_basis_from_bse
+from generativeqc.elements import atomic_number
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -22,6 +28,122 @@ def test_b1_pyproject_declares_basis_set_exchange_optional_extra() -> None:
     opt = data["project"]["optional-dependencies"]
     assert any(dep.startswith("basis-set-exchange") for dep in opt["reference-test"])
     assert any(dep.startswith("basis-set-exchange") for dep in opt["bse"])
+
+
+def test_b1_x2c1e_bse_helpers_raise_actionable_import_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runtime BSE helpers fail with actionable install guidance when BSE is absent."""
+    monkeypatch.setitem(sys.modules, "basis_set_exchange", None)
+    with pytest.raises(ImportError, match=r"generativeqc\[bse\]"):
+        build_unc_x2c_basis_from_bse(["H"])
+    with pytest.raises(ImportError, match=r"generativeqc\[bse\]"):
+        build_aux_basis_from_bse(["H"], "jk_fit")
+
+
+def test_b1_x2c1e_bse_bases_record_bse_release_and_license(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runtime BSE bases record the BSE release and license in their identity."""
+    bse = pytest.importorskip("basis_set_exchange")
+    orbital = build_unc_x2c_basis_from_bse(["H"])
+    fitting = build_aux_basis_from_bse(["H"], "jk_fit")
+    for basis in (orbital, fitting):
+        assert basis.provenance.version == f"basis_set_exchange {bse.get_version()}"
+        assert basis.provenance.license == "BSD-3-Clause"
+    monkeypatch.setattr(bse, "get_version", lambda: "0.0+other")
+    assert build_unc_x2c_basis_from_bse(["H"]).identity != orbital.identity
+    assert build_aux_basis_from_bse(["H"], "jk_fit").identity != fitting.identity
+
+
+def test_b1_x2c1e_production_bse_records_match_their_pins() -> None:
+    """Every production ΔSR element builds from records equal to the pinned content."""
+    pytest.importorskip("basis_set_exchange")
+    elements = (
+        "H",
+        "B",
+        "C",
+        "N",
+        "O",
+        "F",
+        "Na",
+        "Al",
+        "Si",
+        "P",
+        "S",
+        "Cl",
+        "Br",
+        "I",
+    )
+    orbital = build_unc_x2c_basis_from_bse(elements)
+    fitting = build_aux_basis_from_bse(elements, "jk_fit")
+    zs = [atomic_number(symbol) for symbol in elements]
+    assert [e.atomic_number for e in orbital.elements] == zs
+    assert [e.atomic_number for e in fitting.elements] == zs
+    assert [e.ecp_core_electrons for e in orbital.elements[-2:]] == [10, 28]
+
+
+@pytest.mark.parametrize(
+    ("symbol", "basis_name", "role"),
+    [
+        ("H", "x2c-tzvpall", None),
+        ("Br", "cc-pvdz-pp", None),
+        ("H", "def2-universal-jkfit", "jk_fit"),
+        ("H", "def2-tzvp-rifit", "mp2_fit"),
+    ],
+)
+def test_b1_x2c1e_bse_records_with_drifted_values_are_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    symbol: str,
+    basis_name: str,
+    role: Literal["jk_fit", "mp2_fit"] | None,
+) -> None:
+    """Reject changed orbital, scalar ECP and fitting exponents."""
+    bse = pytest.importorskip("basis_set_exchange")
+    get_basis = bse.get_basis
+    z = atomic_number(symbol)
+
+    def drifted_basis(name: str, elements: list[int], fmt: str) -> str:
+        data = json.loads(get_basis(name, elements=elements, fmt=fmt))
+        record = data["elements"][str(z)]
+        if symbol == "Br":
+            exponents = record["ecp_potentials"][0]["gaussian_exponents"]
+        else:
+            exponents = record["electron_shells"][0]["exponents"]
+        exponents[0] = repr(float(exponents[0]) * 1.01)
+        return json.dumps(data)
+
+    monkeypatch.setattr(bse, "get_basis", drifted_basis)
+    with pytest.raises(ValueError, match=rf"{basis_name} Z={z} has content SHA-256"):
+        if role is None:
+            build_unc_x2c_basis_from_bse([symbol])
+        else:
+            build_aux_basis_from_bse([symbol], role)
+
+
+def test_b1_x2c1e_bse_exports_must_hold_one_pinned_element(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Extra elements in an export and records without a pin are refused."""
+    bse = pytest.importorskip("basis_set_exchange")
+    with pytest.raises(ValueError, match="x2c-tzvpall Z=19 has no pinned content"):
+        build_unc_x2c_basis_from_bse(["K"])
+    with pytest.raises(ValueError, match="x2c-qzvpall Z=1 has no pinned content"):
+        build_unc_x2c_basis_from_bse(["H"], ae_basis_name="x2c-qzvpall")
+    with pytest.raises(ValueError, match="def2-universal-jkfit Z=19 has no pinned"):
+        build_aux_basis_from_bse(["K"], "jk_fit")
+    get_basis = bse.get_basis
+    monkeypatch.setattr(
+        bse,
+        "get_basis",
+        lambda name, elements, fmt: get_basis(name, elements=[*elements, 2], fmt=fmt),
+    )
+    with pytest.raises(
+        ValueError, match=r"x2c-tzvpall export holds elements Z=\[1, 2\]"
+    ):
+        build_unc_x2c_basis_from_bse(["H"])
+    with pytest.raises(ValueError, match=r"jkfit export holds elements Z=\[1, 2\]"):
+        build_aux_basis_from_bse(["H"], "jk_fit")
 
 
 # ============================================================================
@@ -276,13 +398,16 @@ def test_frozen_core_shell_gap_refuses_an_explicit_count_that_splits_a_shell() -
 
 
 def test_m7_real_df_hf_shell_gaps_pass_for_h2o_oh_hbr() -> None:
-    """Real DF-HF canonical orbital gaps for H2O and OH are >> 0.05 Eh."""
+    """Real DF-HF canonical orbital gaps for H2O, OH, and ECP HBr (FC4 & FC9) are >> 0.05 Eh."""
+    from generativeqc import Atom
     from generativeqc._f12_focal_reference import df_reference
     from generativeqc._f12_frozen_core import (
         DEFAULT_FROZEN_CORE_MIN_SHELL_GAP_EH,
         select_frozen_occupied_frame,
     )
     from generativeqc.experimental.f12_focal import FocalBasis, FocalSeries, plan_singlepoint
+
+    from _bse_basis_support import jk_fit_basis, pp_orbital_basis
 
     # 1. H2O (RHF) and OH (UHF) in sto-3g / def2-svp.
     light_basis = FocalBasis(
@@ -329,6 +454,47 @@ def test_m7_real_df_hf_shell_gaps_pass_for_h2o_oh_hbr() -> None:
         assert frame.counts(cspace) == (1, 1)
         for channel in frame.channels(cspace):
             assert channel.minimum_gap_eh > 10.0 * DEFAULT_FROZEN_CORE_MIN_SHELL_GAP_EH
+
+    # 2. HBr (ECP10MDF, RHF) via native CPU DF-HF in BSE aug-cc-pVDZ(-PP) for FC4 & FC9.
+    from generativeqc._x2c1e import (
+        _build_sad_density,
+        _factor_df,
+        _solve_df_hf,
+        df_integrals_cpu,
+        one_electron_integrals_cpu,
+    )
+
+    orbital, fit = pp_orbital_basis((1, 35)), jk_fit_basis((1, 35))
+    hbr_basis = FocalBasis(
+        2, "m7-hbr", orbital, jk_fit=fit, mp2_fit=fit, f12_fit=fit, cabs=fit, beta=0.9
+    )
+    hbr_atoms = (Atom(35, (0.0, 0.0, 0.0)), Atom(1, (0.0, 0.0, 2.67)))
+    s_mat, h_mat, e_nuc = one_electron_integrals_cpu(hbr_atoms, hbr_basis.orbital)
+    jk_m, jk_3c = df_integrals_cpu(hbr_atoms, hbr_basis.orbital, hbr_basis.jk_fit)
+    jk_fac = _factor_df(jk_m, jk_3c)
+    sad = _build_sad_density(hbr_atoms, hbr_basis.orbital, s_mat, h_mat, jk_fac, (13, 13))
+    hf_hbr = _solve_df_hf(
+        s_mat, h_mat, e_nuc, jk_fac, (13, 13), unrestricted=False, initial_densities=sad
+    )
+    for cspace, expected_fc in (("frozen-core", 4), ("frozen-core-spd", 9)):
+        plan = plan_singlepoint(
+            hbr_atoms,
+            FocalSeries(hbr_basis),
+            FocalSeries(hbr_basis),
+            None,
+            charge=0,
+            multiplicity=1,
+            root_id="rhf",
+            correlation_space_id=cspace,
+            backend="cpu_reference",
+        )
+        req = plan.steps[0][0]
+        frame = select_frozen_occupied_frame(
+            req.atoms, req.basis.orbital, s_mat, hf_hbr.coefficients[:1],
+            hf_hbr.orbital_energies[:1], (13,), cspace,
+        )
+        assert frame.counts(cspace) == (expected_fc, expected_fc)
+        assert frame.channels(cspace)[0].minimum_gap_eh > 1.0
 
 
 # ============================================================================

@@ -2037,6 +2037,100 @@ def load_library(*, device: str | None = None, device_id: int = 0) -> ctypes.CDL
         library.generativeqc_nonlocal_plan_execute.restype = ctypes.c_int
     if library.generativeqc_get_abi_version() != ABI_VERSION:
         raise RuntimeError("GENERATIVEQC Python/native ABI version mismatch")
+    set_x2c1e = getattr(library, "generativeqc_system_set_x2c1e_v1", None)
+    if set_x2c1e is not None:
+        double_p = ctypes.POINTER(ctypes.c_double)
+        set_x2c1e.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_double,
+        ]
+        set_x2c1e.restype = ctypes.c_int
+        library.generativeqc_system_stvw_integrals_v1.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            double_p,
+            double_p,
+            double_p,
+            double_p,
+            ctypes.c_size_t,
+        ]
+        library.generativeqc_system_stvw_integrals_v1.restype = ctypes.c_int
+        library.generativeqc_system_x2c1e_hcore_v1.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_double,
+            ctypes.c_int,
+            double_p,
+            ctypes.c_size_t,
+        ]
+        library.generativeqc_system_x2c1e_hcore_v1.restype = ctypes.c_int
+        library.generativeqc_system_x2c1e_hcore_derivatives_v1.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_double,
+            ctypes.c_int,
+            double_p,
+            ctypes.c_size_t,
+        ]
+        library.generativeqc_system_x2c1e_hcore_derivatives_v1.restype = ctypes.c_int
+        library.generativeqc_system_x2c1e_weighted_gradient_v1.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_double,
+            ctypes.c_int,
+            double_p,
+            ctypes.c_size_t,
+            double_p,
+            ctypes.c_size_t,
+        ]
+        library.generativeqc_system_x2c1e_weighted_gradient_v1.restype = ctypes.c_int
+        library.generativeqc_system_one_electron_gradient_cpu_v1.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            double_p,
+            double_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            double_p,
+            ctypes.c_size_t,
+        ]
+        library.generativeqc_system_one_electron_gradient_cpu_v1.restype = ctypes.c_int
+        library.generativeqc_system_df_integrals_cpu_v1.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            double_p,
+            ctypes.c_size_t,
+            double_p,
+            ctypes.c_size_t,
+        ]
+        library.generativeqc_system_df_integrals_cpu_v1.restype = ctypes.c_int
+        library.generativeqc_system_df_gradient_cpu_v1.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            double_p,
+            ctypes.c_size_t,
+            double_p,
+            ctypes.c_size_t,
+            double_p,
+            ctypes.c_size_t,
+        ]
+        library.generativeqc_system_df_gradient_cpu_v1.restype = ctypes.c_int
+        library.generativeqc_system_one_electron_integrals_cpu_v1.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            double_p,
+            double_p,
+            ctypes.c_size_t,
+            double_p,
+        ]
+        library.generativeqc_system_one_electron_integrals_cpu_v1.restype = ctypes.c_int
     return library
 
 

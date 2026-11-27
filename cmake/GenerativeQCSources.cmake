@@ -50,6 +50,7 @@ function(generativeqc_add_api_sources target)
     src/api/c_api_response_recycle.cpp
     src/api/c_api_tuning.cpp
     src/api/c_api_ecp.cpp
+    src/api/c_api_x2c1e.cpp
     src/api/error.cpp
     src/methods/registry.cpp
     src/methods/named_ks_catalog.cpp
@@ -375,6 +376,7 @@ function(generativeqc_add_cpu_component_object_targets target)
   generativeqc_add_host_object_component(${target} generativeqc_host_integrals
     SOURCES
       src/integrals/s_integrals.cpp
+      src/integrals/x2c1e.cpp
       src/integrals/generated_df_cpu.cpp
       src/integrals/ecp.cpp
       src/integrals/stationary_component_contract.cpp
