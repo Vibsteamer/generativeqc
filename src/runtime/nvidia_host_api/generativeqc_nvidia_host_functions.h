@@ -15,6 +15,7 @@ cublasStatus_t cublasDgemmBatched(cublasHandle_t arg0, cublasOperation_t arg1, c
 cublasStatus_t cublasDgemmStridedBatched(cublasHandle_t arg0, cublasOperation_t arg1, cublasOperation_t arg2, int arg3, int arg4, int arg5, const double* arg6, const double* arg7, int arg8, long long arg9, const double* arg10, int arg11, long long arg12, const double* arg13, double* arg14, int arg15, long long arg16, int arg17);
 cublasStatus_t cublasDgemm_v2(cublasHandle_t arg0, cublasOperation_t arg1, cublasOperation_t arg2, int arg3, int arg4, int arg5, const double* arg6, const double* arg7, int arg8, const double* arg9, int arg10, const double* arg11, double* arg12, int arg13);
 cublasStatus_t cublasDgemv_v2(cublasHandle_t arg0, cublasOperation_t arg1, int arg2, int arg3, const double* arg4, const double* arg5, int arg6, const double* arg7, int arg8, const double* arg9, double* arg10, int arg11);
+cublasStatus_t cublasDger_v2(cublasHandle_t arg0, int arg1, int arg2, const double* arg3, const double* arg4, int arg5, const double* arg6, int arg7, double* arg8, int arg9);
 cublasStatus_t cublasDnrm2_v2(cublasHandle_t arg0, int arg1, const double* arg2, int arg3, double* arg4);
 cublasStatus_t cublasDscal_v2(cublasHandle_t arg0, int arg1, const double* arg2, double* arg3, int arg4);
 cublasStatus_t cublasDsyr2k_v2(cublasHandle_t arg0, cublasFillMode_t arg1, cublasOperation_t arg2, int arg3, int arg4, const double* arg5, const double* arg6, int arg7, const double* arg8, int arg9, const double* arg10, double* arg11, int arg12);
@@ -65,6 +66,7 @@ cusolverStatus_t cusolverGetProperty(libraryPropertyType arg0, int* arg1);
 #define cublasDestroy cublasDestroy_v2
 #define cublasDgemm cublasDgemm_v2
 #define cublasDgemv cublasDgemv_v2
+#define cublasDger cublasDger_v2
 #define cublasDnrm2 cublasDnrm2_v2
 #define cublasDscal cublasDscal_v2
 #define cublasDsyr2k cublasDsyr2k_v2

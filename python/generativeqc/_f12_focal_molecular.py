@@ -14,6 +14,13 @@ from ._f12_focal_integral_kernel import (
     slater_normalization_code,
 )
 
+from ._f12_focal_energy import (
+    FocalLowOrderEnergy,
+    FocalLowOrderForces,
+    _check_request,
+    molecular_low_order_energy,
+)
+from ._f12_focal_increment import FocalF12Sources, reference_f12_increment
 from ._f12_focal_integrals import (
     contract_live_weights,
     contract_single_channel,
@@ -32,7 +39,14 @@ from ._f12_focal_reference import (
     partition_focal_reference,
 )
 from ._f12_focal_singles import FocalCabsSingles, reference_cabs_singles
-from ._f12_ram_hygiene import disclose_host_assisted_stage, record_ram_phase, release_host_memory, should_stream_panel
+from ._f12_focal_ump2 import FocalCoulombSource, ordinary_df_ump2_unrelaxed, reference_df_ump2
+from ._f12_ram_hygiene import (
+    disclose_host_assisted_stage,
+    record_ram_phase,
+    release_host_memory,
+    should_stream_panel,
+    streamed_f12_increment,
+)
 from .elements import checked_integer
 
 if TYPE_CHECKING:
@@ -69,6 +83,14 @@ _AO_NAME_TO_OP = {
     "ao_double_commutator": "double_commutator",
 }
 
+_METRIC_KEY_TO_OP = {
+    "metric": "coulomb",
+    "metric_f12": "f12",
+    "metric_f12_squared": "f12_squared",
+    "metric_f12_over_coulomb": "f12_over_coulomb",
+    "metric_double_commutator": "double_commutator",
+}
+
 
 @dataclass
 class _Panel:
@@ -98,12 +120,101 @@ class _Panel:
             slater_normalization=self.slater_normalization,
         )
 
+    @staticmethod
+    def stream_key(loader: Callable) -> tuple | None:
+        """Identify all shell evaluator inputs; opaque loaders must be replayed."""
+        from ._f12_spin_ao import _digest_array_full
+
+        if not isinstance(loader, MethodType) or loader.__func__ is not _Panel.load_ao:
+            return None
+        owner = loader.__self__
+        if type(owner) is not _Panel or not owner.streaming or owner.library is None:
+            return None
+        return (
+            id(owner), owner.fit_id, owner.slater_normalization, owner.host_reference,
+            owner.coulomb_only, owner.budget_mib, str(owner.library.resolve()),
+            tuple(
+                (name, _digest_array_full(np.asarray(value)))
+                for name, value in sorted(owner.layout.items())
+            ),
+        )
+
+    def _cached_obs(self, key: tuple | None) -> np.ndarray | None:
+        entry = self._obs_coulomb_cache
+        if entry is not None and entry[0] == key:
+            return entry[1].view()
+        self._obs_coulomb_cache = None
+        return None
+
+    def obs_coulomb(self, n: int) -> np.ndarray:
+        if not self.streaming:
+            return self.data["ao_coulomb"][:, :n, :n]
+        key = self.stream_key(self.load_ao)
+        cached = self._cached_obs(key)
+        if cached is not None and cached.shape[1] == n:
+            return cached
+        self._obs_coulomb_cache = None
+        del cached
+        full = self.load_ao("ao_coulomb")
+        large = full.nbytes >= (256 << 20)
+        block = full[:, :n, :n]
+        # Bytes-backed storage prevents exposed OBS arrays from changing the cache.
+        obs = np.frombuffer(block.tobytes(order="C"), dtype=block.dtype).reshape(block.shape)
+        del block, full
+        if large:
+            release_host_memory()
+        if key is not None:
+            self._obs_coulomb_cache = (key, obs)
+            return obs.view()
+        return obs
+
+    def obs(self, request: FocalRequest, n: int) -> FocalCoulombSource:
+        return FocalCoulombSource(
+            request.surface_id,
+            request.basis.orbital.identity,
+            self.fit_id,
+            request.backend,
+            self.obs_coulomb(n),
+            self.data["metric"],
+            self.whitener,
+        )
+
+    def joint(self, request: FocalRequest, *, explicit: bool) -> FocalF12Sources:
+        if self.streaming:
+            return FocalF12Sources(
+                request.surface_id,
+                request.basis.basis_id,
+                self.fit_id,
+                request.backend,
+                request.basis.beta if explicit else None,
+                self.data if explicit else {"metric": self.data["metric"]},
+                self.whitener,
+                ao_loader=self.load_ao,
+                obs_coulomb=(
+                    self._cached_obs(self.stream_key(self.load_ao))
+                    if self._obs_coulomb_cache is not None else None
+                ),
+            )
+        return FocalF12Sources(
+            request.surface_id,
+            request.basis.basis_id,
+            self.fit_id,
+            request.backend,
+            request.basis.beta if explicit else None,
+            self.data
+            if explicit
+            else {k: self.data[k] for k in ("ao_coulomb", "metric")},
+            self.whitener,
+        )
+
 
 @dataclass(frozen=True, kw_only=True)
 class MolecularFocalProvider:
     """Evaluate molecular focal contributions with a native shell service.
 
     Evaluate HF+CABS energies and analytic Cartesian forces on the requested root.
+    The low-order pair energy uses a single canonical RHF or UHF determinant.
+    The same pair pathways supply analytic MP2-F12 Cartesian forces.
     Supply reference_seed to transport a converged determinant between geometries.
     """
 
@@ -121,6 +232,9 @@ class MolecularFocalProvider:
     slater_normalization: Literal[
         "negative_exponential", "negative_exponential_over_beta"
     ] = DEFAULT_SLATER_FIT_NORMALIZATION
+    _pair_source_cache: dict = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     reference_seed: (
         FocalReferenceSeed | Callable[[FocalRequest], FocalReferenceSeed] | None
@@ -128,6 +242,7 @@ class MolecularFocalProvider:
 
     def __post_init__(self) -> None:
         slater_normalization_code(self.slater_normalization)
+        object.__setattr__(self, "_pair_source_cache", {})
 
 
     def _seed_options(self, request: FocalRequest) -> dict[str, FocalReferenceSeed]:
@@ -205,6 +320,155 @@ class MolecularFocalProvider:
             reference_seed=reference_seed,
         )
 
+    def low_order_energy(
+        self,
+        request: FocalRequest,
+        *,
+        expected_cabs_rank: int | None = None,
+        include_hf_cabs: bool = True,
+        include_occupied_partitions: bool = False,
+        reference: FocalReference | None = None,
+    ) -> FocalLowOrderEnergy:
+        """Return HF+CABS and MP2-F12 energies for one molecular pair request.
+
+        A single canonical RHF or UHF determinant supplies both components.
+        Only forward integrals and electronic contractions are evaluated.
+        Pass the center CABS rank to track its differentiable branch at a displaced point.
+        Set include_hf_cabs=False when only the pair component is required.
+        Occupied partitions retain the canonical spin order for triples scaling.
+        """
+        return molecular_low_order_energy(
+            self,
+            request,
+            expected_cabs_rank,
+            include_hf_cabs=include_hf_cabs,
+            include_occupied_partitions=include_occupied_partitions,
+            reference=reference,
+        )
+
+
+    def _cached_pair_sources(
+        self, request: FocalRequest, *, derivatives: bool, budget: int
+    ) -> tuple[FocalOneElectron, tuple[_Panel, _Panel, _Panel]]:
+        """Bounded 1-entry reuse of read-only 1e and 3-center pair panels on identical geometry+basis."""
+        b = request.basis
+        req_norm = getattr(request, "slater_normalization", None)
+        if b.f12_fit is not None and req_norm is not None and req_norm != self.slater_normalization:
+            raise ValueError(
+                f"Request slater_normalization {req_norm!r} disagrees with "
+                f"provider.slater_normalization {self.slater_normalization!r}"
+            )
+        geom_key = tuple(
+            (a.atomic_number, tuple((v if v else 0.0).hex() for v in a.position))
+            for a in request.atoms
+        )
+        key = (
+            geom_key,
+            request.surface_id,
+            request.charge,
+            request.multiplicity,
+            request.backend,
+            b.basis_id,
+            b.orbital.identity,
+            b.jk_fit.identity,
+            b.mp2_fit.identity if b.mp2_fit is not None else None,
+            b.f12_fit.identity if b.f12_fit is not None else None,
+            b.cabs.identity if b.cabs is not None else None,
+            b.beta,
+            self.slater_normalization,
+            str(self.shell_library),
+            str(self.one_electron_library) if self.one_electron_library is not None else None,
+            int(budget),
+            int(self.budget_mib),
+        )
+        entry = self._pair_source_cache.get("entry")
+        if entry is not None and entry[0] == key:
+            cached_deriv, cached_one, cached_panels = entry[1], entry[2], entry[3]
+            if not derivatives or cached_deriv:
+                if cached_one.surface_id != request.surface_id:
+                    cached_one = replace(cached_one, surface_id=request.surface_id)
+                return cached_one, cached_panels
+            # Upgrading derivatives=False -> True on identical geometry+basis:
+            # reuse read-only panels and release the old 1e matrices first.
+            self._pair_source_cache.pop("entry", None)
+            self._pair_source_cache.pop("projected_frame", None)
+            del cached_one, entry
+            release_host_memory()
+            one = one_electron_sources(
+                request,
+                library=self.one_electron_library or self.shell_library,
+                derivatives=derivatives,
+                budget_mib=budget,
+            )
+            self._pair_source_cache["entry"] = (key, derivatives, one, cached_panels)
+            return one, cached_panels
+        if entry is not None or "projected_frame" in self._pair_source_cache:
+            self._pair_source_cache.pop("entry", None)
+            self._pair_source_cache.pop("projected_frame", None)
+            del entry
+            release_host_memory()
+        one = one_electron_sources(
+            request,
+            library=self.one_electron_library or self.shell_library,
+            derivatives=derivatives,
+            budget_mib=budget,
+        )
+        panels = self._pair_panels(request)
+        self._pair_source_cache["entry"] = (key, derivatives, one, panels)
+        return one, panels
+
+    def _evict_pair_source_cache(self) -> None:
+        """Drop retained pair sources and projected frames and return host pages to the OS."""
+        dropped = False
+        for cache_key in ("entry", "projected_frame"):
+            if cache_key in self._pair_source_cache:
+                self._pair_source_cache.pop(cache_key, None)
+                dropped = True
+        if dropped:
+            release_host_memory()
+
+
+    def low_order_energy_and_forces(
+        self, request: FocalRequest, *, include_hf_cabs: bool = True
+    ) -> FocalLowOrderForces:
+        """Evaluate both low-order analytic forces and energies on one canonical root.
+
+        Use low_order_energy with this center's CABS rank for a displaced energy.
+        Both center roles share the physical determinant and the AO integral panels.
+        Set include_hf_cabs=False to evaluate just the pair response on this basis.
+        """
+        from ._f12_focal_reference import df_reference as resolve_df_reference
+
+        budget = _check_request(self, request)
+        reference = resolve_df_reference(
+            request,
+            forces=include_hf_cabs,
+            budget_mib=budget,
+            **self._seed_options(request),
+        )
+        reference = partition_focal_reference(request, reference, budget)
+        one, panels = self._cached_pair_sources(request, derivatives=True, budget=budget)
+        spin_mp2, increment, rank, correlation_forces = self._pair_components(
+            request, reference, one, panels, expected_cabs_rank=None
+        )
+        singles_energies = hf_cabs_forces = None
+        if include_hf_cabs:
+            import gc
+
+            gc.collect()
+            singles, hf_cabs_forces = self._singles_components(
+                replace(request, role="hf_cabs"),
+                reference,
+                one,
+                panels[0],
+                expected_cabs_rank=rank,
+            )
+            singles_energies = singles.spin_energies
+        energies = FocalLowOrderEnergy(
+            reference, rank, singles_energies, spin_mp2, increment
+        )
+        return FocalLowOrderForces(energies, hf_cabs_forces, correlation_forces)
+
 
     def _panel(
         self,
@@ -212,6 +476,7 @@ class MolecularFocalProvider:
         role: str,
         *,
         orbital_only: bool = False,
+        allow_streaming: bool = False,
     ) -> _Panel:
         if role == "f12_fit" and request.slater_normalization != self.slater_normalization:
             raise ValueError("F12 panel request and provider Slater normalization must match")
@@ -229,8 +494,26 @@ class MolecularFocalProvider:
             projection_library=self.one_electron_library,
         )
         coulomb_only = role != "f12_fit"
+        n_ext, n_aux = map(int, layout["ao_sizes"])
         ao_cart_total = int(layout["ao_offsets"][-1])
-        if coulomb_only and ao_cart_total > 128_000_000:
+        streaming = should_stream_panel(
+            allow_streaming=allow_streaming,
+            ordinary=ordinary,
+            coulomb_only=coulomb_only,
+            n_ext=n_ext,
+            n_aux=n_aux,
+            ao_cart_total=ao_cart_total,
+        )
+        if streaming:
+            raw = forward_metrics_only(
+                layout,
+                self.shell_library,
+                host_reference=host,
+                coulomb_only=coulomb_only,
+                budget_mib=self.budget_mib,
+                slater_normalization=self.slater_normalization,
+            )
+        elif coulomb_only and ao_cart_total > 128_000_000:
             raw = forward_metrics_only(
                 layout,
                 self.shell_library,
@@ -283,6 +566,8 @@ class MolecularFocalProvider:
             raw,
             whitener,
             getattr(request.basis, role).identity,
+            streaming=streaming,
+            library=self.shell_library if streaming else None,
             host_reference=host,
             budget_mib=self.budget_mib,
             coulomb_only=coulomb_only,
@@ -315,7 +600,10 @@ class MolecularFocalProvider:
     def __call__(self, request: FocalRequest) -> FocalEvaluation:
         from .experimental.f12_focal import FocalEvaluation, FocalTerm
 
-        if request.role != "hf_cabs":
+        if request.role not in (
+            "hf_cabs",
+            "mp2_f12_correlation",
+        ):
             if self.high_order is None:
                 raise ValueError(f"Supply the high-order evaluator for {request.role}")
             return self.high_order(request)
@@ -333,6 +621,7 @@ class MolecularFocalProvider:
             raise ValueError(
                 "CUDA molecular focal evaluation requires a device metric library and FP64 graph runner"
             )
+        pair = request.role != "hf_cabs"
         if (
             request.basis.cabs is None
             or not np.isfinite(self.relative_cutoff)
@@ -340,6 +629,16 @@ class MolecularFocalProvider:
         ):
             raise ValueError(
                 "The molecular focal term requires an OptRI basis and positive relative cutoff"
+            )
+        if pair and (
+            request.root_id not in ("rhf", "uhf")
+            or (request.root_id == "rhf" and request.multiplicity != 1)
+            or request.basis.mp2_fit is None
+            or request.basis.f12_fit is None
+            or request.basis.beta is None
+        ):
+            raise ValueError(
+                "The pair term requires UHF or singlet RHF, MP2Fit, F12Fit and beta"
             )
         req_norm = getattr(request, "slater_normalization", None)
         if (
@@ -354,10 +653,12 @@ class MolecularFocalProvider:
         calculation = request
         ref = df_reference(
             request,
-            forces=True,
+            forces=not pair,
             budget_mib=self.budget_mib,
             **self._seed_options(request),
         )
+        if pair:
+            ref = partition_focal_reference(calculation, ref, self.budget_mib)
         one = one_electron_sources(
             calculation,
             library=self.one_electron_library or self.shell_library,
@@ -370,9 +671,12 @@ class MolecularFocalProvider:
             raise ValueError(
                 "The canonical and combined one-electron OBS matrices disagree"
             )
-        energy, forces = self._singles(
-            request, ref, one, self._panel(request, "jk_fit")
-        )
+        if pair:
+            energy, forces = self._pair(calculation, ref, one)
+        else:
+            energy, forces = self._singles(
+                request, ref, one, self._panel(request, "jk_fit")
+            )
         return FocalEvaluation(
             FocalTerm(
                 request.surface_id,
@@ -423,20 +727,41 @@ class MolecularFocalProvider:
                 requested_backend=request.backend,
                 detail="Ozaki-4 compensated host SciPy/NumPy full-rank CABS overlap cotangent",
             )
-        singles = reference_cabs_singles(
-            request,
-            ref,
-            one,
-            complement=projector.frame,
-            three_center=jk.data["ao_coulomb"],
-            metric=jk.data["metric"],
-            whitener=jk.whitener,
-            relax=True,
-            run=self.run,
-            library=self.response_library,
-            relative_cutoff=self.relative_cutoff,
-            budget_mib=self.budget_mib,
-        )
+        if jk.streaming:
+            obs_jk = jk.obs_coulomb(one.obs_ao_count)
+            singles = reference_cabs_singles(
+                request,
+                ref,
+                one,
+                complement=projector.frame,
+                three_center=None,
+                three_center_loader=lambda: jk.load_ao("ao_coulomb"),
+                obs_three_center=obs_jk,
+                metric=jk.data["metric"],
+                whitener=jk.whitener,
+                relax=True,
+                run=self.run,
+                library=self.response_library,
+                relative_cutoff=self.relative_cutoff,
+                budget_mib=self.budget_mib,
+            )
+            del obs_jk
+            jk._obs_coulomb_cache = None
+        else:
+            singles = reference_cabs_singles(
+                request,
+                ref,
+                one,
+                complement=projector.frame,
+                three_center=jk.data["ao_coulomb"],
+                metric=jk.data["metric"],
+                whitener=jk.whitener,
+                relax=True,
+                run=self.run,
+                library=self.response_library,
+                relative_cutoff=self.relative_cutoff,
+                budget_mib=self.budget_mib,
+            )
         w = singles.weights
         assert ref.forces is not None and w is not None
         assert one.d_overlap is not None and one.d_hcore is not None
@@ -450,3 +775,223 @@ class MolecularFocalProvider:
             w["overlap"], w["hcore"], run=self.run, shell_library=self.shell_library
         )
         return singles, ref.forces - grad
+
+    def _pair_panels(
+        self, request: FocalRequest, *, allow_streaming: bool = True
+    ) -> tuple[_Panel, _Panel, _Panel]:
+        basis = request.basis
+        assert basis.mp2_fit is not None and basis.f12_fit is not None
+        f12 = self._panel(request, "f12_fit", allow_streaming=allow_streaming)
+        jk = (
+            f12
+            if f12.fit_id == basis.jk_fit.identity
+            else self._panel(request, "jk_fit", allow_streaming=allow_streaming)
+        )
+        mp2 = next((p for p in (jk, f12) if p.fit_id == basis.mp2_fit.identity), None)
+        if mp2 is None:
+            mp2 = self._panel(request, "mp2_fit", allow_streaming=False)
+        return jk, mp2, f12
+
+    def _pair(
+        self,
+        request: FocalRequest,
+        ref: FocalReference,
+        one: FocalOneElectron,
+        *,
+        expected_cabs_rank: int | None = None,
+    ) -> tuple[float, np.ndarray]:
+        spin_mp2, increment, _, forces = self._pair_components(
+            request,
+            ref,
+            one,
+            self._pair_panels(request),
+            expected_cabs_rank=expected_cabs_rank,
+        )
+        return float(sum(spin_mp2) + increment), forces
+
+    def _pair_components(
+        self,
+        request: FocalRequest,
+        ref: FocalReference,
+        one: FocalOneElectron,
+        panels: tuple[_Panel, _Panel, _Panel],
+        *,
+        expected_cabs_rank: int | None,
+        mp2_weights: SpinOccupied | None = None,
+        f12_weights: SpinOccupied | None = None,
+    ) -> tuple[tuple[float, float, float], float, int, np.ndarray]:
+        ref = partition_focal_reference(request, ref, self.budget_mib)
+        n = one.obs_ao_count
+        jk, mp2, f12 = panels
+        ordinary = ordinary_df_ump2_unrelaxed(
+            request,
+            ref,
+            mp2.obs(request, n),
+            run=self.run,
+            budget_mib=self.budget_mib,
+            occupied_weights=mp2_weights,
+        )
+        spin_energies = ordinary.spin_energies
+        extra_obs_fock_seeds = ordinary.fock_seeds
+        extra_obs_cbar = ordinary.obs_coefficients
+        mp_weights: dict[str, np.ndarray] = {
+            "metric": ordinary.mp2_metric,
+            "ao_coulomb": ordinary.mp2_three_center,
+        }
+        del ordinary
+        if mp2.streaming and mp2 is not jk:
+            mp2._obs_coulomb_cache = None
+            release_host_memory()
+        record_ram_phase("after_ordinary_mp2")
+        host_ref = request.backend == "cpu_reference"
+        if f12.streaming:
+            # Pre-cache compact [Q_jk, obs, obs] slice before any [Q, ext, ext] AO cotangent
+            # is live so relaxed_f12_source_weights never reloads the full [Q_jk, ext, ext] panel.
+            if jk.streaming:
+                jk.obs_coulomb(n)
+            # Stream each F12 [Q, ext, ext] AO cotangent directly into its [natoms, 3]
+            # nuclear gradient and immediately free it (eliminates 5-panel + 5-bar host OOM).
+            streamed_grad = np.zeros((len(request.atoms), 3), dtype=np.float64)
+            if mp2 is not jk and mp2 is not f12:
+                streamed_grad += self._gradient(request, mp2, mp_weights, coulomb_only=True)
+                mp_weights.clear()
+                release_host_memory()
+            add_mp2_in_f12_sink = mp2 is f12 and mp2 is not jk
+
+            def _f12_ao_sink(ao_name: str, bar_ao_mat: np.ndarray) -> None:
+                if ao_name == "ao_coulomb" and add_mp2_in_f12_sink:
+                    mp2_ao = mp_weights.pop("ao_coulomb")
+                    bar_ao_mat[:, :n, :n] += mp2_ao
+                    del mp2_ao
+                streamed_grad[:] += contract_single_channel(
+                    f12.layout,
+                    "ao",
+                    _AO_NAME_TO_OP[ao_name],
+                    bar_ao_mat,
+                    self.shell_library,
+                    host_reference=host_ref,
+                    budget_mib=self.budget_mib,
+                    slater_normalization=self.slater_normalization,
+                )
+                release_host_memory()
+
+            increment_fn = streamed_f12_increment if jk is not f12 else reference_f12_increment
+            stream_extra = (
+                {"shell_library": self.shell_library}
+                if increment_fn is streamed_f12_increment
+                else {}
+            )
+            explicit = increment_fn(
+                request,
+                ref,
+                one,
+                jk.joint(request, explicit=False),
+                f12.joint(request, explicit=True),
+                expected_cabs_rank=expected_cabs_rank,
+                relative_cutoff=self.relative_cutoff,
+                budget_mib=self.budget_mib,
+                run=self.run,
+                library=self.response_library,
+                canonical_library=self.canonical_library,
+                occupied_weights=f12_weights,
+                ao_bar_sink=_f12_ao_sink,
+                extra_obs_fock_seeds=extra_obs_fock_seeds,
+                extra_obs_cbar=extra_obs_cbar,
+                **stream_extra,
+            )
+            del extra_obs_fock_seeds, extra_obs_cbar
+            record_ram_phase("after_f12_increment")
+            energy, cabs_rank = explicit.energy, explicit.cabs_rank
+            one_e_weights = explicit.one_electron_weights
+            wk, wf = explicit.jkfit_weights, explicit.f12fit_weights
+            del explicit
+            if mp2 is jk:
+                wk["metric"] += mp_weights.pop("metric")
+                wk["ao_coulomb"][:, :n, :n] += mp_weights.pop("ao_coulomb")
+            elif mp2 is f12:
+                wf["metric"] += mp_weights.pop("metric")
+            mp_weights.clear()
+            grad = streamed_grad
+            for mkey, op in _METRIC_KEY_TO_OP.items():
+                grad += contract_single_channel(
+                    f12.layout,
+                    "metric",
+                    op,
+                    wf[mkey],
+                    self.shell_library,
+                    host_reference=host_ref,
+                    budget_mib=self.budget_mib,
+                    slater_normalization=self.slater_normalization,
+                )
+            del wf
+            grad += self._gradient(request, jk, wk, coulomb_only=True)
+            del wk
+            release_host_memory()
+            record_ram_phase("after_jk_grad")
+        else:
+            if (
+                expected_cabs_rank is not None
+                and expected_cabs_rank == len(one.overlap) - n
+            ):
+                disclose_host_assisted_stage(
+                    "full_rank_cabs_overlap_bar",
+                    requested_backend=request.backend,
+                    detail="Ozaki-4 compensated host SciPy/NumPy full-rank CABS overlap cotangent",
+                )
+            explicit = reference_f12_increment(
+                request,
+                ref,
+                one,
+                jk.joint(request, explicit=False),
+                f12.joint(request, explicit=True),
+                expected_cabs_rank=expected_cabs_rank,
+                relative_cutoff=self.relative_cutoff,
+                budget_mib=self.budget_mib,
+                run=self.run,
+                library=self.response_library,
+                canonical_library=self.canonical_library,
+                occupied_weights=f12_weights,
+                extra_obs_fock_seeds=extra_obs_fock_seeds,
+                extra_obs_cbar=extra_obs_cbar,
+                preprojected_cache=self._pair_source_cache,
+            )
+            if (
+                expected_cabs_rank is None
+                and explicit.cabs_rank == len(one.overlap) - n
+            ):
+                disclose_host_assisted_stage(
+                    "full_rank_cabs_overlap_bar",
+                    requested_backend=request.backend,
+                    detail="Ozaki-4 compensated host SciPy/NumPy full-rank CABS overlap cotangent",
+                )
+            del extra_obs_fock_seeds, extra_obs_cbar
+            record_ram_phase("after_f12_increment")
+            energy, cabs_rank = explicit.energy, explicit.cabs_rank
+            one_e_weights = explicit.one_electron_weights
+            # A shared fitted operator has one nuclear derivative. Scatter the OBS
+            # cotangents into the leading block of its OBS+OptRI basis, including
+            # metric weights. Operator equality requires the same *basis identity*.
+            wk, wf = explicit.jkfit_weights, explicit.f12fit_weights
+            del explicit
+            if mp2 is jk or mp2 is f12:
+                target = wk if mp2 is jk else wf
+                target["metric"] += mp_weights["metric"]
+                target["ao_coulomb"][:, :n, :n] += mp_weights["ao_coulomb"]
+            if jk is f12:
+                wf["metric"] += wk["metric"]
+                wf["ao_coulomb"] += wk["ao_coulomb"]
+            grad = self._gradient(request, f12, wf, coulomb_only=False)
+            if jk is not f12:
+                grad += self._gradient(request, jk, wk, coulomb_only=True)
+            if mp2 is not jk and mp2 is not f12:
+                grad += self._gradient(request, mp2, mp_weights, coulomb_only=True)
+        assert one.d_overlap is not None and one.d_hcore is not None
+        grad += one.nuclear_gradient(
+            one_e_weights["overlap"],
+            one_e_weights["hcore"],
+            run=self.run,
+            shell_library=self.shell_library,
+        )
+        del one_e_weights
+        record_ram_phase("after_1e_grad")
+        return spin_energies, energy, cabs_rank, -grad

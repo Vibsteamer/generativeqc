@@ -16,12 +16,14 @@ import numpy as np
 
 from .. import (
     _f12_focal_cv,
+    _f12_focal_increment,
     _f12_focal_integral_kernel,
     _f12_focal_molecular,
     _f12_focal_one_electron,
     _f12_focal_projector,
     _f12_focal_reference,
     _f12_focal_singles,
+    _f12_focal_ump2,
     _f12_frozen_core,
     _native,
 )
@@ -71,6 +73,8 @@ DEFAULT_SLATER_FIT_NORMALIZATION = (
     _f12_focal_integral_kernel.DEFAULT_SLATER_FIT_NORMALIZATION
 )
 MolecularFocalProvider = _f12_focal_molecular.MolecularFocalProvider
+FocalLowOrderForces = _f12_focal_molecular.FocalLowOrderForces
+FocalLowOrderEnergy = _f12_focal_molecular.FocalLowOrderEnergy
 conventional_mp2_request = _f12_focal_cv.conventional_mp2_request
 DEFAULT_PRODUCTION_CORRELATION_SPACE = _f12_frozen_core.DEFAULT_PRODUCTION_CORRELATION_SPACE
 FROZEN_CORE_DEFINITION_VERSION = _f12_frozen_core.FROZEN_CORE_DEFINITION_VERSION
@@ -83,10 +87,16 @@ one_electron_sources = _f12_focal_one_electron.one_electron_sources
 FocalReference = _f12_focal_reference.FocalReference
 FocalReferenceSeed = _f12_focal_reference.FocalReferenceSeed
 df_reference = _f12_focal_reference.df_reference
+FocalF12Increment = _f12_focal_increment.FocalF12Increment
+FocalF12Sources = _f12_focal_increment.FocalF12Sources
+reference_f12_increment = _f12_focal_increment.reference_f12_increment
 focal_cabs_projector = _f12_focal_projector.focal_cabs_projector
 CompensatedProductWorkLimit = _f12_focal_projector.CompensatedProductWorkLimit
 FocalCabsSingles = _f12_focal_singles.FocalCabsSingles
 reference_cabs_singles = _f12_focal_singles.reference_cabs_singles
+FocalCoulombSource = _f12_focal_ump2.FocalCoulombSource
+FocalUMP2Weights = _f12_focal_ump2.FocalUMP2Weights
+reference_df_ump2 = _f12_focal_ump2.reference_df_ump2
 
 
 @dataclass(frozen=True)
