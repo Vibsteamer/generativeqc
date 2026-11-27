@@ -1,0 +1,7 @@
+{
+  "path": "src/posthf/canonical_frame_cuda.cu",
+  "reason": "Validates the canonical response request, budgets and stages buffers, dispatches generated_canonical_frame.cuh, checks the reported degeneracy flags and torque norm, and publishes the requested Fock and overlap seeds. The generated kernel owns the pair response equations.",
+  "regions": [],
+  "role": "runtime",
+  "subsystem": "molecular_f12"
+}
