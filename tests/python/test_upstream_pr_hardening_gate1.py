@@ -497,6 +497,24 @@ def test_h5_validate_and_assemble_plan_a_recipe_and_reject_mismatches() -> None:
         )
 
 
+def test_h5_methyl_halide_manifest_tz_beta_and_provenance() -> None:
+    """The hash-only Br/I methyl-halide manifest records Plan-A beta {2: 0.9, 3: 1.0} and provenance."""
+    import json
+
+    from generativeqc._f12_frozen_core import DEFAULT_PRODUCTION_F12_BETA_BY_CARDINAL
+
+    manifest_path = ROOT / "python/generativeqc/data/f12_methyl_halide_external.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    betas = manifest["beta_bohr_inverse_by_cardinal"]
+    assert betas == {"2": 0.9, "3": 1.0}
+    for cardinal in (2, 3):
+        expected = DEFAULT_PRODUCTION_F12_BETA_BY_CARDINAL[cardinal]
+        assert betas[str(cardinal)] == pytest.approx(expected)
+    assert manifest["beta_policy"]
+    for entry in manifest["files"].values():
+        assert entry["citation"] and entry["source"] in manifest["sources"]
+
+
 def test_h5_x2c1e_delta_sr_fc9_parity_and_fd_forces_on_hbr() -> None:
     """evaluate_delta_sr supports frozen-core-spd (FC9) on ECP HBr matching PySCF and central FD."""
     pytest.importorskip("basis_set_exchange")
@@ -784,6 +802,7 @@ def test_m7_real_df_hf_shell_gaps_pass_for_h2o_oh_hbr() -> None:
         )
         assert frame.counts(cspace) == (expected_fc, expected_fc)
         assert frame.channels(cspace)[0].minimum_gap_eh > 1.0
+
 
 
 # ============================================================================

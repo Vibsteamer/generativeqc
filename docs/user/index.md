@@ -60,6 +60,7 @@ hessians
 :caption: Basis and Hamiltonian
 
 external_basis
+restricted_reference_data
 high_angular_momentum
 ecp
 ```

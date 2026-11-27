@@ -1,0 +1,1088 @@
+{
+  "schema": "generativeqc.f12-methyl-halide-external/v1",
+  "description": "SHA-256 records of the CH3Br/CH3I scalar-ECP F12 basis selections and geometries. No coefficients or coordinates are distributed; see docs/user/restricted_reference_data.md.",
+  "series_id": "methyl-halide-ha-PP-F12/def2-universal-JKFit/element-RI",
+  "beta_bohr_inverse_by_cardinal": {
+    "2": 0.9,
+    "3": 1.0
+  },
+  "beta_policy": "Locked Plan-A size-consistent F12 geminal exponents {2: 0.9, 3: 1.0} bohr^-1 matching DEFAULT_PRODUCTION_F12_BETA_BY_CARDINAL",
+  "data_directory": {
+    "argument": "data_dir",
+    "environment": "GENERATIVEQC_EXTERNAL_DATA_DIR",
+    "subdirectory": "f12_methyl_halide"
+  },
+  "content_hashes": {
+    "basis": "generativeqc.basis.element_content_sha256 (generativeqc.basis-element-content/v1, spherical)",
+    "geometry": "generativeqc.experimental.f12_methyl_halide.geometry_content_sha256 (generativeqc.geometry-content/v1)",
+    "assembly": "records are concatenated in order; layout native keeps source order, bse-standard applies BSE uncontract_general, uncontract_spdf and sort_basis, sorted-by-l stable-sorts shells by angular momentum; groups zero, position or source set shell source groups; ecp text bse is BSE ecp_potentials as compact sorted-key JSON, float-repr is json.dumps default formatting of the keys ecp_type, angular_momentum, r_exponents, gaussian_exponents and coefficients with repr(float(value)) strings"
+  },
+  "bse": {
+    "package": "basis_set_exchange",
+    "verified_versions": [
+      "0.12"
+    ],
+    "license": "BSD-3-Clause",
+    "citation": "B. P. Pritchard, D. Altarawy, B. Didier, T. D. Gibson and T. L. Windus, J. Chem. Inf. Model. 59, 4814 (2019), doi:10.1021/acs.jcim.9b00725"
+  },
+  "sources": {
+    "ccrepo-bromine": {
+      "url": "http://www.grant-hill.group.shef.ac.uk/ccrepo/bromine/brbasis.php",
+      "request": "HTTP POST form",
+      "procedure": "submit the fields basis=<query basis> and program=NWChem; take the text of the first <nobr> element of the response, collapse whitespace runs in each line to one space, strip each line, drop empty lines and join the lines with newlines plus a final newline. Only the content hash is enforced; the file hash identifies the bytes this procedure produced",
+      "version": "ccRepo publishes no version identifier; records are identified by content hash"
+    },
+    "ccrepo-iodine": {
+      "url": "http://www.grant-hill.group.shef.ac.uk/ccrepo/iodine/ibasis.php",
+      "request": "HTTP POST form",
+      "procedure": "submit the fields basis=<query basis> and program=NWChem; take the text of the first <nobr> element of the response, collapse whitespace runs in each line to one space, strip each line, drop empty lines and join the lines with newlines plus a final newline. Only the content hash is enforced; the file hash identifies the bytes this procedure produced",
+      "version": "ccRepo publishes no version identifier; records are identified by content hash"
+    },
+    "ccrepo-hydrogen": {
+      "url": "http://www.grant-hill.group.shef.ac.uk/ccrepo/hydrogen/hbasis.php",
+      "request": "HTTP GET query",
+      "procedure": "submit the fields basis=<query basis> and program=NWChem; take the text of the first <nobr> element of the response, collapse whitespace runs in each line to one space, strip each line, drop empty lines and join the lines with newlines plus a final newline. Only the content hash is enforced; the file hash identifies the bytes this procedure produced",
+      "version": "ccRepo publishes no version identifier; records are identified by content hash"
+    },
+    "sylvetsky-2017": {
+      "url": "https://doi.org/10.1063/1.4998332",
+      "procedure": "write the carbon diffuse exponents of the aug-cc-pVnZ-F12 row of Table I as an NWChem block: a BASIS \"ao basis\" SPHERICAL PRINT line, one uncontracted shell per exponent with coefficient 1.0 in increasing angular momentum, then END",
+      "version": "published article"
+    },
+    "nist-cccbdb": {
+      "url": "https://cccbdb.nist.gov/",
+      "procedure": "open the experimental geometry page given for the file and write the listed Cartesian coordinates in angstrom as an XYZ file with the atoms in the order C, halogen, H, H, H",
+      "version": "NIST Standard Reference Database 101"
+    }
+  },
+  "files": {
+    "Br_aug-cc-pVDZ-PP-F12.nwchem": {
+      "description": "Br aug-cc-pVDZ-PP-F12 orbital basis (valence; the ECP comes from BSE cc-pVDZ-PP)",
+      "kind": "basis",
+      "format": "nwchem",
+      "atomic_number": 35,
+      "source": "ccrepo-bromine",
+      "query": {
+        "basis": "aug-cc-pVDZ-PP-F12",
+        "program": "NWChem"
+      },
+      "retrieved": "2026-11-17",
+      "file_sha256": "c0f9cf0f3404279d7a9f28706f713c2ed0e788437341cb83dfe0d5ce5dba39f2",
+      "content_sha256": "8aa43efc27e243947bc303da8568de89d9d95e392b403f7d36c94e7bc3fdc02f",
+      "citation": "J. G. Hill and K. A. Peterson, J. Chem. Phys. 141, 094106 (2014); diffuse functions: J. G. Hill, J. Chem. Phys. 160, 114102 (2024), doi:10.1063/5.0197210 (citation as printed on the ccRepo page)"
+    },
+    "Br_aug-cc-pVDZ-PP-F12_MP2FIT.nwchem": {
+      "description": "Br aug-cc-pVDZ-PP-F12 MP2Fit (RI) auxiliary basis",
+      "kind": "basis",
+      "format": "nwchem",
+      "atomic_number": 35,
+      "source": "ccrepo-bromine",
+      "query": {
+        "basis": "aug-cc-pVDZ-PP-F12_MP2FIT",
+        "program": "NWChem"
+      },
+      "retrieved": "2026-11-20",
+      "file_sha256": "1a96c964998f15d74e9d88008035aff30b81f0bc30c509882232c23597f06fae",
+      "content_sha256": "afbc10c2cd798c9c49a98752ecc43b6081602568afe5f0d866e9fc993237bcdb",
+      "citation": "J. G. Hill and K. A. Peterson, J. Chem. Phys. 141, 094106 (2014); diffuse functions: J. G. Hill, J. Chem. Phys. 160, 114102 (2024), doi:10.1063/5.0197210 (citation as printed on the ccRepo page)",
+      "note": "absent from the ccRepo web form; submit the field values directly"
+    },
+    "Br_aug-cc-pVDZ-PP-F12_OPTRI.nwchem": {
+      "description": "Br aug-cc-pVDZ-PP-F12 OptRI (CABS) auxiliary basis",
+      "kind": "basis",
+      "format": "nwchem",
+      "atomic_number": 35,
+      "source": "ccrepo-bromine",
+      "query": {
+        "basis": "aug-cc-pVDZ-PP-F12_OPTRI",
+        "program": "NWChem"
+      },
+      "retrieved": "2026-11-20",
+      "file_sha256": "74037f506913138bc892a85359228c944bd94ad6a290a27b1c1469354806dd30",
+      "content_sha256": "6154a7f094e0c1c7525eca6e00bd793f73373b339d185a17be942bfce05489c6",
+      "citation": "J. G. Hill and K. A. Peterson, J. Chem. Phys. 141, 094106 (2014); diffuse functions: J. G. Hill, J. Chem. Phys. 160, 114102 (2024), doi:10.1063/5.0197210 (citation as printed on the ccRepo page)",
+      "note": "absent from the ccRepo web form; submit the field values directly"
+    },
+    "Br_aug-cc-pVTZ-PP-F12.nwchem": {
+      "description": "Br aug-cc-pVTZ-PP-F12 orbital basis (valence; the ECP comes from BSE cc-pVTZ-PP)",
+      "kind": "basis",
+      "format": "nwchem",
+      "atomic_number": 35,
+      "source": "ccrepo-bromine",
+      "query": {
+        "basis": "aug-cc-pVTZ-PP-F12",
+        "program": "NWChem"
+      },
+      "retrieved": "2026-11-17",
+      "file_sha256": "4b3e69582cbdbc8bd23a63c2c0c9c69bf2c708219cbece088840ac998786e274",
+      "content_sha256": "417f2b8f2a68a764dd41fdad273ecc1aa1c104afb1f5a9632acfea8371a4a9e4",
+      "citation": "J. G. Hill and K. A. Peterson, J. Chem. Phys. 141, 094106 (2014); diffuse functions: J. G. Hill, J. Chem. Phys. 160, 114102 (2024), doi:10.1063/5.0197210 (citation as printed on the ccRepo page)"
+    },
+    "Br_aug-cc-pVTZ-PP-F12_MP2FIT.nwchem": {
+      "description": "Br aug-cc-pVTZ-PP-F12 MP2Fit (RI) auxiliary basis",
+      "kind": "basis",
+      "format": "nwchem",
+      "atomic_number": 35,
+      "source": "ccrepo-bromine",
+      "query": {
+        "basis": "aug-cc-pVTZ-PP-F12_MP2FIT",
+        "program": "NWChem"
+      },
+      "retrieved": "2026-11-18",
+      "file_sha256": "3d520522768e068dda12b90c9b959a8bb0bdb962632e3a5922fc0911faa527c8",
+      "content_sha256": "3f8e82d2e5c74c6570a7ef70b91d6e50a70f119b4c78039249396e485b9069cd",
+      "citation": "J. G. Hill and K. A. Peterson, J. Chem. Phys. 141, 094106 (2014); diffuse functions: J. G. Hill, J. Chem. Phys. 160, 114102 (2024), doi:10.1063/5.0197210 (citation as printed on the ccRepo page)",
+      "note": "absent from the ccRepo web form; submit the field values directly"
+    },
+    "Br_aug-cc-pVTZ-PP-F12_OPTRI.nwchem": {
+      "description": "Br aug-cc-pVTZ-PP-F12 OptRI (CABS) auxiliary basis",
+      "kind": "basis",
+      "format": "nwchem",
+      "atomic_number": 35,
+      "source": "ccrepo-bromine",
+      "query": {
+        "basis": "aug-cc-pVTZ-PP-F12_OPTRI",
+        "program": "NWChem"
+      },
+      "retrieved": "2026-11-18",
+      "file_sha256": "42a39e6817e60e3729b8431cd4b83dcc014f142e369b2a534e01555180b8f539",
+      "content_sha256": "c8f9cfe636285c4c9dceb533800b8f732a9815c9544fad0b4324287ceaf5f7d6",
+      "citation": "J. G. Hill and K. A. Peterson, J. Chem. Phys. 141, 094106 (2014); diffuse functions: J. G. Hill, J. Chem. Phys. 160, 114102 (2024), doi:10.1063/5.0197210 (citation as printed on the ccRepo page)",
+      "note": "absent from the ccRepo web form; submit the field values directly"
+    },
+    "CH3Br.xyz": {
+      "description": "CH3Br experimental Cartesian geometry in angstrom, atoms C, Br, H, H, H",
+      "kind": "geometry",
+      "format": "xyz-angstrom",
+      "source": "nist-cccbdb",
+      "url": "https://cccbdb.nist.gov/expgeom2x.asp?casno=74839",
+      "retrieved": "recorded 2026-11-21",
+      "file_sha256": "cba0117c67c463558e378c44498bb0a8f120f41cfd2ffee3de49ecccffa639fe",
+      "content_sha256": "4c6f9f5a5cbdcd3dafb88ed048391645cb2b1afa1d3db65e767e0dbadea79219",
+      "citation": "NIST Computational Chemistry Comparison and Benchmark DataBase, NIST Standard Reference Database 101; K. Kuchitsu (ed.), Structure of Free Polyatomic Molecules \u2013 Basic Data (1998), doi:10.1007/978-3-642-45748-7"
+    },
+    "CH3I.xyz": {
+      "description": "CH3I experimental Cartesian geometry in angstrom, atoms C, I, H, H, H",
+      "kind": "geometry",
+      "format": "xyz-angstrom",
+      "source": "nist-cccbdb",
+      "url": "https://cccbdb.nist.gov/expgeom2x.asp?casno=74884",
+      "retrieved": "recorded 2026-11-21",
+      "file_sha256": "3d8fbad99d26da979d30e608848077d788d458dd2578dd5b003cedc881cee708",
+      "content_sha256": "4bb0bf265ab9373c7f2e532bcf59350dce3bb350bab7ff15e441a94ac23b9346",
+      "citation": "NIST Computational Chemistry Comparison and Benchmark DataBase, NIST Standard Reference Database 101; K. Kuchitsu (ed.), Structure of Free Polyatomic Molecules \u2013 Basic Data (1998), doi:10.1007/978-3-642-45748-7"
+    },
+    "C_aug-cc-pVDZ-F12_diffuse.nwchem": {
+      "description": "carbon diffuse supplement of aug-cc-pVDZ-F12 (one d shell) added to BSE cc-pVDZ-F12",
+      "kind": "basis",
+      "format": "nwchem",
+      "atomic_number": 6,
+      "source": "sylvetsky-2017",
+      "retrieved": "published 2017 (Table I)",
+      "file_sha256": "e814596f8225848a05ed8498492ddce44facf404f5ea3d91c656d50fb736efda",
+      "content_sha256": "d4b5542153cec91baf709dfc381054730e6550ce044ed7ab35a4f17c3659f9a2",
+      "citation": "N. Sylvetsky, M. K. Kesharwani and J. M. L. Martin, J. Chem. Phys. 147, 134106 (2017), doi:10.1063/1.4998332, Table I"
+    },
+    "C_aug-cc-pVTZ-F12_diffuse.nwchem": {
+      "description": "carbon diffuse supplement of aug-cc-pVTZ-F12 (one d and one f shell) added to BSE cc-pVTZ-F12",
+      "kind": "basis",
+      "format": "nwchem",
+      "atomic_number": 6,
+      "source": "sylvetsky-2017",
+      "retrieved": "published 2017 (Table I)",
+      "file_sha256": "908c800a9985de19ae9ec64895ce3d110320a9d6ac50c05172bf008ad116435f",
+      "content_sha256": "00bdf917b4fdfdc27af02f7d19807a63414a06aa277b4b0aa5e932e2b43c9ced",
+      "citation": "N. Sylvetsky, M. K. Kesharwani and J. M. L. Martin, J. Chem. Phys. 147, 134106 (2017), doi:10.1063/1.4998332, Table I"
+    },
+    "H_cc-pVDZ-F12_MP2FIT.nwchem": {
+      "description": "H cc-pVDZ-F12 MP2Fit (RI) auxiliary basis",
+      "kind": "basis",
+      "format": "nwchem",
+      "atomic_number": 1,
+      "source": "ccrepo-hydrogen",
+      "query": {
+        "basis": "cc-pVDZ-F12_MP2FIT",
+        "program": "NWChem"
+      },
+      "retrieved": "2026-11-20",
+      "file_sha256": "d711cff115eb7ffe477088e142f523b986c6f70407c6b2832f2f3251b257aec1",
+      "content_sha256": "ff2198eea86f947419584f9cf3c08b2bdceb65203a0deb8dff4b9c214723d41d",
+      "citation": "S. Kritikou and J. G. Hill, J. Chem. Theory Comput. 11, 5269 (2015), doi:10.1021/acs.jctc.5b00816"
+    },
+    "H_cc-pVTZ-F12_MP2FIT.nwchem": {
+      "description": "H cc-pVTZ-F12 MP2Fit (RI) auxiliary basis",
+      "kind": "basis",
+      "format": "nwchem",
+      "atomic_number": 1,
+      "source": "ccrepo-hydrogen",
+      "query": {
+        "basis": "cc-pVTZ-F12_MP2FIT",
+        "program": "NWChem"
+      },
+      "retrieved": "2026-11-19",
+      "file_sha256": "ca0adf154be0ff78185827148821218780a3d87df14ff32e240bc12e0b133101",
+      "content_sha256": "b903db67ddd17eb4e82b89c83f50f21d927745330a3f77df576fc0cc31035542",
+      "citation": "S. Kritikou and J. G. Hill, J. Chem. Theory Comput. 11, 5269 (2015), doi:10.1021/acs.jctc.5b00816"
+    },
+    "I_aug-cc-pVDZ-PP-F12.nwchem": {
+      "description": "I aug-cc-pVDZ-PP-F12 orbital basis (valence; the ECP comes from BSE cc-pVDZ-PP)",
+      "kind": "basis",
+      "format": "nwchem",
+      "atomic_number": 53,
+      "source": "ccrepo-iodine",
+      "query": {
+        "basis": "aug-cc-pVDZ-PP-F12",
+        "program": "NWChem"
+      },
+      "retrieved": "2026-11-17",
+      "file_sha256": "27a44f354e5e6dc1ac1295354ca8c50b3a52cf372a7144631dc9e66958938fd0",
+      "content_sha256": "78bc22318cad55503b33cfa34a7ceda66fbeeb98cf5f8163986c7f42fbf6ca46",
+      "citation": "J. G. Hill and K. A. Peterson, J. Chem. Phys. 141, 094106 (2014); diffuse functions: J. G. Hill, J. Chem. Phys. 160, 114102 (2024), doi:10.1063/5.0197210 (citation as printed on the ccRepo page)"
+    },
+    "I_aug-cc-pVDZ-PP-F12_MP2FIT.nwchem": {
+      "description": "I aug-cc-pVDZ-PP-F12 MP2Fit (RI) auxiliary basis",
+      "kind": "basis",
+      "format": "nwchem",
+      "atomic_number": 53,
+      "source": "ccrepo-iodine",
+      "query": {
+        "basis": "aug-cc-pVDZ-PP-F12_MP2FIT",
+        "program": "NWChem"
+      },
+      "retrieved": "2026-11-20",
+      "file_sha256": "9987466366f49030417520e300482173e4b9a3c8b4b1c7cc4879835c76100547",
+      "content_sha256": "d21b2b477b5adcc76b777afa29803ef63abf2b7879ce179c4db5316eb636a90c",
+      "citation": "J. G. Hill and K. A. Peterson, J. Chem. Phys. 141, 094106 (2014); diffuse functions: J. G. Hill, J. Chem. Phys. 160, 114102 (2024), doi:10.1063/5.0197210 (citation as printed on the ccRepo page)",
+      "note": "absent from the ccRepo web form; submit the field values directly"
+    },
+    "I_aug-cc-pVDZ-PP-F12_OPTRI.nwchem": {
+      "description": "I aug-cc-pVDZ-PP-F12 OptRI (CABS) auxiliary basis",
+      "kind": "basis",
+      "format": "nwchem",
+      "atomic_number": 53,
+      "source": "ccrepo-iodine",
+      "query": {
+        "basis": "aug-cc-pVDZ-PP-F12_OPTRI",
+        "program": "NWChem"
+      },
+      "retrieved": "2026-11-20",
+      "file_sha256": "7fb16c32138c8a3b5e5dd3f48547524c8de9f77b2101370ddc362a842b2aa757",
+      "content_sha256": "09e6496fcc1045539f9aefff0d6a920f0317545f4d55d6b7398df39bc58e0837",
+      "citation": "J. G. Hill and K. A. Peterson, J. Chem. Phys. 141, 094106 (2014); diffuse functions: J. G. Hill, J. Chem. Phys. 160, 114102 (2024), doi:10.1063/5.0197210 (citation as printed on the ccRepo page)",
+      "note": "absent from the ccRepo web form; submit the field values directly"
+    },
+    "I_aug-cc-pVTZ-PP-F12.nwchem": {
+      "description": "I aug-cc-pVTZ-PP-F12 orbital basis (valence; the ECP comes from BSE cc-pVTZ-PP)",
+      "kind": "basis",
+      "format": "nwchem",
+      "atomic_number": 53,
+      "source": "ccrepo-iodine",
+      "query": {
+        "basis": "aug-cc-pVTZ-PP-F12",
+        "program": "NWChem"
+      },
+      "retrieved": "2026-11-17",
+      "file_sha256": "297a93fa530becddbe7442860824253efbc47fa9ceb3e4ef2cae931365725443",
+      "content_sha256": "a49fd743359484c051f9aaefa46f4bcaf37cdc62c2e01adff24027af2cef423e",
+      "citation": "J. G. Hill and K. A. Peterson, J. Chem. Phys. 141, 094106 (2014); diffuse functions: J. G. Hill, J. Chem. Phys. 160, 114102 (2024), doi:10.1063/5.0197210 (citation as printed on the ccRepo page)"
+    },
+    "I_aug-cc-pVTZ-PP-F12_MP2FIT.nwchem": {
+      "description": "I aug-cc-pVTZ-PP-F12 MP2Fit (RI) auxiliary basis",
+      "kind": "basis",
+      "format": "nwchem",
+      "atomic_number": 53,
+      "source": "ccrepo-iodine",
+      "query": {
+        "basis": "aug-cc-pVTZ-PP-F12_MP2FIT",
+        "program": "NWChem"
+      },
+      "retrieved": "2026-11-18",
+      "file_sha256": "5e0b9e9a4e09f92e512e12f8f8e5fe4bbfd52ef2838d91743126675a80bbeaaf",
+      "content_sha256": "0b2ac92ef18e6c8e8aa187d7f166b31f60e3d748a2ea4cdf4df9fc68233a4d3f",
+      "citation": "J. G. Hill and K. A. Peterson, J. Chem. Phys. 141, 094106 (2014); diffuse functions: J. G. Hill, J. Chem. Phys. 160, 114102 (2024), doi:10.1063/5.0197210 (citation as printed on the ccRepo page)",
+      "note": "absent from the ccRepo web form; submit the field values directly"
+    },
+    "I_aug-cc-pVTZ-PP-F12_OPTRI.nwchem": {
+      "description": "I aug-cc-pVTZ-PP-F12 OptRI (CABS) auxiliary basis",
+      "kind": "basis",
+      "format": "nwchem",
+      "atomic_number": 53,
+      "source": "ccrepo-iodine",
+      "query": {
+        "basis": "aug-cc-pVTZ-PP-F12_OPTRI",
+        "program": "NWChem"
+      },
+      "retrieved": "2026-11-18",
+      "file_sha256": "d223a16e3f9aaacd7738c8f610a20bc17b4c5d89ae3f6d297310251739cd105f",
+      "content_sha256": "0eabf47144fdabdcef307c2d4c57cb358b611f326676af073cf836f1259a053d",
+      "citation": "J. G. Hill and K. A. Peterson, J. Chem. Phys. 141, 094106 (2014); diffuse functions: J. G. Hill, J. Chem. Phys. 160, 114102 (2024), doi:10.1063/5.0197210 (citation as printed on the ccRepo page)",
+      "note": "absent from the ccRepo web form; submit the field values directly"
+    }
+  },
+  "geometries": {
+    "Br": "CH3Br.xyz",
+    "I": "CH3I.xyz"
+  },
+  "series": {
+    "br-d": {
+      "halogen": "Br",
+      "cardinal": 2,
+      "basis_id": "ad673dbeff6a60597d20149f776def20ccce580a2d3e3d55ac67dfdb98db4ba6",
+      "roles": {
+        "orbital": {
+          "identity": "6698cbad053b3c8396cccc064096e6492870d79c57674bc6875510d0a326d929",
+          "provenance": {
+            "source": "Methyl-halide element-resolved records",
+            "version": "D",
+            "license": "See per-element coefficient sources",
+            "checksum": "eaae0182342a190d1c7a05fc0a524a9d408d6614bfcaa4d5aa1ffc114dcaacb2"
+          },
+          "elements": [
+            {
+              "atomic_number": 1,
+              "content_sha256": "96f7240d5d589cefd4b27c4e012f13b63680ea49cee44dee40efe28fc933af5c",
+              "records": [
+                {
+                  "bse": "cc-pVDZ-F12"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero"
+            },
+            {
+              "atomic_number": 6,
+              "content_sha256": "e3917076ddb866bc5eea8887867d3f756b0b7334da60dd8cc545e87b315ba143",
+              "records": [
+                {
+                  "bse": "cc-pVDZ-F12"
+                },
+                {
+                  "file": "C_aug-cc-pVDZ-F12_diffuse.nwchem"
+                }
+              ],
+              "layout": "bse-standard",
+              "groups": "position"
+            },
+            {
+              "atomic_number": 35,
+              "content_sha256": "ebf0a12f0b3c2752ce6b7e97a470da130762be337e9eb9129c19c45ab7d9adc8",
+              "records": [
+                {
+                  "file": "Br_aug-cc-pVDZ-PP-F12.nwchem"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero",
+              "ecp": {
+                "bse": "cc-pVDZ-PP",
+                "text": "bse"
+              }
+            }
+          ]
+        },
+        "jkfit": {
+          "identity": "68228c7b0b7c43294c09c0611cd865fc0e15ad71ee6f0165ee1aa8dc0f64ab8a",
+          "provenance": {
+            "source": "Methyl-halide element-resolved records",
+            "version": "D",
+            "license": "See per-element coefficient sources",
+            "checksum": "829f61ef61e239236fe5832782bfaa6fbd15bafe747c4147e0e5b0134c46bf84"
+          },
+          "elements": [
+            {
+              "atomic_number": 1,
+              "content_sha256": "bf11c70bfe971463f3530ca810e50932a844bba80f0b54d1ea14cc6925fdef70",
+              "records": [
+                {
+                  "bse": "def2-universal-JKFIT"
+                }
+              ],
+              "layout": "native",
+              "groups": "position"
+            },
+            {
+              "atomic_number": 6,
+              "content_sha256": "8237aff18f432b9b36bd5f5cac3b5c9edbeee500441772e9eeed89ea283d3e4e",
+              "records": [
+                {
+                  "bse": "def2-universal-JKFIT"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero"
+            },
+            {
+              "atomic_number": 35,
+              "content_sha256": "e9b8c7a2c33b45ed7e18a8864485a7d3be77d856188bd039e40acc6b69631118",
+              "records": [
+                {
+                  "bse": "def2-universal-JKFIT"
+                }
+              ],
+              "layout": "native",
+              "groups": "position"
+            }
+          ]
+        },
+        "ri": {
+          "identity": "bbe2999f279f7476d4b4715b6f43f6810be48e51bdb044a4ee3360b1f903655c",
+          "provenance": {
+            "source": "Methyl-halide element-resolved records",
+            "version": "D",
+            "license": "See per-element coefficient sources",
+            "checksum": "f4796d3d44aabd4cb3ed14d9be4115996dc39872ad3f6dcc11cc05a6c02ee5af"
+          },
+          "elements": [
+            {
+              "atomic_number": 1,
+              "content_sha256": "ff2198eea86f947419584f9cf3c08b2bdceb65203a0deb8dff4b9c214723d41d",
+              "records": [
+                {
+                  "file": "H_cc-pVDZ-F12_MP2FIT.nwchem"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero"
+            },
+            {
+              "atomic_number": 6,
+              "content_sha256": "d534f224aab2dc73148a97eeb59b3bbce7acebaf8a6f6b8efd99b9c1d8a4e5ee",
+              "records": [
+                {
+                  "bse": "aug-cc-pVTZ-RIFIT"
+                }
+              ],
+              "layout": "sorted-by-l",
+              "groups": "source"
+            },
+            {
+              "atomic_number": 35,
+              "content_sha256": "afbc10c2cd798c9c49a98752ecc43b6081602568afe5f0d866e9fc993237bcdb",
+              "records": [
+                {
+                  "file": "Br_aug-cc-pVDZ-PP-F12_MP2FIT.nwchem"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero"
+            }
+          ]
+        },
+        "cabs": {
+          "identity": "84067e46df5e66feec5e90c094a9a55e81991d796b47244a1c6b2ad3e26e802d",
+          "provenance": {
+            "source": "Methyl-halide element-resolved records",
+            "version": "D",
+            "license": "See per-element coefficient sources",
+            "checksum": "516e5ff6f2ec805ea4bcb109572d0ed9a75df09af50d013d755a36a25101a397"
+          },
+          "elements": [
+            {
+              "atomic_number": 1,
+              "content_sha256": "220866f97dcb616cc73d7f26843da77a9cd56e313d766767d8b76d33e7693ff5",
+              "records": [
+                {
+                  "bse": "cc-pVDZ-F12-OPTRI"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero"
+            },
+            {
+              "atomic_number": 6,
+              "content_sha256": "3ad92c7c8ef0c14c030b3c946251e57ac929fea8848b2214233e3043200c4f61",
+              "records": [
+                {
+                  "bse": "cc-pVDZ-F12-OPTRI"
+                }
+              ],
+              "layout": "native",
+              "groups": "position"
+            },
+            {
+              "atomic_number": 35,
+              "content_sha256": "6154a7f094e0c1c7525eca6e00bd793f73373b339d185a17be942bfce05489c6",
+              "records": [
+                {
+                  "file": "Br_aug-cc-pVDZ-PP-F12_OPTRI.nwchem"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero"
+            }
+          ]
+        }
+      }
+    },
+    "br-t": {
+      "halogen": "Br",
+      "cardinal": 3,
+      "basis_id": "0127b8d50cfb6881c5f2aa85d344fe275251085ee4a24121f6bf2c6277251a1f",
+      "roles": {
+        "orbital": {
+          "identity": "2e1859e1eb73578568451a9b199a4492b99e2cef0fe47a03204b35ec13219b3a",
+          "provenance": {
+            "source": "Methyl-halide element-resolved records",
+            "version": "T",
+            "license": "See per-element coefficient sources",
+            "checksum": "89d180bc951930dfd06fbec97577f16641bcf42e36e26a1886c388f08b17ae05"
+          },
+          "elements": [
+            {
+              "atomic_number": 1,
+              "content_sha256": "cff67a29f0a3d043d32e5b3b60d3d209723d40bb4875423a6a5b184ecccd7987",
+              "records": [
+                {
+                  "bse": "cc-pVTZ-F12"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero"
+            },
+            {
+              "atomic_number": 6,
+              "content_sha256": "f1b7dae12aa379d589bf9648de0101e06e783adc44ef9de04bd0ea20d4eba1a2",
+              "records": [
+                {
+                  "bse": "cc-pVTZ-F12"
+                },
+                {
+                  "file": "C_aug-cc-pVTZ-F12_diffuse.nwchem"
+                }
+              ],
+              "layout": "bse-standard",
+              "groups": "position"
+            },
+            {
+              "atomic_number": 35,
+              "content_sha256": "5073b127ec09926296b9c5972549df2e9d141b707c45aff22bd58a1e3d0ec78a",
+              "records": [
+                {
+                  "file": "Br_aug-cc-pVTZ-PP-F12.nwchem"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero",
+              "ecp": {
+                "bse": "cc-pVTZ-PP",
+                "text": "bse"
+              }
+            }
+          ]
+        },
+        "jkfit": {
+          "identity": "70231e3d00243a3656f33991659356bc689f9b97eee406bdf9b34d86cbec8db8",
+          "provenance": {
+            "source": "Methyl-halide element-resolved records",
+            "version": "T",
+            "license": "See per-element coefficient sources",
+            "checksum": "3d1f6fd69226ac975cbac543bdfc19d53858c6ee228ab5a5aac2be7e9fa91b2e"
+          },
+          "elements": [
+            {
+              "atomic_number": 1,
+              "content_sha256": "bf11c70bfe971463f3530ca810e50932a844bba80f0b54d1ea14cc6925fdef70",
+              "records": [
+                {
+                  "bse": "def2-universal-JKFIT"
+                }
+              ],
+              "layout": "native",
+              "groups": "position"
+            },
+            {
+              "atomic_number": 6,
+              "content_sha256": "8237aff18f432b9b36bd5f5cac3b5c9edbeee500441772e9eeed89ea283d3e4e",
+              "records": [
+                {
+                  "bse": "def2-universal-JKFIT"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero"
+            },
+            {
+              "atomic_number": 35,
+              "content_sha256": "e9b8c7a2c33b45ed7e18a8864485a7d3be77d856188bd039e40acc6b69631118",
+              "records": [
+                {
+                  "bse": "def2-universal-JKFIT"
+                }
+              ],
+              "layout": "native",
+              "groups": "position"
+            }
+          ]
+        },
+        "ri": {
+          "identity": "a61cc8a3fe7f28b0770005f87c6e5922c4d0731bd5240fc7d1ce3b71545c6666",
+          "provenance": {
+            "source": "Methyl-halide element-resolved records",
+            "version": "T",
+            "license": "See per-element coefficient sources",
+            "checksum": "b44b9315615ab869cd15d2a3f478e4f972a5cedb25e687fd71de085fdd2fb131"
+          },
+          "elements": [
+            {
+              "atomic_number": 1,
+              "content_sha256": "b903db67ddd17eb4e82b89c83f50f21d927745330a3f77df576fc0cc31035542",
+              "records": [
+                {
+                  "file": "H_cc-pVTZ-F12_MP2FIT.nwchem"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero"
+            },
+            {
+              "atomic_number": 6,
+              "content_sha256": "d534f224aab2dc73148a97eeb59b3bbce7acebaf8a6f6b8efd99b9c1d8a4e5ee",
+              "records": [
+                {
+                  "bse": "aug-cc-pVTZ-RIFIT"
+                }
+              ],
+              "layout": "sorted-by-l",
+              "groups": "source"
+            },
+            {
+              "atomic_number": 35,
+              "content_sha256": "3f8e82d2e5c74c6570a7ef70b91d6e50a70f119b4c78039249396e485b9069cd",
+              "records": [
+                {
+                  "file": "Br_aug-cc-pVTZ-PP-F12_MP2FIT.nwchem"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero"
+            }
+          ]
+        },
+        "cabs": {
+          "identity": "fb4d1d72778cf76b45f850fbb8a19d15e7892ba5efed18aee6eeda0a40083466",
+          "provenance": {
+            "source": "Methyl-halide element-resolved records",
+            "version": "T",
+            "license": "See per-element coefficient sources",
+            "checksum": "df7cc75ed0103d4600d2108bf2d17aaf2973186e0faaad958e92255b037883b5"
+          },
+          "elements": [
+            {
+              "atomic_number": 1,
+              "content_sha256": "cfc9094400f0c20c83df67e0f2a6891fce764bd29ab93ee15e2a573fc89d381d",
+              "records": [
+                {
+                  "bse": "cc-pVTZ-F12-OPTRI"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero"
+            },
+            {
+              "atomic_number": 6,
+              "content_sha256": "4afd7d175039bdcd808c3bd7258422bc5d88dcd8295fcd8c608410a0d3adf373",
+              "records": [
+                {
+                  "bse": "cc-pVTZ-F12-OPTRI"
+                }
+              ],
+              "layout": "native",
+              "groups": "position"
+            },
+            {
+              "atomic_number": 35,
+              "content_sha256": "c8f9cfe636285c4c9dceb533800b8f732a9815c9544fad0b4324287ceaf5f7d6",
+              "records": [
+                {
+                  "file": "Br_aug-cc-pVTZ-PP-F12_OPTRI.nwchem"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero"
+            }
+          ]
+        }
+      }
+    },
+    "i-d": {
+      "halogen": "I",
+      "cardinal": 2,
+      "basis_id": "d09384cc7ad904ff069194371bb36743d1701c623bb58c90d75e43b144e6bb36",
+      "roles": {
+        "orbital": {
+          "identity": "58052a48c736b5796a8e6f060716b480c2e1e1201553261f6d23c0e0b0719d0c",
+          "provenance": {
+            "source": "Methyl-halide element-resolved records",
+            "version": "D",
+            "license": "See per-element coefficient sources",
+            "checksum": "8cc14dc3a16c031c7387fdc72679ab13ffed723b924b0033bf764bd33055bbc4"
+          },
+          "elements": [
+            {
+              "atomic_number": 1,
+              "content_sha256": "96f7240d5d589cefd4b27c4e012f13b63680ea49cee44dee40efe28fc933af5c",
+              "records": [
+                {
+                  "bse": "cc-pVDZ-F12"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero"
+            },
+            {
+              "atomic_number": 6,
+              "content_sha256": "e3917076ddb866bc5eea8887867d3f756b0b7334da60dd8cc545e87b315ba143",
+              "records": [
+                {
+                  "bse": "cc-pVDZ-F12"
+                },
+                {
+                  "file": "C_aug-cc-pVDZ-F12_diffuse.nwchem"
+                }
+              ],
+              "layout": "bse-standard",
+              "groups": "position"
+            },
+            {
+              "atomic_number": 53,
+              "content_sha256": "395895ec2bffe41d795b64a3c9745e158aa7e1347acc2694fca7560c8b20b771",
+              "records": [
+                {
+                  "file": "I_aug-cc-pVDZ-PP-F12.nwchem"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero",
+              "ecp": {
+                "bse": "cc-pVDZ-PP",
+                "text": "float-repr"
+              }
+            }
+          ]
+        },
+        "jkfit": {
+          "identity": "3adaa7ee9e48c5d09552752975fa519a405f18ee0e3dc018876fe0decd0f1546",
+          "provenance": {
+            "source": "Methyl-halide element-resolved records",
+            "version": "D",
+            "license": "See per-element coefficient sources",
+            "checksum": "a6e09c5c8233a3f128617b3c113cb7c07b0e593cb730a9eb45bffaf995b4110e"
+          },
+          "elements": [
+            {
+              "atomic_number": 1,
+              "content_sha256": "bf11c70bfe971463f3530ca810e50932a844bba80f0b54d1ea14cc6925fdef70",
+              "records": [
+                {
+                  "bse": "def2-universal-JKFIT"
+                }
+              ],
+              "layout": "native",
+              "groups": "position"
+            },
+            {
+              "atomic_number": 6,
+              "content_sha256": "8237aff18f432b9b36bd5f5cac3b5c9edbeee500441772e9eeed89ea283d3e4e",
+              "records": [
+                {
+                  "bse": "def2-universal-JKFIT"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero"
+            },
+            {
+              "atomic_number": 53,
+              "content_sha256": "805d83e482a851b19c8e6ceef1cf19144aec9b0424942d069c985430dd09e46b",
+              "records": [
+                {
+                  "bse": "def2-universal-JKFIT"
+                }
+              ],
+              "layout": "native",
+              "groups": "position"
+            }
+          ]
+        },
+        "ri": {
+          "identity": "2f4e8e0354cfe2f525ed2492fc23e83eaa4f81ede4605ed3e7a37d56f39dd7fe",
+          "provenance": {
+            "source": "Methyl-halide element-resolved records",
+            "version": "D",
+            "license": "See per-element coefficient sources",
+            "checksum": "aeda60deb6d6dc7df3419d236a660ad631440048ed38eac1c114a9285dd5b332"
+          },
+          "elements": [
+            {
+              "atomic_number": 1,
+              "content_sha256": "ff2198eea86f947419584f9cf3c08b2bdceb65203a0deb8dff4b9c214723d41d",
+              "records": [
+                {
+                  "file": "H_cc-pVDZ-F12_MP2FIT.nwchem"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero"
+            },
+            {
+              "atomic_number": 6,
+              "content_sha256": "d534f224aab2dc73148a97eeb59b3bbce7acebaf8a6f6b8efd99b9c1d8a4e5ee",
+              "records": [
+                {
+                  "bse": "aug-cc-pVTZ-RIFIT"
+                }
+              ],
+              "layout": "sorted-by-l",
+              "groups": "source"
+            },
+            {
+              "atomic_number": 53,
+              "content_sha256": "d21b2b477b5adcc76b777afa29803ef63abf2b7879ce179c4db5316eb636a90c",
+              "records": [
+                {
+                  "file": "I_aug-cc-pVDZ-PP-F12_MP2FIT.nwchem"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero"
+            }
+          ]
+        },
+        "cabs": {
+          "identity": "aa4ca90d745129b8dd307b2d0c943841692503bceb662dfdcefc86b9fe55ff24",
+          "provenance": {
+            "source": "Methyl-halide element-resolved records",
+            "version": "D",
+            "license": "See per-element coefficient sources",
+            "checksum": "792d6e049dc699e6f1689b6c1a1a100a31ad9fa0b1179c67cbede4bd33bfea17"
+          },
+          "elements": [
+            {
+              "atomic_number": 1,
+              "content_sha256": "220866f97dcb616cc73d7f26843da77a9cd56e313d766767d8b76d33e7693ff5",
+              "records": [
+                {
+                  "bse": "cc-pVDZ-F12-OPTRI"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero"
+            },
+            {
+              "atomic_number": 6,
+              "content_sha256": "3ad92c7c8ef0c14c030b3c946251e57ac929fea8848b2214233e3043200c4f61",
+              "records": [
+                {
+                  "bse": "cc-pVDZ-F12-OPTRI"
+                }
+              ],
+              "layout": "native",
+              "groups": "position"
+            },
+            {
+              "atomic_number": 53,
+              "content_sha256": "09e6496fcc1045539f9aefff0d6a920f0317545f4d55d6b7398df39bc58e0837",
+              "records": [
+                {
+                  "file": "I_aug-cc-pVDZ-PP-F12_OPTRI.nwchem"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero"
+            }
+          ]
+        }
+      }
+    },
+    "i-t": {
+      "halogen": "I",
+      "cardinal": 3,
+      "basis_id": "07a4d183e49dc2eee32057a055db76352cdf4961d4de4fe34a375a443268e3ca",
+      "roles": {
+        "orbital": {
+          "identity": "1db84395c0fc5a104fa19d83ac76fd0305acab04a25c2071b07adf33f875355b",
+          "provenance": {
+            "source": "Methyl-halide element-resolved records",
+            "version": "T",
+            "license": "See per-element coefficient sources",
+            "checksum": "8a64c03f931e2081f8f239dc24795d0d55c55704ff78d4d99c212864bff9d52d"
+          },
+          "elements": [
+            {
+              "atomic_number": 1,
+              "content_sha256": "cff67a29f0a3d043d32e5b3b60d3d209723d40bb4875423a6a5b184ecccd7987",
+              "records": [
+                {
+                  "bse": "cc-pVTZ-F12"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero"
+            },
+            {
+              "atomic_number": 6,
+              "content_sha256": "f1b7dae12aa379d589bf9648de0101e06e783adc44ef9de04bd0ea20d4eba1a2",
+              "records": [
+                {
+                  "bse": "cc-pVTZ-F12"
+                },
+                {
+                  "file": "C_aug-cc-pVTZ-F12_diffuse.nwchem"
+                }
+              ],
+              "layout": "bse-standard",
+              "groups": "position"
+            },
+            {
+              "atomic_number": 53,
+              "content_sha256": "741029e6880e7ab79db3d6e4aa349fbb5bc2e93d2be7ca03e51484f12cedcd44",
+              "records": [
+                {
+                  "file": "I_aug-cc-pVTZ-PP-F12.nwchem"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero",
+              "ecp": {
+                "bse": "cc-pVTZ-PP",
+                "text": "float-repr"
+              }
+            }
+          ]
+        },
+        "jkfit": {
+          "identity": "edec765157bcae94a0376fa13a6de228fbcd7f87041c8233e8de403a473b63a4",
+          "provenance": {
+            "source": "Methyl-halide element-resolved records",
+            "version": "T",
+            "license": "See per-element coefficient sources",
+            "checksum": "37bb8f8ee7663c28368e040f12b79fbf116bfbe7e5f75862a56dc53c60583103"
+          },
+          "elements": [
+            {
+              "atomic_number": 1,
+              "content_sha256": "bf11c70bfe971463f3530ca810e50932a844bba80f0b54d1ea14cc6925fdef70",
+              "records": [
+                {
+                  "bse": "def2-universal-JKFIT"
+                }
+              ],
+              "layout": "native",
+              "groups": "position"
+            },
+            {
+              "atomic_number": 6,
+              "content_sha256": "8237aff18f432b9b36bd5f5cac3b5c9edbeee500441772e9eeed89ea283d3e4e",
+              "records": [
+                {
+                  "bse": "def2-universal-JKFIT"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero"
+            },
+            {
+              "atomic_number": 53,
+              "content_sha256": "805d83e482a851b19c8e6ceef1cf19144aec9b0424942d069c985430dd09e46b",
+              "records": [
+                {
+                  "bse": "def2-universal-JKFIT"
+                }
+              ],
+              "layout": "native",
+              "groups": "position"
+            }
+          ]
+        },
+        "ri": {
+          "identity": "52743a531df87c321df6a17364fcdf73a7ddc6b5fdf076a26d7f7dcba7f8ad3e",
+          "provenance": {
+            "source": "Methyl-halide element-resolved records",
+            "version": "T",
+            "license": "See per-element coefficient sources",
+            "checksum": "2bd59255d2fc66516faf8d9a52f8689333f7393b75bdf64ef2f22a285037c4e8"
+          },
+          "elements": [
+            {
+              "atomic_number": 1,
+              "content_sha256": "b903db67ddd17eb4e82b89c83f50f21d927745330a3f77df576fc0cc31035542",
+              "records": [
+                {
+                  "file": "H_cc-pVTZ-F12_MP2FIT.nwchem"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero"
+            },
+            {
+              "atomic_number": 6,
+              "content_sha256": "d534f224aab2dc73148a97eeb59b3bbce7acebaf8a6f6b8efd99b9c1d8a4e5ee",
+              "records": [
+                {
+                  "bse": "aug-cc-pVTZ-RIFIT"
+                }
+              ],
+              "layout": "sorted-by-l",
+              "groups": "source"
+            },
+            {
+              "atomic_number": 53,
+              "content_sha256": "0b2ac92ef18e6c8e8aa187d7f166b31f60e3d748a2ea4cdf4df9fc68233a4d3f",
+              "records": [
+                {
+                  "file": "I_aug-cc-pVTZ-PP-F12_MP2FIT.nwchem"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero"
+            }
+          ]
+        },
+        "cabs": {
+          "identity": "777670d923f472a25f0871f234710a5e43b62c16655b1415870a52b0ee7d4ea3",
+          "provenance": {
+            "source": "Methyl-halide element-resolved records",
+            "version": "T",
+            "license": "See per-element coefficient sources",
+            "checksum": "a37d079dfca2b9756321b0da26666a7f1124c4951d5357463ad91c7ead33f27a"
+          },
+          "elements": [
+            {
+              "atomic_number": 1,
+              "content_sha256": "cfc9094400f0c20c83df67e0f2a6891fce764bd29ab93ee15e2a573fc89d381d",
+              "records": [
+                {
+                  "bse": "cc-pVTZ-F12-OPTRI"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero"
+            },
+            {
+              "atomic_number": 6,
+              "content_sha256": "4afd7d175039bdcd808c3bd7258422bc5d88dcd8295fcd8c608410a0d3adf373",
+              "records": [
+                {
+                  "bse": "cc-pVTZ-F12-OPTRI"
+                }
+              ],
+              "layout": "native",
+              "groups": "position"
+            },
+            {
+              "atomic_number": 53,
+              "content_sha256": "0eabf47144fdabdcef307c2d4c57cb358b611f326676af073cf836f1259a053d",
+              "records": [
+                {
+                  "file": "I_aug-cc-pVTZ-PP-F12_OPTRI.nwchem"
+                }
+              ],
+              "layout": "native",
+              "groups": "zero"
+            }
+          ]
+        }
+      }
+    }
+  }
+}
