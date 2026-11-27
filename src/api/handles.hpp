@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "cc/lambda_telemetry.hpp"
 #include "core/types.hpp"
 #include "methods/method.hpp"
 #include "scf/types.hpp"
@@ -23,6 +24,7 @@ struct generativeqc_context {
   generativeqc::core::ContextState state;
   // Borrowed by the public error getter: mutate only when recording a failure.
   std::string last_detail;
+  std::optional<generativeqc::cc::detail::LambdaTelemetry> lambda_telemetry;
   generativeqc_calculation* provider_initialization_calculation{};
   bool provider_initialization_failed_candidate{};
 };

@@ -1,5 +1,6 @@
 #include "methods/df_rccsdt_method.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <memory>
 #include <mutex>
@@ -13,6 +14,7 @@
 #include "methods/df_ccsdt_force.hpp"
 #endif
 #include "methods/rccsd_method.hpp"
+#include "molecule/scalar_hamiltonian_identity.hpp"
 
 namespace generativeqc::methods::detail {
 namespace {
@@ -115,6 +117,71 @@ class DfRccsdtPrepared final : public PreparedCalculation {
                         "unsupported DF correlation companions");
     return execute_group(compute_forces, companions);
   }
+
+  FocalRccF12bValues f12b_on_reference(
+      const std::shared_ptr<const hf::PhysicalReference>& retained,
+      const molecule::ScalarHamiltonianIdentity& orbital,
+      const molecule::ScalarHamiltonianIdentity& jk, std::size_t retained_bytes,
+      FocalRccF12bOptions options) {
+    (void)jk;
+    if (!full_df_reference_ || descriptor_.method != GENERATIVEQC_METHOD_DF_RCCSD_T ||
+        !orbital.matches(system_))
+      throw std::invalid_argument(
+          "focal spatial CCSD-F12b requires a matching full-DF CUDA RHF determinant");
+    if (!retained)
+      throw MethodError(GENERATIVEQC_STATUS_NOT_IMPLEMENTED,
+                        "focal spatial CCSD-F12b requires a retained RHF snapshot");
+    std::lock_guard<std::mutex> lock(mutex_);
+    last_correlation_.reset();
+    last_performance_.reset();
+#if GENERATIVEQC_HAS_CUDA
+    DFCorrelationDemand demand{
+        .mp2 = false,
+        .companions = 0,
+        .df_reference = full_df_reference_,
+        .triples_occupied_partition = false,
+        .retained_reference = retained,
+        .retained_reference_bytes = retained_bytes,
+        .frozen_occupied = options.frozen_occupied,
+        .triples_occupied_weights = {},
+        .focal_triples_sources = false,
+        .triples_fp32_w = false,
+        .focal_ccsdf12b_sources = true,
+        .f12 = std::move(options.f12),
+    };
+    auto native = run_df_correlation_group_native(execution_, system_, auxiliary_, descriptor_,
+                                                  options.forces, std::move(demand), convergence_,
+                                                  options.preconvergence);
+    last_correlation_ = native.correlation;
+    last_performance_ = native.primal;
+    FocalRccF12bValues out;
+    out.energy = native.correlation_energy;
+    out.t1 = std::move(native.ccsd_t1);
+    out.t2 = std::move(native.ccsd_t2);
+    out.lambda1 = std::move(native.lambda1);
+    out.lambda2 = std::move(native.lambda2);
+    out.correlation_gradient = std::move(native.correlation_gradient);
+    out.bar_f = std::move(native.bar_f);
+    out.bar_c = std::move(native.bar_c);
+    out.ccsd_fp32_executed = native.primal.ccsd_fp32_executed != 0;
+    out.lambda_fp32_executed = options.forces && (native.lambda.df_fp32_gemm_calls > 0);
+    out.ccsd_iterations = native.solver.iterations;
+    out.lambda_iterations = native.lambda.iterations;
+    out.f12_cuda_preparations = native.solver.f12_cuda_preparations;
+    out.f12_cuda_rhs_evaluations = native.lambda.f12_cuda_rhs_evaluations;
+    out.ccsd_seconds = native.primal.solver_seconds;
+    out.lambda_seconds = native.lambda_seconds;
+    out.source_response_seconds = native.source_response_seconds;
+    out.total_seconds = native.total_seconds;
+    return out;
+#else
+    (void)retained_bytes;
+    (void)options;
+    throw MethodError(GENERATIVEQC_STATUS_NOT_IMPLEMENTED,
+                      "focal spatial CCSD-F12b requires a CUDA-enabled build");
+#endif
+  }
+
   Result execute_group(bool compute_forces, unsigned companions) {
     std::lock_guard<std::mutex> lock(mutex_);
     last_correlation_.reset();
@@ -175,6 +242,17 @@ class DfRccsdtPrepared final : public PreparedCalculation {
 };
 
 }  // namespace
+
+FocalRccF12bValues focal_rcc_f12b_values(
+    PreparedCalculation& plan, const std::shared_ptr<const hf::PhysicalReference>& retained,
+    const molecule::ScalarHamiltonianIdentity& orbital,
+    const molecule::ScalarHamiltonianIdentity& jk, std::size_t retained_reference_bytes,
+    FocalRccF12bOptions options) {
+  auto* cc = dynamic_cast<DfRccsdtPrepared*>(&plan);
+  if (!cc)
+    throw std::invalid_argument("focal spatial CCSD-F12b requires a native DF-RCCSD(T) plan");
+  return cc->f12b_on_reference(retained, orbital, jk, retained_reference_bytes, std::move(options));
+}
 
 generativeqc_status validate_df_rccsdt_system(generativeqc_method method,
                                               const core::System& system, std::string& detail) {

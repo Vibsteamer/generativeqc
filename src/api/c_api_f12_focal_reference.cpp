@@ -11,7 +11,12 @@
 
 #include "api/error.hpp"
 #include "api/handles.hpp"
+#include "cc/f12_fixed_cusp.hpp"
+#include "cc/lambda_response.hpp"
+#include "cc/solver.hpp"
+#include "generated_rccsd_cpu.hpp"
 #include "generativeqc/ucc_fitting.h"
+#include "methods/df_rccsdt_method.hpp"
 #include "molecule/basis.hpp"
 #include "posthf/capacity.hpp"
 #include "runtime/bounded_workspace.hpp"
@@ -529,4 +534,310 @@ extern "C" generativeqc_status generativeqc_focal_df_reference_owned_v1(
 
 extern "C" void generativeqc_focal_reference_destroy_v1(generativeqc_focal_reference* owner) {
   delete owner;
+}
+
+extern "C" GENERATIVEQC_API int generativeqc_focal_rcc_f12b_cuda_stage_counters_v1(void) {
+#if GENERATIVEQC_HAS_CUDA
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_f12b_v1(
+    generativeqc_calculation* calculation, const generativeqc_focal_reference* owner, int forces,
+    std::size_t frozen_occupied, const double* w_vo, std::size_t w_vo_count, const double* w_vv,
+    std::size_t w_vv_count, const double* c_f12, std::size_t c_f12_count,
+    double fixed_geminal_energy, std::uint32_t preconvergence, double* energy_out, double* t1_out,
+    std::size_t t1_count, double* t2_out, std::size_t t2_count, double* lambda1_out,
+    std::size_t lambda1_count, double* lambda2_out, std::size_t lambda2_count,
+    double* corr_gradient_out, std::size_t corr_gradient_count, double* bar_f_out,
+    std::size_t bar_f_count, double* bar_c_out, std::size_t bar_c_count, double* telemetry_out,
+    std::size_t telemetry_count) {
+  if (!calculation || !calculation->context || !owner || !energy_out ||
+      (forces != 0 && forces != 1) || preconvergence > 3 || !w_vo || !w_vv || !c_f12 ||
+      !std::isfinite(fixed_geminal_energy))
+    return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
+  auto* context = calculation->context;
+  std::lock_guard lock(context->mutex);
+  context->lambda_telemetry.reset();
+  try {
+    using namespace generativeqc;
+    runtime::df_progress::Scope trace(
+        forces ? "focal_rcc_f12b_force_sources_v1" : "focal_rcc_f12b_energy_v1", "cuda");
+    if (!owner->uhf || !owner->uhf->source_identity || !owner->rhf ||
+        owner->backend != core::kCudaBackend || owner->backend != context->state.executed_backend ||
+        owner->device != context->state.device_id)
+      throw std::invalid_argument("focal spatial CCSD-F12b requires a retained CUDA RHF owner");
+    const auto& expanded = *owner->uhf;
+    const std::size_t o_full = expanded.nocc[0];
+    if (frozen_occupied >= o_full)
+      throw std::invalid_argument(
+          "focal spatial CCSD-F12b frozen_occupied exceeds occupied count");
+    const std::size_t o_act = o_full - frozen_occupied;
+    const std::size_t n = expanded.nbf;
+    if (n <= o_full)
+      throw std::invalid_argument("focal spatial CCSD-F12b requires nonempty virtual space");
+    const std::size_t v = n - o_full;
+    const std::size_t oo = runtime::size_mul(o_act, o_act);
+    const std::size_t n1 = runtime::size_mul(o_act, v);
+    const std::size_t n2 = runtime::size_mul(oo, runtime::size_mul(v, v));
+    const std::size_t n_vo = runtime::size_mul(oo, runtime::size_mul(v, o_act));
+    const std::size_t nn = runtime::size_mul(n, n);
+    const std::size_t coords = runtime::size_mul(3, calculation->plan->atom_count());
+    if (w_vo_count != n_vo || w_vv_count != n2 || c_f12_count != n2)
+      throw std::invalid_argument("focal spatial CCSD-F12b fixed F12 buffer shape mismatch");
+    if ((t1_out && t1_count != n1) || (!t1_out && t1_count) || (t2_out && t2_count != n2) ||
+        (!t2_out && t2_count))
+      throw std::invalid_argument("focal spatial CCSD-F12b amplitude output buffer shape mismatch");
+    if ((lambda1_out && lambda1_count != n1) || (!lambda1_out && lambda1_count) ||
+        (lambda2_out && lambda2_count != n2) || (!lambda2_out && lambda2_count))
+      throw std::invalid_argument("focal spatial CCSD-F12b Lambda output buffer shape mismatch");
+    if (forces && (!t1_out || !t2_out || !lambda1_out || !lambda2_out || !corr_gradient_out ||
+                   corr_gradient_count != coords || !bar_f_out || bar_f_count != nn || !bar_c_out ||
+                   bar_c_count != nn))
+      throw std::invalid_argument("focal spatial CCSD-F12b force output buffer shape mismatch");
+    if (telemetry_out && telemetry_count < 8)
+      throw std::invalid_argument("focal spatial CCSD-F12b telemetry buffer requires >= 8 slots");
+
+    auto retained = runtime::size_add(owner->jk.storage_bytes(),
+                                     expanded.source_identity->storage_bytes());
+    auto charge = [&](const std::vector<double>& values) {
+      retained = runtime::size_add(retained, runtime::size_mul(values.capacity(), sizeof(double)));
+    };
+    charge(expanded.overlap);
+    charge(expanded.hcore);
+    for (std::size_t spin = 0; spin < 2; ++spin) {
+      charge(expanded.coefficients[spin]);
+      charge(expanded.density[spin]);
+      charge(expanded.fock[spin]);
+      charge(expanded.orbital_energies[spin]);
+    }
+
+    methods::detail::FocalRccF12bOptions options;
+    options.forces = forces != 0;
+    options.frozen_occupied = frozen_occupied;
+    options.preconvergence = static_cast<core::DfPreconvergence>(preconvergence);
+    options.f12.w_vo.assign(w_vo, w_vo + w_vo_count);
+    options.f12.w_vv.assign(w_vv, w_vv + w_vv_count);
+    options.f12.c_f12.assign(c_f12, c_f12 + c_f12_count);
+    options.f12.fixed_geminal_energy = fixed_geminal_energy;
+
+    cc::detail::reset_last_lambda_diagnostic();
+    const auto result = methods::detail::focal_rcc_f12b_values(
+        *calculation->plan, owner->rhf, *expanded.source_identity, owner->jk, retained,
+        std::move(options));
+    if (!std::isfinite(result.energy))
+      throw std::runtime_error("nonfinite focal spatial CCSD-F12b energy");
+    *energy_out = result.energy;
+    if (t1_out) {
+      if (result.t1.size() != n1)
+        throw std::runtime_error("focal spatial CCSD-F12b t1 output size mismatch");
+      std::copy(result.t1.begin(), result.t1.end(), t1_out);
+    }
+    if (t2_out) {
+      if (result.t2.size() != n2)
+        throw std::runtime_error("focal spatial CCSD-F12b t2 output size mismatch");
+      std::copy(result.t2.begin(), result.t2.end(), t2_out);
+    }
+    if (forces) {
+      if (result.lambda1.size() != n1 || result.lambda2.size() != n2 ||
+          result.correlation_gradient.size() != coords || result.bar_f.size() != nn ||
+          result.bar_c.size() != nn)
+        throw std::runtime_error("focal spatial CCSD-F12b force output size mismatch");
+      std::copy(result.lambda1.begin(), result.lambda1.end(), lambda1_out);
+      std::copy(result.lambda2.begin(), result.lambda2.end(), lambda2_out);
+      std::copy(result.correlation_gradient.begin(), result.correlation_gradient.end(),
+                corr_gradient_out);
+      std::copy(result.bar_f.begin(), result.bar_f.end(), bar_f_out);
+      std::copy(result.bar_c.begin(), result.bar_c.end(), bar_c_out);
+    }
+    if (telemetry_out) {
+      telemetry_out[0] = result.ccsd_fp32_executed ? 1.0 : 0.0;
+      telemetry_out[1] = result.lambda_fp32_executed ? 1.0 : 0.0;
+      telemetry_out[2] = static_cast<double>(result.ccsd_iterations);
+      telemetry_out[3] = static_cast<double>(result.lambda_iterations);
+      telemetry_out[4] = result.ccsd_seconds;
+      telemetry_out[5] = result.lambda_seconds;
+      telemetry_out[6] = result.source_response_seconds;
+      telemetry_out[7] = result.total_seconds;
+      if (telemetry_count >= 9) telemetry_out[8] = static_cast<double>(result.f12_cuda_preparations);
+      if (telemetry_count >= 10) telemetry_out[9] = static_cast<double>(result.f12_cuda_rhs_evaluations);
+    }
+    if (forces) cc::detail::capture_last_lambda_telemetry(context->lambda_telemetry);
+    trace.finish();
+    return GENERATIVEQC_STATUS_SUCCESS;
+  } catch (const std::length_error& error) {
+    record_oom_detail_noalloc(context->last_detail, error.what());
+    return GENERATIVEQC_STATUS_OUT_OF_MEMORY;
+  } catch (const std::bad_alloc& error) {
+    record_oom_detail_noalloc(context->last_detail, error.what());
+    return GENERATIVEQC_STATUS_OUT_OF_MEMORY;
+  } catch (...) {
+    return generativeqc::api::map_exception(&context->last_detail);
+  }
+}
+
+extern "C" GENERATIVEQC_API generativeqc_status generativeqc_rcc_f12b_cpu_solve_v1(
+    std::size_t nocc, std::size_t nvir, const double* foo, const double* fov, const double* fvv,
+    const double* ovov, const double* ovvo, const double* oovv, const double* ovvv,
+    const double* ovoo, const double* oooo, const double* vvvv, const double* eps_o,
+    const double* eps_v, const double* w_vo, const double* w_vv, const double* c_f12,
+    double fixed_geminal_energy, int solve_lambda, std::size_t max_bytes, double* energy_out,
+    double* t1_out, double* t2_out, double* lambda1_out, double* lambda2_out, double* bar_foo_out,
+    double* bar_fov_out, double* bar_fvv_out) {
+  if (!nocc || !nvir || !foo || !fov || !fvv || !ovov || !ovvo || !oovv || !ovvv || !ovoo ||
+      !oooo || !vvvv || !eps_o || !eps_v || !w_vo || !w_vv || !c_f12 ||
+      !std::isfinite(fixed_geminal_energy) || (solve_lambda != 0 && solve_lambda != 1) ||
+      !max_bytes || !energy_out || !t1_out || !t2_out)
+    return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
+  if (solve_lambda && (!lambda1_out || !lambda2_out)) return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
+  try {
+    using namespace generativeqc;
+    const std::size_t o = nocc, v = nvir;
+    const std::size_t oo = runtime::size_mul(o, o), vv = runtime::size_mul(v, v);
+    const std::size_t n1 = runtime::size_mul(o, v), n2 = runtime::size_mul(oo, vv);
+    const std::size_t n_vo = runtime::size_mul(oo, runtime::size_mul(v, o));
+    const std::size_t n_ovvv = runtime::size_mul(n1, vv);
+    const std::size_t n_ovoo = runtime::size_mul(n1, oo);
+    const std::size_t n_oooo = runtime::size_mul(oo, oo);
+    const std::size_t n_vvvv = runtime::size_mul(vv, vv);
+
+    // Enforce the caller's byte budget BEFORE copying/allocating vvvv or any
+    // other dense Problem/workspace buffer.
+    std::size_t upfront_elems = 0;
+    for (const std::size_t count :
+         {oo, n1, vv, n2, n2, n2, n_ovvv, n_ovoo, n_oooo, n_vvvv, n_vo, n2, n2, n1, n2, n1, n2,
+          cc::generated::iteration_arena_elements(o, v),
+          cc::generated::replay_arena_elements(o, v)}) {
+      upfront_elems = runtime::size_add(upfront_elems, count);
+    }
+    if (runtime::size_mul(upfront_elems, sizeof(double)) > max_bytes)
+      return GENERATIVEQC_STATUS_OUT_OF_MEMORY;
+
+    cc::Problem p;
+    p.nocc = o;
+    p.nvir = v;
+    p.foo.assign(foo, foo + oo);
+    p.fov.assign(fov, fov + n1);
+    p.fvv.assign(fvv, fvv + vv);
+    p.ovov.assign(ovov, ovov + n2);
+    p.ovvo.assign(ovvo, ovvo + n2);
+    p.oovv.assign(oovv, oovv + n2);
+    p.ovvv.assign(ovvv, ovvv + n_ovvv);
+    p.ovoo.assign(ovoo, ovoo + n_ovoo);
+    p.oooo.assign(oooo, oooo + n_oooo);
+    p.vvvv.assign(vvvv, vvvv + n_vvvv);
+    p.f12.w_vo.assign(w_vo, w_vo + n_vo);
+    p.f12.w_vv.assign(w_vv, w_vv + n2);
+    p.f12.c_f12.assign(c_f12, c_f12 + n2);
+    p.f12.fixed_geminal_energy = fixed_geminal_energy;
+    cc::f12::validate(o, v, p.f12);
+    p.f12.w_vv = cc::f12::symmetrized_pair_copy(o, v, p.f12.w_vv);
+    p.f12.c_f12 = cc::f12::symmetrized_pair_copy(o, v, p.f12.c_f12);
+
+    cc::SolverOptions opts;
+    opts.max_iterations = 150;
+    opts.energy_tolerance = 1e-13;
+    opts.residual_tolerance = 1e-12;
+    opts.max_bytes = max_bytes;
+    std::vector<double> eps;
+    eps.reserve(o + v);
+    eps.insert(eps.end(), eps_o, eps_o + o);
+    eps.insert(eps.end(), eps_v, eps_v + v);
+    cc::initialize_canonical_denominators(p, eps, opts, false);
+
+    p.initial_t1.assign(n1, 0.0);
+    p.initial_t2.resize(n2);
+    for (std::size_t i = 0; i < o; ++i)
+      for (std::size_t j = 0; j < o; ++j)
+        for (std::size_t a = 0; a < v; ++a)
+          for (std::size_t b = 0; b < v; ++b) {
+            const auto t = ((i * o + j) * v + a) * v + b;
+            const auto mate = ((j * o + i) * v + b) * v + a;
+            if (t > mate) continue;
+            const auto g = ((i * v + a) * o + j) * v + b;
+            const auto g_mate = ((j * v + b) * o + i) * v + a;
+            const double val =
+                (0.5 * (p.ovov[g] + p.ovov[g_mate]) + p.f12.w_vv[t] + p.f12.c_f12[t]) / p.d2[t];
+            p.initial_t2[t] = p.initial_t2[mate] = val;
+          }
+
+    const auto solved = cc::solve_cpu(p, opts);
+    if (!solved.converged()) return GENERATIVEQC_STATUS_NUMERICAL_FAILURE;
+    *energy_out = solved.correlation_energy;
+    std::copy(solved.t1.begin(), solved.t1.end(), t1_out);
+    std::copy(solved.t2.begin(), solved.t2.end(), t2_out);
+
+    if (solve_lambda) {
+      cc::LambdaOptions lopts;
+      lopts.cc_tolerance = 1e-10;
+      lopts.lambda_tolerance = 1e-10;
+      lopts.max_bytes = max_bytes;
+      lopts.gmres.absolute_tolerance = 1e-13;
+      lopts.gmres.max_workspace_bytes = max_bytes;
+      const auto lambda = cc::solve_lambda_cpu(p, solved, lopts);
+      if (!lambda.converged()) return GENERATIVEQC_STATUS_NUMERICAL_FAILURE;
+      std::copy(lambda.lambda1.begin(), lambda.lambda1.end(), lambda1_out);
+      std::copy(lambda.lambda2.begin(), lambda.lambda2.end(), lambda2_out);
+      if (bar_foo_out || bar_fov_out || bar_fvv_out) {
+        const auto arena_elems = std::max({cc::generated::parameter_foo_arena_elements(o, v),
+                                           cc::generated::parameter_fov_arena_elements(o, v),
+                                           cc::generated::parameter_fvv_arena_elements(o, v)});
+        const auto live_bytes = runtime::size_add(
+            cc::problem_host_bytes(p),
+            runtime::size_mul(runtime::size_add(runtime::size_mul(2, runtime::size_add(n1, n2)),
+                                                arena_elems),
+                              sizeof(double)));
+        if (live_bytes > max_bytes) return GENERATIVEQC_STATUS_OUT_OF_MEMORY;
+        std::vector<double> arena(arena_elems);
+        const cc::generated::Inputs in{
+            p.foo.data(),  p.fov.data(),  p.fvv.data(),  p.ovov.data(),   p.ovvo.data(),
+            p.oovv.data(), p.ovvv.data(), p.ovoo.data(), p.oooo.data(),   p.vvvv.data(),
+            p.d1.data(),   p.d2.data(),   solved.t1.data(), solved.t2.data()};
+        const double energy_seed = 1.0;
+        if (bar_foo_out) {
+          const auto out = cc::generated::run_parameter_foo_cpu(
+              o, v, in, &energy_seed, lambda.lambda1.data(), lambda.lambda2.data(), arena.data(),
+              arena.size());
+          std::copy_n(out.values, oo, bar_foo_out);
+        }
+        if (bar_fov_out) {
+          const auto out = cc::generated::run_parameter_fov_cpu(
+              o, v, in, &energy_seed, lambda.lambda1.data(), lambda.lambda2.data(), arena.data(),
+              arena.size());
+          std::copy_n(out.values, n1, bar_fov_out);
+        }
+        if (bar_fvv_out) {
+          const auto out = cc::generated::run_parameter_fvv_cpu(
+              o, v, in, &energy_seed, lambda.lambda1.data(), lambda.lambda2.data(), arena.data(),
+              arena.size());
+          std::copy_n(out.values, vv, bar_fvv_out);
+        }
+      }
+    }
+    return GENERATIVEQC_STATUS_SUCCESS;
+  } catch (const std::length_error&) {
+    return GENERATIVEQC_STATUS_OUT_OF_MEMORY;
+  } catch (const std::bad_alloc&) {
+    return GENERATIVEQC_STATUS_OUT_OF_MEMORY;
+  } catch (...) {
+    return generativeqc::api::map_exception(nullptr);
+  }
+}
+
+extern "C" GENERATIVEQC_API void generativeqc_cc_reset_context_lambda_telemetry_v1(
+    generativeqc_context* context) {
+  if (!context) return;
+  std::lock_guard lock(context->mutex);
+  context->lambda_telemetry.reset();
+}
+
+extern "C" GENERATIVEQC_API int generativeqc_cc_context_lambda_telemetry_v1(
+    const generativeqc_context* context, double* scalars, std::size_t scalar_count,
+    std::uint64_t* counts, std::size_t count_len, char* reason, std::size_t reason_len) {
+  if (!context) return 0;
+  std::lock_guard lock(context->mutex);
+  return generativeqc::cc::detail::copy_lambda_telemetry(
+      context->lambda_telemetry, scalars, scalar_count, counts, count_len, reason, reason_len);
 }

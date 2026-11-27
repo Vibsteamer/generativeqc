@@ -41,6 +41,14 @@ class DFLambdaActions {
    * every approximate buffer permanently before strict solve/audit/VJP work.
    */
   bool begin_mixed_precision();
+  /** Suspend FP32 auxiliary actions temporarily so an exact FP64 residual check
+   * can execute inside multi-pass mixed-precision refinement before sealing the epoch.
+   */
+  void suspend_mixed_precision();
+  /** Re-cast immutable FP32 inputs into the shared scratch tail and resume FP32
+   * auxiliary actions after an exact FP64 residual check.
+   */
+  void resume_mixed_precision();
   void finish_mixed_precision();
   void transpose(bool independent, std::span<const double> one, std::span<const double> two,
                  std::vector<double>& out_one, std::vector<double>& out_two);
@@ -51,7 +59,8 @@ class DFLambdaActions {
    * This entry point neither stages dimension-sized data nor fences success.
    */
   [[nodiscard]] std::pair<const double*, const double*> transpose_device(bool independent);
-  void seeds(std::span<const double> one, std::span<const double> two);
+  void seeds(std::span<const double> one, std::span<const double> two,
+             double energy_weight = 1.0);
   std::vector<double> parameter(std::string_view name, std::size_t count);
   std::pair<std::vector<double>, std::vector<double>> virtual_factors();
   const LambdaDiagnostic& diagnostic() const noexcept;

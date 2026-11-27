@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -19,6 +20,7 @@
 
 #include "cc/cuda_solver_support.cuh"
 #include "cc/df_lambda.hpp"
+#include "cc/lambda_krylov.hpp"
 #include "generated_rccsd_cpu.hpp"
 #include "response/resident_krylov.hpp"
 #include "response/solve.hpp"
@@ -121,24 +123,45 @@ struct AmplitudeLayout {
 
   void pack_weighted(std::span<const double> one, std::span<const double> two,
                      std::span<double> output) const {
-    validate_dense(one, two);
+    if (one.size() != n1 || two.size() != n2)
+      throw std::invalid_argument("RCCSD CUDA Lambda amplitude shape mismatch");
     if (output.size() != dimension())
       throw std::invalid_argument("RCCSD CUDA Lambda packed output shape mismatch");
-    std::copy(one.begin(), one.end(), output.begin());
-    for (std::size_t k = 0; k < representatives.size(); ++k)
-      output[n1 + k] = sqrt_weights[n1 + k] * two[representatives[k]];
+    for (std::size_t idx = 0; idx < n1; ++idx) {
+      const double value = one[idx];
+      if (!std::isfinite(value)) throw std::invalid_argument("nonfinite RCCSD Lambda singles");
+      output[idx] = value;
+    }
+    const auto* reps = representatives.data();
+    const auto* mates = partners.data();
+    const auto* w = sqrt_weights.data() + n1;
+    const auto* two_ptr = two.data();
+    auto* out_pairs = output.data() + n1;
+    const auto count = representatives.size();
+    for (std::size_t k = 0; k < count; ++k) {
+      const double first = two_ptr[reps[k]], second = two_ptr[mates[k]];
+      if (!std::isfinite(first) || !std::isfinite(second) ||
+          std::abs(first - second) > 1e-10 * (1.0 + std::max(std::abs(first), std::abs(second))))
+        throw std::invalid_argument("RCCSD doubles violate simultaneous pair symmetry");
+      out_pairs[k] = w[k] * first;
+    }
   }
 
   void unpack_weighted(std::span<const double> packed, std::span<double> one,
                        std::span<double> two) const {
     if (packed.size() != dimension() || one.size() != n1 || two.size() != n2)
       throw std::invalid_argument("RCCSD CUDA Lambda unpack shape mismatch");
-    std::fill(two.begin(), two.end(), 0.0);
     std::copy_n(packed.begin(), static_cast<std::ptrdiff_t>(n1), one.begin());
-    for (std::size_t k = 0; k < representatives.size(); ++k) {
-      const double value = packed[n1 + k] / sqrt_weights[n1 + k];
-      two[representatives[k]] = value;
-      two[partners[k]] = value;
+    const auto* reps = representatives.data();
+    const auto* mates = partners.data();
+    const auto* w = sqrt_weights.data() + n1;
+    const auto* in_pairs = packed.data() + n1;
+    auto* two_ptr = two.data();
+    const auto count = representatives.size();
+    for (std::size_t k = 0; k < count; ++k) {
+      const double value = in_pairs[k] / w[k];
+      two_ptr[reps[k]] = value;
+      two_ptr[mates[k]] = value;
     }
   }
 };
@@ -341,6 +364,7 @@ class CudaLambdaActions {
     target.df_auxiliary_slices = d.df_auxiliary_slices;
     target.df_contraction_terms = d.df_contraction_terms;
     target.df_generated_kernels = d.df_generated_kernels;
+    target.f12_cuda_rhs_evaluations = d.f12_cuda_rhs_evaluations;
     target.df_auxiliary_reduction = d.df_auxiliary_reduction;
     target.df_preparation_calls = d.df_preparation_calls;
     target.df_reduced_actions = d.df_reduced_actions;
@@ -374,6 +398,10 @@ class CudaLambdaActions {
     target.df_fp32_gemm_calls = d.df_fp32_gemm_calls;
     target.df_fp32_gemm_summands = d.df_fp32_gemm_summands;
     target.df_precision_cast_elements = d.df_precision_cast_elements;
+    [&](auto& dst, const auto& src) {
+      if constexpr (requires { dst.df_primal_batch_size; src.df_primal_batch_size; })
+        dst.df_primal_batch_size = src.df_primal_batch_size;
+    }(target, d);
     target.mixed_program_hash = d.mixed_program_hash;
 
     target.shared_program_hash = d.shared_program_hash;
@@ -447,19 +475,61 @@ class CudaLambdaActions {
     transfers.complete();
   }
 
-  bool begin_mixed_precision() { return df_ && df_->begin_mixed_precision(); }
+  bool begin_mixed_precision() {
+    mixed_active_ = df_ && df_->begin_mixed_precision();
+    return mixed_active_;
+  }
+  void suspend_mixed_precision() {
+    if (df_) {
+      [](auto& d) {
+        if constexpr (requires { d.suspend_mixed_precision(); }) d.suspend_mixed_precision();
+      }(*df_);
+    }
+    mixed_active_ = false;
+  }
+  void resume_mixed_precision() {
+    if (df_) {
+      [](auto& d) {
+        if constexpr (requires { d.resume_mixed_precision(); }) d.resume_mixed_precision();
+      }(*df_);
+      mixed_active_ = true;
+    }
+  }
   void finish_mixed_precision() {
     if (df_) df_->finish_mixed_precision();
+    mixed_active_ = false;
   }
+  void add_action_time(double seconds) noexcept {
+    if (mixed_active_)
+      mixed_action_seconds_ += seconds;
+    else
+      strict_action_seconds_ += seconds;
+  }
+  void record_mixed_summary(std::size_t passes, std::size_t strict_refinement_acts,
+                            const char* reason) noexcept {
+    mixed_refinement_passes_ = passes;
+    refinement_strict_actions_ = strict_refinement_acts;
+    mixed_handoff_reason_ = reason;
+  }
+  double mixed_action_seconds() const noexcept { return mixed_action_seconds_; }
+  double strict_action_seconds() const noexcept { return strict_action_seconds_; }
+  std::size_t mixed_refinement_passes() const noexcept { return mixed_refinement_passes_; }
+  std::size_t refinement_strict_actions() const noexcept { return refinement_strict_actions_; }
+  std::size_t mixed_gcr_history_limit() const noexcept {
+    return df_ ? df_->diagnostic().df_mixed_gcr_history_limit : 0;
+  }
+  const char* mixed_handoff_reason() const noexcept { return mixed_handoff_reason_; }
 
-  void set_parameter_seeds(std::span<const double> lambda1, std::span<const double> lambda2) {
+  void set_parameter_seeds(std::span<const double> lambda1, std::span<const double> lambda2,
+                           double energy_seed = 1.0) {
     if (df_) {
-      df_->seeds(lambda1, lambda2);
+      df_->seeds(lambda1, lambda2, energy_seed);
       return;
     }
     if (lambda1.size() != layout_.n1 || lambda2.size() != layout_.n2)
       throw std::invalid_argument("RCCSD CUDA parameter-response seed shape mismatch");
-    const double energy_seed = 1.0;
+    if (!std::isfinite(energy_seed))
+      throw std::invalid_argument("RCCSD CUDA parameter-response energy seed must be finite");
     HostTransferFence transfers(stream_);
     cuda_check(cudaMemcpyAsync(state_.bar_correlation_energy, &energy_seed, sizeof(double),
                                cudaMemcpyHostToDevice, stream_));
@@ -542,6 +612,12 @@ class CudaLambdaActions {
   std::size_t h2d_bytes_{};
   std::size_t d2h_bytes_{};
   std::size_t synchronizations_{};
+  bool mixed_active_{};
+  double mixed_action_seconds_{};
+  double strict_action_seconds_{};
+  std::size_t mixed_refinement_passes_{};
+  std::size_t refinement_strict_actions_{};
+  const char* mixed_handoff_reason_{};
 };
 
 /** Optional vector owner borrowing the immutable terminal action and stream.
@@ -751,6 +827,11 @@ double max_abs(std::span<const double> values) {
 LambdaResult solve_impl(const Problem& p, const SolverResult& cc, std::span<const double> t1_source,
                         std::span<const double> t2_source, int device, const LambdaOptions& options,
                         CudaFixedOrbitalResponseResult* fixed_orbital) {
+  using Clock = std::chrono::steady_clock;
+  const auto elapsed = [](Clock::time_point t0) {
+    return std::chrono::duration<double>(Clock::now() - t0).count();
+  };
+  const auto precompute_begin = Clock::now();
   using Trace = runtime::df_progress::Scope;
   Trace complete("cc_lambda_complete");
   Trace initialization("cc_lambda_initialization");
@@ -762,6 +843,11 @@ LambdaResult solve_impl(const Problem& p, const SolverResult& cc, std::span<cons
     throw std::invalid_argument("nonfinite RCCSD CUDA Lambda primal energy");
 
   const bool with_source = !t1_source.empty() || !t2_source.empty();
+  const bool f12_active = p.f12.active();
+  if (f12_active && !p.naux)
+    throw std::invalid_argument("CUDA RCCSD-F12b Lambda requires density-fitted virtual factors");
+  if (options.energy_source_only && !with_source)
+    throw std::invalid_argument("RCCSD CUDA energy_source_only Lambda requires an energy source");
   AmplitudeLayout validation_layout(p.nocc, p.nvir);
   validation_layout.initialize();
   if (with_source &&
@@ -772,7 +858,8 @@ LambdaResult solve_impl(const Problem& p, const SolverResult& cc, std::span<cons
       if (!std::isfinite(value))
         throw std::invalid_argument("nonfinite RCCSD CUDA Lambda energy source");
 
-  CudaLambdaActions owner(p, cc, options, device, with_source, fixed_orbital != nullptr);
+  CudaLambdaActions owner(p, cc, options, device, with_source,
+                          fixed_orbital != nullptr);
   const auto work_snapshot = [&] {
     LambdaDiagnostic snapshot;
     if (complete.enabled()) {
@@ -816,19 +903,21 @@ LambdaResult solve_impl(const Problem& p, const SolverResult& cc, std::span<cons
   primal_replay.finish();
   Trace rhs_trace("cc_lambda_rhs");
   phase_work = work_snapshot();
-  owner.rhs(false, dense_one, dense_two);
-  std::vector<double> rhs(layout.dimension());
-  layout.pack_weighted(dense_one, dense_two, rhs);
+  std::vector<double> rhs(layout.dimension(), 0.0);
+  if (!options.energy_source_only) {
+    owner.rhs(false, dense_one, dense_two);
+    layout.pack_weighted(dense_one, dense_two, rhs);
+  }
 
   std::vector<double> packed_source;
   if (with_source) {
     packed_source.resize(layout.dimension());
     std::copy(t1_source.begin(), t1_source.end(), packed_source.begin());
     for (std::size_t k = 0; k < layout.representatives.size(); ++k) {
-      const auto first = layout.representatives[k];
-      const auto second = layout.partners[k];
-      const double projected =
-          first == second ? t2_source[first] : 0.5 * (t2_source[first] + t2_source[second]);
+      const double v_first = t2_source[layout.representatives[k]];
+      const double v_second = t2_source[layout.partners[k]];
+      const double projected = layout.representatives[k] == layout.partners[k]
+                                   ? v_first : 0.5 * (v_first + v_second);
       packed_source[layout.n1 + k] = layout.sqrt_weights[layout.n1 + k] * projected;
     }
     for (std::size_t index = 0; index < rhs.size(); ++index) rhs[index] -= packed_source[index];
@@ -836,11 +925,13 @@ LambdaResult solve_impl(const Problem& p, const SolverResult& cc, std::span<cons
 
   std::vector<double> seed_one(layout.n1), seed_two(layout.n2), action_one, action_two;
   auto apply = [&](std::span<const double> input, std::span<double> output) {
+    const auto action_begin = Clock::now();
     const auto before = work_snapshot();
     layout.unpack_weighted(input, seed_one, seed_two);
     owner.transpose(false, seed_one, seed_two, action_one, action_two);
     layout.pack_weighted(action_one, action_two, output);
     trace_work(before);
+    owner.add_action_time(elapsed(action_begin));
   };
 
   const auto response_problem =
@@ -856,79 +947,27 @@ LambdaResult solve_impl(const Problem& p, const SolverResult& cc, std::span<cons
                                                   options.gmres.breakdown_tolerance, independent);
   trace_work(phase_work);
   rhs_trace.finish();
+  const double precompute_s = elapsed(precompute_begin);
+  const auto gmres_begin = Clock::now();
   Trace gmres_trace("cc_lambda_gmres");
   const auto diagonal =
       preconditioned ? std::span<const double>(independent) : std::span<const double>{};
-  std::size_t warmup_iterations = 0, warmup_actions = 0, warmup_preconditioner_actions = 0;
-  runtime::TrackedVector<double> warmup_solution;
-  if (owner.begin_mixed_precision()) {
-    auto warmup_options = options.gmres;
-    warmup_options.absolute_tolerance = options.df_mixed_precision_warmup_tolerance;
-    warmup_options.relative_tolerance = 0.0;
-    warmup_options.max_iterations =
-        std::min(options.gmres.max_iterations, options.df_mixed_precision_max_iterations);
-    warmup_options.restart = std::min(warmup_options.restart, warmup_options.max_iterations);
-    const auto warmup_plan = response::prepare_response(response_problem, warmup_options);
-    auto warmup = response::solve_response(warmup_plan, response_problem, rhs, {}, diagonal);
-    owner.finish_mixed_precision();
-    if (warmup.status == response::GmresStatus::nonfinite_input ||
-        warmup.status == response::GmresStatus::nonfinite_operator ||
-        warmup.status == response::GmresStatus::nonfinite_preconditioner)
-      throw std::runtime_error("nonfinite RCCSD CUDA Lambda mixed warmup");
-    warmup_iterations = warmup.iterations;
-    warmup_actions = warmup.operator_actions;
-    warmup_preconditioner_actions = warmup.preconditioner_actions;
-    // No approximate Krylov basis or residual crosses this boundary. The
-    // original controller recomputes J^T x in FP64 from this finite proposal,
-    // including after finite warmup exhaustion or optional workspace refusal.
-    warmup_solution = std::move(warmup.solution);
-  }
+  const auto warm_start =
+      detail::prepare_lambda_warm_start(owner, options, response_problem, rhs, diagonal);
   const auto krylov_h2d_before = owner.h2d_bytes();
   const auto krylov_d2h_before = owner.d2h_bytes();
   const auto krylov_fences_before = owner.synchronizations();
   phase_work = work_snapshot();
-  std::unique_ptr<CudaLambdaResidentBackend> resident;
-  std::size_t resident_bytes = 0;
-  std::size_t resident_provider_bytes = 0;
-  std::size_t resident_device_admission = 0;
-  std::size_t resident_extra_admission = 0;
-  int resident_provider_version = 0, resident_runtime_version = 0;
-  if (options.cuda_resident_krylov &&
-      layout.dimension() <= static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-    const auto required =
-        CudaLambdaResidentBackend::required_bytes(response_plan, layout, preconditioned);
-    const auto complete_device_admission =
-        checked_add(checked_add(owner.owned_device_bytes(), p.reference_retained_bytes),
-                    checked_add(required, tensor::CudaKrylovVectors::kProviderAllowance));
-    const auto extra_admission =
-        checked_add(required, tensor::CudaKrylovVectors::kProviderAllowance);
-    // DF's max_bytes bounds simultaneous host plus device storage; its
-    // independent device ceiling must also include both provider owners.
-    const bool df_admitted = !p.naux || (checked_add(owner.numeric_capacity_bytes(),
-                                                     extra_admission) <= options.max_bytes &&
-                                         complete_device_admission <= owner.device_limit_bytes());
-    if (complete_device_admission <= options.max_bytes && df_admitted) {
-      try {
-        resident = std::make_unique<CudaLambdaResidentBackend>(owner, response_plan, diagonal);
-        resident_bytes = resident->owned_resident_bytes();
-        resident_device_admission = complete_device_admission;
-        resident_extra_admission = extra_admission;
-        resident_provider_bytes = resident->provider_observed_bytes();
-        resident_provider_version = resident->provider_version();
-        resident_runtime_version = resident->runtime_version();
-      } catch (const std::bad_alloc&) {
-        // Only optional storage/provider allocation refusal is recoverable;
-        // kernel, numerical and stream errors must not be hidden by fallback.
-      }
-    }
-  }
-  const bool resident_selected = resident != nullptr;
-  auto solved = resident ? response::solve_response_resident(response_plan, response_problem,
-                                                             *resident, rhs, warmup_solution)
-                               .result
-                         : response::solve_response(response_plan, response_problem, rhs,
-                                                    warmup_solution, diagonal);
-  resident.reset();
+  auto storage = detail::prepare_lambda_krylov_storage<CudaLambdaResidentBackend>(
+      owner, layout, p, options, response_plan, diagonal,
+      tensor::CudaKrylovVectors::kProviderAllowance);
+  const bool resident_selected = storage.backend != nullptr;
+  auto solved = resident_selected
+                    ? response::solve_response_resident(response_plan, response_problem, *storage.backend,
+                                                        rhs, warm_start.solution).result
+                    : response::solve_response(response_plan, response_problem, rhs, warm_start.solution,
+                                               diagonal);
+  storage.backend.reset();
   const auto krylov_h2d = owner.h2d_bytes() - krylov_h2d_before;
   const auto krylov_d2h = owner.d2h_bytes() - krylov_d2h_before;
   const auto krylov_fences = owner.synchronizations() - krylov_fences_before;
@@ -936,15 +975,19 @@ LambdaResult solve_impl(const Problem& p, const SolverResult& cc, std::span<cons
   if (!solved.converged()) throw std::runtime_error("RCCSD CUDA Lambda GMRES did not converge");
 
   gmres_trace.finish();
+  const double gmres_total_s = elapsed(gmres_begin);
+  const auto audit_begin = Clock::now();
   Trace audit_trace("cc_lambda_independent_audit");
   phase_work = work_snapshot();
   layout.unpack_weighted(solved.solution, seed_one, seed_two);
   owner.transpose(true, seed_one, seed_two, action_one, action_two);
   layout.pack_weighted(action_one, action_two, independent);
 
-  owner.rhs(true, dense_one, dense_two);
-  std::vector<double> independent_rhs(layout.dimension());
-  layout.pack_weighted(dense_one, dense_two, independent_rhs);
+  std::vector<double> independent_rhs(layout.dimension(), 0.0);
+  if (!options.energy_source_only) {
+    owner.rhs(true, dense_one, dense_two);
+    layout.pack_weighted(dense_one, dense_two, independent_rhs);
+  }
   if (!packed_source.empty())
     for (std::size_t index = 0; index < independent_rhs.size(); ++index)
       independent_rhs[index] -= packed_source[index];
@@ -953,15 +996,22 @@ LambdaResult solve_impl(const Problem& p, const SolverResult& cc, std::span<cons
 
   const double independent_norm = response::stable_norm(independent);
   double independent_max = 0.0;
-  for (std::size_t index = 0; index < independent.size(); ++index)
-    independent_max =
-        std::max(independent_max, std::abs(independent[index] / layout.sqrt_weights[index]));
-  if (std::max({solved.residual_norm, independent_norm, independent_max}) >
-      options.lambda_tolerance)
+  for (std::size_t index = 0; index < independent.size(); ++index) {
+    const double scaled = std::abs(independent[index] / layout.sqrt_weights[index]);
+    if (!std::isfinite(scaled))
+      throw std::runtime_error("nonfinite RCCSD CUDA Lambda independent physical residual");
+    if (scaled > independent_max) independent_max = scaled;
+  }
+  if (!std::isfinite(solved.residual_norm) || !std::isfinite(independent_norm) ||
+      !std::isfinite(independent_max) ||
+      std::max({solved.residual_norm, independent_norm, independent_max}) >
+          options.lambda_tolerance)
     throw std::runtime_error("RCCSD CUDA Lambda independent physical residual gate failed");
 
   trace_work(phase_work);
   audit_trace.finish();
+  const double audit_s = elapsed(audit_begin);
+  const auto publication_begin = Clock::now();
   Trace publication_trace("cc_lambda_parameter_factor_vjp");
   phase_work = work_snapshot();
   LambdaResult result;
@@ -977,27 +1027,38 @@ LambdaResult solve_impl(const Problem& p, const SolverResult& cc, std::span<cons
   result.diagnostic.lambda_residual_norm = solved.residual_norm;
   result.diagnostic.independent_residual_norm = independent_norm;
   result.diagnostic.independent_residual_max = independent_max;
-  result.diagnostic.iterations = checked_add(solved.iterations, warmup_iterations);
-  result.diagnostic.operator_actions = checked_add(solved.operator_actions, warmup_actions);
-  result.diagnostic.df_mixed_iterations = warmup_iterations;
+  result.diagnostic.iterations = checked_add(solved.iterations, warm_start.iterations);
+  result.diagnostic.operator_actions = checked_add(
+      checked_add(solved.operator_actions, warm_start.operator_actions),
+      owner.refinement_strict_actions());
+  result.diagnostic.df_mixed_iterations = warm_start.iterations;
   result.diagnostic.df_strict_iterations = solved.iterations;
+  result.diagnostic.df_mixed_refinement_passes = owner.mixed_refinement_passes();
+  result.diagnostic.precompute_seconds = precompute_s;
+  result.diagnostic.audit_seconds = audit_s;
+  result.diagnostic.df_mixed_seconds = owner.mixed_action_seconds();
+  result.diagnostic.df_strict_seconds =
+      resident_selected ? std::max(owner.strict_action_seconds(),
+                                   std::max(0.0, gmres_total_s - owner.mixed_action_seconds()))
+                        : owner.strict_action_seconds();
   result.diagnostic.diagonal_preconditioned = preconditioned;
   result.diagnostic.preconditioner_actions =
-      checked_add(solved.preconditioner_actions, warmup_preconditioner_actions);
+      checked_add(solved.preconditioner_actions, warm_start.preconditioner_actions);
   result.diagnostic.resident_krylov = resident_selected;
   result.diagnostic.resident_krylov_refused = options.cuda_resident_krylov && !resident_selected;
-  result.diagnostic.resident_krylov_bytes = resident_bytes;
+  result.diagnostic.resident_krylov_bytes = storage.bytes;
   result.diagnostic.resident_provider_allowance_bytes =
       resident_selected ? tensor::CudaKrylovVectors::kProviderAllowance : 0;
-  result.diagnostic.resident_provider_observed_bytes = resident_provider_bytes;
-  result.diagnostic.resident_device_admission_bytes = resident_device_admission;
-  result.diagnostic.resident_provider_version = resident_provider_version;
-  result.diagnostic.resident_runtime_version = resident_runtime_version;
+  result.diagnostic.resident_provider_observed_bytes = storage.provider_bytes;
+  result.diagnostic.resident_device_admission_bytes = storage.device_admission;
+  result.diagnostic.resident_provider_version = storage.provider_version;
+  result.diagnostic.resident_runtime_version = storage.runtime_version;
   result.diagnostic.krylov_h2d_bytes = krylov_h2d;
   result.diagnostic.krylov_d2h_bytes = krylov_d2h;
   result.diagnostic.krylov_synchronizations = krylov_fences;
   if (fixed_orbital) {
-    owner.set_parameter_seeds(result.lambda1, result.lambda2);
+    owner.set_parameter_seeds(result.lambda1, result.lambda2,
+                              options.energy_source_only ? 0.0 : 1.0);
     fixed_orbital->foo =
         owner.parameter("foo", generated::run_parameter_foo_cuda, checked_mul(p.nocc, p.nocc));
     fixed_orbital->fov =
@@ -1025,17 +1086,27 @@ LambdaResult solve_impl(const Problem& p, const SolverResult& cc, std::span<cons
     owner.df_factors(*fixed_orbital);
   }
   result.diagnostic.numeric_capacity_bytes =
-      checked_add(owner.numeric_capacity_bytes(), p.naux ? resident_extra_admission : 0);
-  result.diagnostic.owned_device_bytes = checked_add(owner.owned_device_bytes(), resident_bytes);
+      checked_add(owner.numeric_capacity_bytes(), p.naux ? storage.extra_admission : 0);
+  result.diagnostic.owned_device_bytes = checked_add(owner.owned_device_bytes(), storage.bytes);
   result.diagnostic.h2d_bytes = owner.h2d_bytes();
   result.diagnostic.d2h_bytes = owner.d2h_bytes();
   result.diagnostic.synchronizations = owner.synchronizations();
   result.diagnostic.cuda_actions = true;
   trace_work(phase_work);
+  result.diagnostic.publication_seconds = elapsed(publication_begin);
   result.diagnostic.shared_program_hash = generated::lambda_transpose_program_hash;
   result.diagnostic.independent_program_hash =
       generated::lambda_independent_transpose_selected_program_hash(p.nocc, p.nvir);
   owner.df_diagnostic(result.diagnostic);
+  if (owner.mixed_handoff_reason()) {
+    result.diagnostic.df_mixed_handoff_reason = owner.mixed_handoff_reason();
+  } else if (result.diagnostic.df_mixed_precision_refused) {
+    result.diagnostic.df_mixed_handoff_reason = "refused";
+  } else {
+    result.diagnostic.df_mixed_handoff_reason =
+        options.df_mixed_precision ? "refused" : "not_requested";
+  }
+  detail::record_last_lambda_diagnostic(result.diagnostic);
   return result;
 }
 

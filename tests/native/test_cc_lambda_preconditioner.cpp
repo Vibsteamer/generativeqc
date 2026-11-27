@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "cc/lambda_response.hpp"
+#include "generativeqc/ucc_fitting.h"
 
 namespace {
 using namespace generativeqc::cc;
@@ -202,6 +203,33 @@ int main(int argc, char** argv) {
         qualify(true, false, true, budget, true);
         qualify(true, true, true, budget, true);
       }
+    // Audit m5: mixed_inner_relative > kMaxMixedInnerRelativeTolerance (0.05 > 0.01) must fail validation.
+    {
+      LambdaOptions bad_mixed;
+      bad_mixed.df_mixed_precision = true;
+      bad_mixed.df_mixed_precision_inner_relative_tolerance = 0.05;
+      bool rejected = false;
+      try {
+        validate_lambda_options(bad_mixed);
+      } catch (const std::invalid_argument&) {
+        rejected = true;
+      }
+      require(rejected, "mixed_inner_relative=0.05 must be rejected");
+      bad_mixed.df_mixed_precision_inner_relative_tolerance =
+          LambdaOptions::kMaxMixedInnerRelativeTolerance;
+      validate_lambda_options(bad_mixed);
+    }
+    // Audit M16: thread_local reset/read works cleanly after solve.
+    {
+      double scalars[10]{};
+      std::uint64_t counts[16]{};
+      char reason[64]{};
+      require(generativeqc_cc_last_lambda_telemetry_v1(scalars, 10, counts, 16, reason, 64) == 1,
+              "last lambda telemetry must be valid after CPU solve");
+      generativeqc_cc_reset_last_lambda_telemetry_v1();
+      require(generativeqc_cc_last_lambda_telemetry_v1(scalars, 10, counts, 16, reason, 64) == 0,
+              "last lambda telemetry must clear after reset");
+    }
     std::cout << "Lambda preconditioner oracle, fallback and budget gates passed\n";
     return 0;
   } catch (const std::exception& error) {

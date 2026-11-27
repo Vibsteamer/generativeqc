@@ -1,0 +1,14 @@
+{
+  "path": "src/cc/f12_energy_gradient_cuda.cuh",
+  "reason": "Forms the spatial Lambda right-hand side by subtracting the fixed-cusp energy gradient from the conventional negative energy derivative in separate singles and doubles buffers.",
+  "regions": [
+    {
+      "start": "inline void launch_subtract_energy_gradient(",
+      "stop": null,
+      "role": "runtime",
+      "reason": "Launches both component kernels on the response stream and checks CUDA errors."
+    }
+  ],
+  "role": "scientific",
+  "subsystem": "focal_cc"
+}

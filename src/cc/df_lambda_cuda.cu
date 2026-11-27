@@ -7,6 +7,8 @@
 
 #include "cc/df_lambda.hpp"
 #include "cc/df_prepared_regions.hpp"
+#include "cc/f12_energy_gradient_cuda.cuh"
+#include "cc/f12_fixed_cusp_cuda.cuh"
 #include "generated_df_ccsd_core_cpu.hpp"
 #include "generated_df_ccsd_cuda.cuh"
 #include "generated_df_lambda_cuda.cuh"
@@ -135,9 +137,13 @@ struct DFLambdaActions::Impl {
   DFPreparedRegions regions;
   LambdaDiagnostic metrics;
   bool parameters_admitted{};
-  bool mixed_active{}, mixed_finished{};
+  bool mixed_active{}, mixed_suspended{}, mixed_finished{};
   float *mixed_bov{}, *mixed_bvv{};
   std::array<float*, 6> mixed_cut_seeds{};
+  bool f12_active{};
+  double f12_fixed_energy{};
+  std::size_t f12_partial_blocks{};
+  double *f12_r1_const{}, *f12_w_vo{}, *f12_w_vv{}, *f12_c_f12{}, *f12_partials{}, *f12_energy{};
 
   Impl(const Problem& p, const SolverResult& cc, const LambdaOptions& options, int device,
        bool with_source, bool with_parameters)
@@ -159,6 +165,19 @@ struct DFLambdaActions::Impl {
     std::size_t cursor = 0;
     for (std::size_t x = 0; x < host.size(); ++x)
       offsets[x] = reserve(cursor, bytes(host[x]->size()));
+    f12_active = p.f12.active();
+    f12_fixed_energy = p.f12.fixed_geminal_energy;
+    f12_partial_blocks = f12_active ? f12_cuda::energy_partial_blocks(n2) : 0;
+    std::size_t f12_r1_off = 0, f12_wvo_off = 0, f12_wvv_off = 0, f12_cf12_off = 0,
+                f12_part_off = 0, f12_e_off = 0;
+    if (f12_active) {
+      f12_r1_off = reserve(cursor, bytes(n1));
+      f12_wvo_off = reserve(cursor, bytes(p.f12.w_vo.size()));
+      f12_wvv_off = reserve(cursor, bytes(n2));
+      f12_cf12_off = reserve(cursor, bytes(n2));
+      f12_part_off = reserve(cursor, bytes(f12_partial_blocks));
+      f12_e_off = reserve(cursor, sizeof(double));
+    }
     std::size_t scratch = std::max({generated_core::replay_arena_elements(o, v),
                                     generated_response::rhs_arena_elements(o, v),
                                     generated_response::transpose_arena_elements(o, v),
@@ -471,7 +490,11 @@ struct DFLambdaActions::Impl {
       throw std::length_error("DF Lambda mandatory device storage exceeds available memory");
     parameters_admitted = with_parameters;
     cuda_check(cudaStreamCreateWithFlags(&storage.stream, cudaStreamNonBlocking));
-    if (regions.response.has_value() && !storage.contractions.prepare(storage.stream))
+    const auto workspace_bytes = regions.response.has_value() && regions.batch() >= 4
+                                     ? tensor::CudaContractionContext::kOptionalWorkspaceBytes
+                                     : 0;
+    if (regions.response.has_value() &&
+        !storage.contractions.prepare(storage.stream, workspace_bytes))
       scalar_plan();
     auto allocation = cudaMalloc(reinterpret_cast<void**>(&storage.base), allocation_bytes);
     if (allocation == cudaErrorMemoryAllocation && regions.retained_core) {
@@ -514,11 +537,26 @@ struct DFLambdaActions::Impl {
     }
     bov = at(offsets[14]);
     bvv = at(offsets[15]);
+    state.error = reinterpret_cast<int*>(storage.base + checked_add(error, scratch_offset_shift));
+    if (f12_active) {
+      f12_r1_const = at(f12_r1_off);
+      f12_w_vo = at(f12_wvo_off);
+      f12_w_vv = at(f12_wvv_off);
+      f12_c_f12 = at(f12_cf12_off);
+      f12_partials = at(f12_part_off);
+      f12_energy = at(f12_e_off);
+      upload(f12_w_vo, p.f12.w_vo.data(), p.f12.w_vo.size());
+      upload(f12_w_vv, p.f12.w_vv.data(), n2);
+      upload(f12_c_f12, p.f12.c_f12.data(), n2);
+      clear_error();
+      f12_cuda::launch_prepare_constants(o, v, f12_w_vo, f12_w_vv, f12_c_f12, f12_r1_const,
+                                         state.error, storage.stream);
+      finish();
+    }
     state.o = o;
     state.v = v;
     state.stream = storage.stream;
     state.response_arena = state.replay_arena = at(arena);
-    state.error = reinterpret_cast<int*>(storage.base + checked_add(error, scratch_offset_shift));
     state.bar_correlation_energy = at(checked_add(seed0, scratch_offset_shift));
     state.bar_singles_residual = at(checked_add(seed1, scratch_offset_shift));
     state.bar_doubles_residual = at(checked_add(seed2, scratch_offset_shift));
@@ -614,9 +652,25 @@ struct DFLambdaActions::Impl {
       const auto shared_bytes =
           std::max(bytes(matrix_scratch_elements), metrics.df_audit_arena_bytes);
       const auto descriptors = generated_response::mixed_contraction_host_bytes(q % batch ? 2 : 1);
-      const auto extra_host_bytes = checked_add(descriptors, bytes(dim));
+      const std::size_t refinement_passes = options.df_mixed_precision_refinement_passes;
+      const std::size_t base_host_vectors = refinement_passes > 1 ? 5U : 1U;
+      const std::size_t base_host_bytes = checked_mul(base_host_vectors, bytes(dim));
+      const std::size_t min_extra_host_bytes = checked_add(descriptors, base_host_bytes);
       if (storage_bytes <= shared_bytes &&
-          checked_add(metrics.numeric_capacity_bytes, extra_host_bytes) <= options.max_bytes) {
+          checked_add(metrics.numeric_capacity_bytes, min_extra_host_bytes) <= options.max_bytes) {
+        std::size_t admitted_gcr_vectors = 0;
+        std::size_t gcr_host_bytes = 0;
+        if (refinement_passes > 1) {
+          const std::size_t remaining_budget =
+              options.max_bytes -
+              checked_add(metrics.numeric_capacity_bytes, min_extra_host_bytes);
+          const std::size_t pair_bytes = checked_mul(2, bytes(dim));
+          const std::size_t max_possible_gcr = refinement_passes - 1;
+          admitted_gcr_vectors =
+              pair_bytes ? std::min(max_possible_gcr, remaining_budget / pair_bytes)
+                         : max_possible_gcr;
+          gcr_host_bytes = checked_mul(admitted_gcr_vectors, pair_bytes);
+        }
         mixed.o = o;
         mixed.v = v;
         mixed.stream = storage.stream;
@@ -644,9 +698,10 @@ struct DFLambdaActions::Impl {
                                                          q % batch, metrics.df_fp32_gemm_calls,
                                                          metrics.df_fp32_gemm_summands);
           binding_host_bytes = checked_add(binding_host_bytes, descriptors);
-          host_bytes = checked_add(host_bytes, bytes(dim));
+          host_bytes = checked_add(host_bytes, checked_add(base_host_bytes, gcr_host_bytes));
           capacity();
           regions.mixed = true;
+          metrics.df_mixed_gcr_history_limit = admitted_gcr_vectors;
           metrics.df_mixed_storage_bytes = storage_bytes;
           metrics.df_mixed_input_offset_bytes = input_offset;
           metrics.mixed_program_hash = generated_response::mixed_auxiliary_program_hash;
@@ -660,6 +715,7 @@ struct DFLambdaActions::Impl {
     metrics.df_mixed_precision_refused = options.df_mixed_precision && !regions.mixed;
     regions.report(metrics);
     metrics.cuda_actions = true;
+    metrics.df_primal_batch_size = regions.primal.has_value() ? primal_batch_size : 1;
   }
 
   void record_stage(const Stage& stage, bool fp32 = false) {
@@ -850,7 +906,7 @@ const LambdaDiagnostic& DFLambdaActions::diagnostic() const noexcept { return im
 bool DFLambdaActions::begin_mixed_precision() {
   auto& owner = *impl_;
   if (!owner.regions.mixed) return false;
-  if (owner.mixed_active || owner.mixed_finished)
+  if (owner.mixed_active || owner.mixed_suspended || owner.mixed_finished)
     throw std::logic_error("DF Lambda mixed warmup is a single-use epoch");
   owner.clear_error();
   owner.cast_fp32(owner.bov, owner.mixed_bov, checked_mul(owner.q, owner.n1));
@@ -859,20 +915,46 @@ bool DFLambdaActions::begin_mixed_precision() {
   owner.cast_fp32(owner.tau, const_cast<float*>(owner.mixed.df_tau), owner.n2);
   owner.finish();
   owner.mixed_active = true;
+  owner.mixed_suspended = false;
   return true;
+}
+
+void DFLambdaActions::suspend_mixed_precision() {
+  auto& owner = *impl_;
+  if (!owner.mixed_active || owner.mixed_finished)
+    throw std::logic_error("DF Lambda suspend_mixed_precision requires an active warmup epoch");
+  owner.mixed_active = false;
+  owner.mixed_suspended = true;
+}
+
+void DFLambdaActions::resume_mixed_precision() {
+  auto& owner = *impl_;
+  if (!owner.mixed_suspended || owner.mixed_active || owner.mixed_finished)
+    throw std::logic_error("DF Lambda resume_mixed_precision requires a suspended warmup epoch");
+  // The preceding FP64 transpose reused the shared scratch arena, so re-cast
+  // immutable FP32 inputs into the scratch tail before resuming FP32 actions.
+  owner.clear_error();
+  owner.cast_fp32(owner.bov, owner.mixed_bov, checked_mul(owner.q, owner.n1));
+  owner.cast_fp32(owner.bvv, owner.mixed_bvv, checked_mul(owner.q, owner.vv));
+  owner.cast_fp32(owner.state.t1, const_cast<float*>(owner.mixed.t1), owner.n1);
+  owner.cast_fp32(owner.tau, const_cast<float*>(owner.mixed.df_tau), owner.n2);
+  owner.finish();
+  owner.mixed_suspended = false;
+  owner.mixed_active = true;
 }
 
 void DFLambdaActions::finish_mixed_precision() {
   auto& owner = *impl_;
-  if (!owner.mixed_active) return;
+  if (!owner.mixed_active && !owner.mixed_suspended) return;
   owner.mixed_active = false;
+  owner.mixed_suspended = false;
   owner.mixed_finished = true;
   ++owner.metrics.df_precision_switches;
 }
 
 void DFLambdaActions::replay(double& energy, std::vector<double>& r1, std::vector<double>& r2) {
   auto& s = *impl_;
-  if (s.mixed_active)
+  if (s.mixed_active || s.mixed_suspended)
     throw std::logic_error("DF Lambda strict replay cannot invalidate an active warmup epoch");
   runtime::df_progress::number("df_lambda_primal_batch_size",
                                s.regions.primal.has_value() ? s.primal_batch_size : 1);
@@ -898,10 +980,25 @@ void DFLambdaActions::replay(double& energy, std::vector<double>& r1, std::vecto
       ++Q;
     }
   }
+  if (s.f12_active) {
+    f12_cuda::launch_add_residuals(s.state.o, s.state.v, s.f12_r1_const, s.f12_w_vo, s.f12_w_vv,
+                                   s.f12_c_f12, s.state.t1, s.sum1, s.sum2, s.state.error,
+                                   s.storage.stream);
+    s.metrics.df_generated_kernels = checked_add(s.metrics.df_generated_kernels, 2);
+  }
   const auto out = generated_core::run_replay_cuda(s.state);
   s.record(generated_response::replay_contraction_terms, generated_core::replay_operation_count);
+  const double* energy_ptr = out.energy;
+  if (s.f12_active) {
+    f12_cuda::launch_add_energy(s.state.o, s.state.v, s.f12_r1_const, s.f12_w_vv, s.f12_c_f12,
+                                s.state.t1, s.state.t2, s.f12_fixed_energy, out.energy,
+                                s.f12_partials, s.f12_partial_blocks, s.f12_energy, s.state.error,
+                                s.storage.stream);
+    s.metrics.df_generated_kernels = checked_add(s.metrics.df_generated_kernels, 2);
+    energy_ptr = s.f12_energy;
+  }
   Fence fence{s.storage.stream};
-  s.download(&energy, out.energy, 1);
+  s.download(&energy, energy_ptr, 1);
   s.output(out.r1, out.r2, r1, r2);
   fence.complete();
 }
@@ -918,8 +1015,18 @@ void DFLambdaActions::rhs(bool independent, std::vector<double>& one, std::vecto
                        : generated_response::rhs_contraction_terms,
            independent ? generated_response::independent_rhs_operations
                        : generated_response::rhs_operations);
-  s.output(out.t1, out.t2, one, two);
+  if (s.f12_active) {
+    f12_cuda::launch_subtract_energy_gradient(s.state.o, s.state.v, s.f12_r1_const,
+        s.f12_w_vv, s.f12_c_f12, s.state.t1, out.t1, out.t2, s.sum1, s.sum2, s.state.error,
+        s.storage.stream);
+    s.metrics.df_generated_kernels = checked_add(s.metrics.df_generated_kernels, 2);
+    s.metrics.df_contraction_terms = checked_add(s.metrics.df_contraction_terms, s.n2);
+    s.output(s.sum1, s.sum2, one, two);
+  } else {
+    s.output(out.t1, out.t2, one, two);
+  }
   fence.complete();
+  if (s.f12_active) ++s.metrics.f12_cuda_rhs_evaluations;
 }
 
 void DFLambdaActions::transpose(bool independent, std::span<const double> one,
@@ -944,14 +1051,23 @@ DFLambdaResidentState DFLambdaActions::resident_state() const noexcept {
 
 std::pair<const double*, const double*> DFLambdaActions::transpose_device(bool independent) {
   auto& s = *impl_;
-  if (independent && s.mixed_active)
+  if (independent && (s.mixed_active || s.mixed_suspended))
     throw std::logic_error("DF Lambda independent audit requires a finished FP32 epoch");
   Fence fence{s.storage.stream};
+  auto finish_transpose = [&]() -> std::pair<const double*, const double*> {
+    if (s.f12_active) {
+      f12_cuda::launch_lambda_transpose(s.state.o, s.state.v, s.f12_w_vo,
+                                        s.state.bar_doubles_residual, s.sum1, s.state.error,
+                                        s.storage.stream);
+      ++s.metrics.df_generated_kernels;
+    }
+    fence.complete();
+    return {s.sum1, s.sum2};
+  };
   s.clear_error();
   if (s.regions.reduced && !independent) {
     s.reduced_transpose();
-    fence.complete();
-    return {s.sum1, s.sum2};
+    return finish_transpose();
   }
   if (independent && s.regions.audit.has_value()) {
     // Keep the expanded independent core and original per-Q virtual adjoint;
@@ -969,8 +1085,7 @@ std::pair<const double*, const double*> DFLambdaActions::transpose_device(bool i
       ++s.metrics.df_generated_kernels;
       s.record_stage(audit_auxiliary);
     }
-    fence.complete();
-    return {s.sum1, s.sum2};
+    return finish_transpose();
   }
   const auto core = independent ? generated_response::run_independent_transpose_cuda(s.state)
                                 : generated_response::run_transpose_cuda(s.state);
@@ -990,20 +1105,21 @@ std::pair<const double*, const double*> DFLambdaActions::transpose_device(bool i
     s.record(generated_response::virtual_amplitude_vjp_contraction_terms,
              generated_virtual::amplitude_vjp_cuda_operation_count);
   }
-  fence.complete();
-  return {s.sum1, s.sum2};
+  return finish_transpose();
 }
 
-void DFLambdaActions::seeds(std::span<const double> one, std::span<const double> two) {
+void DFLambdaActions::seeds(std::span<const double> one, std::span<const double> two,
+                            double energy_weight) {
   auto& s = *impl_;
-  if (s.mixed_active)
+  if (s.mixed_active || s.mixed_suspended)
     throw std::logic_error("DF Lambda parameter seeds require a finished FP32 epoch");
-  const double energy = 1;
+  if (!std::isfinite(energy_weight))
+    throw std::invalid_argument("DF Lambda parameter energy weight must be finite");
   Fence fence{s.storage.stream};
   if (!s.parameters_admitted || one.size() != s.n1 || two.size() != s.n2)
     throw std::invalid_argument("DF parameter response not admitted or seed shape mismatch");
   s.clear_error();
-  s.upload(s.state.bar_correlation_energy, &energy, 1);
+  s.upload(s.state.bar_correlation_energy, &energy_weight, 1);
   s.upload(s.state.bar_singles_residual, one.data(), s.n1);
   s.upload(s.state.bar_doubles_residual, two.data(), s.n2);
   s.finish();
@@ -1012,7 +1128,7 @@ void DFLambdaActions::seeds(std::span<const double> one, std::span<const double>
 
 std::vector<double> DFLambdaActions::parameter(std::string_view name, std::size_t count) {
   auto& s = *impl_;
-  if (s.mixed_active)
+  if (s.mixed_active || s.mixed_suspended)
     throw std::logic_error("DF Lambda parameter VJP requires a finished FP32 epoch");
   if (!s.parameters_admitted) throw std::logic_error("DF parameter storage not admitted");
   const auto found = std::find_if(parameters.begin(), parameters.end(),
@@ -1045,7 +1161,8 @@ std::vector<double> DFLambdaActions::parameter(std::string_view name, std::size_
 
 std::pair<std::vector<double>, std::vector<double>> DFLambdaActions::virtual_factors() {
   auto& s = *impl_;
-  if (s.mixed_active) throw std::logic_error("DF Lambda factor VJP requires a finished FP32 epoch");
+  if (s.mixed_active || s.mixed_suspended)
+    throw std::logic_error("DF Lambda factor VJP requires a finished FP32 epoch");
   if (!s.parameters_admitted) throw std::logic_error("DF factor publication not admitted");
   std::pair<std::vector<double>, std::vector<double>> result{
       std::vector<double>(checked_mul(s.q, s.n1)), std::vector<double>(checked_mul(s.q, s.vv))};

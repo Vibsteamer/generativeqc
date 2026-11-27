@@ -67,6 +67,22 @@ struct SolverOptions {
 
 enum class DenominatorRepresentation { Explicit, CanonicalSpectrum };
 
+struct FixedCuspF12 {
+  // Compact closed-shell spatial fixed-cusp F12b sources on active (nocc, nvir):
+  //   w_vo[i, j, a, k]   (shape [o, o, v, o]): opposite-spin (abab) W_vo block
+  //   w_vv[i, j, a, b]   (shape [o, o, v, v]): opposite-spin (abab) W_vv block (pair-symmetric)
+  //   c_f12[i, j, a, b]  (shape [o, o, v, v]): opposite-spin (abab) C_f12 block (pair-symmetric)
+  //   fixed_geminal_energy: V + B - X scalar (in Eh)
+  std::vector<double> w_vo;
+  std::vector<double> w_vv;
+  std::vector<double> c_f12;
+  double fixed_geminal_energy{};
+
+  [[nodiscard]] bool active() const noexcept {
+    return !w_vo.empty() || !w_vv.empty() || !c_f12.empty();
+  }
+};
+
 struct Problem {
   std::size_t nocc{}, nvir{};
   std::vector<double> foo, fov, fvv;
@@ -96,6 +112,8 @@ struct Problem {
   // Binds native physical factor derivatives to their immutable source/frame.
   // Supplied algebraic problems may leave this zero.
   std::uint64_t df_source_identity{};
+  // Optional fixed-cusp F12b coupling tensors for closed-shell spatial CCSD-F12b.
+  FixedCuspF12 f12;
 };
 
 enum class SolveStatus { Converged, NotConverged, NumericalFailure };
@@ -109,6 +127,7 @@ struct SolverDiagnostic {
   std::size_t numeric_capacity_bytes{};
   std::size_t owned_device_bytes{};
   std::size_t setup_h2d_bytes{};
+  std::size_t f12_cuda_preparations{};
   std::size_t scalar_d2h_bytes{};
   std::size_t amplitude_d2h_bytes{};
   std::uint64_t denominator_identity{};

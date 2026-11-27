@@ -263,6 +263,7 @@ class MolecularFocalProvider:
     high_order: Callable[[FocalRequest], FocalEvaluation] | None = None
     relative_cutoff: float = 1e-9
     budget_mib: int = 1536
+    preconvergence: str = "auto"
     slater_normalization: Literal[
         "negative_exponential", "negative_exponential_over_beta"
     ] = DEFAULT_SLATER_FIT_NORMALIZATION
@@ -310,6 +311,7 @@ class MolecularFocalProvider:
         one_electron_library: Path | None = None,
         budget_mib: int = 1536,
         relative_cutoff: float = 1e-9,
+        preconvergence: str = "auto",
         high_order: Callable[[FocalRequest], FocalEvaluation] | None = None,
         record_graph: Callable[[dict], None] | None = None,
         lambda_options: UCCSDLambdaOptions | None = None,
@@ -359,6 +361,7 @@ class MolecularFocalProvider:
             relative_cutoff=relative_cutoff,
             budget_mib=budget,
             slater_normalization=slater_normalization,
+            preconvergence=preconvergence,
             high_order=high_order,
             lambda_options=lambda_options,
             rhf_df_ladder=rhf_df_ladder,
@@ -646,6 +649,29 @@ class MolecularFocalProvider:
             weights = None
         return FocalUCCStationary(sources, primal, dual, weights)
 
+    def _spatial_rhf_ccsdf12b_available(
+        self,
+        request: FocalRequest,
+        reference: FocalReference | None,
+        *,
+        use_native: bool | None = None,
+    ) -> bool:
+        if use_native is False:
+            return False
+        return (
+            request.backend == "cuda"
+            and request.root_id == "rhf"
+            and request.multiplicity == 1
+            and reference is not None
+            and reference._native_owner is not None
+            and getattr(
+                reference._native_owner.library,
+                "generativeqc_focal_rcc_f12b_v1",
+                None,
+            )
+            is not None
+        )
+
 
     def f12_doubles_energy(
         self,
@@ -658,6 +684,20 @@ class MolecularFocalProvider:
         """CCSD-F12b minus MP2-F12 on the supplied determinant and CABS rank."""
         if expected_cabs_rank is not None and expected_cabs_rank != low_order.cabs_rank:
             raise ValueError("The displaced and low-order CABS ranks disagree")
+        if self._spatial_rhf_ccsdf12b_available(
+            pair_request, low_order.reference, use_native=use_native
+        ):
+            from ._f12_focal_rcc_f12b import spatial_rhf_ccsdf12b_v1
+
+            res = spatial_rhf_ccsdf12b_v1(
+                self,
+                pair_request,
+                low_order.reference,
+                forces=False,
+                expected_cabs_rank=low_order.cabs_rank,
+            )
+            self._pair_source_cache["last_ccsdf12b_telemetry"] = res.telemetry
+            return res.correlation_energy - low_order.mp2_f12_correlation_energy
         from ._f12_ucc_solver import SolverOptions, solve_focal_uccsd_f12b_energy
 
         sources = molecular_ucc_sources(
@@ -684,6 +724,34 @@ class MolecularFocalProvider:
     ) -> tuple[float, np.ndarray]:
         """Differentiate CCSD-F12b minus the supplied matched MP2-F12 energy."""
         low = low_order.energies
+        if self._spatial_rhf_ccsdf12b_available(
+            pair_request, low.reference, use_native=use_native
+        ):
+            if self.lambda_options is not None:
+                from ._f12_ucc_solver import UCCSDLambdaOptions
+
+                if self.lambda_options != UCCSDLambdaOptions():
+                    raise NotImplementedError(
+                        "Native spatial RHF CCSD-F12b C ABI does not support custom "
+                        "provider.lambda_options; pass use_native=False or omit non-default lambda_options"
+                    )
+            from ._f12_focal_rcc_f12b import spatial_rhf_ccsdf12b_v1
+
+            res = spatial_rhf_ccsdf12b_v1(
+                self,
+                pair_request,
+                low.reference,
+                forces=True,
+                expected_cabs_rank=low.cabs_rank,
+            )
+            self._pair_source_cache["last_ccsdf12b_telemetry"] = res.telemetry
+            assert res.ordinary_forces is not None and res.fixed_forces is not None
+            return (
+                res.correlation_energy - low.mp2_f12_correlation_energy,
+                res.ordinary_forces
+                + res.fixed_forces
+                - low_order.mp2_f12_correlation_forces,
+            )
         solution = self._ucc_stationary(
             pair_request,
             None,
@@ -966,6 +1034,35 @@ class MolecularFocalProvider:
         calculation = request
         if request.role == "ccsd_f12b_minus_mp2_f12":
             calculation = replace(request, role="mp2_f12_correlation")
+            if (
+                request.backend == "cuda"
+                and request.root_id == "rhf"
+                and request.multiplicity == 1
+                and self.canonical_library is not None
+                and getattr(
+                    self.canonical_library, "generativeqc_focal_rcc_f12b_v1", None
+                )
+                is not None
+            ):
+                low_ef = self.low_order_energy_and_forces(
+                    calculation, include_hf_cabs=False
+                )
+                energy, forces = self.f12_doubles_energy_and_forces(
+                    calculation, low_order=low_ef
+                )
+                return FocalEvaluation(
+                    FocalTerm(
+                        request.surface_id,
+                        request.basis.series_id,
+                        request.basis.basis_id,
+                        request.basis.cardinal,
+                        request.role,
+                        energy,
+                        forces,
+                    ),
+                    executed_backend=request.backend,
+                    converged=True,
+                )
             solution = self._ucc_stationary(
                 calculation, None, None, source_cotangents=True, reference_forces=False
             )

@@ -70,9 +70,19 @@ struct LambdaOptions {
   bool df_mixed_precision{false};
   double df_mixed_precision_warmup_tolerance{1e-6};
   std::size_t df_mixed_precision_max_iterations{16};
+  // Multi-pass mixed-precision iterative refinement (defect correction):
+  // solves A_32 delta_k ~= r_k on exact FP64 residuals r_k = b - A_64 x_k with
+  // optimal FP64 outer minimal-residual projection and monotonic contraction
+  // guard before final strict FP64 polish/certification.
+  static constexpr double kMaxMixedInnerRelativeTolerance = 1e-2;
+  std::size_t df_mixed_precision_refinement_passes{4};
+  double df_mixed_precision_inner_relative_tolerance{5e-7};
   // Unpromoted CUDA schedule. Budget/allocation refusal retains
   // the host-vector path with the same diagonal policy and physical audits.
   bool cuda_resident_krylov{false};
+  // Solve J^T DeltaLambda = -(t1_source, t2_source) with zero CCSD energy seed,
+  // isolating pure external-source (e.g. (T) or (T+)) parameter cotangents.
+  bool energy_source_only{false};
   core::CorrelationConvergence convergence;
 };
 
@@ -100,6 +110,7 @@ struct LambdaDiagnostic {
   std::size_t krylov_h2d_bytes{}, krylov_d2h_bytes{}, krylov_synchronizations{};
   // Complete native DF actions, including primal and independent Lambda replay.
   std::size_t df_auxiliary_slices{}, df_contraction_terms{}, df_generated_kernels{};
+  std::size_t f12_cuda_rhs_evaluations{};
   bool df_auxiliary_reduction{};
   std::size_t df_preparation_calls{}, df_reduced_actions{};
   bool df_matrix_gemm{};
@@ -121,11 +132,25 @@ struct LambdaDiagnostic {
   std::size_t df_mixed_actions{}, df_strict_actions{}, df_precision_switches{};
   std::size_t df_fp32_gemm_calls{}, df_fp32_gemm_summands{}, df_precision_cast_elements{};
   std::size_t df_mixed_iterations{}, df_strict_iterations{};
+  std::size_t df_mixed_refinement_passes{};
+  std::size_t df_mixed_gcr_history_limit{};
+  std::size_t df_primal_batch_size{};
+  double df_mixed_seconds{};
+  double df_strict_seconds{};
+  double precompute_seconds{};
+  double audit_seconds{};
+  double publication_seconds{};
+  const char* df_mixed_handoff_reason{};
   const char* mixed_program_hash{};
   const char* audit_schedule_hash{};
   const char* shared_program_hash{};
   const char* independent_program_hash{};
 };
+
+namespace detail {
+void record_last_lambda_diagnostic(const LambdaDiagnostic& diagnostic) noexcept;
+void reset_last_lambda_diagnostic() noexcept;
+}  // namespace detail
 
 struct LambdaResult {
   std::vector<double> lambda1;

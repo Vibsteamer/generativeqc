@@ -101,6 +101,10 @@ endfunction()
 
 macro(generativeqc_add_native_tests)
   enable_testing()
+  generativeqc_native_test(generativeqc_f12_fixed_cusp_host_oracle
+                           tests/native/test_f12_fixed_cusp_oracle.cpp NO_GENERATIVEQC)
+  target_include_directories(generativeqc_f12_fixed_cusp_host_oracle PRIVATE
+                             "${CMAKE_CURRENT_SOURCE_DIR}/include")
   # Algorithmic tests need no CUDA, native solver, Python, or external oracle.
   generativeqc_native_test(generativeqc_geometry_optimizer_tests
                        tests/native/test_geometry_optimizer.cpp
@@ -134,6 +138,12 @@ macro(generativeqc_add_native_tests)
         set_tests_properties(${_screening_target} PROPERTIES TIMEOUT 90)
       endforeach()
     endif()
+    generativeqc_native_test(generativeqc_f12_fixed_cusp_cuda_tests
+                             tests/native/test_f12_fixed_cusp_cuda.cu NO_GENERATIVEQC SKIP_77
+                             LIBRARIES CUDA::cudart)
+    set_target_properties(generativeqc_f12_fixed_cusp_cuda_tests PROPERTIES CUDA_STANDARD 20)
+    target_include_directories(generativeqc_f12_fixed_cusp_cuda_tests PRIVATE
+                               "${CMAKE_CURRENT_SOURCE_DIR}/include")
     generativeqc_native_test(generativeqc_compensated_atomic_cuda_tests
                        tests/native/test_compensated_atomic_cuda.cu LIBRARIES CUDA::cudart)
     if(GENERATIVEQC_CUDA_PROVIDER STREQUAL "nvidia" AND TARGET CUDA::cublasLt)
