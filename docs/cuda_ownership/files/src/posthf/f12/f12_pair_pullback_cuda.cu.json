@@ -1,0 +1,14 @@
+{
+  "path": "src/posthf/f12/f12_pair_pullback_cuda.cu",
+  "reason": "Native pair V, B and exchange contractions, robust bilinear form, strong projector and transposed contractions for molecular source gradients.",
+  "regions": [
+    {
+      "reason": "Device buffer, BLAS handle and row-major dispatch helpers.",
+      "role": "runtime",
+      "start": "struct DeviceBuf {",
+      "stop": "__global__ void k_antisym_quarter"
+    }
+  ],
+  "role": "scientific",
+  "subsystem": "molecular_f12"
+}

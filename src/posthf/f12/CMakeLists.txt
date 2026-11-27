@@ -10,6 +10,7 @@ set(shell_target focal_shell_${GENERATIVEQC_F12_SHELL_DOMAIN})
 set(shell_sources
     f12_molecular_integral_sink.cu
     f12_cabs_h_one_electron.cu
+    f12_pair_pullback_cuda.cu
     f12_ao_mo_project_cuda.cu
     f12_mp2_pair_response_cuda.cu
     f12_spin_fock_1e_cuda.cu
