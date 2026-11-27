@@ -33,6 +33,7 @@ from generativeqc._x2c1e import (
     SPEED_OF_LIGHT_AU,
     build_aux_basis_from_bse,
     build_unc_x2c_basis_from_bse,
+    evaluate_delta_sr,
     stvw_integrals,
     x2c1e_hcore,
     x2c1e_hcore_derivatives,
@@ -202,10 +203,148 @@ def test_hcore_and_analytic_jacobian_parity_vs_pyscf(
     assert np.max(np.abs(g_adj - g_jac)) < 1e-12
 
 
+@pytest.mark.parametrize("name,atoms,charge,mult", AE_MOLECULES)
+@pytest.mark.parametrize("mode,py_approx", [("dlu1e", "ATOM1E"), ("global1e", "1E")])
+def test_df_hf_mp2_and_delta_sr_parity_vs_pyscf(
+    name: str, atoms: list[Atom], charge: int, mult: int, mode: str, py_approx: str
+) -> None:
+    """Verify DF-HF, DF-MP2, and pure additive Delta E_SR match PySCF 2.14.0 to < 1e-10 Eh."""
+    gto = pytest.importorskip("pyscf.gto")
+    mp = pytest.importorskip("pyscf.mp")
+    scf = pytest.importorskip("pyscf.scf")
+    syms = [SYMBOLS[a.atomic_number - 1] for a in atoms]
+    orb = build_unc_x2c_basis_from_bse(syms, ae_basis_name="x2c-svpall")
+    jk = build_aux_basis_from_bse(syms, "jk_fit")
+    mp2_fit = build_aux_basis_from_bse(syms, "mp2_fit")
+
+    mol = gto.M(
+        atom=[(SYMBOLS[a.atomic_number - 1], a.position) for a in atoms],
+        basis=_to_pyscf_basis(orb, atoms),
+        charge=charge,
+        spin=mult - 1,
+        unit="Bohr",
+        cart=False,
+        verbose=0,
+    )
+    jk_py = _to_pyscf_basis(jk, atoms)
+    mp2_py = _to_pyscf_basis(mp2_fit, atoms)
+
+    mf_nr = (scf.UHF(mol) if mult > 1 else scf.RHF(mol)).density_fit(auxbasis=jk_py)
+    mf_nr.conv_tol = 1e-13
+    mf_nr.conv_tol_grad = 1e-10
+    mf_nr.max_cycle = 150
+    e_hf_nr_py = mf_nr.kernel()
+    assert mf_nr.converged
+    e_c_nr_py = (
+        (mp.UMP2(mf_nr) if mult > 1 else mp.MP2(mf_nr)).density_fit(auxbasis=mp2_py).kernel()[0]
+    )
+
+    mf_sr = (scf.UHF(mol) if mult > 1 else scf.RHF(mol)).sfx2c1e().density_fit(auxbasis=jk_py)
+    mf_sr.with_x2c.approx = py_approx
+    if py_approx == "1E":
+        # As in the hcore parity test, use PySCF's FW formula on its own X matrix. Its
+        # default 1E hcore (Eq. 2) is 1.0e-10 (HCl) and 1.8e-10 Eh (SO2) from exact
+        # arithmetic on the same integrals; the FW route is within about 1e-12 Eh.
+        helper = mf_sr.with_x2c
+        helper.get_xmat = lambda xmol=None: type(helper).get_xmat(helper, xmol)
+    mf_sr.conv_tol = 1e-13
+    mf_sr.conv_tol_grad = 1e-10
+    mf_sr.max_cycle = 150
+    e_hf_sr_py = mf_sr.kernel()
+    assert mf_sr.converged
+    e_c_sr_py = (
+        (mp.UMP2(mf_sr) if mult > 1 else mp.MP2(mf_sr)).density_fit(auxbasis=mp2_py).kernel()[0]
+    )
+
+    res = evaluate_delta_sr(
+        atoms,
+        orb,
+        jk,
+        mp2_fit,
+        charge=charge,
+        multiplicity=mult,
+        mode=mode,
+        correlation_space="all-active",
+        forces=False,
+    )
+    e_mp2_nr_py = e_hf_nr_py + e_c_nr_py
+    e_mp2_sr_py = e_hf_sr_py + e_c_sr_py
+
+    assert abs(res.e_hf_nr - e_hf_nr_py) < 1e-10
+    assert abs(res.e_hf_sr - e_hf_sr_py) < 1e-10
+    assert abs(res.e_mp2_nr - e_mp2_nr_py) < 1e-10
+    assert abs(res.e_mp2_sr - e_mp2_sr_py) < 1e-10
+    assert abs(res.delta_sr_hf - (e_hf_sr_py - e_hf_nr_py)) < 1e-10
+    assert abs(res.delta_sr_mp2 - (e_mp2_sr_py - e_mp2_nr_py)) < 1e-10
 
 
+def test_native_cpp_df_reference_x2c1e_end_to_end() -> None:
+    """Verify native C++ PreparedFockPlan `df_reference` E+F agrees with `evaluate_delta_sr`."""
+    atoms = [Atom(8, (0.0, 0.0, 0.0)), Atom(1, (0.0, 1.43, 1.1)), Atom(1, (0.0, -1.43, 1.1))]
+    orb = build_unc_x2c_basis_from_bse(["O", "H"], ae_basis_name="x2c-svpall")
+    jk = _bse_contracted_basis(["O", "H"], "def2-svp-rifit")
+    fb = FocalBasis(2, "gate1-x2c-ref", orb, jk_fit=jk, mp2_fit=jk, f12_fit=jk, cabs=jk, beta=1.0)
+    req = FocalRequest(
+        surface_id="h2o-x2c",
+        atoms=tuple(atoms),
+        charge=0,
+        multiplicity=1,
+        root_id="rhf",
+        role="hf_cabs",
+        basis=fb,
+        backend="cpu_reference",
+        correlation_space_id="all-active",
+    )
+    for mode in ("dlu1e", "global1e"):
+        ref = df_reference(req, forces=True, x2c1e_mode=mode)
+        res = evaluate_delta_sr(
+            atoms, orb, jk, jk, mode=mode, forces=True, return_component_forces=True
+        )
+        assert abs(ref.energy - res.e_hf_sr) < 1e-10
+        assert ref.forces is not None and res.forces_hf_sr is not None
+        assert np.max(np.abs(ref.forces - res.forces_hf_sr)) < 1e-10
 
 
+def test_ecp_isolation_and_hbr_size_consistency() -> None:
+    """Pure ECP Br/I atoms have identically zero Delta-SR; Global1e rejects ECP; HBr dissociates cleanly."""
+    for sym, z in [("Br", 35), ("I", 53)]:
+        atoms = [Atom(z, (0.0, 0.0, 0.0))]
+        orb = build_unc_x2c_basis_from_bse([sym], ecp_basis_name="cc-pvdz-pp")
+        jk = build_aux_basis_from_bse([sym], "jk_fit")
+        dh = x2c1e_hcore(atoms, orb, mode="dlu1e", delta_only=True, multiplicity=2)
+        assert np.max(np.abs(dh)) == 0.0
+        ddh = x2c1e_hcore_derivatives(atoms, orb, mode="dlu1e", delta_only=True, multiplicity=2)
+        assert np.max(np.abs(ddh)) == 0.0
+        with pytest.raises(RuntimeError):
+            x2c1e_hcore(atoms, orb, mode="global1e", delta_only=False, multiplicity=2)
+        res = evaluate_delta_sr(atoms, orb, jk, jk, multiplicity=2, mode="dlu1e", forces=False)
+        assert abs(res.delta_sr_hf) < 1e-14
+        assert abs(res.delta_sr_mp2) < 1e-14
+
+    # Size consistency: HBr at asymptotic separation (R = 5000 Bohr) == H atom + 0 (Br ECP untouched)
+    orb_hbr = build_unc_x2c_basis_from_bse(["Br", "H"], ae_basis_name="x2c-svpall", ecp_basis_name="cc-pvdz-pp")
+    jk_hbr = build_aux_basis_from_bse(["Br", "H"], "jk_fit")
+    dh_far = x2c1e_hcore(
+        [Atom(35, (0.0, 0.0, 0.0)), Atom(1, (0.0, 0.0, 5000.0))],
+        orb_hbr,
+        mode="dlu1e",
+        delta_only=True,
+        multiplicity=3,
+    )
+    assert np.max(np.abs(dh_far[:23, :23])) < 1e-13
+    r_h = evaluate_delta_sr([Atom(1, (0.0, 0.0, 0.0))], orb_hbr, jk_hbr, jk_hbr, multiplicity=2, mode="dlu1e", forces=False)
+    r_far = evaluate_delta_sr(
+        [Atom(35, (0.0, 0.0, 0.0)), Atom(1, (0.0, 0.0, 5000.0))],
+        orb_hbr,
+        jk_hbr,
+        jk_hbr,
+        multiplicity=3,
+        root_id="uhf",
+        mode="dlu1e",
+        forces=False,
+    )
+    assert abs(r_far.delta_sr_hf - r_h.delta_sr_hf) < 1e-11
+    assert abs(r_far.delta_sr_mp2 - r_h.delta_sr_mp2) < 1e-11
 
 
 def _two_step_richardson_fd(
@@ -232,3 +371,76 @@ def _two_step_richardson_fd(
     hf1, mp1 = central(h1)
     hf2, mp2 = central(h2)
     return (4.0 * hf2 - hf1) / 3.0, (4.0 * mp2 - mp1) / 3.0
+
+
+@pytest.mark.parametrize(
+    "label,atoms,charge,mult,cspace,coords_to_check",
+    [
+        ("H2O_AE", [Atom(8, (0.0, 0.0, 0.0)), Atom(1, (0.0, 1.43, 1.1)), Atom(1, (0.0, -1.43, 1.1))], 0, 1, "all-active", [(0, 2), (1, 1), (1, 2)]),
+        ("OH_UHF_FC", [Atom(8, (0.0, 0.0, 0.0)), Atom(1, (0.0, 0.0, 1.83))], 0, 2, "frozen-core", [(0, 2), (1, 2)]),
+        ("HBr_ECP_AE", [Atom(35, (0.0, 0.0, 0.0)), Atom(1, (0.0, 0.0, 2.67))], 0, 1, "all-active", [(0, 2), (1, 2)]),
+        ("HBr_ECP_FC", [Atom(35, (0.0, 0.0, 0.0)), Atom(1, (0.0, 0.0, 2.67))], 0, 1, "frozen-core", [(0, 2), (1, 2)]),
+        (
+            "CH3Br_ECP_FC",
+            [
+                Atom(35, (0.0, 0.0, -1.8)),
+                Atom(6, (0.0, 0.0, 1.86)),
+                Atom(1, (1.94, 0.0, 2.52)),
+                Atom(1, (-0.97, 1.68, 2.52)),
+                Atom(1, (-0.97, -1.68, 2.52)),
+            ],
+            0,
+            1,
+            "frozen-core",
+            [(0, 2), (1, 2), (2, 0), (2, 2)],
+        ),
+    ],
+)
+def test_analytic_delta_sr_forces_vs_two_step_fd(
+    label: str,
+    atoms: list[Atom],
+    charge: int,
+    mult: int,
+    cspace: str,
+    coords_to_check: list[tuple[int, int]],
+) -> None:
+    """Verify analytic Delta F_SR (DF-HF & DF-MP2) vs two-step central FD < 1e-8 and net F/T < 1e-12."""
+    syms = [SYMBOLS[a.atomic_number - 1] for a in atoms]
+    orb = build_unc_x2c_basis_from_bse(syms, ae_basis_name="x2c-svpall", ecp_basis_name="cc-pvdz-pp")
+    jk = build_aux_basis_from_bse(syms, "jk_fit")
+    mp2_fit = build_aux_basis_from_bse(syms, "mp2_fit")
+
+    res_fast = evaluate_delta_sr(
+        atoms, orb, jk, mp2_fit, charge=charge, multiplicity=mult, mode="dlu1e",
+        correlation_space=cspace, forces=True, return_component_forces=False, include_hf_forces=True,
+    )
+    res_full = evaluate_delta_sr(
+        atoms, orb, jk, mp2_fit, charge=charge, multiplicity=mult, mode="dlu1e",
+        correlation_space=cspace, forces=True, return_component_forces=True,
+    )
+    assert res_fast.delta_forces_hf is not None and res_fast.delta_forces_mp2 is not None
+    assert res_full.delta_forces_hf is not None and res_full.delta_forces_mp2 is not None
+    assert np.max(np.abs(res_fast.delta_forces_hf - res_full.delta_forces_hf)) < 1e-12
+    assert np.max(np.abs(res_fast.delta_forces_mp2 - res_full.delta_forces_mp2)) < 1e-12
+
+    coords = np.array([a.position for a in atoms])
+    for forces in (res_fast.delta_forces_hf, res_fast.delta_forces_mp2):
+        net_f = float(np.max(np.abs(forces.sum(axis=0))))
+        net_t = float(np.max(np.abs(np.cross(coords, forces).sum(axis=0))))
+        assert net_f < 1e-12, f"{label}: net force {net_f:.3e} >= 1e-12"
+        assert net_t < 1e-12, f"{label}: net torque {net_t:.3e} >= 1e-12"
+
+    def eval_e(at_list: list[Atom]):
+        return evaluate_delta_sr(
+            at_list, orb, jk, mp2_fit, charge=charge, multiplicity=mult, mode="dlu1e",
+            correlation_space=cspace, forces=False,
+        )
+
+    for ia, ax in coords_to_check:
+        fd_hf, fd_mp2 = _two_step_richardson_fd(atoms, ia, ax, eval_e)
+        assert abs(res_fast.delta_forces_hf[ia, ax] - fd_hf) < 1e-8, (
+            f"{label} ({ia},{ax}) DF-HF FD mismatch: analytic={res_fast.delta_forces_hf[ia, ax]} fd={fd_hf}"
+        )
+        assert abs(res_fast.delta_forces_mp2[ia, ax] - fd_mp2) < 1e-8, (
+            f"{label} ({ia},{ax}) DF-MP2 FD mismatch: analytic={res_fast.delta_forces_mp2[ia, ax]} fd={fd_mp2}"
+        )

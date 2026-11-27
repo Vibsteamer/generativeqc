@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Literal
@@ -146,6 +147,28 @@ def test_b1_x2c1e_bse_exports_must_hold_one_pinned_element(
         build_aux_basis_from_bse(["H"], "jk_fit")
 
 
+def test_b1_x2c1e_gate1_collects_cleanly_without_basis_set_exchange() -> None:
+    """pytest --collect-only skips test_x2c1e_dlu_gate1.py cleanly when BSE is absent."""
+    script = (
+        "import sys, pytest\n"
+        "sys.modules['basis_set_exchange'] = None\n"
+        "rc = pytest.main(['--collect-only', '-q', 'tests/python/test_x2c1e_dlu_gate1.py'])\n"
+        "raise SystemExit(rc)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    # pytest exit code 5 = no tests collected (skipped at module level via importorskip),
+    # 0 = collected without error; 2 = collection/usage error (MUST NOT happen).
+    assert proc.returncode in (0, 5), f"Unexpected collection failure:\n{proc.stdout}\n{proc.stderr}"
+    assert "ModuleNotFoundError" not in proc.stdout
+    assert "ModuleNotFoundError" not in proc.stderr
+
+
 # ============================================================================
 # H1: Br/I ECP CUDA 3rd-level grid escalation (ArithmeticError vs ValueError)
 # ============================================================================
@@ -284,6 +307,84 @@ def test_h1_ecp_cuda_skips_third_grid_when_initial_pair_converges(
     ]
     assert max_w == 2048
     np.testing.assert_array_equal(hcore, fine)
+
+
+def test_h5_x2c1e_delta_sr_fc9_parity_and_fd_forces_on_hbr() -> None:
+    """evaluate_delta_sr supports frozen-core-spd (FC9) on ECP HBr matching PySCF and central FD."""
+    pytest.importorskip("basis_set_exchange")
+    gto = pytest.importorskip("pyscf.gto")
+    mp = pytest.importorskip("pyscf.mp")
+    scf = pytest.importorskip("pyscf.scf")
+
+    from generativeqc import Atom
+    from generativeqc._f12_frozen_core import resolve_frozen_occupied_for_atoms
+    from generativeqc._x2c1e import evaluate_delta_sr
+    from generativeqc.elements import SYMBOLS
+
+    atoms = [Atom(35, (0.0, 0.0, 0.0)), Atom(1, (0.0, 0.0, 2.67))]
+    orb = build_unc_x2c_basis_from_bse(["Br", "H"], ae_basis_name="x2c-svpall", ecp_basis_name="cc-pvdz-pp")
+    jk = build_aux_basis_from_bse(["Br", "H"], "jk_fit")
+    mp2_fit = build_aux_basis_from_bse(["Br", "H"], "mp2_fit")
+
+    assert resolve_frozen_occupied_for_atoms(atoms, orb, (13, 13), "frozen-core") == (4, 4)
+    assert resolve_frozen_occupied_for_atoms(atoms, orb, (13, 13), "frozen-core-spd") == (9, 9)
+
+    res_fc9 = evaluate_delta_sr(
+        atoms,
+        orb,
+        jk,
+        mp2_fit,
+        mode="dlu1e",
+        correlation_space="frozen-core-spd",
+        forces=True,
+    )
+    assert res_fc9.correlation_space == "frozen-core-spd"
+    assert res_fc9.frozen_nr.counts("frozen-core-spd") == (9, 9)
+    assert res_fc9.delta_forces_mp2 is not None and res_fc9.delta_forces_hf is not None
+
+    # Verify independent PySCF parity for NR DF-MP2(frozen=9).
+    def _to_pyscf(b):
+        out = {}
+        for atom in atoms:
+            sym = SYMBOLS[atom.atomic_number - 1]
+            if sym in out:
+                continue
+            eb = b.by_element[atom.atomic_number]
+            out[sym] = [
+                [sh.angular_momentum] + [[float(e), float(c)] for e, c in zip(sh.exponents, crow, strict=True)]
+                for sh in eb.shells
+                for crow in sh.coefficients
+            ]
+        return out
+
+    mol = gto.M(
+        atom=[("Br", (0.0, 0.0, 0.0)), ("H", (0.0, 0.0, 2.67))],
+        basis=_to_pyscf(orb),
+        ecp={"Br": gto.basis.load_ecp("cc-pvdz-pp", "Br")},
+        unit="Bohr",
+        cart=False,
+        verbose=0,
+    )
+    mf_nr = scf.RHF(mol).density_fit(auxbasis=_to_pyscf(jk))
+    mf_nr.conv_tol = 1e-13
+    mf_nr.conv_tol_grad = 1e-10
+    e_hf_nr_py = mf_nr.kernel()
+    assert mf_nr.converged
+    e_corr_nr_py = mp.MP2(mf_nr, frozen=9).density_fit(auxbasis=_to_pyscf(mp2_fit)).kernel()[0]
+    assert abs(res_fc9.e_hf_nr - e_hf_nr_py) < 1e-10
+    assert abs(res_fc9.e_mp2_corr_nr - e_corr_nr_py) < 1e-10
+
+    # Verify FC9 analytic Delta-SR force against two-step Richardson central FD (< 1e-8 Eh/bohr).
+    def central(h: float) -> float:
+        ap = [Atom(35, (0.0, 0.0, 0.0)), Atom(1, (0.0, 0.0, 2.67 + h))]
+        am = [Atom(35, (0.0, 0.0, 0.0)), Atom(1, (0.0, 0.0, 2.67 - h))]
+        ep = evaluate_delta_sr(ap, orb, jk, mp2_fit, mode="dlu1e", correlation_space="frozen-core-spd", forces=False).delta_sr_mp2
+        em = evaluate_delta_sr(am, orb, jk, mp2_fit, mode="dlu1e", correlation_space="frozen-core-spd", forces=False).delta_sr_mp2
+        return -(ep - em) / (2.0 * h)
+
+    fd_rich = (4.0 * central(1e-3) - central(2e-3)) / 3.0
+    assert abs(float(res_fc9.delta_forces_mp2[1, 2]) - fd_rich) < 1e-8
+    assert float(np.max(np.abs(res_fc9.delta_forces_mp2.sum(axis=0)))) < 1e-12
 
 
 # ============================================================================
