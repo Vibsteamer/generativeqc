@@ -21,6 +21,7 @@ tests require `GENERATIVEQC_ECP_CBS_3034_CUDA_TEST=1` and a finite Slurm allocat
 the input-integrity test is host-only.
 
 The physical HF probes require a host C++ compiler and a verified compiler-cache
-launcher. Set `CCACHE` to the selected sccache or ccache executable for the shared
-native-probe fixture. Once CUDA qualification is explicitly enabled, a missing
-probe compiler/cache is an error rather than a silently skipped HF regression.
+launcher. The shared native-probe fixture selects sccache, then ccache, from `PATH`;
+set `CCACHE` to an sccache or ccache executable to choose one explicitly. Once CUDA
+qualification is explicitly enabled, a missing probe compiler/cache is an error
+rather than a silently skipped HF regression.
