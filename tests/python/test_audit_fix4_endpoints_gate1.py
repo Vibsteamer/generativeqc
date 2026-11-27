@@ -21,6 +21,7 @@ from generativeqc._f12_focal_cv import (
     default_valence_correlation_space_id,
 )
 from generativeqc._f12_focal_molecular import (
+    FocalTriplesEvaluation,
     MolecularFocalProvider,
 )
 from generativeqc._f12_focal_rcc_f12b import spatial_rhf_ccsdf12b_v1
@@ -46,6 +47,8 @@ from generativeqc.experimental.f12_focal import (
     FocalRequest,
     FocalSeries,
     plan_singlepoint,
+    singlepoint,
+    singlepoint_energy,
 )
 from generativeqc.profiles import canonical_hash
 from generativeqc.resources_hf import hf_resource_request
@@ -156,6 +159,236 @@ def _dummy_reference(
         request.basis.jk_fit.identity,
         _native_owner=native_owner,  # type: ignore[arg-type]
     )
+
+
+# ---------------------------------------------------------------------------
+# B5: Built-in Public Provider (T+) & Explicit (T)-F12 Contract + M15(iii)
+# ---------------------------------------------------------------------------
+
+
+def test_b5_builtin_cuda_provider_wires_tplus_and_rejects_tf12_forces_and_mock_cuda(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Verify MolecularFocalProvider.cuda wires real (T+), rejects (T)-F12 3N forces, and refuses fake CUDA mocks."""
+    import ctypes
+    from generativeqc import _f12_focal_runner, _native
+
+    fake_lib = tmp_path / "fake_resp.so"
+    fake_lib.write_bytes(b"")
+    dummy_runner = lambda prog, inp: None  # noqa: E731
+    monkeypatch.setattr(ctypes, "CDLL", lambda *_a, **_kw: SimpleNamespace(_handle=1))
+    monkeypatch.setattr(_native, "load_library", lambda **_kw: SimpleNamespace(_handle=2))
+    monkeypatch.setattr(_f12_focal_runner, "focal_cuda_runner", lambda *_a, **_kw: dummy_runner)
+
+    cuda_prov = MolecularFocalProvider.cuda(
+        shell_library=fake_lib,
+        response_library=fake_lib,
+        architecture="sm_80",
+        cache_directory=tmp_path,
+        budget_mib=1024,
+    )
+    assert cuda_prov.triples_models is not None
+    assert cuda_prov.qualified_tplus is None
+    assert cuda_prov.triples_models.__self__ is cuda_prov
+
+    # Replacing budget_mib rebinds built-in triples_models/qualified_tplus to the new instance!
+    replaced_prov = replace(cuda_prov, budget_mib=2048)
+    assert replaced_prov.triples_models.__self__ is replaced_prov
+    assert replaced_prov.qualified_tplus is None
+    assert replaced_prov._pair_source_cache is not cuda_prov._pair_source_cache
+
+    card = FocalBasis(
+        2,
+        "ha-DZ-F12",
+        "sto-3g",
+        jk_fit="sto-3g",
+        mp2_fit="sto-3g",
+        f12_fit="sto-3g",
+        cabs="sto-3g",
+        beta=0.9,
+    )
+    series = FocalSeries(card)
+    water = [("O", (0.0, 0.0, 0.0)), ("H", (0.0, 0.0, 1.8)), ("H", (1.75, 0.0, -0.4))]
+    dispatched: list[tuple[str, bool]] = []
+
+    def fake_low_energy(
+        self: MolecularFocalProvider,
+        request: FocalRequest,
+        *,
+        expected_cabs_rank: int | None = None,
+        include_hf_cabs: bool = True,
+        include_occupied_partitions: bool = False,
+        reference: FocalReference | None = None,
+    ) -> FocalLowOrderEnergy:
+        ref = reference if reference is not None else _dummy_reference(request)
+        occ = (
+            OccupiedMP2F12(
+                (np.full(5, -0.015), np.full(5, -0.015)),
+                (np.full(5, -0.005), np.full(5, -0.005)),
+            )
+            if include_occupied_partitions
+            else None
+        )
+        return FocalLowOrderEnergy(ref, 2, (0.0, 0.0), (-0.05, -0.05, -0.05), -0.05, occ)
+
+    def fake_low_forces(
+        self: MolecularFocalProvider,
+        request: FocalRequest,
+        *,
+        include_hf_cabs: bool = True,
+    ) -> FocalLowOrderForces:
+        return FocalLowOrderForces(
+            fake_low_energy(self, request, include_hf_cabs=include_hf_cabs),
+            np.zeros((3, 3)),
+            np.full((3, 3), 0.1),
+        )
+
+    def fake_rhf_tplus_ef(
+        self: MolecularFocalProvider,
+        request: FocalRequest,
+        *,
+        low_order: FocalLowOrderEnergy,
+        expected_cabs_rank: int | None = None,
+        inactive: tuple[bool, ...] | None = None,
+    ):
+        dispatched.append(("rhf_tplus_ef", low_order.occupied_mp2_f12 is not None))
+        return (
+            -0.03,
+            FocalTriplesEvaluation(
+                -0.04,
+                np.full((3, 3), -0.04),
+                low_order.cabs_rank,
+                executed_backend=request.backend,
+                converged=True,
+                triples_model_id="tplus_rhf_occupied_v2",
+            ),
+            {},
+        )
+
+    def fake_rhf_tplus_e(
+        self: MolecularFocalProvider,
+        request: FocalRequest,
+        *,
+        low_order: FocalLowOrderEnergy,
+        expected_cabs_rank: int | None = None,
+    ):
+        dispatched.append(("rhf_tplus_e", low_order.occupied_mp2_f12 is not None))
+        return (
+            -0.03,
+            FocalTriplesEvaluation(
+                -0.04,
+                None,
+                low_order.cabs_rank,
+                executed_backend=request.backend,
+                converged=True,
+                triples_model_id="tplus_rhf_occupied_v2",
+            ),
+        )
+
+    monkeypatch.setattr(MolecularFocalProvider, "low_order_energy", fake_low_energy)
+    monkeypatch.setattr(MolecularFocalProvider, "low_order_energy_and_forces", fake_low_forces)
+    monkeypatch.setattr(MolecularFocalProvider, "f12_doubles_energy", lambda *a, **kw: -0.02)
+    monkeypatch.setattr(
+        MolecularFocalProvider,
+        "f12_doubles_energy_and_forces",
+        lambda *a, **kw: (-0.02, np.full((3, 3), 0.02)),
+    )
+    monkeypatch.setattr(
+        MolecularFocalProvider,
+        "restricted_tplus_energy_and_forces_on_reference",
+        fake_rhf_tplus_ef,
+    )
+    monkeypatch.setattr(
+        MolecularFocalProvider,
+        "restricted_tplus_energy_on_reference",
+        fake_rhf_tplus_e,
+    )
+
+    # Only an explicit model selection opts in without recipe-specific qualification.
+    res = singlepoint(
+        water,
+        series,
+        series,
+        None,
+        provider=cuda_prov,
+        root_id="rhf",
+        correlation_space_id="all-active",
+        f12_doubles=card,
+        triples={"tplus": card},
+        backend="cuda",
+    )
+    assert res.components[-1].term.role == "triples_plus"
+    assert res.components[-1].executed_backend == "cuda"
+    assert res.components[-1].converged is True
+    assert res.components[-1].triples_model_id == "tplus_rhf_occupied_v2"
+    assert dispatched == [("rhf_tplus_ef", True)]
+
+    def conventional_energy(_self, _req, *, reference, telemetry):
+        telemetry["forward_w_precision"] = "fp64"
+        return -0.03
+
+    monkeypatch.setattr(MolecularFocalProvider, "triples_energy", conventional_energy)
+    unqualified = singlepoint_energy(
+        water, series, series, provider=cuda_prov, root_id="rhf",
+        correlation_space_id="all-active", f12_doubles=card, triples=card, backend="cuda",
+    )
+    assert unqualified.components[-1].triples_model_id == "conventional_rhf"
+    assert unqualified.components[-1].telemetry["forward_w_precision"] == "fp64"
+
+    # 2. Explicit {"tplus": card} energy-only executes built-in (T+) energy evaluator!
+    dispatched.clear()
+    res_e = singlepoint_energy(
+        water,
+        series,
+        series,
+        provider=cuda_prov,
+        root_id="rhf",
+        correlation_space_id="all-active",
+        f12_doubles=card,
+        triples={"tplus": card},
+        backend="cuda",
+    )
+    assert res_e.energy == pytest.approx(-75.26)
+    assert res_e.components[-1].triples_model_id == "tplus_rhf_occupied_v2"
+    assert res_e.components[-1].executed_backend == "cuda"
+    assert res_e.components[-1].converged is True
+    assert dispatched == [("rhf_tplus_e", True)]
+
+    # 3. Explicit Kohn (T)-F12 3N forces MUST be rejected with explicit NO-GO capability error!
+    with pytest.raises(NotImplementedError, match="NO-GO for 3N forces"):
+        singlepoint(
+            water,
+            series,
+            series,
+            None,
+            provider=cuda_prov,
+            root_id="rhf",
+            correlation_space_id="all-active",
+            f12_doubles=card,
+            triples={"f12": card},
+            backend="cuda",
+        )
+
+    # 4. Injected mock callback on CUDA that omits executed_backend MUST NOT be forged as CUDA!
+    bad_mock_prov = replace(
+        cuda_prov,
+        triples_models=lambda reqs, **_kw: {
+            r.role: FocalTriplesEvaluation(-0.04, np.zeros((3, 3)), 2) for r in reqs
+        },
+    )
+    with pytest.raises(RuntimeError, match="refusing to fabricate CUDA provenance"):
+        singlepoint(
+            water,
+            series,
+            series,
+            None,
+            provider=bad_mock_prov,
+            root_id="rhf",
+            correlation_space_id="all-active",
+            f12_doubles=card,
+            triples={"tplus": card},
+            backend="cuda",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -718,6 +951,101 @@ def test_m14_displaced_seed_uses_overlap_normalized_spin_density(monkeypatch) ->
             SimpleNamespace(data={"ao_coulomb": np.zeros((1, 4, 4))}, whitener=np.eye(1)),
             run=None, seed=invalid_center,
         )
+
+
+# ---------------------------------------------------------------------------
+# M15: slater_normalization Fingerprint & Provider Cache Isolation Across replace
+# ---------------------------------------------------------------------------
+
+
+def test_m15_slater_normalization_fingerprint_and_replace_cache_isolation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify slater_normalization enters surface_id & center check, and replace() isolates _pair_source_cache."""
+    card = FocalBasis(
+        2,
+        "ha-DZ-F12",
+        "sto-3g",
+        jk_fit="sto-3g",
+        mp2_fit="sto-3g",
+        f12_fit="sto-3g",
+        cabs="sto-3g",
+        beta=0.9,
+    )
+    series = FocalSeries(card)
+    h2 = [("H", (0.0, 0.0, 0.0)), ("H", (0.0, 0.0, 1.4))]
+    h2_disp = [("H", (0.0, 0.0, 0.0)), ("H", (0.0, 0.0, 1.401))]
+
+    p_exp = plan_singlepoint(
+        h2,
+        series,
+        series,
+        None,
+        root_id="rhf",
+        correlation_space_id="all-active",
+        backend="cpu_reference",
+        slater_normalization="negative_exponential",
+    )
+    p_over = plan_singlepoint(
+        h2,
+        series,
+        series,
+        None,
+        root_id="rhf",
+        correlation_space_id="all-active",
+        backend="cpu_reference",
+        slater_normalization="negative_exponential_over_beta",
+    )
+    assert p_exp.steps[0][0].surface_id != p_over.steps[0][0].surface_id
+
+    # Cross-validating a center produced under negative_exponential with a negative_exponential_over_beta provider fails!
+    monkeypatch.setattr(
+        MolecularFocalProvider,
+        "low_order_energy_and_forces",
+        lambda self, req, *, include_hf_cabs=True: FocalLowOrderForces(
+            FocalLowOrderEnergy(_dummy_reference(req, n=2, occupied=(1,)), 1, (0.0, 0.0), (0.0, -0.01, 0.0), -0.005),
+            np.zeros((2, 3)),
+            np.zeros((2, 3)),
+        ),
+    )
+    prov_exp = MolecularFocalProvider(
+        shell_library=Path("lib_a.so"),
+        slater_normalization="negative_exponential",
+    )
+    prov_over = MolecularFocalProvider(
+        shell_library=Path("lib_a.so"),
+        slater_normalization="negative_exponential_over_beta",
+    )
+    center = singlepoint(
+        h2,
+        series,
+        series,
+        None,
+        provider=prov_exp,
+        root_id="rhf",
+        correlation_space_id="all-active",
+        backend="cpu_reference",
+    )
+    with pytest.raises(ValueError, match="same electronic surface and protocol"):
+        singlepoint_energy(
+            h2_disp,
+            series,
+            series,
+            provider=prov_over,
+            root_id="rhf",
+            correlation_space_id="all-active",
+            backend="cpu_reference",
+            center=center,
+        )
+
+    # Provider cache isolation across dataclasses.replace()!
+    prov_exp._pair_source_cache["entry"] = ("sentinel", True, None, None)
+    prov_replaced_lib = replace(prov_exp, shell_library=Path("lib_b.so"))
+    prov_replaced_budget = replace(prov_exp, budget_mib=256)
+    assert prov_replaced_lib._pair_source_cache == {}
+    assert prov_replaced_budget._pair_source_cache == {}
+    assert prov_replaced_lib._pair_source_cache is not prov_exp._pair_source_cache
+    assert prov_replaced_budget._pair_source_cache is not prov_exp._pair_source_cache
 
 
 # ---------------------------------------------------------------------------

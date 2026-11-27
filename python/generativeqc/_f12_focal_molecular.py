@@ -191,6 +191,7 @@ class _Panel:
     budget_mib: int = 512
     coulomb_only: bool = False
     slater_normalization: str = DEFAULT_SLATER_FIT_NORMALIZATION
+    metric_diagnostics: dict[str, int | float | str] = field(default_factory=dict)
     _obs_coulomb_cache: tuple[tuple, np.ndarray] | None = field(default=None, init=False)
 
     def load_ao(self, ao_name: str) -> np.ndarray:
@@ -1841,18 +1842,27 @@ class MolecularFocalProvider:
             whitener = solve_triangular(
                 np.linalg.cholesky(m), np.eye(len(m)), lower=True
             )
+            metric_diagnostics: dict[str, int | float | str] = {
+                "backend": "cpu_reference",
+                "factorization": "inverse_cholesky",
+            }
         else:
             assert self.metric_library is not None
             try:
-                whitener, _ = metric_whitener(
-                    m, self.metric_library, budget_bytes=self.budget_mib << 20
+                whitener, metric_diagnostics = metric_whitener(
+                    m,
+                    self.metric_library,
+                    budget_bytes=self.budget_mib << 20,
+                    factorization=(
+                        "inverse_cholesky" if role == "f12_fit" and not ordinary else "symmetric"
+                    ),
                 )
             except RuntimeError:
                 if not ordinary:
                     raise
                 # Diffuse core-valence RI bases (e.g. aug-cc-pwCVTZ-RIFIT on ionic pairs)
                 # can remain strictly SPD at min/max ~ 5e-11..9.9e-11; verify full-rank whitener accuracy.
-                whitener, _ = metric_whitener(
+                whitener, metric_diagnostics = metric_whitener(
                     m, self.metric_library, budget_bytes=self.budget_mib << 20, cutoff=1e-12
                 )
                 if not np.allclose(whitener @ m @ whitener.T, np.eye(len(m)), atol=2e-7, rtol=0):
@@ -1868,6 +1878,7 @@ class MolecularFocalProvider:
             budget_mib=self.budget_mib,
             coulomb_only=coulomb_only,
             slater_normalization=self.slater_normalization,
+            metric_diagnostics=metric_diagnostics,
         )
 
     def _gradient(
@@ -1896,6 +1907,21 @@ class MolecularFocalProvider:
     def __call__(self, request: FocalRequest) -> FocalEvaluation:
         from .experimental.f12_focal import FocalEvaluation, FocalTerm
 
+        if (
+            request.role in ("triples_plus", "triples_f12")
+            and self.triples_models is not None
+        ):
+            from .experimental.f12_focal import (
+                FocalMolecularResult,
+                FocalPlan,
+                _molecular_f12_plan,
+            )
+
+            result = _molecular_f12_plan(
+                FocalPlan(((request, 1.0),)), self, forces=True
+            )
+            assert isinstance(result, FocalMolecularResult)
+            return result.components[0]
         if request.role not in (
             "hf_cabs",
             "mp2_f12_correlation",
@@ -2151,12 +2177,19 @@ class MolecularFocalProvider:
         basis = request.basis
         assert basis.mp2_fit is not None and basis.f12_fit is not None
         f12 = self._panel(request, "f12_fit", allow_streaming=allow_streaming)
-        jk = (
-            f12
-            if f12.fit_id == basis.jk_fit.identity
-            else self._panel(request, "jk_fit", allow_streaming=allow_streaming)
-        )
-        mp2 = next((p for p in (jk, f12) if p.fit_id == basis.mp2_fit.identity), None)
+        if f12.fit_id != basis.jk_fit.identity:
+            jk = self._panel(request, "jk_fit", allow_streaming=allow_streaming)
+        elif request.backend == "cuda":
+            # Coincident fits share the raw shell integrals. The JK Fock uses
+            # its symmetric factor and the correlation contractions use L^-1.
+            assert self.metric_library is not None
+            w_jk, info_jk = metric_whitener(
+                f12.data["metric"], self.metric_library, budget_bytes=self.budget_mib << 20
+            )
+            jk = replace(f12, whitener=w_jk, metric_diagnostics=info_jk, coulomb_only=True)
+        else:
+            jk = f12
+        mp2 = next((p for p in (f12, jk) if p.fit_id == basis.mp2_fit.identity), None)
         if mp2 is None:
             mp2 = self._panel(request, "mp2_fit", allow_streaming=False)
         return jk, mp2, f12

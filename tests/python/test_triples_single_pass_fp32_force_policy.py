@@ -21,9 +21,11 @@ from generativeqc._f12_focal_tplus_sources import OccupiedMP2F12
 from generativeqc.experimental.f12_focal import (
     FocalBasis,
     FocalLowOrderEnergy,
+    FocalLowOrderForces,
     FocalSeries,
     TriplesWPrecisionError,
     plan_singlepoint,
+    singlepoint,
 )
 
 if TYPE_CHECKING:
@@ -480,6 +482,80 @@ def test_single_pass_production_refuses_the_bounded_rhf_fallback(
     assert telemetry["reverse_w_precision"] == "fp64"
     assert telemetry["triples_fp32_w_resource_fallback"] is True
     assert telemetry["production_eligible"] is False
+
+
+@pytest.fixture
+def water_singlepoint(
+    native_triples: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> Any:
+    """Run RHF water `singlepoint` forces through stubbed low-order and doubles stages."""
+
+    def low_energy(
+        self: MolecularFocalProvider, request: FocalRequest, **kwargs: Any
+    ) -> FocalLowOrderEnergy:
+        reference = kwargs.get("reference") or _reference(request, (5,))
+        return _low_order(reference, (5, 5))
+
+    def low_forces(
+        self: MolecularFocalProvider, request: FocalRequest, **kwargs: Any
+    ) -> FocalLowOrderForces:
+        return FocalLowOrderForces(
+            low_energy(self, request), np.zeros((3, 3)), np.full((3, 3), 0.1)
+        )
+
+    monkeypatch.setattr(MolecularFocalProvider, "low_order_energy", low_energy)
+    monkeypatch.setattr(
+        MolecularFocalProvider, "low_order_energy_and_forces", low_forces
+    )
+    monkeypatch.setattr(
+        MolecularFocalProvider,
+        "f12_doubles_energy_and_forces",
+        lambda *_a, **_kw: (-0.02, np.full((3, 3), 0.02)),
+    )
+
+    def run(precision: str, triples: object, device: CudaDeviceIdentity = _L20) -> Any:
+        return singlepoint(
+            _WATER,
+            FocalSeries(_BASIS),
+            FocalSeries(_BASIS),
+            None,
+            provider=_provider("cuda", precision, device),
+            root_id="rhf",
+            correlation_space_id="all-active",
+            f12_doubles=_BASIS,
+            triples=triples,
+            backend="cuda",
+        )
+
+    return run
+
+
+_SINGLEPOINT_TRIPLES = pytest.mark.parametrize(
+    ("triples", "entry"),
+    [({"tplus": _BASIS}, "rhf_tplus"), (_BASIS, "conventional")],
+    ids=["tplus", "conventional"],
+)
+
+
+@_SINGLEPOINT_TRIPLES
+def test_singlepoint_single_pass_forces_follow_the_device(
+    triples: object,
+    entry: str,
+    water_singlepoint: Any,
+    native_triples: list[dict[str, Any]],
+) -> None:
+    result = water_singlepoint("fp32_single", triples)
+    telemetry = result.components[-1].telemetry
+    assert telemetry["w_precision_schedule"] == "fp32_single"
+    assert telemetry["device_name"] == "NVIDIA L20"
+    assert "production_eligible" not in telemetry
+    assert len(native_triples) == 1
+    with pytest.raises(TriplesWPrecisionError, match="only on an NVIDIA L20"):
+        water_singlepoint("fp32_single", triples, _A100)
+    assert len(native_triples) == 1
+    result = water_singlepoint("fp32_split3", triples, _A100)
+    assert result.components[-1].telemetry["device_name"] == _A100.name
+    assert len(native_triples) == 2
 
 
 @pytest.mark.parametrize("device", [_L20, _A100], ids=["l20", "a100"])
