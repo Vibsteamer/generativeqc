@@ -1,0 +1,446 @@
+"""Gate 1 external-oracle verification for native X2C-1e and DLU-X2C-1e hcore & analytic gradients.
+
+Directly validates against PySCF 2.14.0 (`pyscf.x2c.sfx2c1e` and
+`pyscf.x2c.sfx2c1e_grad.hcore_grad_generator`) and two-step central finite differences:
+1. Single-atom parity (`O`, `C`, `S`, `Cl`, `H`): DLU-X2C-1e == Global X2C-1e == DLU-localR == PySCF.
+2. Molecular parity on `H2O`, `OH`, `HCl`, `SO2`, `CH4` (both `global1e` and `dlu1e`):
+   - `hcore_x2c` matrix elements, DF-HF & DF-MP2 energies, and `Delta E_SR` match PySCF `< 1e-10 Eh`;
+   - Analytic `dh_X2C/dR` matches `pyscf.x2c.sfx2c1e_grad.hcore_grad_generator` element-wise `< 1e-10`;
+   - O(1)-Sylvester adjoint matches full Jacobian contraction `< 1e-12`;
+   - Native C++ `df_reference(..., x2c1e_mode=...)` E+F matches shared-integral DF-HF `< 1e-10`.
+3. ECP isolation & size-consistency:
+   - Pure ECP `Br` (`ECP10MDF`) and `I` (`ECP28MDF`) have identically zero `Delta h_SR` and `Delta E_SR`;
+   - `global1e` explicitly rejects ECP systems;
+   - Dissociated `HBr` (`R = 50 Bohr`) satisfies `Delta E_SR(HBr) == Delta E_SR(H) + 0`.
+4. Mixed all-electron + ECP analytic forces (`HBr`, `CH3Br`) and AE open-shell/closed-shell (`H2O`, `OH`):
+   - Analytic `Delta F_SR` (DF-HF & DF-MP2, AE & FC, fast difference-weight & full component routes)
+     matches two-step Richardson central finite differences `< 1e-8 Eh/bohr`;
+   - Net force and net torque `< 1e-12`.
+"""
+
+from __future__ import annotations
+
+import json
+
+import numpy as np
+import pytest
+
+bse = pytest.importorskip("basis_set_exchange")
+
+from generativeqc import Atom
+from generativeqc._f12_focal_reference import df_reference
+from generativeqc._x2c1e import (
+    SPEED_OF_LIGHT_AU,
+    build_aux_basis_from_bse,
+    build_unc_x2c_basis_from_bse,
+    evaluate_delta_sr,
+    stvw_integrals,
+    x2c1e_hcore,
+    x2c1e_hcore_derivatives,
+    x2c1e_weighted_gradient,
+)
+from generativeqc.basis import BasisProvenance, BasisSet, BasisShell, ElementBasis
+from generativeqc.elements import SYMBOLS, atomic_number
+from generativeqc.experimental.f12_focal import FocalBasis, FocalRequest
+
+
+def _bse_contracted_basis(elements: list[str], name: str) -> BasisSet:
+    records = []
+    for sym in sorted(set(elements), key=atomic_number):
+        z = atomic_number(sym)
+        raw = bse.get_basis(name, elements=[sym], fmt="json")
+        entry = json.loads(raw)["elements"][str(z)]
+        shells = []
+        for sh in entry["electron_shells"]:
+            ang = sh["angular_momentum"]
+            exps = tuple(str(x) for x in sh["exponents"])
+            if len(ang) == 1:
+                shells.append(
+                    BasisShell(
+                        int(ang[0]),
+                        exps,
+                        tuple(tuple(str(c) for c in row) for row in sh["coefficients"]),
+                    )
+                )
+            else:
+                for ell, row in zip(ang, sh["coefficients"], strict=True):
+                    shells.append(BasisShell(int(ell), exps, (tuple(str(c) for c in row),)))
+        ecp_core = int(entry.get("ecp_electrons", 0))
+        ecp_json = json.dumps(entry["ecp_potentials"], sort_keys=True) if ecp_core > 0 else None
+        records.append(ElementBasis(z, tuple(shells), ecp_core_electrons=ecp_core, ecp_data=ecp_json))
+    return BasisSet(name, tuple(records), BasisProvenance(name, "BSE", "BSE", "0" * 64), "spherical")
+
+
+def _to_pyscf_basis(basis: BasisSet, atoms: list[Atom]) -> dict[str, list]:
+    out: dict[str, list] = {}
+    for atom in atoms:
+        sym = SYMBOLS[atom.atomic_number - 1]
+        if sym in out:
+            continue
+        eb = basis.by_element[atom.atomic_number]
+        shells = []
+        for sh in eb.shells:
+            for crow in sh.coefficients:
+                shells.append(
+                    [sh.angular_momentum]
+                    + [[float(e), float(c)] for e, c in zip(sh.exponents, crow, strict=True)]
+                )
+        out[sym] = shells
+    return out
+
+
+AE_MOLECULES = [
+    ("H2O", [Atom(8, (0.0, 0.0, 0.0)), Atom(1, (0.0, 1.43, 1.1)), Atom(1, (0.0, -1.43, 1.1))], 0, 1),
+    ("OH", [Atom(8, (0.0, 0.0, 0.0)), Atom(1, (0.0, 0.0, 1.83))], 0, 2),
+    ("HCl", [Atom(17, (0.0, 0.0, 0.0)), Atom(1, (0.0, 0.0, 2.41))], 0, 1),
+    ("SO2", [Atom(16, (0.0, 0.0, 0.0)), Atom(8, (0.0, 2.3, 1.4)), Atom(8, (0.0, -2.3, 1.4))], 0, 1),
+    (
+        "CH4",
+        [
+            Atom(6, (0.0, 0.0, 0.0)),
+            Atom(1, (1.18, 1.18, 1.18)),
+            Atom(1, (-1.18, -1.18, 1.18)),
+            Atom(1, (-1.18, 1.18, -1.18)),
+            Atom(1, (1.18, -1.18, -1.18)),
+        ],
+        0,
+        1,
+    ),
+]
+
+
+@pytest.mark.parametrize("symbol,mult", [("H", 2), ("C", 3), ("O", 3), ("S", 3), ("Cl", 2)])
+def test_single_atom_block_parity_vs_pyscf(symbol: str, mult: int) -> None:
+    """For isolated AE atoms, DLU-X2C-1e == Global X2C-1e == DLU-localR == PySCF sfx2c1e."""
+    gto = pytest.importorskip("pyscf.gto")
+    scf = pytest.importorskip("pyscf.scf")
+    z = atomic_number(symbol)
+    atoms = [Atom(z, (0.0, 0.0, 0.0))]
+    basis = _bse_contracted_basis([symbol], "cc-pvdz")
+    mol = gto.M(
+        atom=[(symbol, (0.0, 0.0, 0.0))],
+        basis=_to_pyscf_basis(basis, atoms),
+        spin=mult - 1,
+        unit="Bohr",
+        cart=False,
+        verbose=0,
+    )
+    mf = scf.UHF(mol).sfx2c1e()
+    mf.with_x2c.approx = "ATOM1E"
+    h_py = mf.get_hcore()
+
+    h_dlu = x2c1e_hcore(atoms, basis, mode="dlu1e", multiplicity=mult)
+    h_glob = x2c1e_hcore(atoms, basis, mode="global1e", multiplicity=mult)
+    h_lr = x2c1e_hcore(atoms, basis, mode="dlu_local_r", multiplicity=mult)
+
+    assert np.max(np.abs(h_dlu - h_py)) < 1e-11
+    assert np.max(np.abs(h_glob - h_dlu)) < 1e-11
+    assert np.max(np.abs(h_lr - h_dlu)) < 1e-11
+
+
+@pytest.mark.parametrize("name,atoms,charge,mult", AE_MOLECULES)
+@pytest.mark.parametrize("mode,py_approx", [("dlu1e", "ATOM1E"), ("global1e", "1E")])
+def test_hcore_and_analytic_jacobian_parity_vs_pyscf(
+    name: str, atoms: list[Atom], charge: int, mult: int, mode: str, py_approx: str
+) -> None:
+    """Verify native W, hcore_x2c, dh_X2C/dR, and O(1)-Sylvester adjoint vs PySCF 2.14.0."""
+    gto = pytest.importorskip("pyscf.gto")
+    scf = pytest.importorskip("pyscf.scf")
+    sfx2c1e_grad = pytest.importorskip("pyscf.x2c.sfx2c1e_grad")
+    pyscf_x2c = pytest.importorskip("pyscf.x2c.x2c")
+    syms = [SYMBOLS[a.atomic_number - 1] for a in atoms]
+    basis = _bse_contracted_basis(syms, "cc-pvdz")
+    mol = gto.M(
+        atom=[(SYMBOLS[a.atomic_number - 1], a.position) for a in atoms],
+        basis=_to_pyscf_basis(basis, atoms),
+        charge=charge,
+        spin=mult - 1,
+        unit="Bohr",
+        cart=False,
+        verbose=0,
+    )
+
+    _, _, _, w_our = stvw_integrals(atoms, basis, charge=charge, multiplicity=mult)
+    w_py = mol.intor_symmetric("int1e_pnucp")
+    assert np.max(np.abs(w_our - w_py)) < 1e-10
+
+    mf = (scf.UHF(mol) if mult > 1 else scf.RHF(mol)).sfx2c1e()
+    mf.with_x2c.approx = py_approx
+    h_our = x2c1e_hcore(atoms, basis, mode=mode, charge=charge, multiplicity=mult)
+
+    # Compare against PySCF FW hcore (and direct mf.get_hcore() for ATOM1E & non-S 1E;
+    # on S/SO2, PySCF's internal Eq.2 projection differs from its own FW formula by 1.5e-10).
+    xmol, cc = mf.with_x2c.get_xmol()
+    x_py = mf.with_x2c.get_xmat(xmol)
+    h_fw_py = (
+        cc.T
+        @ pyscf_x2c._get_hcore_fw(
+            xmol.intor_symmetric("int1e_kin"),
+            xmol.intor_symmetric("int1e_nuc"),
+            xmol.intor_symmetric("int1e_pnucp"),
+            xmol.intor_symmetric("int1e_ovlp"),
+            x_py,
+            SPEED_OF_LIGHT_AU,
+        )
+        @ cc
+    )
+    assert np.max(np.abs(h_our - h_fw_py)) < 1e-11
+    if mode == "dlu1e" or name != "SO2":
+        assert np.max(np.abs(h_our - mf.get_hcore())) < 1e-10
+
+    # Element-wise analytic nuclear derivative parity vs pyscf.x2c.sfx2c1e_grad
+    dh_our = x2c1e_hcore_derivatives(atoms, basis, mode=mode, charge=charge, multiplicity=mult)
+    dh_gen = sfx2c1e_grad.hcore_grad_generator(mf.with_x2c)
+    dh_py = np.stack([dh_gen(ia) for ia in range(len(atoms))], axis=0)
+    assert np.max(np.abs(dh_our - dh_py)) < 1e-10
+
+    # O(1)-Sylvester/eigenvector adjoint matches explicit Jacobian contraction
+    rng = np.random.default_rng(1234)
+    wh = rng.standard_normal(h_our.shape)
+    wh = 0.5 * (wh + wh.T)
+    g_adj = x2c1e_weighted_gradient(atoms, basis, wh, mode=mode, charge=charge, multiplicity=mult)
+    g_jac = np.einsum("axij,ij->ax", dh_our, wh)
+    assert np.max(np.abs(g_adj - g_jac)) < 1e-12
+
+
+@pytest.mark.parametrize("name,atoms,charge,mult", AE_MOLECULES)
+@pytest.mark.parametrize("mode,py_approx", [("dlu1e", "ATOM1E"), ("global1e", "1E")])
+def test_df_hf_mp2_and_delta_sr_parity_vs_pyscf(
+    name: str, atoms: list[Atom], charge: int, mult: int, mode: str, py_approx: str
+) -> None:
+    """Verify DF-HF, DF-MP2, and pure additive Delta E_SR match PySCF 2.14.0 to < 1e-10 Eh."""
+    gto = pytest.importorskip("pyscf.gto")
+    mp = pytest.importorskip("pyscf.mp")
+    scf = pytest.importorskip("pyscf.scf")
+    syms = [SYMBOLS[a.atomic_number - 1] for a in atoms]
+    orb = build_unc_x2c_basis_from_bse(syms, ae_basis_name="x2c-svpall")
+    jk = build_aux_basis_from_bse(syms, "jk_fit")
+    mp2_fit = build_aux_basis_from_bse(syms, "mp2_fit")
+
+    mol = gto.M(
+        atom=[(SYMBOLS[a.atomic_number - 1], a.position) for a in atoms],
+        basis=_to_pyscf_basis(orb, atoms),
+        charge=charge,
+        spin=mult - 1,
+        unit="Bohr",
+        cart=False,
+        verbose=0,
+    )
+    jk_py = _to_pyscf_basis(jk, atoms)
+    mp2_py = _to_pyscf_basis(mp2_fit, atoms)
+
+    mf_nr = (scf.UHF(mol) if mult > 1 else scf.RHF(mol)).density_fit(auxbasis=jk_py)
+    mf_nr.conv_tol = 1e-13
+    mf_nr.conv_tol_grad = 1e-10
+    mf_nr.max_cycle = 150
+    e_hf_nr_py = mf_nr.kernel()
+    assert mf_nr.converged
+    e_c_nr_py = (
+        (mp.UMP2(mf_nr) if mult > 1 else mp.MP2(mf_nr)).density_fit(auxbasis=mp2_py).kernel()[0]
+    )
+
+    mf_sr = (scf.UHF(mol) if mult > 1 else scf.RHF(mol)).sfx2c1e().density_fit(auxbasis=jk_py)
+    mf_sr.with_x2c.approx = py_approx
+    if py_approx == "1E":
+        # As in the hcore parity test, use PySCF's FW formula on its own X matrix. Its
+        # default 1E hcore (Eq. 2) is 1.0e-10 (HCl) and 1.8e-10 Eh (SO2) from exact
+        # arithmetic on the same integrals; the FW route is within about 1e-12 Eh.
+        helper = mf_sr.with_x2c
+        helper.get_xmat = lambda xmol=None: type(helper).get_xmat(helper, xmol)
+    mf_sr.conv_tol = 1e-13
+    mf_sr.conv_tol_grad = 1e-10
+    mf_sr.max_cycle = 150
+    e_hf_sr_py = mf_sr.kernel()
+    assert mf_sr.converged
+    e_c_sr_py = (
+        (mp.UMP2(mf_sr) if mult > 1 else mp.MP2(mf_sr)).density_fit(auxbasis=mp2_py).kernel()[0]
+    )
+
+    res = evaluate_delta_sr(
+        atoms,
+        orb,
+        jk,
+        mp2_fit,
+        charge=charge,
+        multiplicity=mult,
+        mode=mode,
+        correlation_space="all-active",
+        forces=False,
+    )
+    e_mp2_nr_py = e_hf_nr_py + e_c_nr_py
+    e_mp2_sr_py = e_hf_sr_py + e_c_sr_py
+
+    assert abs(res.e_hf_nr - e_hf_nr_py) < 1e-10
+    assert abs(res.e_hf_sr - e_hf_sr_py) < 1e-10
+    assert abs(res.e_mp2_nr - e_mp2_nr_py) < 1e-10
+    assert abs(res.e_mp2_sr - e_mp2_sr_py) < 1e-10
+    assert abs(res.delta_sr_hf - (e_hf_sr_py - e_hf_nr_py)) < 1e-10
+    assert abs(res.delta_sr_mp2 - (e_mp2_sr_py - e_mp2_nr_py)) < 1e-10
+
+
+def test_native_cpp_df_reference_x2c1e_end_to_end() -> None:
+    """Verify native C++ PreparedFockPlan `df_reference` E+F agrees with `evaluate_delta_sr`."""
+    atoms = [Atom(8, (0.0, 0.0, 0.0)), Atom(1, (0.0, 1.43, 1.1)), Atom(1, (0.0, -1.43, 1.1))]
+    orb = build_unc_x2c_basis_from_bse(["O", "H"], ae_basis_name="x2c-svpall")
+    jk = _bse_contracted_basis(["O", "H"], "def2-svp-rifit")
+    fb = FocalBasis(2, "gate1-x2c-ref", orb, jk_fit=jk, mp2_fit=jk, f12_fit=jk, cabs=jk, beta=1.0)
+    req = FocalRequest(
+        surface_id="h2o-x2c",
+        atoms=tuple(atoms),
+        charge=0,
+        multiplicity=1,
+        root_id="rhf",
+        role="hf_cabs",
+        basis=fb,
+        backend="cpu_reference",
+        correlation_space_id="all-active",
+    )
+    for mode in ("dlu1e", "global1e"):
+        ref = df_reference(req, forces=True, x2c1e_mode=mode)
+        res = evaluate_delta_sr(
+            atoms, orb, jk, jk, mode=mode, forces=True, return_component_forces=True
+        )
+        assert abs(ref.energy - res.e_hf_sr) < 1e-10
+        assert ref.forces is not None and res.forces_hf_sr is not None
+        assert np.max(np.abs(ref.forces - res.forces_hf_sr)) < 1e-10
+
+
+def test_ecp_isolation_and_hbr_size_consistency() -> None:
+    """Pure ECP Br/I atoms have identically zero Delta-SR; Global1e rejects ECP; HBr dissociates cleanly."""
+    for sym, z in [("Br", 35), ("I", 53)]:
+        atoms = [Atom(z, (0.0, 0.0, 0.0))]
+        orb = build_unc_x2c_basis_from_bse([sym], ecp_basis_name="cc-pvdz-pp")
+        jk = build_aux_basis_from_bse([sym], "jk_fit")
+        dh = x2c1e_hcore(atoms, orb, mode="dlu1e", delta_only=True, multiplicity=2)
+        assert np.max(np.abs(dh)) == 0.0
+        ddh = x2c1e_hcore_derivatives(atoms, orb, mode="dlu1e", delta_only=True, multiplicity=2)
+        assert np.max(np.abs(ddh)) == 0.0
+        with pytest.raises(RuntimeError):
+            x2c1e_hcore(atoms, orb, mode="global1e", delta_only=False, multiplicity=2)
+        res = evaluate_delta_sr(atoms, orb, jk, jk, multiplicity=2, mode="dlu1e", forces=False)
+        assert abs(res.delta_sr_hf) < 1e-14
+        assert abs(res.delta_sr_mp2) < 1e-14
+
+    # Size consistency: HBr at asymptotic separation (R = 5000 Bohr) == H atom + 0 (Br ECP untouched)
+    orb_hbr = build_unc_x2c_basis_from_bse(["Br", "H"], ae_basis_name="x2c-svpall", ecp_basis_name="cc-pvdz-pp")
+    jk_hbr = build_aux_basis_from_bse(["Br", "H"], "jk_fit")
+    dh_far = x2c1e_hcore(
+        [Atom(35, (0.0, 0.0, 0.0)), Atom(1, (0.0, 0.0, 5000.0))],
+        orb_hbr,
+        mode="dlu1e",
+        delta_only=True,
+        multiplicity=3,
+    )
+    assert np.max(np.abs(dh_far[:23, :23])) < 1e-13
+    r_h = evaluate_delta_sr([Atom(1, (0.0, 0.0, 0.0))], orb_hbr, jk_hbr, jk_hbr, multiplicity=2, mode="dlu1e", forces=False)
+    r_far = evaluate_delta_sr(
+        [Atom(35, (0.0, 0.0, 0.0)), Atom(1, (0.0, 0.0, 5000.0))],
+        orb_hbr,
+        jk_hbr,
+        jk_hbr,
+        multiplicity=3,
+        root_id="uhf",
+        mode="dlu1e",
+        forces=False,
+    )
+    assert abs(r_far.delta_sr_hf - r_h.delta_sr_hf) < 1e-11
+    assert abs(r_far.delta_sr_mp2 - r_h.delta_sr_mp2) < 1e-11
+
+
+def _two_step_richardson_fd(
+    atoms: list[Atom],
+    ia: int,
+    ax: int,
+    eval_fn,
+    h1: float = 2e-3,
+    h2: float = 1e-3,
+) -> tuple[float, float]:
+    def central(h: float) -> tuple[float, float]:
+        ap = [
+            Atom(a.atomic_number, tuple(a.position[k] + (h if (j == ia and k == ax) else 0.0) for k in range(3)))
+            for j, a in enumerate(atoms)
+        ]
+        am = [
+            Atom(a.atomic_number, tuple(a.position[k] - (h if (j == ia and k == ax) else 0.0) for k in range(3)))
+            for j, a in enumerate(atoms)
+        ]
+        rp = eval_fn(ap)
+        rm = eval_fn(am)
+        return -(rp.delta_sr_hf - rm.delta_sr_hf) / (2.0 * h), -(rp.delta_sr_mp2 - rm.delta_sr_mp2) / (2.0 * h)
+
+    hf1, mp1 = central(h1)
+    hf2, mp2 = central(h2)
+    return (4.0 * hf2 - hf1) / 3.0, (4.0 * mp2 - mp1) / 3.0
+
+
+@pytest.mark.parametrize(
+    "label,atoms,charge,mult,cspace,coords_to_check",
+    [
+        ("H2O_AE", [Atom(8, (0.0, 0.0, 0.0)), Atom(1, (0.0, 1.43, 1.1)), Atom(1, (0.0, -1.43, 1.1))], 0, 1, "all-active", [(0, 2), (1, 1), (1, 2)]),
+        ("OH_UHF_FC", [Atom(8, (0.0, 0.0, 0.0)), Atom(1, (0.0, 0.0, 1.83))], 0, 2, "frozen-core", [(0, 2), (1, 2)]),
+        ("HBr_ECP_AE", [Atom(35, (0.0, 0.0, 0.0)), Atom(1, (0.0, 0.0, 2.67))], 0, 1, "all-active", [(0, 2), (1, 2)]),
+        ("HBr_ECP_FC", [Atom(35, (0.0, 0.0, 0.0)), Atom(1, (0.0, 0.0, 2.67))], 0, 1, "frozen-core", [(0, 2), (1, 2)]),
+        (
+            "CH3Br_ECP_FC",
+            [
+                Atom(35, (0.0, 0.0, -1.8)),
+                Atom(6, (0.0, 0.0, 1.86)),
+                Atom(1, (1.94, 0.0, 2.52)),
+                Atom(1, (-0.97, 1.68, 2.52)),
+                Atom(1, (-0.97, -1.68, 2.52)),
+            ],
+            0,
+            1,
+            "frozen-core",
+            [(0, 2), (1, 2), (2, 0), (2, 2)],
+        ),
+    ],
+)
+def test_analytic_delta_sr_forces_vs_two_step_fd(
+    label: str,
+    atoms: list[Atom],
+    charge: int,
+    mult: int,
+    cspace: str,
+    coords_to_check: list[tuple[int, int]],
+) -> None:
+    """Verify analytic Delta F_SR (DF-HF & DF-MP2) vs two-step central FD < 1e-8 and net F/T < 1e-12."""
+    syms = [SYMBOLS[a.atomic_number - 1] for a in atoms]
+    orb = build_unc_x2c_basis_from_bse(syms, ae_basis_name="x2c-svpall", ecp_basis_name="cc-pvdz-pp")
+    jk = build_aux_basis_from_bse(syms, "jk_fit")
+    mp2_fit = build_aux_basis_from_bse(syms, "mp2_fit")
+
+    res_fast = evaluate_delta_sr(
+        atoms, orb, jk, mp2_fit, charge=charge, multiplicity=mult, mode="dlu1e",
+        correlation_space=cspace, forces=True, return_component_forces=False, include_hf_forces=True,
+    )
+    res_full = evaluate_delta_sr(
+        atoms, orb, jk, mp2_fit, charge=charge, multiplicity=mult, mode="dlu1e",
+        correlation_space=cspace, forces=True, return_component_forces=True,
+    )
+    assert res_fast.delta_forces_hf is not None and res_fast.delta_forces_mp2 is not None
+    assert res_full.delta_forces_hf is not None and res_full.delta_forces_mp2 is not None
+    assert np.max(np.abs(res_fast.delta_forces_hf - res_full.delta_forces_hf)) < 1e-12
+    assert np.max(np.abs(res_fast.delta_forces_mp2 - res_full.delta_forces_mp2)) < 1e-12
+
+    coords = np.array([a.position for a in atoms])
+    for forces in (res_fast.delta_forces_hf, res_fast.delta_forces_mp2):
+        net_f = float(np.max(np.abs(forces.sum(axis=0))))
+        net_t = float(np.max(np.abs(np.cross(coords, forces).sum(axis=0))))
+        assert net_f < 1e-12, f"{label}: net force {net_f:.3e} >= 1e-12"
+        assert net_t < 1e-12, f"{label}: net torque {net_t:.3e} >= 1e-12"
+
+    def eval_e(at_list: list[Atom]):
+        return evaluate_delta_sr(
+            at_list, orb, jk, mp2_fit, charge=charge, multiplicity=mult, mode="dlu1e",
+            correlation_space=cspace, forces=False,
+        )
+
+    for ia, ax in coords_to_check:
+        fd_hf, fd_mp2 = _two_step_richardson_fd(atoms, ia, ax, eval_e)
+        assert abs(res_fast.delta_forces_hf[ia, ax] - fd_hf) < 1e-8, (
+            f"{label} ({ia},{ax}) DF-HF FD mismatch: analytic={res_fast.delta_forces_hf[ia, ax]} fd={fd_hf}"
+        )
+        assert abs(res_fast.delta_forces_mp2[ia, ax] - fd_mp2) < 1e-8, (
+            f"{label} ({ia},{ax}) DF-MP2 FD mismatch: analytic={res_fast.delta_forces_mp2[ia, ax]} fd={fd_mp2}"
+        )

@@ -1,7 +1,9 @@
 #include "scf/initial_guess/huckel.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <numeric>
 #include <stdexcept>
 
 #include "core/types.hpp"
@@ -29,20 +31,28 @@ struct Orbital {
   double energy{};
 };
 
-AtomicProblem atomic_problem(const core::System& system, std::size_t atom) {
-  const auto configuration = huckel_atomic_configuration(system.atoms[atom].atomic_number);
+using AtomicOccupations = std::array<unsigned, 3>;
+
+AtomicProblem atomic_problem(const core::System& system, std::size_t atom,
+                             const AtomicOccupations& occupations) {
   AtomicProblem result;
-  result.system.atoms = {{system.atoms[atom].atomic_number, {0, 0, 0}}};
-  result.system.electron_count = system.atoms[atom].atomic_number;
+  const auto& nucleus = system.atoms[atom];
+  result.system.atoms = {{nucleus.atomic_number, {0, 0, 0}, nucleus.ecp_core}};
+  result.system.electron_count = nucleus.ionic_charge();
   result.system.multiplicity = 1 + result.system.electron_count % 2;
   result.system.basis_representation = system.basis_representation;
+  for (auto term : system.ecp_terms)
+    if (term.atom_index == atom) {
+      term.atom_index = 0;
+      result.system.ecp_terms.push_back(term);
+    }
   std::size_t offset = 0;
   for (const auto& shell : system.shells) {
     const auto count = system.basis_representation == GENERATIVEQC_BASIS_SPHERICAL
                            ? 2 * shell.angular_momentum + 1
                            : molecule::cartesian_count(shell.angular_momentum);
-    const bool occupied_channel =
-        shell.angular_momentum == 0 || (shell.angular_momentum == 1 && configuration.second != 0);
+    const bool occupied_channel = shell.angular_momentum < occupations.size() &&
+                                  occupations[shell.angular_momentum] != 0;
     if (shell.atom_index == atom && occupied_channel) {
       result.system.shells.push_back({0, shell.angular_momentum, shell.primitives});
       for (std::size_t component = 0; component < count; ++component)
@@ -75,14 +85,14 @@ struct AtomicFrame {
   std::vector<double> energies;
 };
 
-AtomicFrame atomic_frame(const core::System& system, const Matrix& fock, const Matrix& overlap) {
+AtomicFrame atomic_frame(const core::System& system, const AtomicOccupations& occupations,
+                         const Matrix& fock, const Matrix& overlap) {
   const auto dimension = molecule::ao_count(system);
-  const auto [s_electrons, p_electrons] = huckel_atomic_configuration(system.electron_count);
   AtomicFrame frame;
   frame.density.assign(dimension * dimension, 0.0);
   std::vector<std::vector<double>> columns;
-  for (unsigned angular = 0; angular < 2; ++angular) {
-    const auto electrons = angular == 0 ? s_electrons : p_electrons;
+  for (unsigned angular = 0; angular < occupations.size(); ++angular) {
+    const auto electrons = occupations[angular];
     if (!electrons) continue;
     const std::size_t degeneracy = 2 * angular + 1;
     std::vector<std::size_t> indices;
@@ -94,7 +104,8 @@ AtomicFrame atomic_frame(const core::System& system, const Matrix& fock, const M
     }
     const auto radial = indices.size();
     const auto occupied = (electrons + 2 * degeneracy - 1) / (2 * degeneracy);
-    if (radial < occupied) throw std::invalid_argument("Huckel atomic basis lacks occupied shells");
+    if (radial < occupied)
+      throw std::invalid_argument("atomic basis lacks an occupied radial shell");
     Matrix radial_fock(radial * radial, 0.0), radial_overlap(radial * radial, 0.0);
     for (std::size_t row = 0; row < radial; ++row)
       for (std::size_t column = 0; column < radial; ++column)
@@ -129,18 +140,19 @@ AtomicFrame atomic_frame(const core::System& system, const Matrix& fock, const M
   return frame;
 }
 
-AtomicOrbitals solve_atom(core::System system, const PreliminaryOptions& policy,
+AtomicOrbitals solve_atom(core::System system, const AtomicOccupations& occupations,
+                          const PreliminaryOptions& policy,
                           PreliminaryDiagnostic& diagnostic) {
   if (system.electron_count == 1) {
     const auto integrals = integrals::build_integrals(system, false, false);
-    auto frame = atomic_frame(system, integrals.hcore, integrals.overlap);
+    auto frame = atomic_frame(system, occupations, integrals.hcore, integrals.overlap);
     return {std::move(system), std::move(frame.coefficients), std::move(frame.energies)};
   }
   auto spec = make_hf_fock_spec(FockSpin::Restricted, FockApproximation::Exact);
   spec.derivative_order = 0;
   const PreparedFockPlan plan(system, nullptr, resolve_fock_build(spec, FockBackend::Cpu));
   const auto& integrals = plan.one_electron();
-  auto frame = atomic_frame(system, integrals.hcore, integrals.overlap);
+  auto frame = atomic_frame(system, occupations, integrals.hcore, integrals.overlap);
   // Hydrogen is the one-electron atomic Hamiltonian, not a fractional-RHF
   // self-interacting surrogate. All unused angular channels decouple exactly
   // from a spherical density and have already been removed before ERI work.
@@ -153,7 +165,7 @@ AtomicOrbitals solve_atom(core::System system, const PreliminaryOptions& policy,
     const auto energy = reference::electronic_energy(frame.density, integrals.hcore, fock);
     const auto residual =
         reference::commutator_residual(fock, frame.density, integrals.overlap, integrals.nbf);
-    auto physical = atomic_frame(system, fock, integrals.overlap);
+    auto physical = atomic_frame(system, occupations, fock, integrals.overlap);
     // Atomic eigenvalues enter a different Hamiltonian. Do not let loose
     // preliminary molecular tolerances perturb that reproducible model.
     if (std::abs(energy - previous_energy) < std::min(policy.energy_tolerance, 1e-10) &&
@@ -162,9 +174,42 @@ AtomicOrbitals solve_atom(core::System system, const PreliminaryOptions& policy,
         reference::residual_max_abs(residual) < 1e-7)
       return {std::move(system), std::move(physical.coefficients), std::move(physical.energies)};
     previous_energy = energy;
-    frame = atomic_frame(system, diis.update(fock, residual), integrals.overlap);
+    frame = atomic_frame(system, occupations, diis.update(fock, residual), integrals.overlap);
   }
-  throw std::runtime_error("Huckel spherical atomic RHF exhausted its iteration budget");
+  throw std::runtime_error("spherical atomic RHF exhausted its iteration budget");
+}
+
+AtomicOccupations neutral_occupations(unsigned z) {
+  if (z <= 18) {
+    const auto [s, p] = huckel_atomic_configuration(z);
+    return {s, p, 0};
+  }
+  if (z <= 20) return {z - 12, 12, 0};
+  if (z <= 30) {
+    const unsigned s = (z == 24 || z == 29) ? 7 : 8;
+    return {s, 12, z - s - 12};
+  }
+  if (z <= 36) return {8, z - 18, 10};
+  if (z <= 38) return {z - 28, 18, 10};
+  if (z <= 48) {
+    const unsigned s = z == 46 ? 8 : ((z == 39 || z == 40 || z == 43 || z == 48) ? 10 : 9);
+    return {s, 18, z - s - 18};
+  }
+  if (z <= 54) return {10, z - 30, 20};
+  throw std::invalid_argument("atomic core identity supports elements through Xe");
+}
+
+AtomicOccupations removed_ecp_occupations(int core) {
+  switch (core) {
+    case 0: return {0, 0, 0};
+    case 2: return {2, 0, 0};
+    case 10: return {4, 6, 0};
+    case 18: return {6, 12, 0};
+    case 28: return {6, 12, 10};
+    case 36: return {8, 18, 10};
+    case 46: return {8, 18, 20};
+    default: throw std::invalid_argument("atomic core identity requires a complete-shell ECP");
+  }
 }
 }  // namespace
 
@@ -175,6 +220,44 @@ std::pair<unsigned, unsigned> huckel_atomic_configuration(int atomic_number) {
   if (atomic_number <= 10) return {4, static_cast<unsigned>(atomic_number - 4)};
   if (atomic_number <= 12) return {static_cast<unsigned>(atomic_number - 6), 6};
   return {6, static_cast<unsigned>(atomic_number - 6)};
+}
+
+void spherical_atomic_core(const core::System& atom, std::size_t orbitals, std::size_t budget,
+                           double* coefficients, double* energies) {
+  if (atom.atoms.size() != 1 || atom.charge || !orbitals ||
+      atom.basis_representation != core::kSphericalBasis)
+    throw std::invalid_argument("atomic core identity requires one neutral spherical atom");
+  auto occupations = neutral_occupations(atom.atoms[0].atomic_number);
+  const auto ecp = removed_ecp_occupations(atom.atoms[0].ecp_core);
+  for (std::size_t l = 0; l < occupations.size(); ++l) {
+    if (ecp[l] > occupations[l])
+      throw std::invalid_argument("ECP removes more than the neutral atom's shell occupation");
+    occupations[l] -= ecp[l];
+  }
+  auto problem = atomic_problem(atom, 0, occupations);
+  const auto n = molecule::ao_count(atom), radial_basis = problem.target_aos.size();
+  const auto n2 = runtime::size_mul(radial_basis, radial_basis);
+  const auto capacity = runtime::size_add(
+      runtime::size_mul(24, runtime::size_mul(n2, n2)), runtime::size_mul(2048, n2));
+  if (capacity > budget) throw std::length_error("spherical atomic RHF exceeds its numeric budget");
+  PreliminaryOptions policy;
+  policy.max_iterations = 200;
+  PreliminaryDiagnostic diagnostic;
+  const auto solution = solve_atom(std::move(problem.system), occupations, policy, diagnostic);
+  const auto occupied = solution.energies.size();
+  if (occupied <= orbitals)
+    throw std::invalid_argument("atomic basis lacks an occupied shell outside the frozen core");
+  std::vector<std::size_t> order(occupied);
+  std::iota(order.begin(), order.end(), 0);
+  std::stable_sort(order.begin(), order.end(), [&](auto left, auto right) {
+    return solution.energies[left] < solution.energies[right];
+  });
+  std::fill_n(coefficients, n * orbitals, 0.0);
+  for (std::size_t col = 0; col <= orbitals; ++col) energies[col] = solution.energies[order[col]];
+  for (std::size_t row = 0; row < radial_basis; ++row)
+    for (std::size_t col = 0; col < orbitals; ++col)
+      coefficients[problem.target_aos[row] * orbitals + col] =
+          solution.coefficients[row * occupied + order[col]];
 }
 
 HuckelDensityResult huckel_density(const core::System& system,
@@ -191,12 +274,14 @@ HuckelDensityResult huckel_density(const core::System& system,
   std::vector<AtomicOrbitals> cache;
   std::vector<Orbital> orbitals;
   for (std::size_t atom = 0; atom < system.atoms.size(); ++atom) {
-    auto problem = atomic_problem(system, atom);
+    const auto [s, p] = huckel_atomic_configuration(system.atoms[atom].atomic_number);
+    const AtomicOccupations occupations{s, p, 0};
+    auto problem = atomic_problem(system, atom, occupations);
     auto found = std::find_if(cache.begin(), cache.end(), [&](const auto& item) {
       return same_problem(item.system, problem.system);
     });
     if (found == cache.end()) {
-      cache.push_back(solve_atom(std::move(problem.system), policy, diagnostic));
+      cache.push_back(solve_atom(std::move(problem.system), occupations, policy, diagnostic));
       found = cache.end() - 1;
     }
     const auto atomic_n = problem.target_aos.size(), occupied = found->energies.size();

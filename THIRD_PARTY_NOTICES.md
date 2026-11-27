@@ -261,10 +261,10 @@ original references.
 
 | GSCDB record (`xyz_files/`) | Used in | Changes |
 | --- | --- | --- |
-| `W4-17_h2o` | `tests/python/test_f12_aot_mp2f12_gate1.py` | Converted from Å to Bohr (divided by 0.529177210903) |
-| `W4-17_oh` | `tests/python/test_f12_aot_mp2f12_gate1.py`, `tests/python/test_haq_all_electron_ef_gate1.py`, `tests/native/test_df_spin_admission.cpp` | Bond length only, converted from Å to Bohr (divided by 0.529177210903) |
-| `P34_P06_HBr` | `tests/python/test_f12_aot_mp2f12_gate1.py` | Converted from Å to Bohr (divided by 0.529177210903) |
-| `IHB100x10_05.012_OH-Oa__water--hydroxide_080` | `tests/python/test_f12_aot_mp2f12_gate1.py` | Converted from Å to Bohr (divided by 0.529177210903) |
+| `W4-17_h2o` | `tests/python/test_f12_aot_mp2f12_gate1.py`, `tests/python/test_f12_aot_deltacv_gate1.py`, `tests/python/test_focal_cv_additive_gate1.py` | Converted from Å to Bohr (divided by 0.529177210903) |
+| `W4-17_oh` | `tests/python/test_f12_aot_mp2f12_gate1.py`, `tests/python/test_f12_aot_deltacv_gate1.py`, `tests/python/test_haq_all_electron_ef_gate1.py`, `tests/native/test_df_spin_admission.cpp` | Bond length only, converted from Å to Bohr (divided by 0.529177210903) |
+| `P34_P06_HBr` | `tests/python/test_f12_aot_mp2f12_gate1.py`, `tests/python/test_f12_aot_deltacv_gate1.py` | Converted from Å to Bohr (divided by 0.529177210903) |
+| `IHB100x10_05.012_OH-Oa__water--hydroxide_080` | `tests/python/test_f12_aot_mp2f12_gate1.py`, `tests/python/test_f12_aot_deltacv_gate1.py` | Converted from Å to Bohr (divided by 0.529177210903) |
 | `21_H2O-Br_TA13` | `tests/python/test_fitted_halogen_water.py` | Converted from Å to Bohr at run time (divided by 0.529177210544); also used with iodine in the bromine position |
 
 ## Test-embedded Basis Set Exchange excerpts
@@ -278,3 +278,9 @@ Exchange as test inputs. The data are BSD-3-Clause; the license is retained in
 | STO-3G | H, He, B, C, O | Many native and Python tests; the same records as the bundled catalog |
 | 3-21G | H, C, N, O; Br with an added d shell | `tests/python/test_focal_uhf_v2_gate1.py`, `tests/python/test_focal_uhf_f12b_gate1.py`, `tests/python/test_rhf_triples_fp32w_gate1.py` |
 | cc-pVDZ-F12 and aug-cc-pVTZ-RI | H, O | `tests/reference_data/f12/libint_contracted.json`, `tests/reference_data/f12/libint_contracted_full_shells.json` |
+
+Other tests and the scalar-relativistic ΔSR (DLU-X2C-1e) correction read Basis
+Set Exchange records at run time from the optional `basis_set_exchange`
+package (the `bse` and `reference-test` extras); those records are not
+redistributed. The ΔSR bases record the installed package release and
+BSD-3-Clause in their provenance.

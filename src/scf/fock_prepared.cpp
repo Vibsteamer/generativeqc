@@ -7,6 +7,7 @@
 #include <string_view>
 
 #include "generativeqc/generativeqc.hpp"
+#include "integrals/x2c1e.hpp"
 #include "molecule/basis.hpp"
 #include "runtime/df_progress_trace.hpp"
 #include "runtime/resource_usage.hpp"
@@ -101,6 +102,8 @@ FockExecutionVariant execution_variant(const ResolvedFockBuild& strategy,
  * are excluded by the caller, just like absent terms in FockBuildSpec. */
 bool same_system(const core::System& a, const core::System& b) noexcept {
   if (a.ecp_terms != b.ecp_terms) return false;
+  if (a.x2c1e_mode != b.x2c1e_mode || a.x2c1e_speed_of_light != b.x2c1e_speed_of_light)
+    return false;
   if (a.charge != b.charge || a.multiplicity != b.multiplicity ||
       a.electron_count != b.electron_count || a.basis_representation != b.basis_representation ||
       a.atoms.size() != b.atoms.size() || a.shells.size() != b.shells.size())
@@ -362,6 +365,7 @@ struct PreparedFockPlan::Impl {
                                                 export_derivatives, export_derivatives),
               detail);
       auto ints = integrals::transform_integrals(cartesian, system);
+      integrals::apply_x2c1e_to_integrals(system, ints, export_derivatives);
       if (has_df)
         fitted->one_electron = std::move(ints);
       else
@@ -704,6 +708,7 @@ void PreparedFockPlan::ensure_one_electron_derivatives() const {
                                             true, true),
           detail);
   auto derivatives = integrals::transform_integrals(cartesian, impl_->orbital);
+  integrals::apply_x2c1e_to_integrals(impl_->orbital, derivatives, true);
   if (derivatives.nbf != one.nbf || derivatives.ncoord != coordinates ||
       derivatives.hcore_derivative.size() != elements ||
       derivatives.overlap_derivative.size() != elements)

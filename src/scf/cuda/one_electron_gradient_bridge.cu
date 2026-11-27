@@ -8,6 +8,7 @@
 
 #include "generativeqc/generativeqc.hpp"
 #include "integrals/ecp_cuda.hpp"
+#include "integrals/x2c1e.hpp"
 #include "molecule/basis.hpp"
 #include "runtime/cuda_component_trace.hpp"
 #include "runtime/resource_cuda.cuh"
@@ -264,6 +265,16 @@ generativeqc_status execute_cuda_one_electron_gradient(
     if (!std::all_of(result.begin(), result.end(), [](double x) { return std::isfinite(x); })) {
       detail = "nonfinite generated one-electron gradient";
       return GENERATIVEQC_STATUS_NUMERICAL_FAILURE;
+    }
+    if (system.x2c1e_mode != 0 && !wv.empty() &&
+        std::any_of(wv.begin(), wv.end(), [](double value) { return value != 0.0; })) {
+      const double c = system.x2c1e_speed_of_light > 0.0 ? system.x2c1e_speed_of_light
+                                                         : integrals::kSpeedOfLightAu;
+      const auto x2c_state = integrals::build_x2c1e_state(
+          system, static_cast<integrals::X2c1eMode>(system.x2c1e_mode), c);
+      const auto x2c_grad = integrals::contract_weighted_x2c1e_hcore_derivative(
+          *x2c_state, wv, /*delta_only=*/true);
+      for (std::size_t idx = 0; idx < result.size(); ++idx) result[idx] += x2c_grad[idx];
     }
     gradient.swap(result);
     if (resources) *resources = arena.stats;

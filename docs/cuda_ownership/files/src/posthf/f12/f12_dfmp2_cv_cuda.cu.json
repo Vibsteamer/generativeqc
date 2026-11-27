@@ -1,0 +1,14 @@
+{
+  "path": "src/posthf/f12/f12_dfmp2_cv_cuda.cu",
+  "reason": "Physical DF-HF J/K, MP2Fit factor transforms and their adjoints, plus active-space MP2 energies and response for core-valence differences.",
+  "regions": [
+    {
+      "reason": "Streams, handles, bounded buffers, transfer helpers and launch status.",
+      "role": "runtime",
+      "start": "struct CudaStream {",
+      "stop": "__global__ void k_check_finite"
+    }
+  ],
+  "role": "scientific",
+  "subsystem": "molecular_f12"
+}

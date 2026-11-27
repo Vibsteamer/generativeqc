@@ -81,6 +81,7 @@ RHFDFLadderOptions = _uccsd_rhf_virtual_pairs.RHFDFLadderOptions
 UHFDFLadderOptions = _uccsd_uhf_virtual_ladder.UHFDFLadderOptions
 FocalLowOrderForces = _f12_focal_molecular.FocalLowOrderForces
 FocalLowOrderEnergy = _f12_focal_molecular.FocalLowOrderEnergy
+FocalDeltaCVResult = _f12_focal_cv.FocalDeltaCVResult
 conventional_mp2_request = _f12_focal_cv.conventional_mp2_request
 DEFAULT_PRODUCTION_CORRELATION_SPACE = _f12_frozen_core.DEFAULT_PRODUCTION_CORRELATION_SPACE
 FROZEN_CORE_DEFINITION_VERSION = _f12_frozen_core.FROZEN_CORE_DEFINITION_VERSION

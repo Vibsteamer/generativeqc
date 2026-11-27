@@ -18,6 +18,7 @@
 #include "integrals/generated_df_cpu.hpp"
 #include "integrals/generated_scalar_ad.hpp"
 #include "integrals/range_moments.hpp"
+#include "integrals/x2c1e.hpp"
 #include "molecule/basis.hpp"
 #include "molecule/nuclear_gradient.hpp"
 #include "posthf/raw_source.hpp"
@@ -2296,8 +2297,10 @@ IntegralData build_integrals(const core::System& system, bool include_derivative
     }
     spherical.nuclear_repulsion = out.nuclear_repulsion;
     spherical.nuclear_repulsion_derivative = std::move(out.nuclear_repulsion_derivative);
+    apply_x2c1e_to_integrals(system, spherical, include_derivatives);
     return spherical;
   }
+  apply_x2c1e_to_integrals(system, out, include_derivatives);
   return out;
 }
 
@@ -2644,6 +2647,17 @@ std::vector<double> contract_weighted_one_electron_derivative(
             hcore_weights[item] * (ecp.local_derivative[coordinate * matrix_size + item] +
                                    ecp.nonlocal_derivative[coordinate * matrix_size + item]);
   }
+  if (system.x2c1e_mode != 0 &&
+      std::any_of(hcore_weights.begin(), hcore_weights.end(), [](double x) { return x != 0; })) {
+    const double c =
+        system.x2c1e_speed_of_light > 0.0 ? system.x2c1e_speed_of_light : kSpeedOfLightAu;
+    const auto x2c_state =
+        build_x2c1e_state(system, static_cast<X2c1eMode>(system.x2c1e_mode), c);
+    const auto x2c_grad =
+        contract_weighted_x2c1e_hcore_derivative(*x2c_state, hcore_weights, /*delta_only=*/true);
+    for (std::size_t coordinate = 0; coordinate < ncoord; ++coordinate)
+      contracted.derivative[coordinate] += x2c_grad[coordinate];
+  }
   if (!std::isfinite(contracted.value) ||
       !std::all_of(contracted.derivative.begin(), contracted.derivative.end(),
                    [](double value) { return std::isfinite(value); }))
@@ -2757,6 +2771,19 @@ RawSource::RawSource(core::System orbital, const core::System* auxiliary)
     impl_->ecp_matrix = ecp.local;
     for (std::size_t i = 0; i < impl_->ecp_matrix.size(); ++i)
       impl_->ecp_matrix[i] += ecp.nonlocal[i];
+  }
+  if (impl_->orbital.x2c1e_mode != 0) {
+    const double c = impl_->orbital.x2c1e_speed_of_light > 0.0
+                         ? impl_->orbital.x2c1e_speed_of_light
+                         : kSpeedOfLightAu;
+    const auto x2c_state =
+        build_x2c1e_state(impl_->orbital, static_cast<X2c1eMode>(impl_->orbital.x2c1e_mode), c);
+    if (impl_->ecp_matrix.empty()) {
+      impl_->ecp_matrix = x2c_state->hcore_delta;
+    } else {
+      for (std::size_t i = 0; i < impl_->ecp_matrix.size(); ++i)
+        impl_->ecp_matrix[i] += x2c_state->hcore_delta[i];
+    }
   }
   for (const auto& atom : impl_->orbital.atoms) {
     Vec3 position;

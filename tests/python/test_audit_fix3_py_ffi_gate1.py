@@ -22,6 +22,7 @@ from conftest import f12_host_shell
 from generativeqc._f12_ao_mo_native import (
     bind_ao_mo_ops,
     resolve_ao_mo_ops,
+    resolve_cabs_singles_ops,
     run_ao_mo_bilin_rev,
     run_ao_mo_project_rev,
     run_coulomb_fit_rev,
@@ -37,6 +38,7 @@ from generativeqc._f12_cphf_relax_native import (
     resolve_cphf_relax,
     run_df_canonical_driver_native,
 )
+from generativeqc._f12_cv_dfmp2_native import bind_delta_cv_native
 from generativeqc._f12_ext_fock_native import bind_ext_fock_native, resolve_ext_fock_native
 from generativeqc._f12_focal_integral_kernel import (
     LEGACY_SLATER_FIT_NORMALIZATION,
@@ -46,6 +48,9 @@ from generativeqc._f12_focal_integral_kernel import (
 )
 from generativeqc._f12_focal_integral_sink import _bind_fallback_weighted
 from generativeqc._f12_focal_projector import _ozaki_mm, _ozaki_mm_left_dd
+from generativeqc._f12_mp2_pair_native import (
+    bind_mp2_f12_pair_energies,
+)
 from generativeqc._f12_spin_ao import (
     _orbital_sources,
     clear_projected_source_cache,
@@ -77,6 +82,7 @@ def host_sink(tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureR
         "src/posthf/f12/f12_cphf_relax_cuda.cu",
         "src/posthf/f12/f12_cc_fixed_sources_cuda.cu",
         "src/posthf/f12/f12_mp2_pair_response_cuda.cu",
+        "src/posthf/f12/f12_dfmp2_cv_cuda.cu",
     )
     output = tmp_path_factory.mktemp("audit_host") / "libaudit_host_fixture.so"
     compiler = request.getfixturevalue("required_native_cxx")
@@ -1015,6 +1021,27 @@ def test_m7_reverse_rejects_overlapping_operands_before_writing(host_sink):
     np.testing.assert_array_equal(storage, original)
 
 
+def test_m7_cv_mp2_factors_rev_validates_co_and_cv_shapes(host_sink: Path) -> None:
+    """Audit M7(2): run_mp2_factors_rev rejects co.shape=(1,1) when n=2, o=1."""
+    aot = bind_delta_cv_native(host_sink, host_reference=True)
+    assert aot is not None
+
+    q, n, o, v = 2, 2, 1, 1
+    ao = np.ones((q, n, n), dtype=np.float64)
+    w = np.eye(q, dtype=np.float64)
+    co_bad = np.ones((1, o), dtype=np.float64)  # 1 row instead of n=2!
+    cv_ok = np.ones((n, v), dtype=np.float64)
+    b_fac = np.ones((q, o, v), dtype=np.float64)
+
+    with pytest.raises(ValueError, match="Inconsistent dimensions"):
+        aot.run_mp2_factors_rev(ao, w, co_bad, cv_ok, b_fac, b_fac)
+
+    co_ok = np.ones((n, o), dtype=np.float64)
+    cv_bad = np.ones((1, v), dtype=np.float64)
+    with pytest.raises(ValueError, match="Inconsistent dimensions"):
+        aot.run_mp2_factors_rev(ao, w, co_ok, cv_bad, b_fac, b_fac)
+
+
 def test_m7_spin_fock_1e_rejects_readonly_accumulate_and_c_int_overflow(
     host_sink: Path,
 ) -> None:
@@ -1408,6 +1435,72 @@ def test_m9_focal_cc_sources_passes_provider_shell_library_and_backend(
     assert captured.get("native_library") == host_sink
     assert captured.get("host_reference") is True
     clear_had_cc_source_cache(reset_stats=True)
+
+
+# ============================================================================
+# M10: Conflicting REQUIRE + DISABLE AOT env flags across all native bindings
+# ============================================================================
+
+
+def test_m10_conflicting_require_and_disable_env_flags_raise(
+    host_sink: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audit M10: simultaneous REQUIRE + DISABLE AOT flags raise ValueError everywhere."""
+    # 1. Delta-CV (both CV and DELTACV names)
+    for req_k, dis_k in (
+        ("GENERATIVEQC_F12_REQUIRE_AOT_CV", "GENERATIVEQC_F12_DISABLE_AOT_CV"),
+        ("GENERATIVEQC_F12_REQUIRE_AOT_DELTACV", "GENERATIVEQC_F12_DISABLE_AOT_DELTACV"),
+    ):
+        with monkeypatch.context() as mp:
+            mp.setenv(req_k, "1")
+            mp.setenv(dis_k, "1")
+            with pytest.raises(ValueError, match="Conflicting"):
+                bind_delta_cv_native(host_sink, host_reference=True)
+
+    # 2. AO->MO & CABS Singles
+    with monkeypatch.context() as mp:
+        mp.setenv("GENERATIVEQC_F12_REQUIRE_AOT_AOMO", "1")
+        mp.setenv("GENERATIVEQC_F12_DISABLE_AOT_AOMO", "1")
+        with pytest.raises(ValueError, match="Conflicting"):
+            resolve_ao_mo_ops(_cpu_runner(), None, shell_library=host_sink, host_reference=True)
+        with pytest.raises(ValueError, match="Conflicting"):
+            resolve_cabs_singles_ops(_cpu_runner(), shell_library=host_sink, host_reference=True)
+
+    # 3. Spin Fock 1e
+    with monkeypatch.context() as mp:
+        mp.setenv("GENERATIVEQC_F12_REQUIRE_AOT_SPINFOCK_1E", "1")
+        mp.setenv("GENERATIVEQC_F12_DISABLE_AOT_SPINFOCK_1E", "1")
+        with pytest.raises(ValueError, match="Conflicting"):
+            resolve_spin_fock_1e_ops(_cpu_runner(), library=host_sink, host_reference=True)
+
+    # 4. Extended Fock
+    with monkeypatch.context() as mp:
+        mp.setenv("GENERATIVEQC_F12_REQUIRE_AOT_EXTFOCK", "1")
+        mp.setenv("GENERATIVEQC_F12_DISABLE_AOT_EXTFOCK", "1")
+        with pytest.raises(ValueError, match="Conflicting"):
+            resolve_ext_fock_native(cuda=False, native_library=host_sink, host_reference=True)
+
+    # 5. MP2-F12 pairs
+    with monkeypatch.context() as mp:
+        mp.setenv("GENERATIVEQC_F12_REQUIRE_AOT_MP2F12", "1")
+        mp.setenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", "1")
+        with pytest.raises(ValueError, match="Conflicting"):
+            bind_mp2_f12_pair_energies(host_reference=True, shell_library=host_sink)
+
+    # 6. CC fixed sources
+    with monkeypatch.context() as mp:
+        mp.setenv("GENERATIVEQC_F12_REQUIRE_AOT_CCFIXED", "1")
+        mp.setenv("GENERATIVEQC_F12_DISABLE_AOT_CCFIXED", "1")
+        with pytest.raises(ValueError, match="Conflicting"):
+            resolve_ccfixed_library(host_sink, True, _cpu_runner())
+
+    # 7. CPHF relax
+    with monkeypatch.context() as mp:
+        mp.setenv("GENERATIVEQC_F12_REQUIRE_AOT_CPHF", "1")
+        mp.setenv("GENERATIVEQC_F12_DISABLE_AOT_CPHF", "1")
+        with pytest.raises(ValueError, match="Conflicting"):
+            resolve_cphf_relax(host_sink, "whiten_3c", host_reference=True)
 
 
 # ============================================================================

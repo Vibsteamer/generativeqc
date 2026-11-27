@@ -164,7 +164,8 @@ bool force_source_matches_system(const core::System& a, const core::System& b) n
   if (a.basis_representation != b.basis_representation || a.charge != b.charge ||
       a.multiplicity != b.multiplicity || a.electron_count != b.electron_count ||
       a.atoms.size() != b.atoms.size() || a.shells.size() != b.shells.size() ||
-      a.ecp_terms != b.ecp_terms)
+      a.ecp_terms != b.ecp_terms || a.x2c1e_mode != b.x2c1e_mode ||
+      a.x2c1e_speed_of_light != b.x2c1e_speed_of_light)
     return false;
   for (std::size_t i = 0; i < a.atoms.size(); ++i) {
     const auto& left = a.atoms[i];

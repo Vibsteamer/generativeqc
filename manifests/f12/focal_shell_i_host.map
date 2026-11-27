@@ -28,6 +28,14 @@
     gqc_f12_coulomb_fit_rev_host_reference;
     gqc_f12_cphf_action_host_reference;
     gqc_f12_cphf_whiten_3c_host_reference;
+    gqc_f12_cv_cphf_matvec_host_reference;
+    gqc_f12_cv_df_jk_fock_host_reference;
+    gqc_f12_cv_jk_fock_pullback_host_reference;
+    gqc_f12_cv_jk_mo_fock_fwd_host_reference;
+    gqc_f12_cv_mp2_factors_fwd_host_reference;
+    gqc_f12_cv_mp2_factors_rev_host_reference;
+    gqc_f12_cv_mp2_pairs_host_reference;
+    gqc_f12_cv_nuclear_source_weights_host_reference;
     gqc_f12_df_canonical_driver_host_reference;
     gqc_f12_df_nuclear_weights_host_reference;
     gqc_f12_ext_fock_congruence_rev_host_reference;
