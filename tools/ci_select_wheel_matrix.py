@@ -35,6 +35,8 @@ FULL_MATRIX_FILES = frozenset(
 FULL_MATRIX_PREFIXES = (
     ".github/actions/restore-wheel-ccache/",
     "cmake/3rdparty/implib/",
+    "manifests/f12/",
+    "src/posthf/f12/",
     "src/runtime/nvidia_host_api/",
 )
 
