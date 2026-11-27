@@ -1,0 +1,14 @@
+{
+  "path": "src/posthf/f12/f12_cc_fixed_sources_cuda.cu",
+  "reason": "Native fixed-cusp spin-pair sources, Coulomb fitting and forward and reverse contractions, including the strong-orthogonality mask, fixed-source dressings and same-/opposite-spin energies.",
+  "regions": [
+    {
+      "reason": "CUDA buffer and handle ownership and row-major library dispatch.",
+      "role": "runtime",
+      "start": "struct DeviceBuf {",
+      "stop": "__global__ void k_symmetrize_neg_half_inplace"
+    }
+  ],
+  "role": "scientific",
+  "subsystem": "molecular_f12"
+}

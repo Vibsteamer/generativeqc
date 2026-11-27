@@ -14,7 +14,8 @@ set(shell_sources
     f12_mp2_pair_response_cuda.cu
     f12_spin_fock_1e_cuda.cu
     f12_cphf_relax_cuda.cu
-    f12_ext_fock_cuda.cu)
+    f12_ext_fock_cuda.cu
+    f12_cc_fixed_sources_cuda.cu)
 if(GENERATIVEQC_ENABLE_CUDA)
   set(backend cuda)
 else()

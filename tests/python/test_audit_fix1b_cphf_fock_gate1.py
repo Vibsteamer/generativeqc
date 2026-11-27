@@ -24,6 +24,15 @@ import numpy as np
 import pytest
 
 from conftest import configured_test_library
+
+from generativeqc._f12_cc_fixed_sources_native import (
+    bind_coulomb_fit_fwd,
+    bind_coulomb_fit_rev,
+    bind_fixed_pair_sources,
+    run_coulomb_fit_fwd_native,
+    run_coulomb_fit_rev_native,
+    run_fixed_pair_sources_native,
+)
 from generativeqc._f12_cphf_relax_native import (
     bind_cphf_relax,
     run_cphf_action_native,
@@ -103,6 +112,13 @@ def cphf_host_lib(tmp_path_factory: pytest.TempPathFactory) -> Path:
 def ext_fock_host_lib(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return _compile_host_unit(
         tmp_path_factory, "ext_fock", "src/posthf/f12/f12_ext_fock_cuda.cu", "-std=c++20"
+    )
+
+
+@pytest.fixture(scope="module")
+def cc_fixed_host_lib(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return _compile_host_unit(
+        tmp_path_factory, "cc_fixed", "src/posthf/f12/f12_cc_fixed_sources_cuda.cu", "-std=c++17"
     )
 
 
@@ -377,6 +393,151 @@ def test_m6_ext_fock_hard_budget_audit_counterexamples(ext_fock_host_lib: Path) 
     assert ops.half_rev_fn(1, 5000, 1, 0, p, _NULL_D, _NULL_D, p, _NULL_D, p, _NULL_D, p, 0, p, _NULL_D) == -5
 
 
+def test_m6_cc_coulomb_fit_hard_budget_exact_boundaries(cc_fixed_host_lib: Path) -> None:
+    """M6: coulomb_fit_{fwd,rev} enforce hard budgets (no chunk=1 override) down to exact bytes."""
+    fwd_fn = bind_coulomb_fit_fwd(cc_fixed_host_lib, host_reference=True)
+    rev_fn = bind_coulomb_fit_rev(cc_fixed_host_lib, host_reference=True)
+    assert fwd_fn is not None and rev_fn is not None
+
+    # 1. Exact M6 audit counterexample: aux=8192 under default 480 MiB budget -> 1 GiB fixed > 480 MiB.
+    dummy = np.zeros(1, dtype=np.float64)
+    p = _dptr(dummy)
+    assert fwd_fn(8192, 1, p, p, p, 0) == -5
+    assert rev_fn(8192, 1, p, p, _NULL_D, p, p, p, 0) == -5
+    assert rev_fn(8192, 1, p, _NULL_D, p, p, p, p, 0) == -5
+
+    # 2. Byte-exact acceptance/rejection boundaries on small problem.
+    rng = np.random.default_rng(606)
+    aux, ncols = 7, 13
+    w = np.ascontiguousarray(rng.standard_normal((aux, aux)) * 0.25 + np.eye(aux))
+    raw = np.ascontiguousarray(rng.standard_normal((aux, ncols)) * 0.4)
+    fit_bar = np.ascontiguousarray(rng.standard_normal((aux, ncols)) * 0.3)
+
+    for invalid in (-1, 1 << 63, 1 << 64):
+        with pytest.raises(ValueError, match="workspace budget"):
+            run_coulomb_fit_fwd_native(fwd_fn, w, raw, max_workspace_bytes=invalid)
+
+    ref_fit = w.T @ (w @ raw)
+    ref_tc_bar = w.T @ (w @ fit_bar)
+    weight = ref_fit @ ref_tc_bar.T
+    ref_m_bar = -0.5 * (weight + weight.T)
+
+    # Forward: fixed = 1*aux^2, per_col = 2*aux doubles.
+    min_fwd = (1 * aux * aux + 2 * aux) * 8
+    with pytest.raises(RuntimeError, match="status -5"):
+        run_coulomb_fit_fwd_native(fwd_fn, w, raw, max_workspace_bytes=1)
+    with pytest.raises(RuntimeError, match="status -5"):
+        run_coulomb_fit_fwd_native(fwd_fn, w, raw, max_workspace_bytes=min_fwd - 1)
+    got_fit = run_coulomb_fit_fwd_native(fwd_fn, w, raw, max_workspace_bytes=min_fwd)
+    np.testing.assert_allclose(got_fit, ref_fit, atol=1e-13, rtol=1e-13)
+
+    # Reverse (precomputed fit): fixed = 2*aux^2, per_col = 2*aux doubles.
+    min_rev_pre = (2 * aux * aux + 2 * aux) * 8
+    with pytest.raises(RuntimeError, match="status -5"):
+        run_coulomb_fit_rev_native(rev_fn, w, fit_bar, fit_precomputed=ref_fit, max_workspace_bytes=1)
+    with pytest.raises(RuntimeError, match="status -5"):
+        run_coulomb_fit_rev_native(
+            rev_fn, w, fit_bar, fit_precomputed=ref_fit, max_workspace_bytes=min_rev_pre - 1
+        )
+    tc_bar, m_bar = run_coulomb_fit_rev_native(
+        rev_fn, w, fit_bar, fit_precomputed=ref_fit, max_workspace_bytes=min_rev_pre
+    )
+    np.testing.assert_allclose(tc_bar, ref_tc_bar, atol=1e-13, rtol=1e-13)
+    np.testing.assert_allclose(m_bar, ref_m_bar, atol=1e-13, rtol=1e-13)
+
+    # Reverse (on-the-fly fit): fixed = 2*aux^2, per_col = 3*aux doubles.
+    min_rev_otf = (2 * aux * aux + 3 * aux) * 8
+    with pytest.raises(RuntimeError, match="status -5"):
+        run_coulomb_fit_rev_native(
+            rev_fn, w, fit_bar, three_center=raw, max_workspace_bytes=min_rev_otf - 1
+        )
+    tc_bar2, m_bar2 = run_coulomb_fit_rev_native(
+        rev_fn, w, fit_bar, three_center=raw, max_workspace_bytes=min_rev_otf
+    )
+    np.testing.assert_allclose(tc_bar2, ref_tc_bar, atol=1e-13, rtol=1e-13)
+    np.testing.assert_allclose(m_bar2, ref_m_bar, atol=1e-13, rtol=1e-13)
+
+    # Negative budget rejected as invalid arg (-1).
+    assert fwd_fn(aux, ncols, _dptr(w), _dptr(raw), _dptr(np.empty_like(raw)), -1) == -1
+
+
+def test_m6_cc_fixed_pair_sources_hard_budget_exact_boundaries(cc_fixed_host_lib: Path) -> None:
+    """M6: gqc_f12_cc_fixed_pair_sources enforces hard budgets across Stages 0, 1, and 2."""
+    fn = bind_fixed_pair_sources(cc_fixed_host_lib, host_reference=True)
+    assert fn is not None
+
+    rng = np.random.default_rng(707)
+    nl = nr = 2
+    fl = fr = 0
+    obs, ext, aux = 4, 6, 5
+    pairs = [(0, 0), (0, 1), (1, 1)]
+    ae = aux * ext
+    ee = ext * ext
+    oo = obs * obs
+    vv = (obs - nl) * (obs - nr)
+
+    def _sym(n: int) -> np.ndarray:
+        m = rng.standard_normal((n, n)) * 0.2
+        return np.ascontiguousarray(0.5 * (m + m.T))
+
+    kwargs = dict(
+        same_spin=True,
+        compute_wc=True,
+        compute_quad=True,
+        nl=nl,
+        nr=nr,
+        fl=fl,
+        fr=fr,
+        obs=obs,
+        ext=ext,
+        aux=aux,
+        pairs=pairs,
+        fit_l=rng.standard_normal((aux, nl, ext)) * 0.2,
+        fit_r=None,
+        raw_coul_r=rng.standard_normal((aux, nr, ext)) * 0.2,
+        raw_g_l=rng.standard_normal((aux, nl, ext)) * 0.2,
+        raw_g_r=None,
+        raw_gc_l=rng.standard_normal((aux, nl, ext)) * 0.2,
+        raw_gc_r=None,
+        metric_g=_sym(aux),
+        metric_gc=_sym(aux),
+        raw_sq_l=rng.standard_normal((aux, nl, ext)) * 0.2,
+        raw_sq_r=None,
+        raw_dc_l=rng.standard_normal((aux, nl, ext)) * 0.2,
+        raw_dc_r=None,
+        metric_sq=_sym(aux),
+        metric_dc=_sym(aux),
+        fock_l=_sym(ext),
+        fock_r=None,
+        exch_l=_sym(ext),
+        exch_r=None,
+        cross_overlap=None,
+        fit_obs_l=rng.standard_normal((aux, obs, obs)) * 0.2,
+        raw_obs_r=rng.standard_normal((aux, obs, obs)) * 0.2,
+    )
+
+    ref = run_fixed_pair_sources_native(fn, max_workspace_bytes=0, **kwargs)
+
+    # Exact minimum bytes across Stage 0, Stage 1 (same_spin, wc, quad -> 9*ee + 4 + max(oo,vv) + 4*ae), Stage 2 (5*oo).
+    stage0_res_min = (aux * aux + 2 * ae) * 8
+    stage0_fmix_min = ((nl - fl) ** 2 + 2 * (nl - fl)) * 8
+    stage1_min = (9 * ee + 4 + max(oo, vv) + 4 * ae) * 8
+    stage2_min = 5 * oo * 8
+    min_required = max(stage0_res_min, stage0_fmix_min, stage1_min, stage2_min)
+
+    with pytest.raises(RuntimeError, match="status -5"):
+        run_fixed_pair_sources_native(fn, max_workspace_bytes=1, **kwargs)
+    with pytest.raises(RuntimeError, match="status -5"):
+        run_fixed_pair_sources_native(fn, max_workspace_bytes=min_required - 1, **kwargs)
+
+    got = run_fixed_pair_sources_native(fn, max_workspace_bytes=min_required, **kwargs)
+    assert got[0] is not None and ref[0] is not None
+    assert got[1] is not None and ref[1] is not None
+    np.testing.assert_allclose(got[0], ref[0], atol=1e-13, rtol=1e-13)
+    np.testing.assert_allclose(got[1], ref[1], atol=1e-13, rtol=1e-13)
+    np.testing.assert_allclose(got[2:], ref[2:], atol=1e-13, rtol=1e-13)
+
+
 # =============================================================================
 # M8: Fail-closed NaN/Inf checks & no uncaught C++ exceptions across extern "C"
 # =============================================================================
@@ -520,6 +681,47 @@ def test_m8_ext_fock_all_7_primitives_reject_nonfinite(ext_fock_host_lib: Path) 
             bar_raw,
             np.zeros((2, 1)),
             None,
+        )
+
+
+def test_m8_cc_fixed_sources_all_3_primitives_reject_nonfinite(cc_fixed_host_lib: Path) -> None:
+    """All 3 cc_fixed_sources entry points fail closed with -2 on Inf/NaN outputs."""
+    fwd_fn = bind_coulomb_fit_fwd(cc_fixed_host_lib, host_reference=True)
+    rev_fn = bind_coulomb_fit_rev(cc_fixed_host_lib, host_reference=True)
+    pair_fn = bind_fixed_pair_sources(cc_fixed_host_lib, host_reference=True)
+    assert fwd_fn is not None and rev_fn is not None and pair_fn is not None
+
+    with pytest.raises(RuntimeError, match="status -2"):
+        run_coulomb_fit_fwd_native(fwd_fn, np.array([[1e308]]), np.array([[2.0]]))
+
+    with pytest.raises(RuntimeError, match="status -2"):
+        run_coulomb_fit_rev_native(
+            rev_fn, np.array([[1e308]]), np.array([[2.0]]), three_center=np.array([[1.0]])
+        )
+
+    with pytest.raises(RuntimeError, match="status -2"):
+        run_fixed_pair_sources_native(
+            pair_fn,
+            same_spin=True,
+            compute_wc=False,
+            compute_quad=False,
+            nl=1,
+            nr=1,
+            fl=0,
+            fr=0,
+            obs=2,
+            ext=3,
+            aux=1,
+            pairs=[(0, 0)],
+            fit_l=np.full((1, 1, 3), 1e308),
+            fit_r=None,
+            raw_coul_r=np.full((1, 1, 3), 2.0),
+            raw_g_l=np.ones((1, 1, 3)),
+            raw_g_r=None,
+            raw_gc_l=np.ones((1, 1, 3)),
+            raw_gc_r=None,
+            metric_g=np.ones((1, 1)),
+            metric_gc=np.ones((1, 1)),
         )
 
 
