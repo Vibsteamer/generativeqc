@@ -229,3 +229,19 @@ with Laikov's permission. Please cite V. I. Lebedev and D. N. Laikov,
 *Doklady Mathematics* **59**(3), 477–481 (1999), when using these grids.
 Treutler radial quadrature: O. Treutler and R. Ahlrichs,
 *Journal of Chemical Physics* **102**, 346–354 (1995).
+
+## Psi4 Slater-geminal fit coefficients
+
+The six Gaussian exponents and coefficients that fit the Slater-type F12
+geminal in `src/integrals/f12_geminal.hpp`, which is compiled into the native
+library and shipped in wheels as a compiler asset, and the test fixture
+`tests/reference_data/f12/psi4_geminal_coefficients.json` are the values of
+`MintsHelper::f12_cgtg` in Psi4 1.11 (https://github.com/psi4/psi4),
+Copyright (c) 2007-2026 The Psi4 Developers. Psi4 is licensed under the GNU
+Lesser General Public License, version 3; its license texts are retained in
+`LICENSES/psi4-COPYING.LESSER.txt` and `LICENSES/psi4-COPYING.txt` and
+installed with every native SDK/CLI build under `share/generativeqc/licenses/`
+(or the configured CMake data directory). The twelve
+numbers are used unchanged; at run time the exponents are multiplied by the
+square of the Slater exponent and, for the second normalization, the
+coefficients are divided by it.

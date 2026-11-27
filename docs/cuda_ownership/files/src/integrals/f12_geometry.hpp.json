@@ -1,0 +1,7 @@
+{
+  "path": "src/integrals/f12_geometry.hpp",
+  "reason": "Computes the Gaussian-geminal Hermite seed moments for bare, inverse-distance and squared-distance-weighted radial factors.",
+  "regions": [],
+  "role": "scientific",
+  "subsystem": "molecular_f12"
+}
