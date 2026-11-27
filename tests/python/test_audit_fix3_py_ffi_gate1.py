@@ -1305,6 +1305,111 @@ def test_m9_spin_fock_1e_disables_inplace_on_unsafe_older_library(
     np.testing.assert_allclose(got_bars["raw_coulomb_alpha"], ref_bars["raw_coulomb_alpha"], atol=1e-13)
 
 
+def test_m9_focal_cc_sources_passes_provider_shell_library_and_backend(
+    host_sink: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audit M9: molecular_ucc_sources forwards provider.shell_library and host_reference=(not cuda)."""
+    from generativeqc._f12_focal_cc_sources import (
+        clear_had_cc_source_cache,
+        molecular_ucc_sources,
+    )
+
+    clear_had_cc_source_cache(reset_stats=True)
+    obs, ext, aux = 2, 3, 2
+    eps = np.array([-1.0, 1.0], dtype=np.float64)
+    fock_mat = np.diag([-1.0, 1.0, 2.0])
+
+    captured: dict = {}
+
+    def spy_feeds(*args, **kwargs):
+        captured.update(kwargs)
+        return {"fixed_geminal_energy": np.array(0.0)}
+
+    dummy_panel = types.SimpleNamespace(
+        fit_id="f12-fit",
+        whitener=np.eye(aux, dtype=np.float64),
+        joint=lambda req, explicit=False: {},
+    )
+    provider = types.SimpleNamespace(
+        run=_cpu_runner(),
+        metric_library=None,
+        response_library=None,
+        shell_library=host_sink,
+        budget_mib=128,
+        relative_cutoff=1e-9,
+        slater_normalization="negative_exponential_over_beta",
+        _seed_options=lambda req: {},
+        _cached_pair_sources=lambda req, derivatives=False, budget=128: (
+            types.SimpleNamespace(),
+            (dummy_panel, dummy_panel, dummy_panel),
+        ),
+    )
+    basis = types.SimpleNamespace(
+        basis_id="b-cc",
+        orbital=types.SimpleNamespace(identity="orb"),
+        jk_fit=types.SimpleNamespace(identity="jk"),
+        f12_fit=types.SimpleNamespace(identity="f12-fit"),
+        mp2_fit=types.SimpleNamespace(identity="f12-fit"),
+        cabs=types.SimpleNamespace(identity="cabs"),
+        beta=1.0,
+    )
+    request = types.SimpleNamespace(
+        role="mp2_f12_correlation",
+        root_id="rhf",
+        multiplicity=1,
+        charge=0,
+        backend="cpu_reference",
+        surface_id="surf",
+        correlation_space_id="all-active",
+        atoms=(types.SimpleNamespace(atomic_number=1, position=(0.0, 0.0, 0.0)),),
+        basis=basis,
+    )
+    ref = types.SimpleNamespace(
+        surface_id="surf",
+        basis_id="b-cc",
+        executed_backend="cpu_reference",
+        orbital_id="orb",
+        jk_fit_id="jk",
+        forces=None,
+        occupied=(1,),
+        coefficients=np.eye(obs, dtype=np.float64)[None, :, :],
+        orbital_energies=eps[None, :],
+        energy=-1.0,
+        _pair_spin_indices=lambda req: (0, 0),
+    )
+    proj = types.SimpleNamespace(rank=1)
+
+    with (
+        patch(
+            "generativeqc._f12_focal_cc_sources.canonical_pair_frame",
+            return_value=((1, 1, obs, ext, aux), {}, None, proj),
+        ),
+        patch(
+            "generativeqc._f12_focal_cc_sources._orbital_sources",
+            return_value=({}, None),
+        ),
+        patch(
+            "generativeqc._f12_focal_cc_sources.extended_fock_response",
+            return_value=({"fock_alpha": fock_mat, "fock_beta": fock_mat}, None),
+        ),
+        patch(
+            "generativeqc._f12_focal_cc_sources.unrestricted_cc_f12_fixed_source_feeds",
+            side_effect=spy_feeds,
+        ),
+    ):
+        molecular_ucc_sources(
+            provider,
+            request,
+            include_ordinary=False,
+            reference=ref,
+        )
+
+    assert captured.get("native_library") == host_sink
+    assert captured.get("host_reference") is True
+    clear_had_cc_source_cache(reset_stats=True)
+
+
 # ============================================================================
 # M12: Streaming reverse releases bar_ao_mat AND target_bar_ao before next load
 # ============================================================================

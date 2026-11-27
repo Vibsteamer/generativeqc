@@ -1,0 +1,263 @@
+"""Ordinary canonical Hamiltonian directions on a moving unrestricted DF frame."""
+
+from collections.abc import Callable, Mapping
+from math import prod
+
+import numpy as np
+from generativeqc_compiler.cc.uccsd_coulomb_blocks import (
+    antisymmetrized_integral_requests,
+)
+from generativeqc_compiler.cc.uccsd_equations import build_program
+from generativeqc_compiler.cc.uccsd_f12_sources import unrestricted_cc_obs_fit_direction
+from generativeqc_compiler.cc.uccsd_layout import BLOCK_NAMES
+from generativeqc_compiler.common.arrays import immutable
+from generativeqc_compiler.mp2.f12_density_fitting import (
+    coulomb_fit_response,
+    coulomb_pair_projection,
+    fitted_integral_block,
+)
+from generativeqc_compiler.tensor import Program, linearize
+
+
+def _spin_fock_weight(
+    weights: Mapping[str, np.ndarray], spin: str, nmo: int, no: int, nf: int
+) -> np.ndarray:
+    if not 0 <= nf <= no <= nmo:
+        raise ValueError("Invalid frozen or occupied spin partition")
+    tag = spin[0] * 2
+    bar = np.zeros((nmo, nmo))
+    slices = {"o": slice(nf, no), "v": slice(no, nmo)}
+    for block in ("oo", "ov", "vv"):
+        name = "f" + block + "_" + tag
+        dst = bar[slices[block[0]], slices[block[1]]]
+        value = weights[name]
+        if value.dtype != np.float64 or value.shape != dst.shape:
+            raise ValueError(f"Inconsistent ordinary Fock cotangent {name}")
+        dst[...] = value
+    # The Fock and Hcore tangents are symmetric. The ov input has a single
+    # copy, so averaging distributes half its weight to each transpose.
+    return (bar + bar.T) / 2
+
+
+def unrestricted_cc_df_hamiltonian_tangent(
+    space: tuple[int, int, int, int, int],
+    data: Mapping[str, np.ndarray],
+    whitener: np.ndarray,
+    run: Callable,
+    *,
+    data_tangent: Mapping[str, np.ndarray],
+    fock_tangent: Mapping[str, np.ndarray],
+    coulomb_metric_tangent: np.ndarray,
+    frozen_occupied: tuple[int, int] = (0, 0),
+) -> dict[str, np.ndarray]:
+    """Build the ordinary dF and antisymmetrized dERI inputs for one direction.
+
+    Raw Coulomb columns and their total derivatives use the same moving MO
+    frames as the F12 sources. Fock tangents include both occupied spin
+    densities. Frozen orbitals remain in the supplied Fock and are removed
+    from the output occupied legs. Each Coulomb tile contracts one solved
+    density and one raw density, including both derivatives and the metric.
+    """
+    return _hamiltonian_blocks(
+        space,
+        data,
+        whitener,
+        run,
+        fock_tangent,
+        frozen_occupied,
+        direction=(data_tangent, coulomb_metric_tangent),
+    )
+
+
+def unrestricted_cc_df_hamiltonian(
+    space: tuple[int, int, int, int, int],
+    data: Mapping[str, np.ndarray],
+    fock: Mapping[str, np.ndarray],
+    whitener: np.ndarray,
+    run: Callable,
+    *,
+    frozen_occupied: tuple[int, int] = (0, 0),
+    max_output_bytes: int | None = None,
+    retain_rhf_virtual_factors: dict[str, np.ndarray] | None = None,
+    retain_uhf_virtual_factors: dict[str, np.ndarray] | None = None,
+) -> dict[str, np.ndarray]:
+    """Build ordinary sources, optionally retaining a single RHF virtual factor pair."""
+    return _hamiltonian_blocks(
+        space,
+        data,
+        whitener,
+        run,
+        fock,
+        frozen_occupied,
+        direction=None,
+        max_output_bytes=max_output_bytes,
+        retain_rhf_virtual_factors=retain_rhf_virtual_factors,
+        retain_uhf_virtual_factors=retain_uhf_virtual_factors,
+    )
+
+
+def _hamiltonian_blocks(
+    space: tuple[int, int, int, int, int],
+    data: Mapping[str, np.ndarray],
+    whitener: np.ndarray,
+    run: Callable,
+    spin_fock: Mapping[str, np.ndarray],
+    frozen_occupied: tuple[int, int],
+    direction: tuple[Mapping[str, np.ndarray], np.ndarray] | None,
+    max_output_bytes: int | None = None,
+    retain_rhf_virtual_factors: dict[str, np.ndarray] | None = None,
+    retain_uhf_virtual_factors: dict[str, np.ndarray] | None = None,
+) -> dict[str, np.ndarray]:
+    oa, ob, obs, ext, aux = space
+    fa, fb = frozen_occupied
+    if not (0 <= fa <= oa < obs and 0 <= fb <= ob < obs <= ext and aux > 0):
+        raise ValueError("Invalid UCC occupied, frozen, OBS or fitting dimensions")
+    if retain_rhf_virtual_factors is not None and (
+        oa != ob
+        or fa != fb
+        or retain_rhf_virtual_factors
+        or direction is not None
+        or retain_uhf_virtual_factors is not None
+    ):
+        raise ValueError("Bounded virtual preparation requires a matched RHF frame")
+    if retain_uhf_virtual_factors is not None and (
+        retain_uhf_virtual_factors or direction is not None
+    ):
+        raise ValueError(
+            "UHF virtual factor destination must be empty with no direction"
+        )
+    bounded = (
+        retain_rhf_virtual_factors is not None or retain_uhf_virtual_factors is not None
+    )
+    ordinary = build_program(oa - fa, ob - fb, obs - oa, obs - ob)
+    shapes = {
+        node.attrs["name"]: node.spec.shape
+        for node in ordinary.live_nodes
+        if node.op == "input"
+        and node.attrs["name"] not in BLOCK_NAMES
+        and (not bounded or not node.attrs["name"].startswith("gvvvv_"))
+    }
+    if max_output_bytes is not None:
+        retained_bytes = (
+            sum(prod(shape) for shape in shapes.values())
+            + (
+                2 * aux * (obs - oa) ** 2
+                if retain_rhf_virtual_factors is not None
+                else 2 * aux * ((obs - oa) ** 2 + (obs - ob) ** 2)
+                if bounded
+                else 0
+            )
+        ) * np.dtype(np.float64).itemsize
+        if retained_bytes > max_output_bytes:
+            raise MemoryError(
+                f"ordinary UCC Hamiltonian outputs require {retained_bytes} bytes with {max_output_bytes} available"
+            )
+    spins = {"a": "alpha", "b": "beta"}
+    domains = {
+        (spin, region): sl
+        for spin, occupied, frozen in (("a", oa, fa), ("b", ob, fb))
+        for region, sl in (("o", slice(frozen, occupied)), ("v", slice(occupied, obs)))
+    }
+    solve = coulomb_fit_response(aux, obs * obs)
+    fit_graph = Program({"fit": solve.outputs["fit"]})
+    projection = coulomb_pair_projection(aux, obs) if bounded else None
+    dfit_graph = unrestricted_cc_obs_fit_direction(aux, obs)
+    factors = {}
+    for spin in spins.values():
+        fock = spin_fock["fock_" + spin]
+        if (
+            fock.shape != (ext, ext)
+            or fock.dtype != np.float64
+            or not np.isfinite(fock).all()
+        ):
+            raise ValueError("Expected a finite FP64 extended spin Fock matrix")
+        name = "source/raw_coulomb_" + spin
+        raw = np.ascontiguousarray(data[name][:, :obs, :obs])
+        if projection is not None:
+            # The inverse metric can amplify roundoff in the two MO orders.
+            if not np.allclose(raw, raw.swapaxes(1, 2), rtol=0, atol=1e-10):
+                raise ValueError(f"Raw ordinary Coulomb pairs lack symmetry for {spin}")
+            raw = run(projection, {"raw_coulomb": raw}).outputs["raw_coulomb"]
+        raw = raw.reshape(aux, -1)
+        fit = run(
+            fit_graph, {"metric_whitener": whitener, "three_center": raw}
+        ).outputs["fit"]
+        fields = {"fit_left": fit, "raw_right": raw}
+        if direction is not None:
+            data_tangent, metric_tangent = direction
+            draw = np.ascontiguousarray(data_tangent[name][:, :obs, :obs]).reshape(
+                aux, -1
+            )
+            dfit = run(
+                dfit_graph,
+                {
+                    "metric_whitener": whitener,
+                    "d_metric": metric_tangent,
+                    "fit": fit,
+                    "d_three_center": draw,
+                },
+            ).outputs["d_fit"]
+            fields.update(d_fit_left=dfit, d_raw_right=draw)
+        factors[spin] = {k: v.reshape(aux, obs, obs) for k, v in fields.items()}
+
+    virtual_factors = None
+    if retain_rhf_virtual_factors is not None:
+        # This path comes from a single RHF coefficient matrix. Confirm that
+        # both projected fits describe that same spatial Hamiltonian.
+        alpha, beta = factors["alpha"], factors["beta"]
+        if any(not np.array_equal(alpha[key], beta[key]) for key in alpha):
+            raise ValueError(
+                "Bounded virtual preparation requires identical RHF factors"
+            )
+        virtual_factors = {
+            key: immutable(alpha[key][:, oa:, oa:]) for key in ("fit_left", "raw_right")
+        }
+    elif retain_uhf_virtual_factors is not None:
+        virtual_factors = {
+            f"{key}_{spin}": immutable(factors[spin][key][:, occupied:, occupied:])
+            for spin, occupied in (("alpha", oa), ("beta", ob))
+            for key in ("fit_left", "raw_right")
+        }
+
+    kernels = {}
+    result = {}
+    for name, shape in shapes.items():
+        sections, labels = name[1:].split("_")
+        slices = tuple(domains[s, d] for s, d in zip(labels, sections, strict=True))
+        if name.startswith("f"):
+            result[name] = np.ascontiguousarray(
+                spin_fock["fock_" + spins[labels[0]]][slices]
+            )
+            continue
+        value = np.zeros(shape, dtype=np.float64)
+        if value.size:
+            slots = tuple(tuple(range(sl.start, sl.stop)) for sl in slices)
+            owners = tuple(spins[s] for s in labels)
+            for sign, request, axes in antisymmetrized_integral_requests(slots, owners):
+                nl, nr = prod(request.shape[:2]), prod(request.shape[2:])
+                if (nl, nr) not in kernels:
+                    graph = fitted_integral_block(aux, nl, nr, coulomb=True)
+                    kernels[nl, nr] = (
+                        graph if direction is None else linearize(graph, None).program
+                    )
+                rows = tuple(slice(s[0], s[-1] + 1) for s in request.slots)
+                fields = {}
+                for key, side in (("fit_left", 0), ("raw_right", 2)):
+                    for prefix in ("",) if direction is None else ("", "d_"):
+                        field = prefix + key
+                        arr = factors[request.spins[side]][field]
+                        tile = arr[:, rows[side], rows[side + 1]]
+                        fields[field] = np.ascontiguousarray(tile).reshape(aux, -1)
+                output = "block" if direction is None else "d_block"
+                chemists = run(kernels[nl, nr], fields).outputs[output]
+                value += sign * chemists.reshape(request.shape).transpose(axes)
+        result[name] = value
+    if virtual_factors is not None:
+        destination = (
+            retain_rhf_virtual_factors
+            if retain_rhf_virtual_factors is not None
+            else retain_uhf_virtual_factors
+        )
+        assert destination is not None
+        destination.update(virtual_factors)
+    return result

@@ -26,6 +26,8 @@ from .. import (
     _f12_focal_ump2,
     _f12_frozen_core,
     _native,
+    _uccsd_rhf_virtual_pairs,
+    _uccsd_uhf_virtual_ladder,
 )
 from .._api_types import Atom
 from .._cbs_plan import native_cbs_plan
@@ -73,6 +75,8 @@ DEFAULT_SLATER_FIT_NORMALIZATION = (
     _f12_focal_integral_kernel.DEFAULT_SLATER_FIT_NORMALIZATION
 )
 MolecularFocalProvider = _f12_focal_molecular.MolecularFocalProvider
+RHFDFLadderOptions = _uccsd_rhf_virtual_pairs.RHFDFLadderOptions
+UHFDFLadderOptions = _uccsd_uhf_virtual_ladder.UHFDFLadderOptions
 FocalLowOrderForces = _f12_focal_molecular.FocalLowOrderForces
 FocalLowOrderEnergy = _f12_focal_molecular.FocalLowOrderEnergy
 conventional_mp2_request = _f12_focal_cv.conventional_mp2_request
@@ -82,6 +86,10 @@ frozen_core_orbitals_for_atom = _f12_frozen_core.frozen_core_orbitals_for_atom
 frozen_core_spd_orbitals_for_atom = _f12_frozen_core.frozen_core_spd_orbitals_for_atom
 cv_active_frozen_orbitals_for_atom = _f12_frozen_core.cv_active_frozen_orbitals_for_atom
 resolve_frozen_occupied = _f12_frozen_core.resolve_frozen_occupied
+FocalUCCEquationSources = _f12_focal_molecular.FocalUCCEquationSources
+FocalUCCFixedSources = _f12_focal_molecular.FocalUCCFixedSources
+FocalUCCStationary = _f12_focal_molecular.FocalUCCStationary
+FocalUCCSDResult = _f12_focal_molecular.FocalUCCSDResult
 FocalOneElectron = _f12_focal_one_electron.FocalOneElectron
 one_electron_sources = _f12_focal_one_electron.one_electron_sources
 FocalReference = _f12_focal_reference.FocalReference
