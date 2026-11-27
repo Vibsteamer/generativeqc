@@ -12,11 +12,48 @@ The highest supplied angular channel is local. Each lower channel denotes
 `U_l - U_local`, with radial terms `c r^(n-2) exp(-alpha r^2)`. The nonlocal
 operator sums normalized real spherical projectors over `m = -l..l`. Orbital
 normalization and Cartesian/spherical ordering come from the ordinary basis
-layer. Supported orbitals are s/p/d/f in Cartesian and real spherical layouts;
-projectors are s/p/d/f, local labels at
+layer. Supported orbitals are s/p/d/f in Cartesian and real spherical layouts,
+and real spherical g for the
+[fitted small-core halide states](#orbital-g-for-fitted-small-core-halides).
+Projectors are s/p/d/f, local labels at
 most g, radial powers 0..4, at most 256 AOs and 128 atoms. Unknown parameter
 fields, multiple coefficient rows, spin-orbit formats and higher angular
 momenta are rejected. Parameter import performs no online lookup.
+
+## Orbital g for fitted small-core halides
+
+`generativeqc_system_create_ecp` accepts g orbital shells only in a real
+spherical basis whose composition and electronic state lie in the fitted
+small-core halide domain. The domain requires at least one Br with a
+10-electron core or I with a 28-electron core. Every other atom must be
+all-electron H through Ar. The electron count is the sum of ionic charges minus
+the molecular charge, and its parity must match the multiplicity. In the table,
+X is the small-core Br or I.
+
+| Composition | Charge | Multiplicity |
+|---|---|---|
+| HX | 0 | 1 |
+| X or XH2 | 0 | 2 |
+| HX | +1 | 2 |
+| X or XH2 | +1 | 1 |
+| X | -1 | 1 |
+| One X with at least one C and any number of H; or one X with one O and two H | 0 or +1 | 1 or 2 |
+| Any other composition with at least one X, such as Br2, HOBr, CH2BrCl or C4H6Br2O | -1, 0 or +1 | 1 or 2 |
+
+A composition named in an earlier row is admitted only with that row's charges
+and multiplicities; for example, CH3Br with charge -1 does not admit g. The
+one-X families contain no other element. Other neutral doublet hydrides with
+an even number of H, such as XH4, are fitted with orbitals only through f.
+Every other hydride state lies outside the fitted domain.
+
+Outside this domain, and for every Cartesian basis, a g orbital shell makes the
+constructor return `GENERATIVEQC_STATUS_INVALID_ARGUMENT`. An h orbital shell is
+always rejected. The rule depends only on composition, charge and
+multiplicity, not on geometry. The native rule is
+`SmallCoreHalideComposition::fitted_orbital_angular_limit` in
+`src/molecule/small_core_halide.hpp`. The Python preflight
+`generativeqc.ecp.fitted_hf_ecp_domain` mirrors it for the fitted CUDA HF path,
+which additionally requires RHF singlets or UHF doublets.
 
 ## Interfaces and derivatives
 
@@ -103,8 +140,10 @@ independent CPU implementation and its convergence policy remain a test oracle;
 the production CPU provider now consumes the generated policy. See the [ownership audit](../../.agents/notes/implemented/architecture/2026-09-19-ecp-generated-policy.md).
 
 Orbital f uses the existing Gaussian DAG, generated component normalization and
-molecular real-spherical expansion. The compiler-owned orbital limit also
-defines the native ECP constructor boundary. The Python preflight applies the
+molecular real-spherical expansion. The compiler-owned orbital limit caps the
+native ECP constructor. Below that cap, the constructor admits g only in the
+[fitted small-core halide domain](#orbital-g-for-fitted-small-core-halides)
+and otherwise admits s through f. The Python preflight applies the
 same limit to both ECP atoms and all-electron atoms in mixed systems. Component
 dispatch checks the angular powers before encoding them, so unsupported g
 components cannot alias supported lower components. This orbital extension
@@ -113,8 +152,8 @@ does not itself expand projector channels, radial powers, element families or me
 The separate projector extension includes seven orthonormal real f harmonics
 (slots 9..15) and compiler-owned f-channel reductions. The native constructor
 uses the emitted projector bound; BSE/NWChem local labels may extend through g
-so that f is a nonlocal difference. This local label does not enable g orbitals
-or g projectors. Each staged radial layer contains 16 projected jets per AO.
+so that f is a nonlocal difference. A local g label never enables g projectors
+and does not by itself enable g orbitals. Each staged radial layer contains 16 projected jets per AO.
 CPU stages one layer; CUDA stages up to four within the bounded schedule
 described above. The resource inventory includes this projection storage.
 Synthetic signed f-channel parameters qualify this operator capability without
@@ -191,8 +230,10 @@ raises. The f budget/replay gate uses a 16-AO spherical fixture; larger f
 endpoint measurements qualify numerical execution only.
 
 Direct RHF/UHF and the bounded Python CUDA semilocal DFT path below provide
-complete first forces. Standalone HF ECP density fitting remains explicitly
-rejected. Native MP2/UMP2 and restricted/unrestricted CCSD/(T), including
+complete first forces. CUDA FP64 fitted HF accepts a separate spherical JKFit on
+neutral singlet HBr and HI with ECP10MDF and ECP28MDF, respectively, and on
+the supported unrestricted halogen hydrides. The restricted solver uses one
+13-orbital occupied space for the 26 explicit electrons. Native MP2/UMP2 and restricted/unrestricted CCSD/(T), including
 same-reference HF/MP2 companions and the [CBS workflow](ccsdt_cbs.md#scalar-ecp-references),
 accept supported scalar ECPs for energies and analytic first forces on CPU/CUDA.
 Explicit fitted correlation and fitted correlated-reference policies retain
@@ -330,7 +371,8 @@ s/p/d/f nonlocal projectors. The neutral singlet has 20 explicit electrons
 finite differences are checked independently against the difference between
 the full potential and the same potential with f coefficients set to zero.
 This protects the physical f channel from silent omission or relabeling.
-The local g label does not imply a g orbital or nonlocal g capability.
+The local g label implies neither nonlocal g capability nor g orbitals; Au lies
+outside the fitted small-core halide domain.
 
 The 23-AO AuH fixture exceeds the CUDA budget inventory's 16-public-AO limit.
 Numerical CUDA singlepoints and changed-geometry replay run without an explicit
@@ -398,7 +440,10 @@ fixed-weight contractions. Complete RHF/UHF energies and forces are checked
 against PySCF for both representations; CUDA additionally checks complete
 energy finite differences. Prepared geometry replay is checked under the
 planned host/device budget. The native capability test checks f acceptance,
-g orbital/projector rejection and acceptance of f projectors through the C API.
+g projector rejection, rejection of g orbitals outside the fitted halide domain
+and acceptance of f projectors through the C API.
+`generativeqc_ecp_fitted_g_admission_tests` checks the constructor's orbital-g
+boundary over representation, composition, charge and multiplicity.
 
 `generativeqc_ecp_projector_tests` independently checks the emitted host arithmetic
 using a double angular-node sum and the Legendre addition theorem, without

@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <memory>
 
@@ -9,6 +10,7 @@
 #include "integrals/ecp.hpp"
 #include "integrals/ecp_cuda.hpp"
 #include "molecule/basis.hpp"
+#include "molecule/small_core_halide.hpp"
 
 extern "C" {
 generativeqc_status generativeqc_system_create_ecp(generativeqc_context* context,
@@ -28,16 +30,31 @@ generativeqc_status generativeqc_system_create_ecp(generativeqc_context* context
   std::lock_guard<std::recursive_mutex> context_lock(context->mutex);
   try {
     std::int64_t removed = 0;
+    generativeqc::molecule::SmallCoreHalideComposition halide_comp;
     std::vector<bool> local(descriptor->atom_count, false), present(descriptor->atom_count, false);
     for (unsigned a = 0; a < descriptor->atom_count; ++a) {
       if (core_electrons[a] < 0 || core_electrons[a] >= descriptor->atoms[a].atomic_number)
         throw std::invalid_argument("ECP core count must leave positive effective ionic charge");
       removed += core_electrons[a];
+      halide_comp.add(descriptor->atoms[a].atomic_number, core_electrons[a]);
     }
+    const long long electrons =
+        halide_comp.neutral_valence_electrons - static_cast<long long>(descriptor->charge);
+    const int multiplicity = static_cast<int>(std::min<std::uint32_t>(
+        descriptor->multiplicity, static_cast<std::uint32_t>(std::numeric_limits<int>::max())));
+    const bool fitted_g_domain =
+        descriptor->basis_representation == GENERATIVEQC_BASIS_SPHERICAL &&
+        halide_comp.fitted_orbital_angular_limit(descriptor->charge, multiplicity, electrons) >= 4U;
+    const unsigned max_orbital =
+        fitted_g_domain ? std::min<unsigned>(4U, generativeqc::generated::ecp_max_orbital_angular)
+                        : 3U;
     for (unsigned s = 0; s < descriptor->shell_count; ++s)
-      if (descriptor->shells[s].angular_momentum > generativeqc::generated::ecp_max_orbital_angular)
+      if (descriptor->shells[s].angular_momentum > max_orbital)
         throw std::invalid_argument(
-            "scalar ECP execution currently supports orbital s/p/d/f shells");
+            max_orbital == 3U
+                ? "scalar ECP execution currently supports orbital s/p/d/f shells"
+                : "scalar ECP execution supports orbital shells through g for validated spherical "
+                  "small-core halides");
     std::vector<generativeqc::core::EcpTerm> owned;
     for (std::size_t i = 0; i < term_count; ++i) {
       const auto& t = terms[i];

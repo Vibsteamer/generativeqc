@@ -79,8 +79,13 @@ class UccsdPrepared final : public PreparedCalculation {
         capabilities_.method != GENERATIVEQC_METHOD_UCCSD_T)
       throw std::invalid_argument(
           "focal triples requires the same molecular determinant and JKFit");
-    (void)refine_ecp_quadrature;
-    return evaluate(system_, forces, 0, ref);
+    // Retain the quadrature selected by the physical SCF owner for its
+    // one-electron response. Ordinary evaluations keep their own system.
+    if (system_.refine_ecp_quadrature == refine_ecp_quadrature)
+      return evaluate(system_, forces, 0, ref);
+    auto physical = system_;
+    physical.refine_ecp_quadrature = refine_ecp_quadrature;
+    return evaluate(physical, forces, 0, ref);
   }
 
  private:

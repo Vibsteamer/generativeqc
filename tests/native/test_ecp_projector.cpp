@@ -133,7 +133,7 @@ void check_grid() {
   }
   bool rejected = false;
   try {
-    (void)ecp_component_coefficient(1, 1, 2, 1.0);
+    (void)ecp_component_coefficient(1, 1, 3, 1.0);
   } catch (const std::invalid_argument&) {
     rejected = true;
   }
@@ -223,8 +223,8 @@ void check_ao_consumer() {
               }
             }
           }
-  // g powers must not alias a supported component in the base-4 dispatch key.
-  for (const auto powers : {std::array<unsigned, 3>{0, 0, 4}, {0, 4, 0}, {4, 0, 0}, {2, 1, 1}}) {
+  // h powers (l > ecp_max_orbital_angular = 4) must not alias a supported component.
+  for (const auto powers : {std::array<unsigned, 3>{0, 0, 5}, {0, 5, 0}, {5, 0, 0}, {2, 2, 1}}) {
     double jet[4];
     generativeqc::generated::ecp_ao(powers[0], powers[1], powers[2], 0.2, -0.3, 0.4, 0.7, jet);
     for (double value : jet)

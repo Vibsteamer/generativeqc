@@ -198,3 +198,198 @@ def test_i_batch_compact_projection_and_nonsymmetric_weights(libraries, full_bas
         - (reference(_XYZ + 2 * direction) - reference(_XYZ - 2 * direction))
     ) / (12 * step)
     np.testing.assert_allclose(gradient[0], np.vdot(weights, derivative), rtol=0, atol=3e-8)
+
+
+def test_full_basis_ecp_composition_and_signed_response(libraries):
+    gto = pytest.importorskip("pyscf.gto")
+    from benchmarks.f12_cabs_ecp import CabsEcpOneElectron, ResidualEcpPanel
+    from benchmarks.f12_cabs_h_batch import CabsHShells
+
+    angular = np.array([0, 2, 6])
+    exponents = np.array([0.8, 0.9, 1.0])
+    sizes = 2 * angular + 1
+    n = int(sizes.sum())
+    rng = np.random.default_rng(426)
+    rows = np.full((3, 13), -1)
+    order = rng.permutation(n)
+    offsets = np.concatenate(([0], np.cumsum(sizes)))
+    for shell, (start, stop) in enumerate(zip(offsets[:-1], offsets[1:], strict=True)):
+        rows[shell, :stop - start] = order[start:stop]
+    radial = [
+        (2 * a / np.pi) ** 0.75 * (4 * a) ** (0.5 * int(l))
+        / np.sqrt(prod(range(1, 2 * l + 1, 2)))
+        for l, a in zip(angular, exponents, strict=True)
+    ]
+    shells = [
+        dict(angular_momentum=int(l), atom_index=i, primitives=[[a, 1.0]])
+        for i, (l, a) in enumerate(zip(angular, exponents, strict=True))
+    ]
+    with_rows = {
+        **{f"transform_{l}": gto.cart2sph(l, normalized="sp").T for l in range(7)},
+        "angular": angular,
+        "atom": np.arange(3),
+        "exponents": exponents,
+        "radial": np.array(radial),
+        "orbital_shell_count": 3,
+        "prim_offsets": np.arange(4),
+        "spherical_rows": rows,
+    }
+    residual_map = rng.permutation(n)
+    ix = np.ix_(residual_map, residual_map)
+    raw = rng.normal(size=(n, n)) / n
+    potential = raw + raw.T
+    raw = rng.normal(size=(3, 3, n, n)) / n
+    nuclear = raw + raw.swapaxes(-1, -2)
+    ws, wh = rng.normal(size=(2, n, n))
+    budget = 8 << 20
+
+    def source(geometry, matrix, derivative, labels=residual_map, charges=_CHARGES):
+        bare = CabsHShells(
+            dict(elements=["Br", "I", "H"], coordinates_bohr=geometry, shells=shells),
+            order, {**with_rows, "centers": geometry}, Path(libraries["i"]._name),
+            angular_momentum=6, host_reference=True, effective_charges=_CHARGES, full_basis=True,
+        )
+        residual = ResidualEcpPanel(
+            matrix, derivative, ao_to_source=labels, coordinates_bohr=geometry,
+            effective_charges=charges, resources={"device_bytes": 1},
+        )
+        return bare, residual
+
+    matrix = potential.copy()
+    derivative = nuclear.copy()
+    bare, residual = source(_XYZ, matrix, derivative)
+    matrix[:] = 0
+    derivative[:] = 0
+    provider = CabsEcpOneElectron(bare, residual)
+    with pytest.raises(ValueError, match="current complete"):
+        provider.gradient(ws, wh, budget)
+    s, h, _ = provider.matrices(derivatives=True, max_bytes=budget)
+    bare_s, bare_h = bare.assemble()
+    np.testing.assert_array_equal(s, bare_s)
+    np.testing.assert_allclose(h[ix] - bare_h[ix], potential, rtol=0, atol=5e-14)
+    observed = provider.gradient(ws, wh, budget)
+    point_charge_gradient, _ = bare.high_gradient(ws, wh, budget)
+    expected = point_charge_gradient + np.einsum("axij,ij->ax", nuclear, wh[ix])
+    np.testing.assert_allclose(observed.gradient, expected, rtol=0, atol=3e-13)
+    assert observed.resources["residual_contraction_device_bytes"] > 0
+
+    def signed_energy(atom, axis, step):
+        moved = _XYZ.copy()
+        moved[atom, axis] += step
+        source_bare, ecp = source(moved, potential + step * nuclear[atom, axis], None)
+        s, h, _ = CabsEcpOneElectron(source_bare, ecp).matrices(derivatives=False, max_bytes=budget)
+        return np.vdot(ws, s) + np.vdot(wh, h)
+
+    for step in (2e-4, 1e-4):
+        # Richardson endpoints provide an independent signed-energy oracle for
+        # one ECP-center and one hydrogen-center Cartesian component.
+        for atom, axis in ((1, 0), (2, 2)):
+            def difference(delta):
+                plus = signed_energy(atom, axis, delta)
+                minus = signed_energy(atom, axis, -delta)
+                return (plus - minus) / (2 * delta)
+
+            numeric = (4 * difference(step / 2) - difference(step)) / 3
+            assert abs(numeric - observed.gradient[atom, axis]) < 3e-8
+
+    bare.evaluate(derivatives=False, max_bytes=budget)
+    with pytest.raises(ValueError, match="current complete"):
+        provider.gradient(ws, wh, budget)
+    with pytest.raises(ValueError, match="bijection"):
+        source(_XYZ, potential, nuclear, labels=np.zeros(n, dtype=int))
+    with pytest.raises(ValueError, match="geometry or charge"):
+        CabsEcpOneElectron(*source(_XYZ, potential, nuclear, charges=np.array([35, 53, 1])))
+
+
+@pytest.mark.parametrize(("element", "elements", "occupations"), [
+    ("Br", ("Br", "H"), (13, 13)),
+    ("I", ("I", "H", "H"), (14, 13)),
+])
+def test_spin_center_ecp_core_against_displaced_hydrides(
+    libraries, tmp_path, monkeypatch, record_property, element, elements, occupations
+):
+    """Exercise the center's selected core and its full ECP-center and AO response."""
+    from functools import partial
+    from dataclasses import replace
+
+    gto = pytest.importorskip("pyscf.gto")
+    from pyscf.scf.hf import get_hcore
+
+    from benchmarks import f12_unrestricted_gaussian_center as center
+    from benchmarks.f12_cabs_ecp import ResidualEcpPanel
+    from benchmarks.f12_cabs_h_batch import CabsHShells
+
+    xyz = np.array([[0.2, -0.1, 0.3], [0.5, -0.3, 3.1], [2.7, 0.4, -0.6]])[:len(elements)]
+    multiplicity = occupations[0] - occupations[1] + 1
+    heavy_shells = [
+        [l, [e, 1.0]] for l, e in ((0, 6.), (0, 2.), (0, 0.5), (1, 2.),
+                                     (1, 0.5), (2, 1.), (6, 0.8))
+    ]
+    mol = gto.M(atom=list(zip(elements, xyz, strict=True)), unit="Bohr", verbose=0,
+                basis={element: heavy_shells, "H": [[0, [0.7, 1.]]]},
+                ecp={element: "cc-pvtz-pp"}, spin=multiplicity - 1)
+    assert mol.nelec == occupations
+    angular = np.array([mol.bas_angular(i) for i in range(mol.nbas)])
+    atoms = np.array([mol.bas_atom(i) for i in range(mol.nbas)])
+    exps = np.array([mol.bas_exp(i).item() for i in range(mol.nbas)])
+    radial = np.array([(2 * e / pi)**0.75 * (4 * e)**(0.5 * l) / np.sqrt(prod(range(1, 2*l+1, 2)))
+                       for l, e in zip(angular, exps, strict=True)])
+    case = dict(elements=elements, coordinates_bohr=xyz.tolist(), charge=0, multiplicity=multiplicity,
+                shells=[dict(angular_momentum=int(l), atom_index=int(a), primitives=[[e, 1.]])
+                        for l, a, e in zip(angular, atoms, exps, strict=True)])
+    # Source rows interleave the two centers independently of the ECP evaluator.
+    rng = np.random.default_rng(153)
+    order = rng.permutation(mol.nao)
+    rows = np.full((mol.nbas, 13), -1)
+    for s, (start, end) in enumerate(zip(mol.ao_loc[:-1], mol.ao_loc[1:], strict=True)):
+        rows[s, :end-start] = order[start:end]
+    topology = tmp_path / "topology.npz"
+    np.savez(topology, angular=angular, atom=atoms, centers=xyz[atoms], orbital_shell_count=mol.nbas,
+             prim_offsets=np.arange(mol.nbas+1), exponents=exps, radial=radial, spherical_rows=rows,
+             **{f"transform_{l}": gto.cart2sph(l).T * np.sqrt(4*pi/(2*l+1)) for l in set(angular)})
+    potential = mol.intor_symmetric("ECPscalar")
+    bra = -mol.intor("ECPscalar_ipnuc", comp=3)
+    derivative = np.zeros((mol.natm, 3, mol.nao, mol.nao))
+    for atom, (_, _, lo, hi) in enumerate(mol.aoslice_by_atom()):
+        derivative[atom, :, lo:hi] = bra[:, lo:hi]
+    with mol.with_rinv_at_nucleus(0):
+        derivative[0] += mol.intor("ECPscalar_iprinv", comp=3)
+    derivative = derivative + derivative.swapaxes(-1, -2)
+    panel = ResidualEcpPanel(potential, derivative, ao_to_source=order,
+                             coordinates_bohr=xyz, effective_charges=mol.atom_charges())
+    monkeypatch.setattr(center, "CabsHShells", partial(CabsHShells, host_reference=True))
+
+    def provider(state, residual):
+        return center._center_one_electron(case, {"native_to_source": order}, topology, state,
+                                           None, Path(libraries["i"]._name), residual)
+
+    with pytest.raises(ValueError, match="occupations"):
+        provider((occupations[0]+1, occupations[1]), panel)
+    with pytest.raises(ValueError, match="residual nuclear derivatives"):
+        provider(occupations, replace(panel, derivative=None))
+    source = provider(occupations, panel)
+    s, h, _ = source.matrices(derivatives=True, max_bytes=16 << 20)
+    ix = np.ix_(order, order)
+    s_reference = mol.intor_symmetric("int1e_ovlp")
+    h_reference = get_hcore(mol)
+    np.testing.assert_allclose(s[ix], s_reference, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(h[ix], h_reference, rtol=0, atol=5e-11)
+    record_property("max_abs_hcore_error_Eh", float(abs(h[ix] - h_reference).max()))
+    ws, wh = rng.normal(size=(2, mol.nao, mol.nao)) / mol.nao
+    measured = source.gradient(ws, wh, 16 << 20).gradient
+
+    def displaced_energy(atom, delta):
+        moved = xyz.copy()
+        moved[atom] += delta
+        displaced = mol.set_geom_(moved, unit="Bohr", inplace=False)
+        return np.vdot(ws[ix], displaced.intor_symmetric("int1e_ovlp")) + np.vdot(wh[ix], get_hcore(displaced))
+
+    np.testing.assert_allclose(measured.sum(axis=0), 0, atol=3e-10)
+    for step in (2e-4, 1e-4):
+        errors = []
+        for atom, axis in np.ndindex(mol.natm, 3):
+            delta = np.eye(3)[axis] * step
+            fd = (displaced_energy(atom, delta) - displaced_energy(atom, -delta)) / (2 * step)
+            errors.append(abs(measured[atom, axis] - fd))
+        assert max(errors) < 2e-7
+        record_property(f"max_abs_gradient_error_Eh_per_bohr_step_{step}", float(max(errors)))

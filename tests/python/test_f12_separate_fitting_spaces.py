@@ -1,6 +1,10 @@
 """Two independent Coulomb metrics for unrestricted Fock and F12 pair response."""
 
+import json
+from pathlib import Path
+
 import numpy as np
+import pytest
 from generativeqc._f12_unrestricted import (
     UnrestrictedF12Energy,
     unrestricted_mp2_f12_ao_response,
@@ -174,3 +178,259 @@ def test_identical_fit_recombines_once_and_singles_uses_only_jkfit() -> None:
     for k in ("ao_coulomb", "metric/coulomb"):
         np.testing.assert_array_equal(w[k], np.zeros_like(w[k]))
         assert np.linalg.norm(w["jkfit/" + k]) > 1e-7
+
+
+def orbital_layout(q: int, manifest: dict) -> dict:
+    return {
+        "manifest": np.array(json.dumps(manifest)),
+        "ao_sizes": np.array([4, q]),
+        "orbital_shell_count": 4,
+        "angular": np.zeros(4 + q, int),
+        "atom": np.zeros(4 + q, int),
+        "centers": np.zeros((4 + q, 3)),
+        "prim_offsets": np.arange(5 + q),
+        "exponents": np.ones(4 + q),
+        "radial": np.ones(4 + q),
+        "spherical_rows": np.arange(4 + q)[:, None],
+        "transform_0": np.ones((1, 1)),
+    }
+
+
+def test_nuclear_response_uses_correlation_sink_and_jkfit_orbital_sink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+
+    from generativeqc._one_electron_gradient import IntegralGradient
+    from generativeqc.f12_orbital_response import unrestricted_nuclear_source_terms
+
+    from benchmarks import f12_unrestricted_gaussian as gaussian
+
+    ao, jk = inputs()
+    _, direct = response(ao, jk)
+    rng = np.random.default_rng(510)
+    xyz = [[0.0, 0.0, 0.0], [0.2, 0.0, 1.1]]
+    manifest = {
+        "case": "test",
+        "elements": ["H", "H"],
+        "geometry_bohr": xyz,
+        "geometry_sha256": "one",
+        "options": {},
+    }
+    geom = {
+        "combined_basis": {"elements": ["H", "H"], "coordinates_bohr": xyz},
+        "layout": {"space": (2, 1, 3, 4, 3)},
+        "geometry": {"geometry_sha256": "one"},
+        "options": {},
+        "molecule": "test",
+    }
+
+    corr_layout, jk_layout = orbital_layout(3, manifest), orbital_layout(2, manifest)
+    invalid = {**jk_layout, "spherical_rows": jk_layout["spherical_rows"][::-1]}
+    with pytest.raises(ValueError, match="ordering"):
+        gaussian.check_shared_orbital_basis(corr_layout, invalid)
+    central = {"whitener": jk["metric_whitener"]}
+    df = (central["whitener"] @ jk["ao_coulomb"].reshape(2, -1)).reshape(2, 4, 4)
+    for spin, occ in (("alpha", 2), ("beta", 1)):
+        c = ao["coefficients_" + spin][:, :3]
+        central["coefficients_" + spin] = c
+        central["df_" + spin] = c.T @ df @ c
+        central["occupied_energies_" + spin] = np.array([-2.0, -1.0])[:occ]
+        for key in ("fock_seed_", "overlap_seed_"):
+            raw = rng.normal(size=(3, 3))
+            central[key + spin] = (raw + raw.T) / 2
+    shared = ("hcore_ao", "overlap_ao")
+    corr_ops = {
+        **{v: k for k, v in gaussian._METRICS.items()},
+        **{k: k for k in ao if k.startswith("ao_")},
+    }
+    jk_ops = {"metric": "jkfit/metric/coulomb", "ao_coulomb": "jkfit/ao_coulomb"}
+    jets = {}
+    for k in (*shared, *corr_ops.values(), *jk_ops.values()):
+        d = rng.normal(size=(3, *direct[k].shape)) * 0.01
+        d = (d + d.swapaxes(-1, -2)) / 2
+        jets[k] = np.stack((d, -d))
+
+    def contract(
+        layout: dict, weights: dict, library: object, **kwargs: object
+    ) -> dict:
+        keys = jk_ops if layout is jk_layout else corr_ops
+        gradient = sum(
+            np.einsum("ax..., ...->ax", jets[name], weights[label], optimize=True)
+            for label, name in keys.items()
+        )
+        return {
+            "gradient_Eh_per_bohr": gradient.tolist(),
+            "passes_contraction_checks": True,
+        }
+
+    class Core:
+        def gradient(
+            self, ws: np.ndarray, wh: np.ndarray, budget: int
+        ) -> IntegralGradient:
+            return IntegralGradient(
+                np.einsum("axij,ij->ax", jets["overlap_ao"], ws)
+                + np.einsum("axij,ij->ax", jets["hcore_ao"], wh),
+                {},
+            )
+
+    monkeypatch.setattr(gaussian, "contract_live_weights", contract)
+    reference = rng.normal(size=(2, 3))
+    spec = (2, 1, 3, 2)
+    z = rng.normal(size=4)
+    forces, costs, _ = gaussian.gaussian_orbital_forces(
+        spec,
+        central,
+        z,
+        direct,
+        {s: np.zeros((4, 4)) for s in ("alpha", "beta")},
+        geom,
+        corr_layout,
+        reference,
+        None,
+        execute,
+        cabs_h_shells=Core(),
+        jkfit_layout=jk_layout,
+    )
+    directions = [
+        {
+            "dmetric": jets["jkfit/metric/coulomb"][idx],
+            "dthree_center": jets["jkfit/ao_coulomb"][idx],
+            "doverlap": jets["overlap_ao"][idx],
+            "dhcore": jets["hcore_ao"][idx],
+        }
+        for idx in np.ndindex(2, 3)
+    ]
+    independent = unrestricted_nuclear_source_terms(
+        spec, central, directions, 2, execute
+    )
+    explicit = sum(
+        np.einsum("ax...,...->ax", d, direct[k], optimize=True) for k, d in jets.items()
+    )
+    expected = (
+        reference
+        - explicit
+        - sum(independent.fixed_gradients.values())
+        - independent.nuclear_rhs @ z
+    )
+    np.testing.assert_allclose(forces, expected, rtol=0, atol=4e-12)
+    assert costs["JKFit"]["passes_contraction_checks"]
+
+
+def test_gaussian_center_uses_jkfit_for_the_snapshot_and_returns_pair_weights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from benchmarks import f12_unrestricted_gaussian_center as center
+
+    ao, jk = inputs()
+    h = np.diag([-2.0, -1.0, 1.0, 3.0])
+    h[0, 3] = h[3, 0] = 0.08
+    ao["hcore_ao"] = h
+    for spin in ("alpha", "beta"):
+        ao["coefficients_" + spin] = np.eye(4)
+    diagonal = np.array([[0.1, 0.2, 0.4, 0.7], [0.3, 0.15, 0.05, 0.25]])
+    jk["ao_coulomb"] = np.stack([np.diag(row) for row in diagonal])
+    fitted = jk["metric_whitener"] @ diagonal
+    occupations = (2, 1)
+    charge = 2 * fitted[:, 0] + fitted[:, 1]
+    snapshot = {
+        "occupations": occupations,
+        "nbf": 3,
+        "overlap": np.eye(3),
+        "hcore": h[:3, :3],
+        "forces": np.zeros((2, 3)),
+        "energy": -2.5,
+    }
+    for spin, occupied in zip(("alpha", "beta"), occupations, strict=True):
+        eps = np.diag(h)[:3] + charge @ fitted[:, :3]
+        eps[:occupied] -= (fitted[:, :occupied] ** 2).sum(axis=0)
+        snapshot[spin] = {"mo": np.eye(3), "fock": np.diag(eps), "eps": eps}
+    manifest = {
+        "case": "replay",
+        "elements": ["H", "H"],
+        "geometry_bohr": [[0, 0, 0], [0, 0, 1]],
+        "geometry_sha256": "same-center",
+        "options": {},
+    }
+    basis = {"elements": ["H", "H"], "shells": [{"angular_momentum": 0}]}
+    geometry = tmp_path / "geometry.json"
+    geometry.write_text(
+        json.dumps({"layout": {"space": [2, 1, 3, 4, 3]}, "combined_basis": basis})
+    )
+    paths = [tmp_path / "correlation.npz", tmp_path / "jkfit.npz"]
+    for nfit, path in zip((3, 2), paths, strict=True):
+        np.savez(path, **orbital_layout(nfit, manifest))
+
+    def gaussian(*args: object, **kwargs: object) -> tuple:
+        return (
+            dict(ao),
+            np.eye(4)[:, :3],
+            np.eye(4)[:, 3:],
+            np.arange(3),
+            np.eye(3),
+            h[:3, :3],
+            {},
+        )
+
+    def fit(*args: object, **kwargs: object) -> tuple:
+        return {"ao_coulomb": jk["ao_coulomb"], "metric": jk["metric/coulomb"]}, {}
+
+    def gradient(
+        space: tuple,
+        central: dict,
+        orbital: object,
+        direct: dict,
+        frame: dict,
+        science: dict,
+        layout: object,
+        reference: np.ndarray,
+        *args: object,
+        **kwargs: object,
+    ) -> tuple:
+        assert space == (2, 1, 3, 2)
+        assert (
+            direct["ao_coulomb"].shape[0] == 3
+            and direct["jkfit/ao_coulomb"].shape[0] == 2
+        )
+        return reference, {}, {}
+
+    def solve_singles(
+        fock: np.ndarray,
+        occupied: int,
+        *,
+        library: object,
+        spin_weight: int,
+        pullback: bool,
+    ) -> tuple:
+        return singles(fock, occupied, spin_weight=spin_weight, pullback=pullback)
+
+    monkeypatch.setattr(center, "gaussian_sources", gaussian)
+    monkeypatch.setattr(center, "forward_integrals", fit)
+    monkeypatch.setattr(
+        center, "metric_whitener", lambda m, *args, **kwargs: (whitener(m), {})
+    )
+    monkeypatch.setattr(center, "gaussian_orbital_forces", gradient)
+    monkeypatch.setattr(center, "cabs_singles", solve_singles)
+    terms, _ = response(ao, jk)
+    energy, _, costs = center.center_energy_forces(
+        geometry,
+        paths[0],
+        tmp_path / "unused",
+        snapshot,
+        None,
+        execute,
+        sink_library=None,
+        forward_library=None,
+        jkfit_layout_path=paths[1],
+        metric_library=tmp_path / "metric",
+        projector_library=None,
+        canonical_library=None,
+        orbital_library=None,
+    )
+    assert (
+        max(costs["shell_reference_fit"]["canonical_Fock_errors_Eh"].values()) < 1e-12
+    )
+    assert abs(energy["UMP2_Eh"] - terms.ordinary_mp2) < 2e-13
+    assert abs(energy["F12_Eh"] - terms.f12_increment) < 2e-13
+    np.testing.assert_allclose(
+        energy["CABS_singles_Eh"], terms.cabs_singles, atol=2e-13, rtol=0
+    )

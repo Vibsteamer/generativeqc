@@ -1,0 +1,14 @@
+{
+  "path": "src/posthf/f12/f12_focal_ecp.cu",
+  "reason": "Semilocal ECP projector quadrature and contractions for the focal extended basis apply AO jets to the angular channels and assemble local and nonlocal matrix elements and derivatives.",
+  "regions": [
+    {
+      "reason": "CUDA error translation, device arena and launch sizing.",
+      "role": "runtime",
+      "start": "struct AllocationError {};",
+      "stop": "__global__ void point_jets"
+    }
+  ],
+  "role": "scientific",
+  "subsystem": "molecular_f12"
+}

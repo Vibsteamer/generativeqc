@@ -55,6 +55,8 @@ struct System {
   int electron_count{};
   BasisRepresentation basis_representation{kCartesianBasis};
   std::vector<EcpTerm> ecp_terms;
+  // Prepared CUDA DF-UHF can refine the ECP quadrature within its workspace bound.
+  bool refine_ecp_quadrature{};
 };
 
 /** One context-owned execution workspace, independent of method interfaces.

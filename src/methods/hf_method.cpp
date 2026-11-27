@@ -13,6 +13,7 @@
 #include "methods/batch_capabilities.hpp"
 #include "methods/scf_common_options.hpp"
 #include "runtime/execution_context.hpp"
+#include "methods/hf_ecp_df.hpp"
 #include "scf/fleet.hpp"
 #include "scf/fock_prepared.hpp"
 #include "scf/hf_fock_work.hpp"
@@ -450,13 +451,13 @@ std::unique_ptr<PreparedCalculation> prepare_hf_calculation(
                       "CUDA density-fitting mode requires a CUDA execution context");
   }
   resolve_hf_options(options, capabilities.method, execution);
+  core::System prepared_system = system;
   if (options.density_fitting_mode != GENERATIVEQC_DENSITY_FITTING_NONE) {
-    if (!system.ecp_terms.empty())
-      throw MethodError(GENERATIVEQC_STATUS_NOT_IMPLEMENTED,
-                        "ECP density-fitting execution is not yet validated");
+    prepare_ecp_df_hf(prepared_system, options, capabilities.method, execution,
+                       auxiliary ? &*auxiliary : nullptr);
     validate_density_fitting_auxiliary(system, auxiliary);
   }
-  return std::make_unique<HfPreparedCalculation>(capabilities, std::move(execution), system,
+  return std::make_unique<HfPreparedCalculation>(capabilities, std::move(execution), std::move(prepared_system),
                                                  options,
                                                  normalized_auxiliary_template(system, auxiliary));
 }
@@ -483,10 +484,9 @@ std::unique_ptr<PreparedBatch> prepare_hf_batch(const Capabilities& capabilities
   }
   resolve_hf_options(options, capabilities.method, execution);
   if (options.density_fitting_mode != GENERATIVEQC_DENSITY_FITTING_NONE)
-    for (const auto& system : systems)
-      if (!system.ecp_terms.empty())
-        throw MethodError(GENERATIVEQC_STATUS_NOT_IMPLEMENTED,
-                          "ECP density-fitting execution is not yet validated");
+    for (auto& system : systems)
+      prepare_ecp_df_hf(system, options, capabilities.method, execution,
+                       auxiliary ? &*auxiliary : nullptr);
   if (options.density_fitting_mode != GENERATIVEQC_DENSITY_FITTING_NONE && auxiliary.has_value()) {
     if (auxiliary->atoms.size() != systems.front().atoms.size()) {
       throw MethodError(GENERATIVEQC_STATUS_INVALID_ARGUMENT,

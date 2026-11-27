@@ -17,7 +17,7 @@ from generativeqc import (
     Calculator,
     ElementBasis,
 )
-from generativeqc.ecp import ecp_integrals, resolve_ecp
+from generativeqc.ecp import ECPIntegrals, ecp_integrals, resolve_ecp
 from generativeqc.profiles import canonical_hash
 
 
@@ -642,3 +642,133 @@ def test_all_radial_powers_and_d_projector_libcint(
             - detached_reference(xyz - delta, power=power, d_projector=True)
         ) / 8e-5
         np.testing.assert_allclose(actual[:, 1 + d], expected, atol=1e-8, rtol=2e-7)
+
+
+def test_projected_ecp_gradient_on_moving_rectangular_frame() -> None:
+    rng = np.random.default_rng(58733)
+    coefficients = rng.normal(size=(5, 3))
+    weights = rng.normal(size=(3, 3))
+    matrix = rng.normal(size=(5, 5))
+    matrix = (matrix + matrix.T) / 2
+    direction = rng.normal(size=(2, 3, 5, 5))
+    direction = (direction + direction.swapaxes(-1, -2)) / 2
+    frame_motion = rng.normal(size=(2, 3, 5, 3))
+    integrals = ECPIntegrals(
+        matrix * 0.25, matrix * 0.75, direction * 0.25, direction * 0.75,
+        64, 16, "cpu", "fixture",
+    )
+    for moving in (False, True):
+        velocity = frame_motion if moving else np.zeros_like(frame_motion)
+        actual = integrals.contract(
+            weights, orbital_coefficients=coefficients,
+            coefficient_derivatives=velocity if moving else None,
+        )
+        from generativeqc._ecp_cuda import projected_inputs
+        from generativeqc_compiler.common.cuda_target import cuda_target_info
+        from generativeqc_compiler.tensor.cuda_plan import plan_cuda
+        from generativeqc_compiler.tensor.interpreter import execute
+
+        program, feeds = projected_inputs(
+            integrals, weights, coefficients, frame_motion if moving else None
+        )
+        planned = plan_cuda(program, cuda_target_info("sm_89"))
+        assert len(planned.inputs) == (7 if moving else 4)
+        assert len(planned.outputs) == 1
+        np.testing.assert_allclose(execute(program, feeds).outputs["gradient"], actual, atol=2e-13)
+        for step in (2e-5, 1e-5):
+            plus = coefficients + step * velocity
+            minus = coefficients - step * velocity
+            ep = np.einsum(
+                "ij,axki,axkl,axlj->ax", weights, plus, matrix + step * direction, plus
+            )
+            em = np.einsum(
+                "ij,axki,axkl,axlj->ax", weights, minus, matrix - step * direction, minus
+            )
+            np.testing.assert_allclose(actual, (ep - em) / (2 * step), atol=3e-8, rtol=0)
+    program, feeds = projected_inputs(integrals, matrix)
+    assert len(feeds) == 3
+    np.testing.assert_allclose(
+        execute(program, feeds).outputs["gradient"], integrals.contract(matrix), atol=2e-13
+    )
+    with pytest.raises(ValueError, match="require their frame"):
+        integrals.contract(matrix, coefficient_derivatives=frame_motion)
+    with pytest.raises(ValueError, match="dimensions"):
+        integrals.contract(weights, orbital_coefficients=coefficients.T)
+    with pytest.raises(ValueError, match="atom, Cartesian"):
+        integrals.contract(
+            weights, orbital_coefficients=coefficients,
+            coefficient_derivatives=frame_motion[:1],
+        )
+
+
+@pytest.mark.parametrize("nocc,occupation", [(3, 2), (2, 1), (1, 1), (0, 1)])
+def test_occupied_ecp_expectation_in_moving_metric(nocc: int, occupation: int) -> None:
+    rng = np.random.default_rng(50638)
+    nao = 5
+    frame, _ = np.linalg.qr(rng.normal(size=(nao, nao)))
+    co, cv = frame[:, :nocc], frame[:, nocc:]
+
+    def symmetric(x: np.ndarray) -> np.ndarray:
+        return (x + x.swapaxes(-1, -2)) / 2
+
+    matrix = symmetric(rng.normal(size=(nao, nao)))
+    dv = symmetric(rng.normal(size=(2, 3, nao, nao)))
+    ds = symmetric(rng.normal(size=dv.shape))
+    uvo = rng.normal(size=(2, 3, nao - nocc, nocc))
+    integrals = ECPIntegrals(
+        matrix, np.zeros_like(matrix), dv, np.zeros_like(dv), 64, 16, "cpu", "fixture"
+    )
+    analytic = integrals.occupied_expectation_gradient(co, cv, ds, uvo, occupation=occupation)
+
+    def displaced(step: float) -> np.ndarray:
+        trial = co + step * (cv @ uvo)
+        metric = trial.swapaxes(-1, -2) @ (np.eye(nao) + step * ds) @ trial
+        eigenvalues, vectors = np.linalg.eigh(metric)
+        orbitals = trial @ ((vectors * eigenvalues[..., None, :] ** -0.5) @ vectors.swapaxes(-1, -2))
+        projected = orbitals.swapaxes(-1, -2) @ (matrix + step * dv) @ orbitals
+        return occupation * np.trace(projected, axis1=-2, axis2=-1)
+
+    for step in (2e-5, 1e-5):
+        numerical = (displaced(step) - displaced(-step)) / (2 * step)
+        np.testing.assert_allclose(analytic, numerical, atol=1e-7, rtol=0)
+    with pytest.raises(ValueError, match="orbital dimensions"):
+        integrals.occupied_expectation_gradient(co, cv, ds, uvo[:1])
+
+
+@pytest.mark.parametrize("occupations", [(2,), (2, 1), (1, 0), (3, 1)])
+def test_batched_relaxed_ecp_cuda_program(occupations: tuple[int, ...]) -> None:
+    from generativeqc._ecp_occupied_cuda import inputs
+    from generativeqc_compiler.common.cuda_target import cuda_target_info
+    from generativeqc_compiler.tensor.cuda_plan import plan_cuda
+    from generativeqc_compiler.tensor.interpreter import execute
+
+    rng = np.random.default_rng(124)
+    matrix = rng.normal(size=(3, 3))
+    matrix += matrix.T.copy()
+    derivative = rng.normal(size=(2, 3, 3, 3))
+    derivative += derivative.swapaxes(-1, -2).copy()
+    integrals = ECPIntegrals(
+        matrix, -0.2 * matrix, derivative, 0.25 * derivative, 32, 12, "cpu", "fixture"
+    )
+    overlap = rng.normal(size=derivative.shape)
+    overlap += overlap.swapaxes(-1, -2).copy()
+    frames = [
+        (rng.normal(size=(3, n)), rng.normal(size=(3, 3-n)), rng.normal(size=(2, 3, 3-n, n)))
+        for n in occupations
+    ]
+    occupation = 2 if len(frames) == 1 else 1
+    expected = np.stack([
+        integrals.occupied_expectation_gradient(co, cv, overlap, uvo, occupation=occupation)
+        for co, cv, uvo in frames
+    ])
+    program, feeds = inputs(integrals, overlap, frames, occupation)
+    native_plan = plan_cuda(program, cuda_target_info("sm_89"))
+    assert len(native_plan.inputs) == 8 and len(native_plan.outputs) == 1
+    assert native_plan.semantic_traffic["device_to_host_bytes"] == expected.nbytes
+    np.testing.assert_allclose(execute(program, feeds).outputs["gradient"], expected, atol=3e-13)
+    if len(frames) == 2:
+        occupied, virtual, response = zip(*frames)
+        actual = integrals.occupied_expectation_gradient(occupied, virtual, overlap, response)
+        np.testing.assert_allclose(actual, expected, atol=3e-13)
+        with pytest.raises(ValueError, match="occupation 1"):
+            integrals.occupied_expectation_gradient(occupied, virtual, overlap, response, occupation=2)
