@@ -188,3 +188,83 @@ def test_m7_real_df_hf_shell_gaps_pass_for_h2o_oh_hbr() -> None:
         assert frame.counts(cspace) == (1, 1)
         for channel in frame.channels(cspace):
             assert channel.minimum_gap_eh > 10.0 * DEFAULT_FROZEN_CORE_MIN_SHELL_GAP_EH
+
+
+# ============================================================================
+# M8: Guard single-pass fp32_single W schedule on forces
+# ============================================================================
+
+
+def test_m8_fp32_single_never_default_and_refused_on_non_l20_forces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fp32_single is never default; non-L20 forces refuse it before the native contraction."""
+    import inspect
+    import warnings
+    from types import SimpleNamespace
+
+    from generativeqc import _f12_focal_ucc_triples as ucc_triples
+    from generativeqc._cuda_device import CudaDeviceIdentity
+    from generativeqc._f12_focal_molecular import MolecularFocalProvider
+    from generativeqc.experimental.f12_focal import TriplesWPrecisionError
+
+    # 1. Verify defaults never select fp32_single.
+    default_provider = MolecularFocalProvider(shell_library=Path("fake.so"))
+    assert default_provider.triples_fp32_w is False
+    assert default_provider.triples_w_schedule is None
+    cuda_sig = inspect.signature(MolecularFocalProvider.cuda)
+    assert cuda_sig.parameters["triples_fp32_w"].default is False
+    assert cuda_sig.parameters["triples_w_schedule"].default is None
+
+    # 2. Verify MolecularFocalProvider.triples_energy vs triples_energy_and_forces.
+    native_calls: list[bool] = []
+
+    def fake_triples(req: object, ref: object, **kw: object) -> tuple[float, np.ndarray | None]:
+        native_calls.append(bool(kw.get("forces")))
+        return -0.01, np.zeros((1, 3), dtype=np.float64) if kw.get("forces") else None
+
+    monkeypatch.setattr(ucc_triples, "molecular_triples_on_reference", fake_triples)
+    fake_req = SimpleNamespace(
+        atoms=(),
+        basis=SimpleNamespace(orbital=SimpleNamespace(by_element={})),
+        backend="cuda",
+        correlation_space_id="all-active",
+        root_id="rhf",
+    )
+    fake_ref = SimpleNamespace(
+        occupied=(2,),
+        orbital_energies=None,
+        _pair_spin_indices=lambda req: (0, 0),
+    )
+
+    def a100() -> CudaDeviceIdentity:
+        return CudaDeviceIdentity("NVIDIA A100-SXM4-80GB", "sm_80")
+
+    fp32_single_provider = MolecularFocalProvider(
+        shell_library=Path("fake.so"), triples_fp32_w=True, _cuda_device=a100
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        e = fp32_single_provider.triples_energy(fake_req, reference=fake_ref)  # type: ignore[arg-type]
+    assert e == pytest.approx(-0.01)
+    assert native_calls == [False]
+
+    with pytest.raises(TriplesWPrecisionError, match="only on an NVIDIA L20"):
+        fp32_single_provider.triples_energy_and_forces(
+            fake_req, reference=fake_ref  # type: ignore[arg-type]
+        )
+    assert native_calls == [False]
+
+    # Default FP64 and compensated fp32_split3 forces run without warnings.
+    for prov in (
+        MolecularFocalProvider(shell_library=Path("fake.so"), _cuda_device=a100),
+        MolecularFocalProvider(
+            shell_library=Path("fake.so"), triples_w_schedule="fp32_split3", _cuda_device=a100
+        ),
+    ):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            e_f, f_arr = prov.triples_energy_and_forces(fake_req, reference=fake_ref)  # type: ignore[arg-type]
+        assert e_f == pytest.approx(-0.01)
+        assert f_arr.shape == (1, 3)
+    assert native_calls == [False, True, True]

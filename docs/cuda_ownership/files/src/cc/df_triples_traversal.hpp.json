@@ -1,0 +1,7 @@
+{
+  "path": "src/cc/df_triples_traversal.hpp",
+  "reason": "Assigns canonical tile addresses and occurrence counts. The streaming and serpentine schedules visit the same occupied triples and retain the canonical reduction order.",
+  "regions": [],
+  "role": "runtime",
+  "subsystem": "focal_cc"
+}

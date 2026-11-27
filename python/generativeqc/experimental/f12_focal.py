@@ -23,8 +23,10 @@ from .. import (
     _f12_focal_projector,
     _f12_focal_reference,
     _f12_focal_singles,
+    _f12_focal_ucc_triples,
     _f12_focal_ump2,
     _f12_frozen_core,
+    _f12_triples_w_policy,
     _native,
     _uccsd_rhf_virtual_pairs,
     _uccsd_uhf_virtual_ladder,
@@ -86,10 +88,13 @@ frozen_core_orbitals_for_atom = _f12_frozen_core.frozen_core_orbitals_for_atom
 frozen_core_spd_orbitals_for_atom = _f12_frozen_core.frozen_core_spd_orbitals_for_atom
 cv_active_frozen_orbitals_for_atom = _f12_frozen_core.cv_active_frozen_orbitals_for_atom
 resolve_frozen_occupied = _f12_frozen_core.resolve_frozen_occupied
+FocalTriplesEvaluation = _f12_focal_molecular.FocalTriplesEvaluation
+TriplesWPrecisionError = _f12_triples_w_policy.TriplesWPrecisionError
 FocalUCCEquationSources = _f12_focal_molecular.FocalUCCEquationSources
 FocalUCCFixedSources = _f12_focal_molecular.FocalUCCFixedSources
 FocalUCCStationary = _f12_focal_molecular.FocalUCCStationary
 FocalUCCSDResult = _f12_focal_molecular.FocalUCCSDResult
+conventional_df_ucc_triples = _f12_focal_ucc_triples.conventional_df_ucc_triples
 FocalOneElectron = _f12_focal_one_electron.FocalOneElectron
 one_electron_sources = _f12_focal_one_electron.one_electron_sources
 FocalReference = _f12_focal_reference.FocalReference

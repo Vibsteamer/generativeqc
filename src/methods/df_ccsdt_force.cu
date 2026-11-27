@@ -259,12 +259,20 @@ static DFCCSDTResult run_df_ccsdt_native_attempt(
   auto phase = Clock::now();
   if (trace.enabled()) Trace::label("phase", "triples");
   if (with_triples) {
+    const auto effective_triples_w =
+        (admitted_triples_w.is_strict_fp64() && demand.triples_fp32_w)
+            ? runtime::PrecisionDirective{runtime::PrecisionDtype::Fp32,
+                                          runtime::PrecisionDtype::Fp32,
+                                          runtime::PrecisionDtype::Fp32,
+                                          "issue1764/df-triples-w-fp32-candidate-v1"}
+            : admitted_triples_w;
     if (forces) {
       auto response = cc::triples::pullback_and_fock_df_cuda(
           o, v, q, p.df_bov.data(), p.df_bvv.data(), p.ovoo.data(), p.ovov.data(), p.fov.data(),
           state.solved.t1.data(), state.solved.t2.data(), state.eps_o.data(), state.eps_v.data(),
           1e-10, budget, device, difference(base, borrowed), 0, 3, parallel_gap_reduction,
-          request_triples_gap_cotangents, fused_triples_scalar_response, admitted_triples_w);
+          request_triples_gap_cotangents, fused_triples_scalar_response, effective_triples_w,
+          demand.triples_occupied_weights, demand.triples_occupied_partition, demand.triples_compensated_w);
       t = std::move(response.pullback);
       result.triples_fock = std::move(response.fock);
       result.triples = t.diagnostic;
@@ -284,7 +292,8 @@ static DFCCSDTResult run_df_ccsdt_native_attempt(
       result.triples = cc::triples::evaluate_df_cuda(
           o, v, q, p.df_bov.data(), p.df_bvv.data(), p.ovoo.data(), p.ovov.data(), p.fov.data(),
           state.solved.t1.data(), state.solved.t2.data(), state.eps_o.data(), state.eps_v.data(),
-          1e-10, difference(budget, base), device, 3, admitted_triples_w);
+          1e-10, difference(budget, base), device, 3, effective_triples_w,
+          demand.triples_occupied_partition, demand.triples_compensated_w);
       result.numeric_capacity_bytes = std::max(result.numeric_capacity_bytes,
                                                checked_add(base, result.triples.workspace_bytes));
     }
@@ -310,7 +319,8 @@ static DFCCSDTResult run_df_ccsdt_native_attempt(
     if (demand.companions & kMp2Component) {
       const auto companion = cc::evaluate_df_mp2_cuda(
           o, v, q, p.df_bov, state.eps_o, state.eps_v, p.df_source_identity, false, budget, device,
-          checked_add(base, capacity({&state.eps_o, &state.eps_v})),
+          checked_add(base, capacity({&state.eps_o, &state.eps_v,
+                                      &result.triples.occupied_energies})),
           descriptor.mp2_denominator_threshold ? descriptor.mp2_denominator_threshold : 1e-10);
       Result::Companion component;
       component.energy = result.reference_energy + companion.opposite_spin + companion.same_spin;

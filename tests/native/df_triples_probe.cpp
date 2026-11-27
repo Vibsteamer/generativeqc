@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <exception>
+#include <string_view>
 
 #include "cc/df_triples.hpp"
 
@@ -22,8 +23,11 @@ extern "C" int df_triples_probe_v2(std::size_t o, std::size_t v, std::size_t q,
     if (!values || !counts || counts_size < 26)
       throw std::invalid_argument("insufficient triples diagnostic buffer");
     if (precision != 0 && precision != 1 && precision != 2 && precision != 3 && precision != 4 &&
-        precision != 5 && precision != 12 && precision != 13)
+        precision != 5 && precision != 12 && precision != 13 && precision != 17)
       throw std::invalid_argument("invalid precision admission");
+    const bool compensated = precision == 17;
+    if (compensated && counts_size < 32)
+      throw std::invalid_argument("insufficient compensated triples diagnostic buffer");
     struct Reset {
       ~Reset() {
         if (df_triples_reject_library_for_test_v1) df_triples_reject_library_for_test_v1(false);
@@ -48,7 +52,7 @@ extern "C" int df_triples_probe_v2(std::size_t o, std::size_t v, std::size_t q,
                                                "issue1764/df-triples-w-fp32-candidate-v1"};
     const auto result = generativeqc::cc::triples::evaluate_df_cuda(
         o, v, q, inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5], inputs[6],
-        inputs[7], inputs[8], threshold, budget, 0, panels, mode);
+        inputs[7], inputs[8], threshold, budget, 0, panels, mode, false, compensated);
     const double scalars[] = {result.energy, result.minimum_absolute_denominator, result.seconds};
     const std::size_t work[] = {result.virtual_triples,
                                 result.occupied_tiles,
@@ -78,9 +82,41 @@ extern "C" int df_triples_probe_v2(std::size_t o, std::size_t v, std::size_t q,
                                 std::size_t(result.w_provider_version)};
     std::copy(std::begin(scalars), std::end(scalars), values);
     std::copy(std::begin(work), std::end(work), counts);
+    if (counts_size >= 28) {
+      counts[26] = result.triples_fp32_w_forward_executed();
+      counts[27] = result.triples_fp32_w_reverse_executed();
+    }
+    if (counts_size >= 32) {
+      constexpr std::string_view schedule =
+          "spatial-triples/three-limb-fp32-sgemm-k64-high8-fp64-combine-v1";
+      counts[28] = result.compensated_fp32_w_executed;
+      counts[29] = result.fp32_forward_gemms;
+      counts[30] = result.fp32_reverse_gemms;
+      counts[31] = result.w_codegen_precision_schedule_identity == schedule &&
+                   result.w_candidate_identity == schedule &&
+                   result.w_precision_identity == schedule;
+    }
     return 0;
   } catch (const std::exception& e) {
     if (error && error_size) std::snprintf(error, error_size, "%s", e.what());
+    return 1;
+  }
+}
+
+extern "C" int df_triples_occupied_probe_v1(std::size_t o, std::size_t v, std::size_t q,
+                                            const double* const* inputs, double* values,
+                                            std::size_t values_size) noexcept {
+  try {
+    if (!values || !values_size || values_size - 1 != o)
+      throw std::invalid_argument("incorrect occupied triples output capacity");
+    const auto result = generativeqc::cc::triples::evaluate_df_cuda(
+        o, v, q, inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5], inputs[6],
+        inputs[7], inputs[8], 1e-10, std::size_t{1} << 30, 0, 3,
+        generativeqc::runtime::strict_fp64_precision(), true);
+    values[0] = result.energy;
+    std::copy(result.occupied_energies.begin(), result.occupied_energies.end(), values + 1);
+    return 0;
+  } catch (const std::exception&) {
     return 1;
   }
 }

@@ -72,16 +72,21 @@ def moment_vjp(occupied: int, virtuals: int, output: str) -> Program:
     return _pullback(Program({output: primal.outputs[output]}))
 
 
-def energy_scalar_vjp(inputs: Iterable[str] | None = None) -> Program:
+def energy_scalar_vjp(
+    inputs: Iterable[str] | None = None, *, occupied_weighted: bool = False
+) -> Program:
     """Demand-driven scalar pullback of the exact occupied-triangle epilogue.
 
     The denominator input already contains the forward 6/2/1 multiplicity.
     The caller composes its derivative with gap * multiplicity exactly once.
     Virtual-coordinate permutations belong to the source binding: gathering
     their inverse maps avoids nondeterministic atomic accumulation into W.
+    The weighted variant additionally returns the three orbital weight
+    cotangents. The physical owner scatters all three slots, including
+    duplicates, and propagates the orbital frame and ratio derivatives.
     This scalar boundary alone is not a full same-space Fock response.
     """
-    return _pullback(energy_scalar_program(), inputs)
+    return _pullback(energy_scalar_program(occupied_weighted=occupied_weighted), inputs)
 
 
 def fused_tile_program() -> Program:

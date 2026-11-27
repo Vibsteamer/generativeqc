@@ -31,6 +31,9 @@ from conftest import f12_host_shell
 from generativeqc._f12_focal_molecular import MolecularFocalProvider
 from generativeqc._f12_focal_reference import df_reference
 from generativeqc._f12_focal_ucc_triples import (
+    molecular_occupied_triples_on_reference,
+    molecular_triples_on_reference,
+    relax_spatial_rhf_force_sources,
     spin_blocked_uhf_triples_v2,
 )
 from generativeqc._f12_frozen_core import resolve_frozen_occupied
@@ -330,6 +333,25 @@ def test_closed_shell_h2o_matches_pyscf_rccsd_t_and_occupied_closure(
     assert res.telemetry["frozen_alpha"] == frozen
     assert res.telemetry["frozen_beta"] == frozen
 
+    # Verify focal wrapper routing matches identically
+    e_hook, f_hook = molecular_triples_on_reference(
+        req, ref, budget_mib=512, forces=False
+    )
+    assert f_hook is None
+    assert abs(e_hook - res.energy) < 1e-14
+    e_occ_hook, occ_obj = molecular_occupied_triples_on_reference(
+        replace(req, role="triples_plus"), ref, budget_mib=512
+    )
+    assert abs(e_occ_hook - res.energy) < 1e-14
+    if root == "rhf":
+        assert isinstance(occ_obj.values, np.ndarray)
+        assert np.max(np.abs(occ_obj.values - (res.occupied_alpha + res.occupied_beta))) < 1e-14
+    else:
+        assert isinstance(occ_obj.values, tuple)
+        assert np.max(np.abs(occ_obj.values[0] - res.occupied_alpha)) < 1e-14
+        assert np.max(np.abs(occ_obj.values[1] - res.occupied_beta)) < 1e-14
+
+
 @pytest.mark.parametrize(
     "name,geom,mult",
     [
@@ -611,3 +633,258 @@ NH2_ASYM_GEOM = (
     ("H", (0.11, -1.52, 1.18)),
     ("H", (-0.06, 1.46, 1.24)),
 )
+
+
+@pytest.mark.parametrize("correlation_space_id", ["all-active", "frozen-core"])
+def test_force_gate1_closed_shell_h2o_fd_and_rhf_spatial_parity(
+    correlation_space_id: str,
+):
+    """Closed-shell H2O (AE & FC, split-fit): UHF v2 (T) & (T+) forces match FD & RHF spatial."""
+    provider = _host_focal_provider()
+    basis = _build_split_hcno_bases()
+
+    def eval_point(geom, *, root: str, weights=None, forces: bool = False):
+        req, ref = _make_triples_request(
+            geom,
+            basis,
+            root=root,
+            multiplicity=1,
+            correlation_space_id=correlation_space_id,
+        )
+        res = spin_blocked_uhf_triples_v2(
+            req,
+            ref,
+            budget_mib=512,
+            forces=forces,
+            occupied_partition=True,
+            occupied_weights=weights,
+            provider=provider if forces else None,
+        )
+        return req, ref, res
+
+    req_uhf, ref_uhf, res_uhf_unw = eval_point(H2O_ASYM_GEOM, root="uhf", forces=True)
+    req_rhf, ref_rhf, res_rhf_unw = eval_point(H2O_ASYM_GEOM, root="rhf", forces=True)
+    assert res_uhf_unw.forces is not None and res_rhf_unw.forces is not None
+    assert res_uhf_unw.telemetry["lambda_iterations"] > 0
+    _assert_net_force_and_torque(H2O_ASYM_GEOM, res_uhf_unw.forces)
+    _assert_net_force_and_torque(H2O_ASYM_GEOM, res_rhf_unw.forces)
+
+    # UHF v2 vs RHF v2 and direct spatial RHF relaxation parity (< 1e-11 Eh/bohr)
+    assert np.max(np.abs(res_uhf_unw.forces - res_rhf_unw.forces)) < 1e-11
+    bfa, bfb, bca, bcb, cgrad = _extract_raw_v2_force_sources(req_rhf, ref_rhf)
+    assert np.max(np.abs(bfa - bfb)) < 1e-12
+    assert np.max(np.abs(bca - bcb)) < 1e-12
+    spatial_unw = relax_spatial_rhf_force_sources(
+        provider, req_rhf, ref_rhf, bfa + bfb, bca + bcb, cgrad
+    )
+    assert np.max(np.abs(res_uhf_unw.forces - spatial_unw)) < 1e-11
+
+    # Focal wrapper routing parity
+    e_hook, f_hook = molecular_triples_on_reference(
+        req_uhf, ref_uhf, budget_mib=512, forces=True, provider=provider
+    )
+    assert f_hook is not None
+    assert abs(e_hook - res_uhf_unw.energy) < 1e-14
+    assert np.max(np.abs(f_hook - res_uhf_unw.forces)) < 1e-14
+
+    # Independent legacy retained all-active (T) force oracle parity (< 1e-11 Eh/bohr)
+    if correlation_space_id == "all-active":
+        e_leg, f_leg = molecular_triples_on_reference(
+            req_rhf, ref_rhf, budget_mib=512, forces=True, provider=None
+        )
+        assert f_leg is not None
+        assert abs(res_uhf_unw.energy - e_leg) < 1e-12
+        assert np.max(np.abs(res_uhf_unw.forces - f_leg)) < 1e-11
+
+    # Weighted (T+) with unequal spin-symmetric weights
+    fa, _ = resolve_frozen_occupied(req_rhf, (ref_rhf.occupied[0], ref_rhf.occupied[0]))
+    eps_o = ref_rhf.orbital_energies[0][fa : ref_rhf.occupied[0]]
+    w_spatial = _make_degeneracy_safe_weights(eps_o, 0.06)
+    weights = (w_spatial, w_spatial.copy())
+
+    _, _, res_uhf_w = eval_point(H2O_ASYM_GEOM, root="uhf", weights=weights, forces=True)
+    _, _, res_rhf_w = eval_point(H2O_ASYM_GEOM, root="rhf", weights=weights, forces=True)
+    assert res_uhf_w.forces is not None and res_rhf_w.forces is not None
+    _assert_net_force_and_torque(H2O_ASYM_GEOM, res_uhf_w.forces)
+    assert np.max(np.abs(res_uhf_w.forces - res_rhf_w.forces)) < 1e-11
+
+    bfa_w, bfb_w, bca_w, bcb_w, cgrad_w = _extract_raw_v2_force_sources(
+        req_rhf, ref_rhf, occupied_weights=weights
+    )
+    spatial_w = relax_spatial_rhf_force_sources(
+        provider, req_rhf, ref_rhf, bfa_w + bfb_w, bca_w + bcb_w, cgrad_w
+    )
+    assert np.max(np.abs(res_uhf_w.forces - spatial_w)) < 1e-11
+
+    # Two-step central FD (h = 4e-4, 2e-4 bohr) for both unweighted (T) and weighted (T+)
+    for atom_idx, axis in ((0, 2), (1, 0), (1, 1)):
+        for h in (4e-4, 2e-4):
+            gp = _shift_geom(H2O_ASYM_GEOM, atom_idx, axis, +h)
+            gm = _shift_geom(H2O_ASYM_GEOM, atom_idx, axis, -h)
+
+            ep = eval_point(gp, root="uhf")[2].energy
+            em = eval_point(gm, root="uhf")[2].energy
+            fd_unw = -(ep - em) / (2.0 * h)
+            err_unw = abs(res_uhf_unw.forces[atom_idx, axis] - fd_unw)
+            assert err_unw < 2e-8, (
+                f"H2O {correlation_space_id} (T) FD mismatch at ({atom_idx},{axis}) h={h}: "
+                f"an={res_uhf_unw.forces[atom_idx, axis]:.12f} fd={fd_unw:.12f} err={err_unw:.3e}"
+            )
+
+            ep_w = eval_point(gp, root="uhf", weights=weights)[2].energy
+            em_w = eval_point(gm, root="uhf", weights=weights)[2].energy
+            fd_w = -(ep_w - em_w) / (2.0 * h)
+            err_w = abs(res_uhf_w.forces[atom_idx, axis] - fd_w)
+            assert err_w < 2e-8, (
+                f"H2O {correlation_space_id} weighted (T+) FD mismatch at ({atom_idx},{axis}) h={h}: "
+                f"an={res_uhf_w.forces[atom_idx, axis]:.12f} fd={fd_w:.12f} err={err_w:.3e}"
+            )
+
+
+@pytest.mark.parametrize(
+    "name,geom,coords_to_check",
+    [
+        ("OH", OH_GEOM, ((1, 2),)),
+        ("NH2", NH2_ASYM_GEOM, ((0, 2), (1, 0), (1, 1))),
+    ],
+)
+@pytest.mark.parametrize("correlation_space_id", ["all-active", "frozen-core"])
+def test_force_gate1_open_shell_unweighted_and_weighted_two_step_fd(
+    name: str, geom, coords_to_check, correlation_space_id: str
+):
+    """Open-shell OH & NH2 (AE & FC, split-fit): (T), weighted (T+), & live (T+) vs two-step FD."""
+    provider = _host_focal_provider()
+    basis = _build_split_hcno_bases()
+
+    def eval_triples(g, *, weights=None, forces: bool = False):
+        req, ref = _make_triples_request(
+            g,
+            basis,
+            root="uhf",
+            multiplicity=2,
+            correlation_space_id=correlation_space_id,
+        )
+        res = spin_blocked_uhf_triples_v2(
+            req,
+            ref,
+            budget_mib=512,
+            forces=forces,
+            occupied_partition=True,
+            occupied_weights=weights,
+            provider=provider if forces else None,
+        )
+        return req, ref, res
+
+    req0, ref0, res_unw = eval_triples(geom, forces=True)
+    assert res_unw.forces is not None
+    assert res_unw.telemetry["lambda_iterations"] > 0
+    _assert_net_force_and_torque(geom, res_unw.forces)
+
+    fa, fb = resolve_frozen_occupied(req0, (ref0.occupied[0], ref0.occupied[1]))
+    wa = _make_degeneracy_safe_weights(ref0.orbital_energies[0][fa : ref0.occupied[0]], 0.05)
+    wb = _make_degeneracy_safe_weights(ref0.orbital_energies[1][fb : ref0.occupied[1]], 0.13)
+    weights = (wa, wb)
+
+    _, _, res_w = eval_triples(geom, weights=weights, forces=True)
+    assert res_w.forces is not None
+    _assert_net_force_and_torque(geom, res_w.forces)
+
+    # Full end-to-end unrestricted_tplus_energy_and_forces_on_reference (live MP2-F12 weights!)
+    def eval_live_tplus(g, *, forces: bool = False, cabs_rank: int | None = None):
+        plan = plan_singlepoint(
+            g,
+            FocalSeries(basis),
+            FocalSeries(basis),
+            basis,
+            charge=0,
+            multiplicity=2,
+            root_id="uhf",
+            correlation_space_id=correlation_space_id,
+            backend="cpu_reference",
+        )
+        pair_req = next(r for r, _ in plan.steps if r.role == "mp2_f12_correlation")
+        tplus_req = replace(pair_req, role="triples_plus")
+        low = provider.low_order_energy(
+            pair_req,
+            include_hf_cabs=False,
+            include_occupied_partitions=True,
+            expected_cabs_rank=cabs_rank,
+        )
+        if forces:
+            return provider.unrestricted_tplus_energy_and_forces_on_reference(
+                tplus_req, low_order=low, expected_cabs_rank=cabs_rank
+            )
+        conv, ev = provider.unrestricted_tplus_energy_on_reference(
+            tplus_req, low_order=low, expected_cabs_rank=cabs_rank
+        )
+        return conv, ev, {}
+
+    conv_e, ev_tplus, tel_tplus = eval_live_tplus(geom, forces=True)
+    assert ev_tplus.forces is not None
+    assert abs(conv_e - res_unw.energy) < 1e-12
+    assert tel_tplus["lambda_iterations"] > 0
+    _assert_net_force_and_torque(geom, ev_tplus.forces)
+
+    for atom_idx, axis in coords_to_check:
+        for h in (4e-4, 2e-4):
+            gp = _shift_geom(geom, atom_idx, axis, +h)
+            gm = _shift_geom(geom, atom_idx, axis, -h)
+
+            # 1) Unweighted (T)
+            fd_unw = -(eval_triples(gp)[2].energy - eval_triples(gm)[2].energy) / (2.0 * h)
+            err_unw = abs(res_unw.forces[atom_idx, axis] - fd_unw)
+            assert err_unw < 2e-8, (
+                f"{name} {correlation_space_id} (T) FD mismatch at ({atom_idx},{axis}) h={h}: "
+                f"an={res_unw.forces[atom_idx, axis]:.12f} fd={fd_unw:.12f} err={err_unw:.3e}"
+            )
+
+            # 2) Fixed unequal-weighted (T+)
+            fd_w = -(
+                eval_triples(gp, weights=weights)[2].energy
+                - eval_triples(gm, weights=weights)[2].energy
+            ) / (2.0 * h)
+            err_w = abs(res_w.forces[atom_idx, axis] - fd_w)
+            assert err_w < 2e-8, (
+                f"{name} {correlation_space_id} weighted (T+) FD mismatch at ({atom_idx},{axis}) "
+                f"h={h}: an={res_w.forces[atom_idx, axis]:.12f} fd={fd_w:.12f} err={err_w:.3e}"
+            )
+
+            # 3) Live dynamic-weight (T+) including tplus_scaling_forces
+            _, ev_p, _ = eval_live_tplus(gp, cabs_rank=ev_tplus.cabs_rank)
+            _, ev_m, _ = eval_live_tplus(gm, cabs_rank=ev_tplus.cabs_rank)
+            fd_live = -(ev_p.energy - ev_m.energy) / (2.0 * h)
+            err_live = abs(ev_tplus.forces[atom_idx, axis] - fd_live)
+            assert err_live < 2e-8, (
+                f"{name} {correlation_space_id} live (T+) FD mismatch at ({atom_idx},{axis}) "
+                f"h={h}: an={ev_tplus.forces[atom_idx, axis]:.12f} fd={fd_live:.12f} err={err_live:.3e}"
+            )
+
+
+def test_provider_pair_source_cache_isolates_surface_id():
+    """Reusing one MolecularFocalProvider across RHF/UHF or AE/FC surfaces must not collide."""
+    provider = _host_focal_provider()
+    basis = _build_split_hcno_bases()
+    energies = []
+    for root_id, corr_space in (
+        ("rhf", "all-active"),
+        ("uhf", "all-active"),
+        ("uhf", "frozen-core"),
+    ):
+        plan = plan_singlepoint(
+            H2O_ASYM_GEOM,
+            FocalSeries(basis),
+            FocalSeries(basis),
+            basis,
+            charge=0,
+            multiplicity=1,
+            root_id=root_id,
+            correlation_space_id=corr_space,
+            backend="cpu_reference",
+        )
+        pair_req = next(r for r, _ in plan.steps if r.role == "mp2_f12_correlation")
+        low = provider.low_order_energy(
+            pair_req, include_hf_cabs=True, include_occupied_partitions=True
+        )
+        energies.append((root_id, corr_space, low.hf_cabs_energy, low.mp2_f12_correlation_energy))
+    assert abs(energies[0][2] - energies[1][2]) < 1e-12
+    assert abs(energies[0][3] - energies[1][3]) < 1e-12

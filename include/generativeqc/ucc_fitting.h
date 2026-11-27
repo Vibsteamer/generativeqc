@@ -27,6 +27,57 @@ GENERATIVEQC_API generativeqc_status generativeqc_focal_df_reference_owned_v1(
     generativeqc_focal_reference** owner);
 GENERATIVEQC_API void generativeqc_focal_reference_destroy_v1(generativeqc_focal_reference* owner);
 
+/** Use a fresh full-DF UCCSD(T) plan with the retained determinant.
+ * Output is the (T) energy followed by optional analytic Cartesian forces.
+ * The two force Lagrangians use the same converged conventional amplitudes. */
+GENERATIVEQC_API generativeqc_status generativeqc_focal_ucc_triples_v1(
+    generativeqc_calculation* calculation, const generativeqc_focal_reference* owner, int forces,
+    double* output, size_t count);
+
+/** Return the spatial DF-RCCSD(T) increment on the retained canonical RHF root.
+ * Requires CUDA, an all-electron full-DF plan and one common JK/correlation fit.
+ * This entry computes only the scalar conventional (T) energy. */
+GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_energy_v1(
+    generativeqc_calculation* calculation, const generativeqc_focal_reference* owner,
+    double* output);
+
+/** Return the same value-only (T) energy followed by one contribution for
+ * each spatial occupied orbital, in the retained RHF canonical order.
+ * Count must be exactly one plus the number of occupied spatial orbitals.
+ * Requires CUDA, an all-electron full-DF plan and one common JK/correlation fit. */
+GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_occupied_v1(
+    generativeqc_calculation* calculation, const generativeqc_focal_reference* owner,
+    double* output, size_t count);
+
+/** Extended spatial DF-RCCSD(T) / (T+) focal entry on the retained canonical RHF root.
+ * Supports split JK/correlation fits, scalar ECP, optional frozen_occupied orbitals,
+ * optional per-active-occupied weights for exact (T+) analytic force sources,
+ * preconvergence (0=Legacy/FP64, 1=FP64, 2=Mixed, 3=Automatic), and optional FP32 W
+ * mixed precision (when triples_fp32_w == 1, forward DF-panel/W GEMMs and, on the fast
+ * forces path, reverse W-pullback bar_panel/bar_t2 GEMMs execute in pedantic IEEE FP32
+ * SGEMM while denominators, energy reduction, V/ovoo/Fock contractions, and outer
+ * orbital/T2 accumulations remain FP64). Mode 0 is strict FP64. Mode 2 explicitly requests
+ * three FP32 limbs per operand, nine FP32 GEMMs per inner tile, and FP64 panel storage and
+ * recombination for the compensated spatial forward and reverse W contractions. Mode 2
+ * refuses unsupported or insufficient resources instead of switching to another W schedule.
+ * When forces != 0, writes pure triples-increment (corr_gradient, bar_f, bar_c) for focal CPHF.
+ * Optional telemetry_out (count >= 8) receives [ccsd_fp32, lambda_fp32, t_fp32_gemms,
+ * t_fp64_gemms, ccsd_s, triples_s, lambda_s, source_response_s], when count >= 10
+ * appends [triples_fp32_w_executed, triples_fp32_w_resource_fallback], and when
+ * count >= 12 appends [triples_fp32_w_forward_executed, triples_fp32_w_reverse_executed].
+ * With count >= 13 slot 12 reports whether any reverse W pullback executed, including FP64.
+ * A provider/resource fallback can retain FP32 W and execute the DF panels in FP64.
+ * Slots 8, 10 and 11 report the work performed independently of the fallback flag.
+ * Slots 13–16, when present, report observed compensated execution, physical forward and
+ * reverse FP32 GEMM counts, and the workspace size in bytes, respectively. */
+GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_v2(
+    generativeqc_calculation* calculation, const generativeqc_focal_reference* owner, int forces,
+    int occupied_partition, size_t frozen_occupied, const double* occupied_weights,
+    size_t weights_count, uint32_t preconvergence, int triples_fp32_w, double* energy_out,
+    double* occupied_out, size_t occupied_count, double* corr_gradient_out,
+    size_t corr_gradient_count, double* bar_f_out, size_t bar_f_count, double* bar_c_out,
+    size_t bar_c_count, double* telemetry_out, size_t telemetry_count);
+
 /** Returns 1 when the build supports native CUDA fixed-cusp preparation and RHS stage
  * counters, and 0 for a host-only build. This probe does not access a CUDA device. */
 GENERATIVEQC_API int generativeqc_focal_rcc_f12b_cuda_stage_counters_v1(void);
@@ -184,6 +235,51 @@ GENERATIVEQC_API void generativeqc_cc_reset_context_lambda_telemetry_v1(
 GENERATIVEQC_API int generativeqc_cc_context_lambda_telemetry_v1(
     const generativeqc_context* context, double* scalars, size_t scalar_count, uint64_t* counts,
     size_t count_len, char* reason, size_t reason_len);
+
+/** Returns NULL when the experimental Kohn extended-SP (T)-F12 engine is compiled
+ * into this build (-DGENERATIVEQC_ENABLE_EXPLICIT_TF12=ON), or a static detail string
+ * explaining why the entry points return GENERATIVEQC_STATUS_NOT_IMPLEMENTED. */
+GENERATIVEQC_API const char* generativeqc_rcc_explicit_tf12_disabled_detail_v1(void);
+
+/** Evaluate closed-shell spatial DF Kohn extended-SP (T)-F12 energy on CPU.
+ * Set q_f12=0 for exact zero-coupling degeneration to DF-RCCSD(T).
+ * z2_mode: 0=Direct (R_Q g R_Q), 1=FfgCompleted (GeCCo default), 2=Zero.
+ * Optional breakdown_out (count >= 28) returns the term-by-term scalar breakdown.
+ * With count >= 30, slots 28 and 29 hold executed CUDA FP32 and FP64 W GEMM counts. */
+GENERATIVEQC_API generativeqc_status generativeqc_rcc_explicit_tf12_df_cpu_v1(
+    size_t o_full, size_t frozen, size_t obs, size_t ext, size_t q_mp2, size_t q_f12,
+    const double* bov, const double* bvv, const double* ovoo, const double* ovov, const double* fov,
+    const double* t1, const double* t2, const double* eps_o, const double* eps_v,
+    const double* b_g_ext_obs, const double* b_g_ext_ext, const double* fit_ext_obs,
+    const double* r_f_ext_obs, const double* r_fg_obs_obs, const double* r_ff_ext_obs,
+    const double* r_u_obs_obs, const double* f_ext, const double* k_ext, uint32_t z2_mode,
+    double geminal_scale, double* energy_out, double* breakdown_out, size_t breakdown_count);
+
+/** Evaluate closed-shell spatial exact-4-index Kohn extended-SP (T)-F12 energy on CPU
+ * for direct non-DF contract parity (e.g. GeCCo archived BH integrals). */
+GENERATIVEQC_API generativeqc_status generativeqc_rcc_explicit_tf12_exact4_cpu_v1(
+    size_t o_full, size_t frozen, size_t obs, size_t ext, const double* ovvv, const double* ovoo,
+    const double* ovov, const double* fov, const double* t1, const double* t2, const double* eps_o,
+    const double* eps_v, const double* c2_ab, const double* g_obs_obs_ext_ext,
+    const double* g_chem_ext_ext_o_v, const double* g_chem_ext_o_ext_v, const double* f12,
+    const double* fg, const double* ff, const double* ftf, const double* ffbar, const double* f_ext,
+    const double* k_ext, uint32_t z2_mode, double geminal_scale, double* energy_out,
+    double* breakdown_out, size_t breakdown_count);
+
+/** Evaluate closed-shell spatial DF-CUDA Kohn extended-SP (T)-F12 energy on GPU.
+ * Uses on-the-fly 3-index DF C-INT[2] panel augmentation, a caller-provided arena cap,
+ * optional triples_fp32_w mixed precision, and GPU cuBLAS V/X/B/Bh/Z2 contractions.
+ * With >10 active occupied orbitals and nonzero F12 coupling, the unevaluated
+ * conventional diagnostic in breakdown slot 1 is NaN. */
+GENERATIVEQC_API generativeqc_status generativeqc_rcc_explicit_tf12_df_cuda_v1(
+    int device, size_t max_bytes, int triples_fp32_w, size_t o_full, size_t frozen, size_t obs,
+    size_t ext, size_t q_mp2, size_t q_f12, const double* bov, const double* bvv,
+    const double* ovoo, const double* ovov, const double* fov, const double* t1, const double* t2,
+    const double* eps_o, const double* eps_v, const double* b_g_ext_obs, const double* b_g_ext_ext,
+    const double* fit_ext_obs, const double* r_f_ext_obs, const double* r_fg_obs_obs,
+    const double* r_ff_ext_obs, const double* r_u_obs_obs, const double* f_ext, const double* k_ext,
+    uint32_t z2_mode, double geminal_scale, double* energy_out, double* breakdown_out,
+    size_t breakdown_count);
 
 #ifdef __cplusplus
 }

@@ -13,6 +13,7 @@ if __package__ in (None, ""):
     sys.path[:0] = [str(ROOT), str(ROOT / "python")]
 
 from generativeqc_compiler.cc.occupied_triples import (
+    OCCUPIED_ORBITAL_SHARE,
     PERMUTATIONS,
     df_panel_program,
     energy_scalar_program,
@@ -931,7 +932,10 @@ struct WPlan {
                                   checked_mul(checked_add(panels,1),v3)),sizeof(float));
   }
 };
-inline WPlan prepare_w_plan(runtime::PrecisionDirective admitted,bool library_available=true) {
+inline WPlan prepare_w_plan(runtime::PrecisionDirective admitted,bool library_available=true,
+                           bool require_pedantic=false) {
+  if(require_pedantic && !library_available)
+    throw std::length_error("compensated triples W requires the pedantic BLAS provider");
   const bool strict=admitted.is_strict_fp64();
   if(admitted.math_mode!=runtime::kStrictPrecisionMathMode ||
       (!strict && (admitted.storage_dtype!=runtime::PrecisionDtype::Fp32 ||
@@ -947,6 +951,8 @@ inline WPlan prepare_w_plan(runtime::PrecisionDirective admitted,bool library_av
     auto& offer=offers[i];
     const bool offer_strict=w_lowering_precisions[offer.precision].arithmetic.is_strict_fp64();
     if(strict && !offer_strict) offer.rejection="scientific owner did not admit this precision";
+    if(require_pedantic && offer.provider!="cublas")
+      offer.rejection="compensated triples W requires pedantic BLAS";
     if(!library_available && offer.provider!="generated.cuda")
       offer.rejection="optional provider preparation unavailable";
     if(offer.provider=="cutensor") {
@@ -1279,6 +1285,7 @@ def cuda_header() -> str:
 #include <cuda_runtime.h>
 #include "generated_df_occupied_triples.hpp"
 namespace generativeqc::cc::triples::generated_df {
+inline constexpr double occupied_orbital_share = @OCCUPIED_ORBITAL_SHARE@;
 void energy_tile(std::size_t o,std::size_t v,std::size_t i,std::size_t j,std::size_t k,
                  double degeneracy,double threshold,const Inputs& in,const double* moments,
                  unsigned blocks,double* partials,int* error,cudaStream_t stream);
@@ -1305,7 +1312,10 @@ void resolvent_tile(std::size_t o,std::size_t v,std::size_t i,std::size_t j,std:
                     double threshold,const Inputs& in,const double* moments,unsigned blocks,
                     double* x,double* y,int* error,cudaStream_t stream);
 }
-"""
+""".replace(
+        "@OCCUPIED_ORBITAL_SHARE@",
+        f"{OCCUPIED_ORBITAL_SHARE.numerator}.0 / {OCCUPIED_ORBITAL_SHARE.denominator}.0",
+    )
 
 
 def _energy_tile_kernel(name: str, *, remapped: bool = False) -> str:

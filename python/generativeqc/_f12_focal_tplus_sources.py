@@ -1,4 +1,4 @@
-"""Occupied energy partitions and pair cotangents for focal MP2 and F12."""
+"""Occupied energy sources and pair cotangents for Kállay's (T+) scaling."""
 
 from __future__ import annotations
 
@@ -31,6 +31,31 @@ class OccupiedMP2F12:
         if self.mp2[0].shape != self.mp2[1].shape:
             raise ValueError("a restricted partition requires paired occupied spaces")
         return sum(self.mp2), sum(self.f12_increment)
+
+
+@dataclass(frozen=True)
+class FocalOccupiedTriples:
+    """Conventional per-occupied triples from one retained canonical determinant.
+
+    Use spatial orbital order for RHF, and separate alpha and beta arrays for UHF.
+    The fit is the one used for the physical parent CC and its triples correction.
+    """
+
+    reference: FocalReference
+    correlation_space_id: str
+    correlation_fit_id: str
+    values: np.ndarray | SpinOccupied
+    telemetry: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class FocalTPlusWeights:
+    """One scaled increment with response seeds in the input orbital coordinates."""
+
+    energy: float
+    mp2: SpinOccupied
+    f12_increment: SpinOccupied
+    triples: np.ndarray | SpinOccupied
 
 
 def checked_occupied_weights(

@@ -18,12 +18,22 @@ from generativeqc_compiler.cc.occupied_triples_fock import (
     resolvent_scalar_program,
 )
 from generativeqc_compiler.cc.triples import _LABELS, VP, triples_energy
+from generativeqc_compiler.cc.triples_response import full_triples_vjp
 from generativeqc_compiler.cc.triples_fock_response import (
     build_runtime_triples_resolvent_program,
 )
 from generativeqc_compiler.tensor import execute
-from test_cc_triples_fock_response import NAMES, _canonical_energy, _dense_reference
-from test_df_occupied_triples import case
+from test_cc_triples_fock_response import (
+    NAMES,
+    _canonical_energy,
+    _dense_reference,
+    _rotate,
+)
+from test_df_occupied_triples import (
+    case,
+    native_probe,  # noqa: F401 -- pytest fixture
+)
+from test_df_occupied_triples import run as run_energy
 
 
 def conventional(inputs: list[np.ndarray]) -> list[np.ndarray]:
@@ -312,7 +322,7 @@ def run_combined(
         *(np.full_like(x, np.nan) for x in arrays[:7]),
     ]
     values = np.full(3, np.nan)
-    counts = np.full(24 if precision is None else 31, 19, dtype=np.uintp)
+    counts = np.full(24 if precision is None else 38, 19, dtype=np.uintp)
     error = ct.create_string_buffer(2048)
     dp = ct.POINTER(ct.c_double)
     if precision is not None:
@@ -338,6 +348,104 @@ def run_combined(
     return status, output, values, counts, error.value.decode()
 
 
+@pytest.fixture(scope="module")
+def compensated_oracle() -> tuple:
+    """Independent virtual-triples VJP plus the dense six-index Fock resolvent."""
+    o, v, q = 2, 3, 65
+    inputs, _ = case(o, v, q)
+    tensors = conventional(inputs)
+    energy = triples_energy(o, v, *tensors, *inputs[-2:])
+    bars = full_triples_vjp(o, v, *tensors, *inputs[-2:], inputs=NAMES)
+    # The native panel uses Bvv[Q,b,f] for the conventional V[i,a,f,b].
+    # Keep this unprojected adjoint so every stored matrix element is checked.
+    expected = [
+        *_dense_reference(tensors, *inputs[-2:])[:2],
+        np.einsum("iafb,Qbf->Qia", bars["ovvv"], inputs[1]),
+        np.einsum("iafb,Qia->Qbf", bars["ovvv"], inputs[0]),
+        *(bars[name] for name in NAMES[1:]),
+    ]
+    rng = np.random.default_rng(2718)
+    directions = [rng.normal(scale=0.03, size=x.shape) for x in expected]
+    for i in (0, 1, 3):  # Foo, Fvv, and each row of the fitted Bvv are symmetric.
+        directions[i] = (directions[i] + directions[i].swapaxes(-2, -1)) / 2
+    directions[-1] = (directions[-1] + directions[-1].transpose(1, 0, 3, 2)) / 2
+    return inputs, energy, expected, directions
+
+
+def _displaced_canonical_inputs(
+    inputs: list[np.ndarray], directions: list[np.ndarray], step: float
+) -> list[np.ndarray]:
+    eo, uo = np.linalg.eigh(np.diag(inputs[-2]) + step * directions[0])
+    ev, uv = np.linalg.eigh(np.diag(inputs[-1]) + step * directions[1])
+    displaced = [x + step * d for x, d in zip(inputs[:7], directions[2:], strict=True)]
+    rotated = _rotate(conventional(displaced), uo, uv)
+    return [
+        np.einsum("Qia,ij,ab->Qjb", displaced[0], uo, uv),
+        np.einsum("Qab,ai,bj->Qij", displaced[1], uv, uv),
+        *rotated[1:],
+        eo,
+        ev,
+    ]
+
+
+def test_full_fock_and_seven_tensor_oracles_match_joint_energy_difference(
+    compensated_oracle: tuple,
+) -> None:
+    inputs, _, expected, directions = compensated_oracle
+    analytic = sum(
+        np.vdot(bar, d) for bar, d in zip(expected, directions, strict=True)
+    )
+    o, v = inputs[5].shape
+    for h in (4e-4, 8e-4):
+        points = [
+            _displaced_canonical_inputs(inputs, directions, signed) for signed in (-h, h)
+        ]
+        minus, plus = [
+            triples_energy(o, v, *conventional(point), *point[-2:]) for point in points
+        ]
+        np.testing.assert_allclose((plus - minus) / (2 * h), analytic, rtol=0, atol=1e-8)
+
+
+def test_compensated_combined_matches_full_oracles_and_same_mode_fd(
+    native_combined_probe: typing.Any,
+    native_probe: typing.Any,
+    compensated_oracle: tuple,
+) -> None:
+    inputs, energy, expected, directions = compensated_oracle
+    status, output, values, counts, error = run_combined(
+        native_combined_probe, inputs, precision=2
+    )
+    assert status == 0, error
+    assert tuple(counts[31:35]) == (1, 1, 1, 1)
+    forward, reverse = (int(n) for n in counts[35:37])
+    assert forward > 0 and reverse > 0 and forward % 9 == reverse % 9 == 0
+    assert counts[25] == forward + reverse and counts[37] == 1
+    np.testing.assert_allclose(values[0], energy, rtol=0, atol=2e-11)
+    for actual, wanted in zip(output, expected, strict=True):
+        np.testing.assert_allclose(actual, wanted, rtol=2e-10, atol=2e-11)
+    analytic = sum(
+        np.vdot(bar, d) for bar, d in zip(output, directions, strict=True)
+    )
+    for h in (4e-4, 8e-4):
+        energies = []
+        for signed in (-h, h):
+            displaced = _displaced_canonical_inputs(inputs, directions, signed)
+            status, scalars, work, error = run_energy(native_probe, displaced, compensated=True)
+            assert status == 0, error
+            assert work[28] == work[31] == 1 and work[29] > 0 and work[30] == 0
+            energies.append(scalars[0])
+        np.testing.assert_allclose(
+            (energies[1] - energies[0]) / (2 * h), analytic, rtol=0, atol=1e-8
+        )
+
+    status, output, values, counts, error = run_combined(
+        native_combined_probe, inputs, precision=2, panels=1
+    )
+    assert status != 0 and "compensated" in error
+    assert all(np.isnan(x).all() for x in (*output, values))
+    np.testing.assert_array_equal(counts, 19)
+
+
 @pytest.mark.parametrize("fused", ["0", "1"])
 def test_mixed_forward_w_has_strict_budget_fallback(
     native_combined_probe: typing.Any, monkeypatch: pytest.MonkeyPatch, fused: str
@@ -354,11 +462,25 @@ def test_mixed_forward_w_has_strict_budget_fallback(
     )
     assert status == 0, error
     assert mixed_counts[24] == 32 and mixed_counts[25] > 0 and mixed_counts[26] > 0
-    assert mixed_counts[27] == 0
+    assert mixed_counts[27] == 1  # One panel forces the bounded response.
+    assert tuple(mixed_counts[31:34]) == (1, 0, 1)
+    assert tuple(strict_counts[31:34]) == (0, 0, 1)
+    assert tuple(strict_counts[34:38]) == (0, 0, 0, 0)
+    assert mixed_counts[34] == mixed_counts[37] == 0
     assert mixed_counts[4] > strict_counts[4]
     for actual, expected in zip(mixed, strict, strict=True):
         np.testing.assert_allclose(actual, expected, atol=2e-6, rtol=2e-6)
     np.testing.assert_allclose(mixed_values[0], strict_values[0], atol=2e-6, rtol=2e-6)
+
+    status, fast, fast_values, fast_counts, error = run_combined(
+        native_combined_probe, inputs, rows=1, panels=3, precision=1
+    )
+    assert status == 0, error
+    assert tuple(fast_counts[31:34]) == (1, 1, 1)
+    assert fast_counts[27] == 0
+    for actual, expected in zip(fast, strict, strict=True):
+        np.testing.assert_allclose(actual, expected, atol=2e-6, rtol=2e-6)
+    np.testing.assert_allclose(fast_values[0], strict_values[0], atol=2e-6, rtol=2e-6)
 
     budget = int(strict_counts[4])
     status, fallback, fallback_values, fallback_counts, error = run_combined(
@@ -367,6 +489,7 @@ def test_mixed_forward_w_has_strict_budget_fallback(
     assert status == 0, error
     assert fallback_counts[24] == 64 and fallback_counts[25] == 0
     assert fallback_counts[27] == 1 and fallback_counts[4] == budget
+    assert tuple(fallback_counts[31:34]) == (0, 0, 1)
     for actual, expected in zip(fallback, strict, strict=True):
         np.testing.assert_array_equal(actual, expected)
     assert fallback_values[0] == strict_values[0]
@@ -410,6 +533,9 @@ def test_combined_distinct_w_keeps_all_slots_and_independent_cotangents(
         native_combined_probe, inputs, rows=rows, panels=panels, precision=precision
     )
     assert status == 0, error
+    fast = precision == 1 and panels == 3
+    assert tuple(counts[31:34]) == (precision, int(fast), 1)
+    assert counts[27] == int(precision == 1 and not fast)
     capacity = min(o, rows) if rows else o
     seeds = 0
     cubes = 0
@@ -781,8 +907,6 @@ def test_native_recanonicalized_fock_differences(
 
 
 def test_native_internal_degenerate_covariance(native_fock_probe: typing.Any) -> None:
-    from test_cc_triples_fock_response import _rotate
-
     inputs, _ = case(3, 3, 4)
     inputs[-2][:2] = -1.0
     inputs[-1][:2] = 0.3

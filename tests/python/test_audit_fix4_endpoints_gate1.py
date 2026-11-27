@@ -17,6 +17,7 @@ from generativeqc._f12_focal_rcc_f12b import spatial_rhf_ccsdf12b_v1
 from generativeqc._f12_focal_reference import (
     FocalReference,
 )
+from generativeqc._f12_focal_tplus_sources import FocalOccupiedTriples, OccupiedMP2F12
 from generativeqc._f12_ram_hygiene import (
     STRICT_GPU_ONLY_ENV,
     capture_hybrid_phases,
@@ -387,6 +388,73 @@ def test_m5_m16_m20_spatial_rhf_ccsdf12b_contracts(
     )
     with pytest.raises(MemoryError, match="exceeding exact budget_mib=1"):
         spatial_rhf_ccsdf12b_v1(prov_tiny, req_active, ref_big, forces=True, expected_cabs_rank=2)
+
+
+def test_m10_tplus_from_occupied_zero_cuda_runner_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify tplus_from_occupied runs directly in exact FP64 NumPy (0 calls to provider.run on CUDA)."""
+    from generativeqc_compiler.tensor import execute
+
+    card = _compact_h2o_split_basis(split_mp2=False)
+    atoms = [("O", (0.0, 0.0, 0.0)), ("H", (0.0, 0.0, 1.8)), ("H", (1.75, 0.0, -0.4))]
+    req = next(
+        r
+        for r, _ in plan_singlepoint(
+            atoms,
+            FocalSeries(card),
+            FocalSeries(card),
+            None,
+            root_id="rhf",
+            correlation_space_id="all-active",
+            backend="cuda",
+        ).steps
+        if r.role == "mp2_f12_correlation"
+    )
+    ref = _dummy_reference(req, n=7, occupied=(5,))
+    mp2_occ = np.array([-0.02, -0.03, -0.025, -0.015, -0.01], dtype=np.float64)
+    f12_occ = np.array([-0.005, -0.006, -0.004, -0.003, -0.002], dtype=np.float64)
+    triples_occ = np.array([-0.001, -0.002, -0.0015, -0.0008, -0.0005], dtype=np.float64)
+    low = FocalLowOrderEnergy(
+        ref,
+        2,
+        (0.0, 0.0),
+        (0.0, float(2.0 * mp2_occ.sum()), 0.0),
+        float(2.0 * f12_occ.sum()),
+        OccupiedMP2F12((mp2_occ, mp2_occ), (f12_occ, f12_occ)),
+    )
+    assert card.mp2_fit is not None
+    triples = FocalOccupiedTriples(ref, "all-active", card.mp2_fit.identity, triples_occ)
+
+    cuda_run_calls = 0
+
+    def counting_cuda_runner(*_a, **_kw):
+        nonlocal cuda_run_calls
+        cuda_run_calls += 1
+        raise AssertionError("tplus_from_occupied must not invoke CUDA TensorIR runner")
+
+    prov = MolecularFocalProvider(
+        shell_library=Path("unused.so"),
+        metric_library=Path("unused.so"),
+        response_library=object(),  # type: ignore[arg-type]
+        run=counting_cuda_runner,
+    )
+    monkeypatch.delenv("GENERATIVEQC_F12_STRICT_GPU_ONLY", raising=False)
+    with capture_hybrid_phases() as phases:
+        out = prov.tplus_from_occupied(req, low, triples)
+    assert [(p["stage"], p["execution_mode"]) for p in phases] == [
+        ("tplus_occupied_scaling", "hybrid_host_assisted"),
+    ]
+    assert cuda_run_calls == 0
+    expected_q = (2.0 * mp2_occ + 2.0 * f12_occ) / (2.0 * mp2_occ)
+    assert out.energy == pytest.approx(float(np.dot(expected_q, triples_occ)), abs=1e-14)
+    np.testing.assert_allclose(out.triples, expected_q, atol=1e-14, rtol=0)
+
+    # CPU tensor execute masquerading as CUDA runner is still rejected!
+    prov_bad = replace(prov, run=execute)
+    with pytest.raises(RuntimeError, match="FP64 CUDA executor"):
+        prov_bad.tplus_from_occupied(req, low, triples)
+    monkeypatch.setenv("GENERATIVEQC_F12_STRICT_GPU_ONLY", "1")
+    with pytest.raises(NotImplementedError, match="tplus_occupied_scaling"):
+        prov.tplus_from_occupied(req, low, triples)
 
 
 # ---------------------------------------------------------------------------

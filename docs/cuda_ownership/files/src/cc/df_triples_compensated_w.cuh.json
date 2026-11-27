@@ -1,0 +1,7 @@
+{
+  "path": "src/cc/df_triples_compensated_w.cuh",
+  "reason": "Executes compensated matrix products for spatial triples W. Each bounded K segment is packed into three scaled FP32 limbs per operand, contracted by nine pedantic SGEMMs, and recombined in FP64. The caller supplies the matrix views and triples equations.",
+  "regions": [],
+  "role": "runtime",
+  "subsystem": "focal_cc"
+}

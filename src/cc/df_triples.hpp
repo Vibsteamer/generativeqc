@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -20,15 +21,34 @@ struct DFCudaResult {
       w_algorithm;
   int w_provider_version{}, cuda_runtime_version{};
   bool retained_incumbent{}, resource_fallback{};
+  // Weighted tiles with a zero seed skip the reverse W contractions.
+  bool reverse_w_executed{}, compensated_fp32_w_executed{};
   std::uint32_t w_contraction_storage_bits{64}, w_contraction_compute_bits{64};
   std::uint32_t w_contraction_accumulation_bits{64};
+  std::uint32_t w_reverse_contraction_compute_bits{64};
   std::string_view w_precision_identity, w_codegen_precision_schedule_identity;
   std::size_t virtual_triples{}, occupied_tiles{};
   std::size_t workspace_bytes{}, arena_bytes{}, provider_retained_bytes{}, host_binding_bytes{};
   std::size_t panel_capacity{}, panel_gemms{}, moment_gemms{};
   std::size_t fp64_gemms{}, fp32_gemms{}, precision_cast_elements{};
+  std::size_t fp32_forward_gemms{}, fp32_reverse_gemms{};
   std::size_t epilogue_kernels{}, reduction_kernels{}, epilogue_points{};
   std::size_t contraction_summands{}, h2d_bytes{}, d2h_bytes{};
+  /** Optional conventional triples energies by canonical spatial occupied orbital. */
+  std::vector<double> occupied_energies;
+
+  // A bounded provider may preserve FP32 W work while changing panels or reverse arithmetic.
+  [[nodiscard]] bool triples_fp32_w_forward_executed() const noexcept {
+    return fp32_forward_gemms > 0;
+  }
+
+  [[nodiscard]] bool triples_fp32_w_reverse_executed() const noexcept {
+    return fp32_reverse_gemms > 0;
+  }
+
+  [[nodiscard]] bool triples_fp32_w_executed() const noexcept {
+    return triples_fp32_w_forward_executed() || triples_fp32_w_reverse_executed();
+  }
 };
 
 /** Actual gap-schedule launches and compiler-derived logical data/work counts. */
@@ -106,6 +126,11 @@ struct DFCudaCombinedResponseResult {
  * V, denominators, energy epilogue and final reductions remain FP64, and the
  * result records the actual contraction precision plus the generated code's
  * compiler precision-schedule identity.
+ * compensated_fp32_w selects the opt-in nine-SGEMM, three-limb policy. It requires
+ * admitted FP32 W and refuses insufficient device/provider resources.
+ * occupied_partition retains the contribution from each occupied orbital,
+ * using Eq. (13) of Kállay et al. (10.1063/5.0057426). It adds one on-device
+ * reduction and one returned vector. Standard (T) energy remains unchanged.
  */
 #if GENERATIVEQC_HAS_CUDA
 DFCudaResult evaluate_df_cuda(std::size_t o, std::size_t v, std::size_t q, const double* bov,
@@ -114,7 +139,8 @@ DFCudaResult evaluate_df_cuda(std::size_t o, std::size_t v, std::size_t q, const
                               const double* eps_o, const double* eps_v,
                               double denominator_threshold, std::size_t max_bytes, int device,
                               std::size_t max_panel_buffers = 3,
-                              generativeqc::runtime::PrecisionDirective admitted_w = {});
+                              generativeqc::runtime::PrecisionDirective admitted_w = {},
+                              bool occupied_partition = false, bool compensated_fp32_w = false);
 /** Differentiate the complete occupied-tile energy on CUDA.
  * Includes both the original energy and all nine input cotangents, staged once.
  * Complete admission charges borrowed host input values, detached outputs,
@@ -161,11 +187,17 @@ DFCudaFockResult fock_response_df_cuda(std::size_t o, std::size_t v, std::size_t
  * to the admitted arena; insufficient capacity retains the original schedule
  * before reducing panel/page residency. The default remains unfused pending
  * complete-endpoint qualification. Full rank-six T3 is never retained.
- * admitted_w optionally admits the compiler's FP32 forward-W candidate. All
- * pullback contractions and Fock products remain FP64, but their seeds use the
- * same approximate W as the energy. This is an experimental approximate force,
- * not an exact derivative of discontinuous FP32 rounding. External energy and
- * force qualification is required; insufficient optional storage restores FP64.
+ * With compensated_fp32_w=false, admitted_w optionally admits the original FP32 W
+ * policy. On its fast path, both forward DF-panel/W GEMMs and reverse W-pullback bar_panel/bar_t2 GEMMs
+ * execute in pedantic IEEE FP32 SGEMM with FP64 outer accumulation; denominators,
+ * energy reduction, V/ovoo/pullback_panel/Fock contractions, and all outer orbital/T2
+ * accumulations remain FP64. If the fast path declines for resources and the bounded
+ * WExecution path executes, only forward W uses FP32 while reverse GEMMs stay FP64.
+ * DFCudaResult reports forward and reverse FP32 execution separately. External energy
+ * and force qualification is required. The opt-in compensated_fp32_w policy
+ * recombines nine pedantic SGEMMs per K tile in FP64 for all forward DF-panel/W
+ * contractions, both DF-factor adjoints and all four W adjoints. It retains FP64
+ * panels between contractions. Resource refusal is explicit before publication.
  */
 DFCudaCombinedResponseResult pullback_and_fock_df_cuda(
     std::size_t o, std::size_t v, std::size_t q, const double* bov, const double* bvv,
@@ -174,7 +206,9 @@ DFCudaCombinedResponseResult pullback_and_fock_df_cuda(
     int device, std::size_t caller_bytes = 0, std::size_t max_page_rows = 0,
     std::size_t max_panel_buffers = 3, bool parallel_gap_reduction = true,
     bool include_gap_response = true, bool fused_scalar_response = false,
-    generativeqc::runtime::PrecisionDirective admitted_w = {});
+    generativeqc::runtime::PrecisionDirective admitted_w = {},
+    std::span<const double> occupied_weights = {}, bool occupied_partition = false,
+    bool compensated_fp32_w = false);
 #endif
 
 }  // namespace generativeqc::cc::triples

@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <string_view>
 #include <string>
 
 #include "cc/df_triples.hpp"
@@ -58,7 +59,9 @@ static int combined_probe_impl(std::size_t o, std::size_t v, std::size_t q,
                                char* error, std::size_t error_size, int precision,
                                std::size_t counts_size) noexcept {
   try {
-    if ((precision != 0 && precision != 1) || counts_size < 24 || (precision && counts_size < 29))
+    const bool compensated = precision == 2;
+    if (precision < 0 || precision > 2 || counts_size < 24 ||
+        (precision && counts_size < 29) || (compensated && counts_size < 38))
       throw std::invalid_argument("invalid combined precision diagnostic contract");
     const auto admitted_w =
         precision
@@ -72,7 +75,7 @@ static int combined_probe_impl(std::size_t o, std::size_t v, std::size_t q,
     const auto r = generativeqc::cc::triples::pullback_and_fock_df_cuda(
         o, v, q, inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5], inputs[6],
         inputs[7], inputs[8], threshold, budget, 0, caller_bytes, rows, panels, true, false, fused,
-        admitted_w);
+        admitted_w, {}, false, compensated);
     if (r.pullback.gap.requested || !r.pullback.eps_o.empty() || !r.pullback.eps_v.empty())
       throw std::runtime_error("combined gap-free response published epsilon cotangents");
     std::copy(r.fock.foo.begin(), r.fock.foo.end(), output[0]);
@@ -120,6 +123,22 @@ static int combined_probe_impl(std::size_t o, std::size_t v, std::size_t q,
     if (counts_size >= 31) {
       counts[29] = r.fock.w_copy_calls;
       counts[30] = r.fock.w_copy_bytes;
+    }
+    if (counts_size >= 34) {
+      counts[31] = r.pullback.diagnostic.triples_fp32_w_forward_executed();
+      counts[32] = r.pullback.diagnostic.triples_fp32_w_reverse_executed();
+      counts[33] = r.pullback.diagnostic.reverse_w_executed;
+    }
+    if (counts_size >= 38) {
+      const auto& diagnostic = r.pullback.diagnostic;
+      constexpr std::string_view schedule =
+          "spatial-triples/three-limb-fp32-sgemm-k64-high8-fp64-combine-v1";
+      counts[34] = diagnostic.compensated_fp32_w_executed;
+      counts[35] = diagnostic.fp32_forward_gemms;
+      counts[36] = diagnostic.fp32_reverse_gemms;
+      counts[37] = diagnostic.w_codegen_precision_schedule_identity == schedule &&
+                   diagnostic.w_candidate_identity == schedule &&
+                   diagnostic.w_precision_identity == schedule;
     }
     return 0;
   } catch (const std::exception& e) {
