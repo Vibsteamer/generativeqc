@@ -53,6 +53,21 @@ class FocalLowOrderEnergy:
         return self.hf_cabs_energy + self.mp2_f12_correlation_energy
 
 
+@dataclass(frozen=True)
+class FocalLowOrderForces:
+    """Component energies and analytic forces in Eh/bohr for the requested terms on one root."""
+
+    energies: FocalLowOrderEnergy
+    hf_cabs_forces: np.ndarray | None
+    mp2_f12_correlation_forces: np.ndarray
+
+    @property
+    def forces(self) -> np.ndarray:
+        if self.hf_cabs_forces is None:
+            raise ValueError("HF+CABS was not requested on this basis")
+        return self.hf_cabs_forces + self.mp2_f12_correlation_forces
+
+
 def _ordinary_pair_energies_blas(
     b_left: np.ndarray,
     b_right: np.ndarray,

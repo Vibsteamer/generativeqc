@@ -32,6 +32,7 @@
     gqc_f12_ext_fock_j_rev_cuda;
     gqc_f12_ext_fock_rev_cuda;
     gqc_f12_mp2_pair_energies_cuda;
+    gqc_f12_mp2_pair_response_cuda;
     gqc_f12_one_electron_grad_cuda;
     gqc_f12_orbital_rot_metric_cuda;
     gqc_f12_ordinary_df_mp2_cuda;

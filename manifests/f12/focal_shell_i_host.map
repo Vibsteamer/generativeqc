@@ -32,6 +32,7 @@
     gqc_f12_ext_fock_j_rev_host_reference;
     gqc_f12_ext_fock_rev_host_reference;
     gqc_f12_mp2_pair_energies_host_reference;
+    gqc_f12_mp2_pair_response_host_reference;
     gqc_f12_one_electron_grad_host_reference;
     gqc_f12_orbital_rot_metric_host_reference;
     gqc_f12_ordinary_df_mp2_host_reference;

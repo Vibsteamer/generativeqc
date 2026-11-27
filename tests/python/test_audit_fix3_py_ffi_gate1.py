@@ -48,6 +48,7 @@ from generativeqc._f12_spin_fock_1e_native import (
     bind_spin_fock_1e_ops,
     run_spin_fock_rev,
 )
+from generativeqc._f12_unrestricted import unrestricted_mp2_f12_ao_response
 from generativeqc.f12_orbital_response import unrestricted_source_orbital_adjoint
 
 
@@ -508,6 +509,108 @@ def test_m8_projected_lru_concurrent_access_and_clear_no_keyerror(
         t.join()
     assert errors == []
     clear_projected_source_cache(reset_stats=True)
+
+
+# ============================================================================
+# M1: Two in-place overwrite ownership bugs
+# ============================================================================
+
+
+def test_m1_unrestricted_jkfit_q1_snapshot_not_corrupted(
+    host_sink: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audit M1(1): q_jk=1 independent JKFit must copy occupied slice before inplace spin_fock_pullback."""
+    monkeypatch.setenv("GENERATIVEQC_F12_SHELL_LIBRARY", str(host_sink))
+    monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_AOT_SPINFOCK_1E", raising=False)
+    monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_AOT_AOMO", raising=False)
+    clear_projected_source_cache(reset_stats=True)
+
+    rng = np.random.default_rng(1111)
+    oa, ob, obs, ext, aux = 1, 1, 2, 3, 2
+    nc = ext
+    c_mat, _ = np.linalg.qr(rng.normal(size=(nc, nc)))
+    c_mat = np.ascontiguousarray(c_mat)
+
+    def sym3(q_dim):
+        x = rng.normal(size=(q_dim, nc, nc)) * 0.25
+        return np.ascontiguousarray(0.5 * (x + x.swapaxes(1, 2)))
+
+    def spd(q_dim):
+        a = rng.normal(size=(q_dim, q_dim)) * 0.2
+        m = a.T @ a + 2.0 * np.eye(q_dim)
+        w = np.linalg.inv(np.linalg.cholesky(m))
+        return m, w
+
+    m_corr, w_corr = spd(aux)
+    m_jk, w_jk = spd(1)  # EXACT M1 COUNTEREXAMPLE: q_jk == 1!
+    h_ao = np.diag([-1.5, 0.8, 1.9]) + 0.05 * (rng.normal(size=(nc, nc)))
+    h_ao = 0.5 * (h_ao + h_ao.T)
+
+    ao = {
+        "overlap_ao": np.eye(nc, dtype=np.float64),
+        "hcore_ao": h_ao,
+        "coefficients_alpha": c_mat,
+        "coefficients_beta": c_mat,
+        "metric_whitener": w_corr,
+        "metric/coulomb": m_corr,
+        "metric/geminal": m_corr * 0.7,
+        "metric/squared_geminal": m_corr * 0.5,
+        "metric/geminal_coulomb": m_corr * 0.6,
+        "metric/double_commutator": m_corr * 0.4,
+        "ao_coulomb": sym3(aux),
+        "ao_f12": sym3(aux),
+        "ao_f12_squared": sym3(aux),
+        "ao_f12_over_coulomb": sym3(aux),
+        "ao_double_commutator": sym3(aux),
+    }
+    jk_ao = sym3(1)
+    jkfit = {
+        "ao_coulomb": jk_ao,
+        "metric/coulomb": m_jk,
+        "metric_whitener": w_jk,
+    }
+    space = (oa, ob, obs, ext, aux)
+    run = _cpu_runner()
+    from generativeqc._f12_focal_singles import _reference_singles
+
+    def cpu_singles(matrix, occupied, *, spin_weight=1, pullback=True):
+        e, bar = _reference_singles(matrix, occupied, pullback)
+        return spin_weight * e, (None if bar is None else spin_weight * bar)
+
+    terms, bars = unrestricted_mp2_f12_ao_response(
+        space, ao, run, jkfit=jkfit, component="singles", singles=cpu_singles
+    )
+    assert abs(sum(terms.cabs_singles)) > 1e-6
+
+    # Independent finite-difference check on jkfit metric and jkfit ao_coulomb!
+    eps = 1e-6
+
+    def eval_singles(m_val: float, ao_mat: np.ndarray) -> float:
+        m_mat = np.array([[m_val]], dtype=np.float64)
+        w_mat = np.array([[1.0 / np.sqrt(m_val)]], dtype=np.float64)
+        e, _ = unrestricted_mp2_f12_ao_response(
+            space,
+            ao,
+            run,
+            jkfit={
+                "ao_coulomb": ao_mat,
+                "metric/coulomb": m_mat,
+                "metric_whitener": w_mat,
+            },
+            component="singles",
+            singles=cpu_singles,
+        )
+        return float(sum(e.cabs_singles))
+
+    fd_metric = (eval_singles(m_jk[0, 0] + eps, jk_ao) - eval_singles(m_jk[0, 0] - eps, jk_ao)) / (2.0 * eps)
+    np.testing.assert_allclose(bars["jkfit/metric/coulomb"][0, 0], fd_metric, atol=1e-7, rtol=1e-6)
+
+    d_ao = rng.normal(size=jk_ao.shape)
+    d_ao = 0.5 * (d_ao + d_ao.swapaxes(1, 2))
+    fd_ao = (eval_singles(m_jk[0, 0], jk_ao + eps * d_ao) - eval_singles(m_jk[0, 0], jk_ao - eps * d_ao)) / (2.0 * eps)
+    analytic_ao = float(np.sum(bars["jkfit/ao_coulomb"] * d_ao))
+    np.testing.assert_allclose(analytic_ao, fd_ao, atol=1e-7, rtol=1e-6)
 
 
 @pytest.mark.parametrize("use_native", [True, False])

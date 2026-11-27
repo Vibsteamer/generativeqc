@@ -44,8 +44,10 @@ from generativeqc._f12_ao_mo_native import (
 )
 from generativeqc._f12_mp2_pair_native import (
     bind_mp2_f12_pair_energies,
+    bind_mp2_f12_pair_response,
     bind_ordinary_df_mp2,
     run_mp2_f12_pair_energies_native,
+    run_mp2_f12_pair_response_native,
     run_ordinary_df_mp2_native,
 )
 
@@ -185,6 +187,293 @@ def _make_synthetic_f12_problem(
 # Supplying a CUDA artifact opts the real-device lane in, including its direct
 # comparisons with the separately compiled serial FP64 oracle.
 _AUDIT_BACKENDS = ["host"] + (["cuda"] if os.getenv("GENERATIVEQC_F12_CUDA_AUDIT_SINK") else [])
+
+
+@pytest.mark.parametrize("backend", _AUDIT_BACKENDS)
+def test_b1_mp2_pair_response_cross_warp_and_diagonal_rhf_uhf_fd_parity(
+    host_sink: Path, backend: str,
+):
+    """Verify cross-warp (i=0, j=32 with o=36) and diagonal (i==j) cotangents."""
+    path = host_sink if backend == "host" else Path(os.environ["GENERATIVEQC_F12_CUDA_AUDIT_SINK"])
+    resp_fn = bind_mp2_f12_pair_response(host_reference=backend == "host", shell_library=path)
+    ener_fn = bind_mp2_f12_pair_energies(host_reference=backend == "host", shell_library=path)
+    assert resp_fn is not None and ener_fn is not None
+
+    # 1. o = 36 >= 32 (exercises cross-warp pair i=0, j=32 and all diagonal pairs i==j)
+    oa, obs, ext, aux = 36, 38, 40, 4
+    space, data, sources, fock = _make_synthetic_f12_problem(
+        oa=oa, ob=oa, obs=obs, ext=ext, aux=aux, rhf=True, seed=20261125
+    )
+
+    rhf_res = run_mp2_f12_pair_response_native(
+        resp_fn,
+        space=space,
+        frozen_occupied=(0, 0),
+        rhf_spatial=True,
+        include_f12=True,
+        include_ordinary=True,
+        budget_bytes=512 << 20,
+        data=data,
+        sources=sources,
+        fock=fock,
+    )
+    uhf_res = run_mp2_f12_pair_response_native(
+        resp_fn,
+        space=space,
+        frozen_occupied=(0, 0),
+        rhf_spatial=False,
+        include_f12=True,
+        include_ordinary=True,
+        budget_bytes=512 << 20,
+        data=data,
+        sources=sources,
+        fock=fock,
+    )
+
+    if backend == "cuda":
+        serial = bind_mp2_f12_pair_response(host_reference=True, shell_library=host_sink)
+        assert serial is not None
+        for rhf, actual in ((True, rhf_res), (False, uhf_res)):
+            reference = run_mp2_f12_pair_response_native(
+                serial, space=space, frozen_occupied=(0, 0), rhf_spatial=rhf,
+                include_f12=True, include_ordinary=True, budget_bytes=512 << 20,
+                data=data, sources=sources, fock=fock,
+            )
+            np.testing.assert_allclose(actual[:2], reference[:2], rtol=0, atol=1e-11)
+            assert actual[2] == reference[2]
+            for fields in (3, 4, 5):
+                for key, value in reference[fields].items():
+                    if value is not None:
+                        np.testing.assert_allclose(actual[fields][key], value, rtol=0, atol=1e-11)
+
+    # Scalar totals and every cotangent (including bar_cross_overlap at (0,32), (32,0), (0,0), (32,32))
+    assert float(np.max(np.abs(np.asarray(rhf_res[0]) - np.asarray(uhf_res[0])))) <= 1e-11
+    assert float(np.max(np.abs(np.asarray(rhf_res[1]) - np.asarray(uhf_res[1])))) <= 1e-11
+    assert rhf_res[2] == uhf_res[2]
+    bar_sab_rhf = rhf_res[4]["cross_overlap"]
+    bar_sab_uhf = uhf_res[4]["cross_overlap"]
+    assert float(np.max(np.abs(bar_sab_rhf - bar_sab_uhf))) <= 1e-11
+    for p, q in ((0, 32), (32, 0), (0, 0), (32, 32), (1, 35), (35, 1)):
+        assert abs(bar_sab_rhf[p, q] - bar_sab_uhf[p, q]) <= 1e-12
+    # In RHF spatial, spin-averaged alpha+beta cotangents equal the UHF alpha+beta sum
+    # (UHF splits the opposite-spin Coulomb/geminal contractions asymmetrically between alpha and beta).
+    assert float(
+        np.max(
+            np.abs(
+                (rhf_res[3]["fit_alpha"] + rhf_res[3]["fit_beta"])
+                - (uhf_res[3]["fit_alpha"] + uhf_res[3]["fit_beta"])
+            )
+        )
+    ) <= 1e-11
+    for op in ("geminal", "squared_geminal", "geminal_coulomb", "double_commutator"):
+        assert float(
+            np.max(
+                np.abs(
+                    (rhf_res[4][f"raw/{op}/alpha"] + rhf_res[4][f"raw/{op}/beta"])
+                    - (uhf_res[4][f"raw/{op}/alpha"] + uhf_res[4][f"raw/{op}/beta"])
+                )
+            )
+        ) <= 1e-11
+
+    # Central finite-difference check on cross-warp entries of bar_cross_overlap in UHF (Sab != I)
+    space_u, data_u, src_u, fock_u = _make_synthetic_f12_problem(
+        oa=36,
+        ob=36,
+        obs=38,
+        ext=40,
+        aux=4,
+        rhf=False,
+        seed=20261126,
+        non_identity_sab=True,
+    )
+    uhf_gen = run_mp2_f12_pair_response_native(
+        resp_fn,
+        space=space_u,
+        frozen_occupied=(0, 0),
+        rhf_spatial=False,
+        include_f12=True,
+        include_ordinary=False,
+        budget_bytes=512 << 20,
+        data=data_u,
+        sources=src_u,
+        fock=fock_u,
+    )
+    bar_sab_u = uhf_gen[4]["cross_overlap"]
+    step = 1e-6
+
+    def _eval_total_f12(d_override: dict) -> float:
+        out = run_mp2_f12_pair_energies_native(
+            ener_fn,
+            space=space_u,
+            frozen_occupied=(0, 0),
+            rhf_spatial=False,
+            include_ordinary=False,
+            budget_bytes=512 << 20,
+            data=d_override,
+            sources=src_u,
+            fock=fock_u,
+        )
+        return float(sum(out[0]))
+
+    for p, q in ((0, 32), (32, 0), (0, 0), (32, 32)):
+        d_plus = dict(data_u)
+        d_minus = dict(data_u)
+        sab_p = data_u["cross_overlap"].copy()
+        sab_m = data_u["cross_overlap"].copy()
+        sab_p[p, q] += step
+        sab_m[p, q] -= step
+        d_plus["cross_overlap"] = sab_p
+        d_minus["cross_overlap"] = sab_m
+        fd = (_eval_total_f12(d_plus) - _eval_total_f12(d_minus)) / (2.0 * step)
+        assert abs(bar_sab_u[p, q] - fd) <= 1e-7 * max(1.0, abs(fd)), (
+            f"bar_Sab[{p},{q}] mismatch: analytic={bar_sab_u[p, q]}, fd={fd}"
+        )
+
+    # 2. Pure diagonal case (o = 1: ONLY i == j == 0, directly isolating k_robust_elem_pullback p == r)
+    space_d, data_d, src_d, fock_d = _make_synthetic_f12_problem(
+        oa=1, ob=1, obs=4, ext=6, aux=5, rhf=True, seed=777
+    )
+    rhf_d = run_mp2_f12_pair_response_native(
+        resp_fn,
+        space=space_d,
+        frozen_occupied=(0, 0),
+        rhf_spatial=True,
+        include_f12=True,
+        include_ordinary=True,
+        budget_bytes=512 << 20,
+        data=data_d,
+        sources=src_d,
+        fock=fock_d,
+    )
+    uhf_d = run_mp2_f12_pair_response_native(
+        resp_fn,
+        space=space_d,
+        frozen_occupied=(0, 0),
+        rhf_spatial=False,
+        include_f12=True,
+        include_ordinary=True,
+        budget_bytes=512 << 20,
+        data=data_d,
+        sources=src_d,
+        fock=fock_d,
+    )
+    assert float(
+        np.max(
+            np.abs(
+                (rhf_d[3]["fit_alpha"] + rhf_d[3]["fit_beta"])
+                - (uhf_d[3]["fit_alpha"] + uhf_d[3]["fit_beta"])
+            )
+        )
+    ) <= 1e-12
+    assert float(np.max(np.abs(rhf_d[4]["cross_overlap"] - uhf_d[4]["cross_overlap"]))) <= 1e-12
+
+    # Central FD on fit_alpha[A, 0, 0] (the exact aliased p == r == 0 element in k_robust_elem_pullback!)
+    def _eval_diag_e(src_override: dict) -> float:
+        out = run_mp2_f12_pair_energies_native(
+            ener_fn,
+            space=space_d,
+            frozen_occupied=(0, 0),
+            rhf_spatial=True,
+            include_ordinary=True,
+            budget_bytes=512 << 20,
+            data=data_d,
+            sources=src_override,
+            fock=fock_d,
+        )
+        return float(sum(out[0]) + sum(out[1]))
+
+    for a_idx in range(5):
+        s_p = dict(src_d)
+        s_m = dict(src_d)
+        fa_p = src_d["fit_alpha"].copy()
+        fa_m = src_d["fit_alpha"].copy()
+        fa_p[a_idx, 0, 0] += step
+        fa_m[a_idx, 0, 0] -= step
+        s_p["fit_alpha"] = fa_p
+        s_p["fit_beta"] = fa_p
+        s_m["fit_alpha"] = fa_m
+        s_m["fit_beta"] = fa_m
+        fd = (_eval_diag_e(s_p) - _eval_diag_e(s_m)) / (2.0 * step)
+        # RHF spatial mirrors alpha+beta fit cotangent into bar_fit_alpha + bar_fit_beta (2x alpha derivative)
+        analytic = float(rhf_d[3]["fit_alpha"][a_idx, 0, 0] + rhf_d[3]["fit_beta"][a_idx, 0, 0])
+        assert abs(analytic - fd) <= 1e-7 * max(1.0, abs(fd)), (
+            f"diag fit[{a_idx},0,0] mismatch: analytic={analytic}, fd={fd}"
+        )
+
+
+# =============================================================================
+# M6: Explicit tight-budget rejection tests
+# =============================================================================
+
+
+def test_m6_mp2_pair_response_and_energies_reject_over_budget(host_sink: Path):
+    """Verify aux=300 vs 1 MiB counterexample cleanly rejects with status -3."""
+    resp_fn = bind_mp2_f12_pair_response(host_reference=True, shell_library=host_sink)
+    ener_fn = bind_mp2_f12_pair_energies(host_reference=True, shell_library=host_sink)
+    assert resp_fn is not None and ener_fn is not None
+
+    # Exact audit M6 counterexample: aux=300 => 3 * aux^2 * 8 = 2,160,000 B > 1 MiB (1,048,576 B)
+    space, data, sources, fock = _make_synthetic_f12_problem(
+        oa=2, ob=2, obs=3, ext=4, aux=300, rhf=True, seed=101
+    )
+
+    with pytest.raises(RuntimeError, match="status -3"):
+        run_mp2_f12_pair_response_native(
+            resp_fn,
+            space=space,
+            frozen_occupied=(0, 0),
+            rhf_spatial=True,
+            include_f12=True,
+            include_ordinary=True,
+            budget_bytes=1 << 20,  # 1 MiB < 2.16 MB required by 3 aux*aux matrices alone
+            data=data,
+            sources=sources,
+            fock=fock,
+        )
+
+    # UHF path also rejects under tight budget
+    with pytest.raises(RuntimeError, match="status -3"):
+        run_mp2_f12_pair_response_native(
+            resp_fn,
+            space=space,
+            frozen_occupied=(0, 0),
+            rhf_spatial=False,
+            include_f12=True,
+            include_ordinary=True,
+            budget_bytes=1 << 20,
+            data=data,
+            sources=sources,
+            fock=fock,
+        )
+
+    # Pair energies also rejects when minimum working set exceeds budget
+    with pytest.raises(RuntimeError, match="status -3"):
+        run_mp2_f12_pair_energies_native(
+            ener_fn,
+            space=space,
+            frozen_occupied=(0, 0),
+            rhf_spatial=True,
+            include_ordinary=True,
+            budget_bytes=64 * 1024,  # 64 KiB << aux^2 * 8 = 720 KiB
+            data=data,
+            sources=sources,
+            fock=fock,
+        )
+
+    # Adequate budget succeeds cleanly
+    ok = run_mp2_f12_pair_response_native(
+        resp_fn,
+        space=space,
+        frozen_occupied=(0, 0),
+        rhf_spatial=True,
+        include_f12=True,
+        include_ordinary=True,
+        budget_bytes=64 << 20,
+        data=data,
+        sources=sources,
+        fock=fock,
+    )
+    assert np.all(np.isfinite(ok[0]))
 
 
 @pytest.mark.parametrize("backend", _AUDIT_BACKENDS)
@@ -348,7 +637,8 @@ def test_m8_mp2_pair_and_ordinary_mp2_fail_closed_overflow_and_nan(host_sink: Pa
     """MP2-F12 & ordinary DF-MP2 reject non-finite inputs (-2) and Inf outputs (-5)."""
     ord_fn = bind_ordinary_df_mp2(host_reference=True, shell_library=host_sink)
     ener_fn = bind_mp2_f12_pair_energies(host_reference=True, shell_library=host_sink)
-    assert ord_fn is not None and ener_fn is not None
+    resp_fn = bind_mp2_f12_pair_response(host_reference=True, shell_library=host_sink)
+    assert ord_fn is not None and ener_fn is not None and resp_fn is not None
 
     # Overflow in ordinary DF-MP2 -> status -5
     c = np.eye(2, dtype=np.float64)
@@ -388,6 +678,20 @@ def test_m8_mp2_pair_and_ordinary_mp2_fail_closed_overflow_and_nan(host_sink: Pa
             space=space,
             frozen_occupied=(0, 0),
             rhf_spatial=True,
+            include_ordinary=True,
+            budget_bytes=64 << 20,
+            data=data,
+            sources=sources,
+            fock=fock,
+        )
+
+    with pytest.raises(RuntimeError, match="status -5"):
+        run_mp2_f12_pair_response_native(
+            resp_fn,
+            space=space,
+            frozen_occupied=(0, 0),
+            rhf_spatial=True,
+            include_f12=True,
             include_ordinary=True,
             budget_bytes=64 << 20,
             data=data,

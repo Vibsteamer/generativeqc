@@ -4,7 +4,8 @@ Step 12.1 coverage (ordinary_df_mp2):
 - Closed-shell RHF spatial spin-symmetric fast path (2*t - t^T + i <= j) vs
   general UHF AOT path (aa/bb/ab) vs TensorIR oracle on H2O, CH4, IHB93 (OH- * H2O).
 - Open-shell UHF (oa != ob, fa != fb, unequal occupied weights) on OH and bare Br atom (ECP10MDF).
-- ECP HBr (ECP10MDF) under all-active, FC4 (frozen-core), and FC9 (frozen-core-spd).
+- ECP HBr (ECP10MDF) under all-active, FC4 (frozen-core), and FC9 (frozen-core-spd),
+  including full relaxed nuclear forces via MolecularFocalProvider.
 - Edge cases: o_act=1 (H2), oa_act=1/ob_act=0 (H atom), compute_response=False,
   bounded-memory fallback (tiny budget_bytes), finiteness/missing-symbol error guards,
   and strict 0 TensorIR calls in ordinary_df_ump2_unrelaxed.
@@ -684,6 +685,82 @@ def test_ordinary_df_mp2_hbr_ecp_fc4_fc9_parity(
     for key in rel_tir.weights:
         diff = float(np.max(np.abs(rel_aot.weights[key] - rel_tir.weights[key])))
         assert diff <= 1e-11, f"HBr-{corr_space} relaxed weight {key} diff {diff:.3e}"
+
+
+@pytest.mark.parametrize(
+    "label,atoms_spec,elements,charge,mult,root_id,corr_space",
+    [
+        ("H2O-FC", GEOM_H2O, (1, 8), 0, 1, "rhf", "frozen-core"),
+        ("CH4-FC", GEOM_CH4, (1, 6), 0, 1, "rhf", "frozen-core"),
+        ("IHB93-FC", GEOM_IHB93, (1, 8), -1, 1, "rhf", "frozen-core"),
+        ("OH-FC", GEOM_OH, (1, 8), 0, 2, "uhf", "frozen-core"),
+        ("HBr-FC4", GEOM_HBR, (1, 35), 0, 1, "rhf", "frozen-core"),
+        ("HBr-FC9", GEOM_HBR, (1, 35), 0, 1, "rhf", "frozen-core-spd"),
+    ],
+)
+def test_ordinary_df_mp2_end_to_end_forces_parity(
+    host_sink: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+    atoms_spec,
+    elements: tuple[int, ...],
+    charge: int,
+    mult: int,
+    root_id: str,
+    corr_space: str,
+) -> None:
+    """Verify full MolecularFocalProvider low-order MP2-F12 E+F forces (auto-discovered AOT vs TensorIR)."""
+    basis = _compact_split_basis(elements)
+    plan = plan_singlepoint(
+        atoms_spec,
+        FocalSeries(basis),
+        FocalSeries(basis),
+        None,
+        charge=charge,
+        multiplicity=mult,
+        root_id=root_id,
+        correlation_space_id=corr_space,
+        backend="cpu_reference",
+    )
+    req = next(r for r, _ in plan.steps if r.role == "mp2_f12_correlation")
+
+    has_ecp = any(
+        req.basis.orbital.by_element[a.atomic_number].ecp_core_electrons for a in req.atoms
+    )
+
+    if not has_ecp:
+        monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", raising=False)
+        prov_aot = MolecularFocalProvider(shell_library=host_sink, budget_mib=512)
+        ef_aot = prov_aot.low_order_energy_and_forces(req, include_hf_cabs=False)
+        e_aot = ef_aot.energies.mp2_f12_correlation_energy
+        f_aot = ef_aot.mp2_f12_correlation_forces
+
+        monkeypatch.setenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", "1")
+        prov_tir = MolecularFocalProvider(shell_library=host_sink, budget_mib=512)
+        ef_tir = prov_tir.low_order_energy_and_forces(req, include_hf_cabs=False)
+        e_tir = ef_tir.energies.mp2_f12_correlation_energy
+        f_tir = ef_tir.mp2_f12_correlation_forces
+    else:
+        prov_aot = MolecularFocalProvider(shell_library=host_sink, budget_mib=512)
+        ref = _canonical_reference_for_test(prov_aot, req)
+        one = one_electron_sources(
+            req,
+            library=host_sink,
+            orbital_only=False,
+            derivatives=True,
+            budget_mib=512,
+        )
+        monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", raising=False)
+        e_aot, f_aot = prov_aot._pair(req, ref, one)
+
+        monkeypatch.setenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", "1")
+        prov_tir = MolecularFocalProvider(shell_library=host_sink, budget_mib=512)
+        e_tir, f_tir = prov_tir._pair(req, ref, one)
+
+    e_diff = abs(e_aot - e_tir)
+    f_diff = float(np.max(np.abs(f_aot - f_tir)))
+    assert e_diff <= 1e-12, f"{label} E+F energy diff {e_diff:.3e}"
+    assert f_diff <= 1e-11, f"{label} E+F force max diff {f_diff:.3e}"
 
 
 def test_ordinary_df_mp2_edge_cases_and_bounded_fallback(
@@ -1372,4 +1449,873 @@ def test_mp2_f12_pair_energies_edge_cases_nonsym_and_guards(
                 frozen_occupied=frozen_h2,
                 shell_library=Path("/nonexistent/fake_shell_library.so"),
             )
+        )
+
+
+# =============================================================================
+# Step 12.3a Gate 1: AOT MP2-F12 pair response pullback (host-reference FP64)
+# =============================================================================
+
+
+def _run_tensorir_pair_response_oracle(
+    space: tuple[int, int, int, int, int],
+    data: dict[str, np.ndarray],
+    sources: dict[str, np.ndarray],
+    fock: dict[str, np.ndarray],
+    frozen_occupied: tuple[int, int],
+    *,
+    include_f12: bool,
+    include_ordinary: bool,
+    occ_w: tuple[np.ndarray, np.ndarray] | None = None,
+):
+    from generativeqc._f12_spin_pairs import (
+        _shared_contiguous_operands,
+        occupied_pair_blocks,
+        pair_operands,
+        prefactor_operator_residuals,
+        pullback_operator_residuals,
+    )
+    from generativeqc_compiler.tensor import Program, execute, transpose_program
+
+    oa, ob, _obs, ext, _aux = space
+    fa, fb = frozen_occupied
+    selected = tuple(
+        name
+        for flag, name in ((include_f12, "pair_energy"), (include_ordinary, "ordinary_pair_energy"))
+        if flag
+    )
+    occ_w_full = None
+    if occ_w is not None:
+        wa, wb = occ_w
+        wa_f = np.concatenate((np.zeros(fa), wa)) if len(wa) == oa - fa else np.asarray(wa)
+        wb_f = np.concatenate((np.zeros(fb), wb)) if len(wb) == ob - fb else np.asarray(wb)
+        occ_w_full = (wa_f, wb_f)
+
+    blocks = occupied_pair_blocks(space, frozen_occupied=frozen_occupied, prefactored_metric=True)
+    residuals = prefactor_operator_residuals(data, sources)
+    source_bars = {k: np.zeros_like(v) for k, v in sources.items()}
+    raw_bars = {
+        k: np.zeros_like(v)
+        for k, v in data.items()
+        if k == "cross_overlap" or k.startswith(("raw/", "metric/"))
+    }
+    fock_bars = {k: np.zeros_like(v) for k, v in fock.items()}
+    res_bars = {k: np.zeros_like(v) for k, v in residuals.items()}
+    e_f12 = 0.0
+    e_ord = 0.0
+    count = 0
+    for sl, sr, nl, nr, graph, pairs in blocks:
+        primal_graph = Program({name: graph.outputs[name] for name in selected})
+        rev = transpose_program(
+            primal_graph, selected, max_elements=max(1_000_000, ext * ext)
+        ).program
+        kernel = Program({**rev.outputs, **primal_graph.outputs})
+        shared = _shared_contiguous_operands(data, fock, sl, sr, include_metrics=False)
+        for i, j in pairs:
+            primal = pair_operands(
+                data, sources, fock, sl, sr, nl, nr, ext, i, j, residuals=residuals
+            )
+            feeds = dict(shared)
+            for k, v in primal.items():
+                if k not in shared:
+                    feeds[k] = np.ascontiguousarray(v)
+            weight = (
+                1.0
+                if occ_w_full is None
+                else 0.5 * (float(occ_w_full[sl == "beta"][i]) + float(occ_w_full[sr == "beta"][j]))
+            )
+            feeds.update({"bar_" + name: np.array(weight) for name in selected})
+            res = execute(kernel, feeds).outputs
+            count += 1
+            if include_f12:
+                e_f12 += float(res["pair_energy"]) * weight
+            if include_ordinary:
+                e_ord += float(res["ordinary_pair_energy"]) * weight
+            buffers = pair_operands(
+                raw_bars, source_bars, fock_bars, sl, sr, nl, nr, ext, i, j, residuals=res_bars
+            )
+            for k in rev.outputs:
+                buffers[k.removeprefix("bar_")] += res[k]
+    if selected:
+        pullback_operator_residuals(data, sources, res_bars, raw_bars, source_bars)
+    return e_f12, e_ord, count, source_bars, raw_bars, fock_bars
+
+
+def _assert_mo_response_close(
+    label: str,
+    got_f12: float,
+    got_ord: float,
+    got_count: int,
+    got_src: dict[str, np.ndarray],
+    got_raw: dict[str, np.ndarray],
+    got_fock: dict[str, np.ndarray],
+    ref_f12: float,
+    ref_ord: float,
+    ref_count: int,
+    ref_src: dict[str, np.ndarray],
+    ref_raw: dict[str, np.ndarray],
+    ref_fock: dict[str, np.ndarray],
+    *,
+    rhf_sym_coulomb: bool,
+    e_tol: float = 1e-12,
+    grad_tol: float = 1e-11,
+) -> None:
+    assert got_count == ref_count, f"{label} active_pairs {got_count} != {ref_count}"
+    assert abs(got_f12 - ref_f12) <= e_tol, f"{label} E_f12 diff {abs(got_f12 - ref_f12):.3e}"
+    assert abs(got_ord - ref_ord) <= e_tol, f"{label} E_ord diff {abs(got_ord - ref_ord):.3e}"
+    for key in ref_raw:
+        diff = float(np.max(np.abs(got_raw[key] - ref_raw[key])))
+        assert diff <= grad_tol, f"{label} raw/{key} max diff {diff:.3e} > {grad_tol}"
+    for key in ref_fock:
+        diff = float(np.max(np.abs(got_fock[key] - ref_fock[key])))
+        assert diff <= grad_tol, f"{label} fock/{key} max diff {diff:.3e} > {grad_tol}"
+    if rhf_sym_coulomb:
+        for base in ("fit", "raw_coulomb"):
+            ka, kb = f"{base}_alpha", f"{base}_beta"
+            if ka in ref_src and kb in ref_src:
+                assert np.array_equal(got_src[ka], got_src[kb]), f"{label} RHF {base} not spin-equal"
+                diff = float(np.max(np.abs((got_src[ka] + got_src[kb]) - (ref_src[ka] + ref_src[kb]))))
+                assert diff <= grad_tol, f"{label} src/{base}_sum max diff {diff:.3e} > {grad_tol}"
+    else:
+        for key in ref_src:
+            diff = float(np.max(np.abs(got_src[key] - ref_src[key])))
+            assert diff <= grad_tol, f"{label} src/{key} max diff {diff:.3e} > {grad_tol}"
+
+
+def _assert_increment_close(
+    label: str,
+    got,
+    ref,
+    *,
+    e_tol: float = 1e-12,
+    f12_tol: float = 1e-11,
+    cphf_tol: float = 1e-10,
+) -> None:
+    """Assert reference_f12_increment parity.
+
+    F12 AO/metric weights bypass iterative CPHF and are checked at <=1e-11;
+    CPHF-relaxed one-electron and JKFit weights inherit CPU MINRES rtol=1e-11
+    solver jitter (~5e-11 on H2O-FC even under 1e-15 perturbation), while
+    contracted nuclear forces and unrelaxed AO bars are checked at <=1e-11.
+    """
+    assert got.active_pairs == ref.active_pairs
+    assert got.cabs_rank == ref.cabs_rank
+    assert abs(got.energy - ref.energy) <= e_tol, f"{label} energy diff {abs(got.energy - ref.energy):.3e}"
+    for group_name, gd, rd, tol in (
+        ("one_electron", got.one_electron_weights, ref.one_electron_weights, cphf_tol),
+        ("jkfit", got.jkfit_weights, ref.jkfit_weights, cphf_tol),
+        ("f12fit", got.f12fit_weights, ref.f12fit_weights, f12_tol),
+    ):
+        assert set(gd) == set(rd), f"{label} {group_name} keys mismatch: {set(gd)} vs {set(rd)}"
+        for key in rd:
+            diff = float(np.max(np.abs(gd[key] - rd[key])))
+            assert diff <= tol, f"{label} {group_name}/{key} max diff {diff:.3e} > {tol}"
+
+
+def _setup_increment_problem(
+    atoms_spec: tuple[tuple[str, tuple[float, float, float]], ...],
+    elements: tuple[int, ...],
+    *,
+    charge: int,
+    multiplicity: int,
+    root_id: str,
+    corr_space: str,
+    host_sink: Path,
+):
+    prov, req, ref, _, _ = _setup_mp2_problem(
+        atoms_spec,
+        elements,
+        charge=charge,
+        multiplicity=multiplicity,
+        root_id=root_id,
+        corr_space=corr_space,
+        host_sink=host_sink,
+    )
+    one, (jk, _mp2, f12) = prov._cached_pair_sources(req, derivatives=False, budget=512)
+    jk_joint = jk.joint(req, explicit=False)
+    f12_joint = f12.joint(req, explicit=True)
+    return prov, req, ref, one, jk_joint, f12_joint
+
+
+@pytest.mark.parametrize(
+    "label,atoms_spec,elements,charge,corr_space,weighted,include_ordinary",
+    [
+        ("H2O-AE", GEOM_H2O, (1, 8), 0, "all-active", False, False),
+        ("H2O-FC", GEOM_H2O, (1, 8), 0, "frozen-core", False, False),
+        ("H2O-FC-weighted", GEOM_H2O, (1, 8), 0, "frozen-core", True, False),
+        ("H2O-FC-all", GEOM_H2O, (1, 8), 0, "frozen-core", False, True),
+        ("CH4-AE", GEOM_CH4, (1, 6), 0, "all-active", False, False),
+        ("CH4-FC", GEOM_CH4, (1, 6), 0, "frozen-core", False, False),
+        ("IHB93-AE", GEOM_IHB93, (1, 8), -1, "all-active", False, False),
+        ("IHB93-FC", GEOM_IHB93, (1, 8), -1, "frozen-core", False, False),
+        ("IHB93-FC-weighted", GEOM_IHB93, (1, 8), -1, "frozen-core", True, False),
+    ],
+)
+def test_mp2_f12_pair_response_rhf_three_way_parity(
+    host_sink: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+    atoms_spec,
+    elements: tuple[int, ...],
+    charge: int,
+    corr_space: str,
+    weighted: bool,
+    include_ordinary: bool,
+) -> None:
+    """Prove 3-way MO & reference_f12_increment parity (RHF spatial == UHF == TensorIR) with 0 TensorIR calls."""
+    import generativeqc_compiler.tensor as tensor_mod
+    from generativeqc._f12_focal_increment import (
+        mp2_f12_pair_response,
+        reference_f12_increment,
+    )
+
+    _, _, space, data, src, fock, frozen, _ = _setup_f12_pair_inputs(
+        atoms_spec,
+        elements,
+        charge=charge,
+        multiplicity=1,
+        root_id="rhf",
+        corr_space=corr_space,
+        host_sink=host_sink,
+    )
+    o_act = space[0] - frozen[0]
+    occ_w = None
+    if weighted:
+        rng = np.random.default_rng(12301 + o_act)
+        w = rng.uniform(0.65, 1.45, size=o_act)
+        occ_w = (w, w.copy())
+
+    # 1. RHF spatial AOT + UHF general AOT with TensorIR strictly forbidden inside mp2_f12_pair_response
+    monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", raising=False)
+    forbid_calls = 0
+
+    def _forbid_exec(*_args, **_kwargs):
+        nonlocal forbid_calls
+        forbid_calls += 1
+        raise AssertionError("TensorIR execute must NOT be called inside mp2_f12_pair_response")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(tensor_mod, "execute", _forbid_exec)
+        f12_r, ord_r, n_r, sb_r, rb_r, fb_r = mp2_f12_pair_response(
+            space,
+            data,
+            src,
+            fock,
+            frozen_occupied=frozen,
+            include_f12=True,
+            include_ordinary=include_ordinary,
+            occupied_weights=occ_w,
+            budget_mib=512,
+            cuda=False,
+            shell_library=host_sink,
+            rhf_spatial=True,
+        )
+        f12_u, ord_u, n_u, sb_u, rb_u, fb_u = mp2_f12_pair_response(
+            space,
+            data,
+            src,
+            fock,
+            frozen_occupied=frozen,
+            include_f12=True,
+            include_ordinary=include_ordinary,
+            occupied_weights=occ_w,
+            budget_mib=512,
+            cuda=False,
+            shell_library=host_sink,
+            rhf_spatial=False,
+        )
+    assert forbid_calls == 0
+
+    # 2. TensorIR MO oracle
+    ef_t, eo_t, n_t, sb_t, rb_t, fb_t = _run_tensorir_pair_response_oracle(
+        space,
+        data,
+        src,
+        fock,
+        frozen,
+        include_f12=True,
+        include_ordinary=include_ordinary,
+        occ_w=occ_w,
+    )
+
+    _assert_mo_response_close(
+        f"{label}[UHF-AOT vs TensorIR]",
+        sum(f12_u), sum(ord_u), n_u, sb_u, rb_u, fb_u,
+        ef_t, eo_t, n_t, sb_t, rb_t, fb_t,
+        rhf_sym_coulomb=False,
+    )
+    _assert_mo_response_close(
+        f"{label}[RHF-AOT vs TensorIR]",
+        sum(f12_r), sum(ord_r), n_r, sb_r, rb_r, fb_r,
+        ef_t, eo_t, n_t, sb_t, rb_t, fb_t,
+        rhf_sym_coulomb=True,
+    )
+    _assert_mo_response_close(
+        f"{label}[RHF-AOT vs UHF-AOT]",
+        sum(f12_r), sum(ord_r), n_r, sb_r, rb_r, fb_r,
+        sum(f12_u), sum(ord_u), n_u, sb_u, rb_u, fb_u,
+        rhf_sym_coulomb=True,
+    )
+
+    # 3. Full reference_f12_increment relaxed AO weights (AOT vs TensorIR)
+    if not include_ordinary:
+        prov, req, ref, one, jk_joint, f12_joint = _setup_increment_problem(
+            atoms_spec,
+            elements,
+            charge=charge,
+            multiplicity=1,
+            root_id="rhf",
+            corr_space=corr_space,
+            host_sink=host_sink,
+        )
+        monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", raising=False)
+        inc_aot = reference_f12_increment(
+            req,
+            ref,
+            one,
+            jk_joint,
+            f12_joint,
+            relative_cutoff=prov.relative_cutoff,
+            budget_mib=512,
+            library=prov.response_library,
+            occupied_weights=occ_w,
+            shell_library=host_sink,
+        )
+        monkeypatch.setenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", "1")
+        inc_tir = reference_f12_increment(
+            req,
+            ref,
+            one,
+            jk_joint,
+            f12_joint,
+            relative_cutoff=prov.relative_cutoff,
+            budget_mib=512,
+            library=prov.response_library,
+            occupied_weights=occ_w,
+            shell_library=host_sink,
+        )
+        _assert_increment_close(f"{label}[reference_f12_increment]", inc_aot, inc_tir)
+
+
+@pytest.mark.parametrize(
+    "label,atoms_spec,elements,corr_space,weighted",
+    [
+        ("OH-AE", GEOM_OH, (1, 8), "all-active", False),
+        ("OH-FC", GEOM_OH, (1, 8), "frozen-core", False),
+        ("OH-FC-weighted", GEOM_OH, (1, 8), "frozen-core", True),
+        ("OH-asymmetric-frozen", GEOM_OH, (1, 8), "frozen:1,0", False),
+        ("Br-atom-AE", GEOM_BR, (35,), "all-active", False),
+        ("Br-atom-FC4", GEOM_BR, (35,), "frozen-core", False),
+        ("Br-atom-FC9", GEOM_BR, (35,), "frozen-core-spd", False),
+        ("Br-atom-FC9-weighted", GEOM_BR, (35,), "frozen-core-spd", True),
+    ],
+)
+def test_mp2_f12_pair_response_uhf_parity(
+    host_sink: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+    atoms_spec,
+    elements: tuple[int, ...],
+    corr_space: str,
+    weighted: bool,
+) -> None:
+    """Verify general UHF MO cotangents + reference_f12_increment (OH, bare Br FC4 & FC9)."""
+    import generativeqc_compiler.tensor as tensor_mod
+    from generativeqc._f12_focal_increment import (
+        mp2_f12_pair_response,
+        reference_f12_increment,
+    )
+
+    _, _, space, data, src, fock, frozen, _ = _setup_f12_pair_inputs(
+        atoms_spec,
+        elements,
+        charge=0,
+        multiplicity=2,
+        root_id="uhf",
+        corr_space=corr_space,
+        host_sink=host_sink,
+    )
+    oa, ob = space[0], space[1]
+    assert oa != ob
+    if label == "Br-atom-FC4":
+        assert frozen == (4, 4)
+    elif label == "Br-atom-FC9":
+        assert frozen == (9, 9)
+
+    occ_w = None
+    if weighted:
+        rng = np.random.default_rng(12351 + oa + frozen[0])
+        occ_w = (
+            rng.uniform(0.6, 1.5, size=oa - frozen[0]),
+            rng.uniform(0.6, 1.5, size=ob - frozen[1]),
+        )
+
+    monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", raising=False)
+
+    def _forbid_exec(*_args, **_kwargs):
+        raise AssertionError("TensorIR execute must NOT be called inside mp2_f12_pair_response")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(tensor_mod, "execute", _forbid_exec)
+        f12_u, ord_u, n_u, sb_u, rb_u, fb_u = mp2_f12_pair_response(
+            space,
+            data,
+            src,
+            fock,
+            frozen_occupied=frozen,
+            include_f12=True,
+            include_ordinary=False,
+            occupied_weights=occ_w,
+            budget_mib=512,
+            cuda=False,
+            shell_library=host_sink,
+        )
+
+    ef_t, eo_t, n_t, sb_t, rb_t, fb_t = _run_tensorir_pair_response_oracle(
+        space,
+        data,
+        src,
+        fock,
+        frozen,
+        include_f12=True,
+        include_ordinary=False,
+        occ_w=occ_w,
+    )
+    _assert_mo_response_close(
+        f"{label}[UHF-AOT vs TensorIR]",
+        sum(f12_u), sum(ord_u), n_u, sb_u, rb_u, fb_u,
+        ef_t, eo_t, n_t, sb_t, rb_t, fb_t,
+        rhf_sym_coulomb=False,
+    )
+
+    prov, req, ref, one, jk_joint, f12_joint = _setup_increment_problem(
+        atoms_spec,
+        elements,
+        charge=0,
+        multiplicity=2,
+        root_id="uhf",
+        corr_space=corr_space,
+        host_sink=host_sink,
+    )
+    monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", raising=False)
+    inc_aot = reference_f12_increment(
+        req,
+        ref,
+        one,
+        jk_joint,
+        f12_joint,
+        relative_cutoff=prov.relative_cutoff,
+        budget_mib=512,
+        library=prov.response_library,
+        occupied_weights=occ_w,
+        shell_library=host_sink,
+    )
+    monkeypatch.setenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", "1")
+    inc_tir = reference_f12_increment(
+        req,
+        ref,
+        one,
+        jk_joint,
+        f12_joint,
+        relative_cutoff=prov.relative_cutoff,
+        budget_mib=512,
+        library=prov.response_library,
+        occupied_weights=occ_w,
+        shell_library=host_sink,
+    )
+    _assert_increment_close(f"{label}[reference_f12_increment]", inc_aot, inc_tir)
+
+
+@pytest.mark.parametrize(
+    "corr_space,expected_frozen",
+    [
+        ("all-active", (0, 0)),
+        ("frozen-core", (4, 4)),
+        ("frozen-core-spd", (9, 9)),
+    ],
+)
+def test_mp2_f12_pair_response_hbr_ecp_fc4_fc9_parity(
+    host_sink: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corr_space: str,
+    expected_frozen: tuple[int, int],
+) -> None:
+    """Verify ECP HBr (all-active, FC4, FC9) 3-way MO response + reference_f12_increment parity."""
+    from generativeqc._f12_focal_increment import (
+        mp2_f12_pair_response,
+        reference_f12_increment,
+    )
+
+    _, _, space, data, src, fock, frozen, _ = _setup_f12_pair_inputs(
+        GEOM_HBR,
+        (1, 35),
+        charge=0,
+        multiplicity=1,
+        root_id="rhf",
+        corr_space=corr_space,
+        host_sink=host_sink,
+    )
+    assert frozen == expected_frozen
+
+    monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", raising=False)
+    f12_r, ord_r, n_r, sb_r, rb_r, fb_r = mp2_f12_pair_response(
+        space, data, src, fock, frozen_occupied=frozen,
+        include_f12=True, include_ordinary=False, budget_mib=512,
+        cuda=False, shell_library=host_sink, rhf_spatial=True,
+    )
+    f12_u, ord_u, n_u, sb_u, rb_u, fb_u = mp2_f12_pair_response(
+        space, data, src, fock, frozen_occupied=frozen,
+        include_f12=True, include_ordinary=False, budget_mib=512,
+        cuda=False, shell_library=host_sink, rhf_spatial=False,
+    )
+    ef_t, eo_t, n_t, sb_t, rb_t, fb_t = _run_tensorir_pair_response_oracle(
+        space, data, src, fock, frozen, include_f12=True, include_ordinary=False,
+    )
+
+    _assert_mo_response_close(
+        f"HBr-{corr_space}[UHF-AOT vs TensorIR]",
+        sum(f12_u), sum(ord_u), n_u, sb_u, rb_u, fb_u,
+        ef_t, eo_t, n_t, sb_t, rb_t, fb_t,
+        rhf_sym_coulomb=False,
+    )
+    _assert_mo_response_close(
+        f"HBr-{corr_space}[RHF-AOT vs TensorIR]",
+        sum(f12_r), sum(ord_r), n_r, sb_r, rb_r, fb_r,
+        ef_t, eo_t, n_t, sb_t, rb_t, fb_t,
+        rhf_sym_coulomb=True,
+    )
+
+    prov, req, ref, one, jk_joint, f12_joint = _setup_increment_problem(
+        GEOM_HBR, (1, 35), charge=0, multiplicity=1, root_id="rhf",
+        corr_space=corr_space, host_sink=host_sink,
+    )
+    monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", raising=False)
+    inc_aot = reference_f12_increment(
+        req, ref, one, jk_joint, f12_joint,
+        relative_cutoff=prov.relative_cutoff, budget_mib=512,
+        library=prov.response_library, shell_library=host_sink,
+    )
+    monkeypatch.setenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", "1")
+    inc_tir = reference_f12_increment(
+        req, ref, one, jk_joint, f12_joint,
+        relative_cutoff=prov.relative_cutoff, budget_mib=512,
+        library=prov.response_library, shell_library=host_sink,
+    )
+    _assert_increment_close(f"HBr-{corr_space}[reference_f12_increment]", inc_aot, inc_tir)
+
+
+@pytest.mark.parametrize("shared_fit", [False, True])
+def test_dense_projected_frame_tracks_source_mutation_and_ownership(
+    host_sink: Path, shared_fit: bool,
+) -> None:
+    from dataclasses import replace
+
+    from generativeqc._f12_focal_increment import reference_f12_increment
+
+    provider, req, ref, one, jk, f12 = _setup_increment_problem(
+        GEOM_H2, (1,), charge=0, multiplicity=1, root_id="rhf",
+        corr_space="all-active", host_sink=host_sink,
+    )
+    if shared_fit:
+        basis = req.basis
+        shared = FocalBasis(
+            basis.cardinal, basis.series_id, basis.orbital, jk_fit=basis.jk_fit,
+            mp2_fit=basis.jk_fit, f12_fit=basis.jk_fit, cabs=basis.cabs, beta=basis.beta,
+        )
+        req = replace(req, basis=shared)
+        ref = _canonical_reference_for_test(provider, req)
+        one, (jk_panel, _, f12_panel) = provider._cached_pair_sources(req, derivatives=False, budget=512)
+        jk, f12 = jk_panel.joint(req, explicit=False), f12_panel.joint(req, explicit=True)
+    warm = provider.low_order_energy(req, reference=ref, include_hf_cabs=False)
+    cache = provider._pair_source_cache
+    assert "projected_frame" in cache
+    options = dict(expected_cabs_rank=warm.cabs_rank, shell_library=host_sink)
+    valid = reference_f12_increment(req, ref, one, jk, f12, preprojected_cache=cache, **options)
+    fresh = reference_f12_increment(req, ref, one, jk, f12, **options)
+    _assert_increment_close("unchanged projected frame", valid, fresh)
+    # The same fit object, manifest and SCF orbitals now supply different integrals.
+    f12.integrals["ao_f12"][...] *= 1.02
+    cold = reference_f12_increment(req, ref, one, jk, f12, **options)
+    cached = reference_f12_increment(req, ref, one, jk, f12, preprojected_cache=cache, **options)
+    assert abs(cold.energy - warm.f12_increment) > 1e-9
+    _assert_increment_close("mutated F12 panel", cached, cold)
+
+    # An unchanged matching set of tensors from a different source still fails
+    # the canonical frame provenance check, even if a projection is available.
+    rebased = provider.low_order_energy(req, reference=ref, include_hf_cabs=False)
+    assert rebased.cabs_rank == warm.cabs_rank
+    with pytest.raises(ValueError, match="same surface"):
+        reference_f12_increment(
+            req, ref, replace(one, surface_id="foreign"), jk, f12,
+            preprojected_cache=cache, **options,
+        )
+
+
+def test_mp2_f12_pair_response_streaming_ao_bar_sink_and_preprojected_cache(
+    host_sink: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify streaming ao_bar_sink and preprojected_cache match TensorIR to <=1e-11."""
+    from generativeqc._f12_focal_increment import reference_f12_increment
+
+    for label, geom, elems, mult, root in (
+        ("H2O-FC-sink", GEOM_H2O, (1, 8), 1, "rhf"),
+        ("OH-FC-sink", GEOM_OH, (1, 8), 2, "uhf"),
+    ):
+        prov, req, ref, one, jk_joint, f12_joint = _setup_increment_problem(
+            geom, elems, charge=0, multiplicity=mult, root_id=root,
+            corr_space="frozen-core", host_sink=host_sink,
+        )
+        streamed_aot: dict[str, np.ndarray] = {}
+        streamed_tir: dict[str, np.ndarray] = {}
+
+        monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", raising=False)
+        inc_aot = reference_f12_increment(
+            req, ref, one, jk_joint, f12_joint,
+            relative_cutoff=prov.relative_cutoff, budget_mib=512,
+            library=prov.response_library,
+            ao_bar_sink=lambda name, arr: streamed_aot.__setitem__(name, arr.copy()),
+            shell_library=host_sink,
+        )
+        monkeypatch.setenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", "1")
+        inc_tir = reference_f12_increment(
+            req, ref, one, jk_joint, f12_joint,
+            relative_cutoff=prov.relative_cutoff, budget_mib=512,
+            library=prov.response_library,
+            ao_bar_sink=lambda name, arr: streamed_tir.__setitem__(name, arr.copy()),
+            shell_library=host_sink,
+        )
+        _assert_increment_close(label, inc_aot, inc_tir)
+        expected_channels = {
+            "ao_coulomb", "ao_f12", "ao_f12_squared", "ao_f12_over_coulomb", "ao_double_commutator",
+        }
+        assert set(streamed_aot) == expected_channels
+        assert set(streamed_tir) == expected_channels
+        assert not any(k.startswith("ao_") for k in inc_aot.f12fit_weights)
+        for ch in expected_channels:
+            diff = float(np.max(np.abs(streamed_aot[ch] - streamed_tir[ch])))
+            assert diff <= 1e-11, f"{label} streamed {ch} diff {diff:.3e}"
+
+    # Verify unrelaxed AO cotangents directly (<=1e-11 on all 16 AO/metric/coeff channels)
+    from functools import partial
+    from generativeqc._f12_focal_frame import canonical_pair_frame
+    from generativeqc._f12_focal_increment import _aot_mp2_f12_ao_response
+    from generativeqc._f12_mp2_pair_native import bind_mp2_f12_pair_response
+    from generativeqc._f12_unrestricted import unrestricted_mp2_f12_ao_response
+    from generativeqc_compiler.tensor import execute
+
+    monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", raising=False)
+    native_fn = bind_mp2_f12_pair_response(host_reference=True, shell_library=host_sink)
+    assert native_fn is not None
+    for label, geom, elems, mult, root, cs in (
+        ("H2O-FC-ao", GEOM_H2O, (1, 8), 1, "rhf", "frozen-core"),
+        ("OH-FC-ao", GEOM_OH, (1, 8), 2, "uhf", "frozen-core"),
+        ("HBr-AE-ao", GEOM_HBR, (1, 35), 1, "rhf", "all-active"),
+    ):
+        prov, req, ref, one, jk_joint, f12_joint = _setup_increment_problem(
+            geom, elems, charge=0, multiplicity=mult, root_id=root,
+            corr_space=cs, host_sink=host_sink,
+        )
+        space, ao, panel, _ = canonical_pair_frame(
+            req, ref, one, jk_joint, f12_joint,
+            expected_cabs_rank=None, relative_cutoff=prov.relative_cutoff,
+            library=prov.response_library,
+        )
+        frozen = resolve_frozen_occupied(req, (space[0], space[1]))
+        run_cpu = partial(execute, max_bytes=512 << 20)
+        t_aot, b_aot = _aot_mp2_f12_ao_response(
+            space, ao, run_cpu, native_fn=native_fn, frozen_occupied=frozen,
+            jkfit=panel, budget_mib=512, cuda=False,
+        )
+        t_tir, b_tir = unrestricted_mp2_f12_ao_response(
+            space, ao, run_cpu, frozen_occupied=frozen, jkfit=panel, component="f12",
+        )
+        assert abs(t_aot.f12_increment - t_tir.f12_increment) <= 1e-12
+        assert set(b_aot) == set(b_tir)
+        for key in b_tir:
+            diff = float(np.max(np.abs(b_aot[key] - b_tir[key])))
+            assert diff <= 1e-11, f"{label} unrelaxed AO bar {key} diff {diff:.3e}"
+
+    # Verify MolecularFocalProvider.low_order_energy_and_forces (full AOT vs TensorIR)
+    for label, geom, elems, charge, mult, root, corr_space in (
+        ("H2O-FC", GEOM_H2O, (1, 8), 0, 1, "rhf", "frozen-core"),
+        ("CH4-FC", GEOM_CH4, (1, 6), 0, 1, "rhf", "frozen-core"),
+        ("OH-FC", GEOM_OH, (1, 8), 0, 2, "uhf", "frozen-core"),
+        ("IHB93-FC", GEOM_IHB93, (1, 8), -1, 1, "rhf", "frozen-core"),
+    ):
+        basis = _compact_split_basis(elems)
+        plan = plan_singlepoint(
+            geom, FocalSeries(basis), FocalSeries(basis), None,
+            charge=charge, multiplicity=mult, root_id=root,
+            correlation_space_id=corr_space, backend="cpu_reference",
+        )
+        req = next(r for r, _ in plan.steps if r.role == "mp2_f12_correlation")
+        monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", raising=False)
+        prov_aot = MolecularFocalProvider(shell_library=host_sink, budget_mib=512)
+        # Warm preprojected_cache via low_order_energy before forces to exercise cache reuse too
+        e_warm = prov_aot.low_order_energy(req, include_hf_cabs=True)
+        ef_aot = prov_aot.low_order_energy_and_forces(req, include_hf_cabs=True)
+        assert abs(e_warm.f12_increment - ef_aot.energies.f12_increment) <= 1e-12
+
+        monkeypatch.setenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", "1")
+        prov_tir = MolecularFocalProvider(shell_library=host_sink, budget_mib=512)
+        ef_tir = prov_tir.low_order_energy_and_forces(req, include_hf_cabs=True)
+
+        assert abs(ef_aot.energies.f12_increment - ef_tir.energies.f12_increment) <= 1e-12
+        assert abs(
+            ef_aot.energies.mp2_f12_correlation_energy - ef_tir.energies.mp2_f12_correlation_energy
+        ) <= 1e-12
+        assert float(
+            np.max(np.abs(ef_aot.mp2_f12_correlation_forces - ef_tir.mp2_f12_correlation_forces))
+        ) <= 1e-11
+        assert float(np.max(np.abs(ef_aot.forces - ef_tir.forces))) <= 1e-11
+
+
+def test_mp2_f12_pair_response_edge_cases_nonsym_and_guards(
+    host_sink: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify H2 (o=1), H atom (ob=0), non-symmetric F/K/Sab, and error guards."""
+    from generativeqc._f12_focal_increment import (
+        mp2_f12_pair_response,
+        reference_f12_increment,
+    )
+    from generativeqc._f12_mp2_pair_native import (
+        bind_mp2_f12_pair_response,
+        run_mp2_f12_pair_response_native,
+    )
+
+    # 1. H2 (o=1, diagonal AB(0,0) only): 3-way MO + reference_f12_increment parity
+    _, _, space_h2, data_h2, src_h2, fock_h2, frozen_h2, _ = _setup_f12_pair_inputs(
+        GEOM_H2, (1,), charge=0, multiplicity=1, root_id="rhf", corr_space="all-active", host_sink=host_sink,
+    )
+    monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", raising=False)
+    f12_r, ord_r, n_r, sb_r, rb_r, fb_r = mp2_f12_pair_response(
+        space_h2, data_h2, src_h2, fock_h2, frozen_occupied=frozen_h2,
+        include_f12=True, include_ordinary=True, budget_mib=512,
+        cuda=False, shell_library=host_sink, rhf_spatial=True,
+    )
+    f12_u, ord_u, n_u, sb_u, rb_u, fb_u = mp2_f12_pair_response(
+        space_h2, data_h2, src_h2, fock_h2, frozen_occupied=frozen_h2,
+        include_f12=True, include_ordinary=True, budget_mib=512,
+        cuda=False, shell_library=host_sink, rhf_spatial=False,
+    )
+    ef_t, eo_t, n_t, sb_t, rb_t, fb_t = _run_tensorir_pair_response_oracle(
+        space_h2, data_h2, src_h2, fock_h2, frozen_h2, include_f12=True, include_ordinary=True,
+    )
+    _assert_mo_response_close(
+        "H2[UHF-AOT vs TensorIR]",
+        sum(f12_u), sum(ord_u), n_u, sb_u, rb_u, fb_u,
+        ef_t, eo_t, n_t, sb_t, rb_t, fb_t,
+        rhf_sym_coulomb=False,
+    )
+    _assert_mo_response_close(
+        "H2[RHF-AOT vs TensorIR]",
+        sum(f12_r), sum(ord_r), n_r, sb_r, rb_r, fb_r,
+        ef_t, eo_t, n_t, sb_t, rb_t, fb_t,
+        rhf_sym_coulomb=True,
+    )
+    prov_h2, req_h2, ref_h2, one_h2, jk_h2, f12_h2 = _setup_increment_problem(
+        GEOM_H2, (1,), charge=0, multiplicity=1, root_id="rhf",
+        corr_space="all-active", host_sink=host_sink,
+    )
+    inc_h2_aot = reference_f12_increment(
+        req_h2, ref_h2, one_h2, jk_h2, f12_h2,
+        relative_cutoff=prov_h2.relative_cutoff, budget_mib=512,
+        library=prov_h2.response_library, shell_library=host_sink,
+    )
+    monkeypatch.setenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", "1")
+    inc_h2_tir = reference_f12_increment(
+        req_h2, ref_h2, one_h2, jk_h2, f12_h2,
+        relative_cutoff=prov_h2.relative_cutoff, budget_mib=512,
+        library=prov_h2.response_library, shell_library=host_sink,
+    )
+    _assert_increment_close("H2[o=1]", inc_h2_aot, inc_h2_tir)
+
+    # 2. H atom (oa=1, ob=0 -> 0 active pairs, zero cotangents)
+    monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", raising=False)
+    _, _, space_h, data_h, src_h, fock_h, frozen_h, _ = _setup_f12_pair_inputs(
+        GEOM_H, (1,), charge=0, multiplicity=2, root_id="uhf", corr_space="all-active", host_sink=host_sink,
+    )
+    f12_h, ord_h, n_h, sb_h, rb_h, fb_h = mp2_f12_pair_response(
+        space_h, data_h, src_h, fock_h, frozen_occupied=frozen_h,
+        include_f12=True, include_ordinary=True, budget_mib=512,
+        cuda=False, shell_library=host_sink,
+    )
+    assert f12_h == (0.0, 0.0, 0.0) and ord_h == (0.0, 0.0, 0.0) and n_h == 0
+    for d in (sb_h, rb_h, fb_h):
+        for arr in d.values():
+            assert np.all(arr == 0.0)
+
+    # 3. Synthetic non-symmetric F/K/Sab/metrics across all 3 component modes & unequal weights
+    rng = np.random.default_rng(12399)
+    space_syn = (3, 2, 6, 9, 5)
+    oa, ob, _obs, ext, aux = space_syn
+    data_syn: dict[str, np.ndarray] = {
+        "cross_overlap": np.eye(ext) + 0.08 * rng.normal(size=(ext, ext)),
+    }
+    src_syn: dict[str, np.ndarray] = {}
+    fock_syn: dict[str, np.ndarray] = {}
+    for spin, occ in (("alpha", oa), ("beta", ob)):
+        fock_syn["fock_" + spin] = np.diag(np.linspace(-2.0, 3.0, ext)) + 0.05 * rng.normal(size=(ext, ext))
+        fock_syn["exchange_" + spin] = 0.04 * rng.normal(size=(ext, ext))
+        src_syn["fit_" + spin] = 0.1 * rng.normal(size=(aux, occ, ext))
+        src_syn["raw_coulomb_" + spin] = 0.1 * rng.normal(size=(aux, ext, ext))
+        for op in ("geminal", "squared_geminal", "geminal_coulomb", "double_commutator"):
+            data_syn[f"raw/{op}/{spin}"] = 0.1 * rng.normal(size=(aux, occ, ext))
+    for op in ("geminal", "squared_geminal", "geminal_coulomb", "double_commutator"):
+        data_syn["metric/" + op] = 0.1 * rng.normal(size=(aux, aux))
+
+    wa = np.array([0.8, 1.35])
+    wb = np.array([0.7, 1.25])
+    for name, inc_f, inc_o, frz, ow in (
+        ("syn-f12", True, False, (0, 0), None),
+        ("syn-ord", False, True, (0, 0), None),
+        ("syn-all", True, True, (0, 0), None),
+        ("syn-frozen-w", True, False, (1, 0), (wa, wb)),
+    ):
+        f12_n, ord_n, n_n, sb_n, rb_n, fb_n = mp2_f12_pair_response(
+            space_syn, data_syn, src_syn, fock_syn, frozen_occupied=frz,
+            include_f12=inc_f, include_ordinary=inc_o, occupied_weights=ow,
+            budget_mib=512, cuda=False, shell_library=host_sink,
+        )
+        ef_t, eo_t, n_t, sb_t, rb_t, fb_t = _run_tensorir_pair_response_oracle(
+            space_syn, data_syn, src_syn, fock_syn, frz,
+            include_f12=inc_f, include_ordinary=inc_o, occ_w=ow,
+        )
+        _assert_mo_response_close(
+            name,
+            sum(f12_n), sum(ord_n), n_n, sb_n, rb_n, fb_n,
+            ef_t, eo_t, n_t, sb_t, rb_t, fb_t,
+            rhf_sym_coulomb=False,
+        )
+
+    # 4. Non-finite input guard (-2)
+    native_fn = bind_mp2_f12_pair_response(host_reference=True, shell_library=host_sink)
+    assert native_fn is not None
+    bad_fock = dict(fock_h2)
+    bad_fa = fock_h2["fock_alpha"].copy()
+    bad_fa[0, 0] = np.nan
+    bad_fock["fock_alpha"] = bad_fa
+    with pytest.raises(RuntimeError, match="status -2"):
+        run_mp2_f12_pair_response_native(
+            native_fn,
+            space=space_h2,
+            frozen_occupied=frozen_h2,
+            rhf_spatial=True,
+            include_f12=True,
+            include_ordinary=False,
+            budget_bytes=512 << 20,
+            data=data_h2,
+            sources=src_h2,
+            fock=bad_fock,
+        )
+
+    # 5. Missing symbol on explicit shell_library raises (zero silent fallback)
+    with pytest.raises(RuntimeError, match="does not export"):
+        reference_f12_increment(
+            req_h2, ref_h2, one_h2, jk_h2, f12_h2,
+            relative_cutoff=prov_h2.relative_cutoff, budget_mib=512,
+            library=prov_h2.response_library,
+            shell_library=Path("/nonexistent/fake_shell_library.so"),
         )

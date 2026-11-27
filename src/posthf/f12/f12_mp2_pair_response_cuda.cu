@@ -1,6 +1,6 @@
 // AOT GPU-resident cuBLAS (and matching FP64 host reference) kernels for:
 // 1. Ordinary DF-MP2 energy + unrelaxed response pullback (RHF spatial fast path + UHF dual-spin)
-// 2. Fixed-cusp 3C(FIX) MP2-F12 pair energy (RHF fast path + UHF)
+// 2. Fixed-cusp 3C(FIX) MP2-F12 pair energy + reverse MO-source pullback (RHF fast path + UHF)
 #include <algorithm>
 #include <climits>
 #include <cmath>
@@ -91,6 +91,110 @@ PairBatchWorkspace ab_batch_workspace(int oa, int ob, int obs, int ext) {
   return {sub_a, sub_b, sum_sizes({sat_mul(2, Size(ext) * ext), Size(obs) * obs,
                                    Size(oa) * c, c * ob, Size(obs) * vb, va * obs,
                                    sub_a, sub_b, 3})};
+}
+
+Size estimate_mp2_pair_response_device_bytes(
+    bool rhf_spatial, bool include_f12, bool include_ordinary, bool has_pair_f12_out,
+    bool has_pair_ord_out, bool has_bar_cross_overlap, int oa, int ob, int fa, int fb, int obs,
+    int ext, int aux) {
+  const int oa_act = oa - fa;
+  const int ob_act = ob - fb;
+  const Size qq = sat_mul(Size(aux), Size(aux));
+  const Size ee = sat_mul(Size(ext), Size(ext));
+  const Size qoe_a = sat_mul(sat_mul(Size(aux), Size(oa_act)), Size(ext));
+  const Size qoe_b = sat_mul(sat_mul(Size(aux), Size(ob_act)), Size(ext));
+  const Size max_qoe = std::max(qoe_a, qoe_b);
+  const Size n_aa = (oa_act >= 2) ? (Size(oa_act) * (oa_act - 1)) / 2 : 0;
+  const Size n_ab = sat_mul(Size(oa_act), Size(ob_act));
+  const Size n_bb = (ob_act >= 2) ? (Size(ob_act) * (ob_act - 1)) / 2 : 0;
+  const Size n_total = sat_add(sat_add(n_aa, n_ab), n_bb);
+
+  Size base = 6;
+  if (include_f12 && has_pair_f12_out) base = sat_add(base, n_total);
+  if (include_ordinary && has_pair_ord_out) base = sat_add(base, n_total);
+  base = sat_add(base, max_qoe);
+  base = sat_add(base, sat_mul(Size(3), qq));  // d_metric_buf, d_bar_metric_buf, d_m_tmp
+
+  const Size obs2 = sat_mul(Size(obs), Size(obs));
+  const int cabs = ext - obs;
+
+  if (rhf_spatial) {
+    Size fixed = sat_mul(Size(5 + ((include_f12 && has_bar_cross_overlap) ? 1 : 0)), ee);
+    fixed = sat_add(fixed, sat_mul(Size(4), qoe_a));
+    if (include_f12) {
+      fixed = sat_add(fixed, sat_mul(Size(8), sat_mul(Size(oa_act), Size(oa_act))));
+    }
+    Size s1a = 0;
+    Size s1b = 0;
+    if (include_f12) {
+      s1a = sat_mul(Size(6), sat_mul(sat_mul(Size(aux), Size(oa_act)), Size(oa)));
+      s1b = sat_add(sat_mul(Size(5), qoe_a),
+                    sat_add(ee, sat_add(sat_mul(Size(18), Size(ext)), sat_mul(Size(2), Size(aux)))));
+    }
+    Size s2 = sat_mul(Size(include_f12 ? 7 : 2), qoe_a);
+    const Size va = Size(obs - oa);
+    const Size vv = sat_mul(va, va);
+    if (include_f12) {
+      const Size oc = sat_mul(Size(oa), Size(cabs));
+      const auto batch = ss_batch_workspace(oa, obs, ext);
+      const Size s2_ws = sum_sizes({sat_mul(13, ee), sat_mul(3, obs2), sat_mul(6, oc),
+                                    sat_mul(6, vv), batch.sub_a, batch.sub_b, 6});
+      s2 = sat_add(s2, s2_ws);
+    } else if (include_ordinary) {
+      s2 = sat_add(s2, sat_mul(Size(3), vv));
+    }
+    const Size peak = sat_add(sat_add(base, fixed), std::max({s1a, s1b, s2}));
+    return sat_add(bytes_of_doubles(peak), sizeof(int));
+  }
+
+  // General UHF path.
+  Size fixed = sat_mul(Size(14), ee);
+  if (oa_act > 0 && ob_act > 0 && include_f12) {
+    fixed = sat_add(fixed, sat_mul(Size(has_bar_cross_overlap ? 4 : 3), ee));
+  }
+  fixed = sat_add(fixed, sat_mul(Size(4), sat_add(qoe_a, qoe_b)));
+  if (include_f12) {
+    if (oa_act >= 2) fixed = sat_add(fixed, sat_mul(Size(8), sat_mul(Size(oa_act), Size(oa_act))));
+    if (ob_act >= 2) fixed = sat_add(fixed, sat_mul(Size(8), sat_mul(Size(ob_act), Size(ob_act))));
+    if (oa_act > 0 && ob_act > 0) fixed = sat_add(fixed, sat_mul(Size(4), n_ab));
+  }
+  Size s1a = 0;
+  Size s1b = 0;
+  if (include_f12) {
+    const Size ss_a = (oa_act >= 2) ? sat_mul(Size(6), sat_mul(sat_mul(Size(aux), Size(oa_act)), Size(oa))) : 0;
+    const Size ss_b = (ob_act >= 2) ? sat_mul(Size(6), sat_mul(sat_mul(Size(aux), Size(ob_act)), Size(ob))) : 0;
+    const Size ab_ws = (oa_act > 0 && ob_act > 0) ? ab_projection_scratch(oa_act, ob_act, ext, aux) : 0;
+    s1a = std::max({ss_a, ss_b, ab_ws});
+    const Size q_s1b_a = (oa_act >= 2) ? sat_mul(Size(4), qoe_a) : (oa_act > 0 ? sat_mul(Size(2), qoe_a) : 0);
+    const Size q_s1b_b = (ob_act > 0) ? sat_mul(Size(4), qoe_b) : 0;
+    const Size scratch_s1b = std::max(
+        sat_add(ee, sat_add(sat_mul(Size(18), Size(ext)), sat_mul(Size(2), Size(aux)))),
+        sat_add(sat_mul(Size(4), Size(aux)), sat_mul(Size(22), Size(ext))));
+    s1b = sat_add(sat_add(q_s1b_a, q_s1b_b), scratch_s1b);
+  }
+  const Size q_s2_a = (oa_act > 0) ? sat_mul(Size(2 + (include_f12 ? (oa_act >= 2 ? 4 : 2) : 0)), qoe_a) : 0;
+  const Size q_s2_b = (ob_act > 0) ? sat_mul(Size(2 + (include_f12 ? 4 : 0)), qoe_b) : 0;
+  const Size va = Size(obs - oa);
+  const Size vb = Size(obs - ob);
+  const Size vab = sat_mul(va, vb);
+  Size s2_ws = 0;
+  if (include_f12) {
+    const Size ab_s2 = sum_sizes({sat_mul(8, ee), sat_mul(2, obs2),
+        sat_mul(2 * Size(cabs), Size(oa) + Size(ob)), sat_mul(2, vab), 3});
+    auto same_spin_scratch = [&](int o, Size v) {
+      const auto batch = ss_batch_workspace(o, obs, ext);
+      return sum_sizes({sat_mul(7, ee), sat_mul(2, obs2), sat_mul(4 * Size(o), Size(cabs)),
+                        sat_mul(5, v * v), batch.sub_a, batch.sub_b, 6});
+    };
+    s2_ws = std::max({oa_act > 0 && ob_act > 0 ? ab_s2 : 0,
+                      oa_act >= 2 ? same_spin_scratch(oa, va) : 0,
+                      ob_act >= 2 ? same_spin_scratch(ob, vb) : 0});
+  } else if (include_ordinary) {
+    s2_ws = sat_mul(Size(2), std::max({sat_mul(va, va), sat_mul(vb, vb), vab}));
+  }
+  const Size s2 = sat_add(sat_add(q_s2_a, q_s2_b), s2_ws);
+  const Size peak = sat_add(sat_add(base, fixed), std::max({s1a, s1b, s2}));
+  return sat_add(bytes_of_doubles(peak), sizeof(int));
 }
 
 Size estimate_mp2_pair_energies_device_bytes(
@@ -1263,6 +1367,1670 @@ int eval_uhf_opp_spin_channel_host(
       const double wij = has_occ_weights ? 0.5 * (occ_w_a[i_loc] + occ_w_b[j_loc]) : 1.0;
       e_f12_tot += wij * e_f12;
       if (include_ordinary) e_ord_tot += wij * e_ord;
+    }
+  }
+  return 0;
+}
+
+// -------------------------------------------------------------------------
+// Host-Reference MP2-F12 Pair Response Pullback (General UHF + RHF Spatial)
+// -------------------------------------------------------------------------
+
+void transpose_oqe_to_qoe_host(const std::vector<double>& in_oqe, int aux, int o_act, int ext,
+                               std::vector<double>& out_qoe) {
+  out_qoe.resize(Size(aux) * Size(o_act) * ext);
+  for (int i = 0; i < o_act; ++i) {
+    for (int A = 0; A < aux; ++A) {
+      const double* s = in_oqe.data() + (Size(i) * aux + A) * ext;
+      double* d = out_qoe.data() + (Size(A) * o_act + i) * ext;
+      std::copy_n(s, ext, d);
+    }
+  }
+}
+
+void scatter_active_qoe_host(const std::vector<double>& in_qoe, int aux, int occ, int f, int o_act,
+                             int ext, double* dst) {
+  if (!dst || o_act <= 0) return;
+  for (int A = 0; A < aux; ++A) {
+    const double* s = in_qoe.data() + Size(A) * o_act * ext;
+    double* d = dst + (Size(A) * occ + f) * ext;
+    std::copy_n(s, Size(o_act) * ext, d);
+  }
+}
+
+void scatter_active_oqe_host(const std::vector<double>& in_oqe, int aux, int occ, int f, int o_act,
+                             int ext, double* dst) {
+  if (!dst || o_act <= 0) return;
+  for (int A = 0; A < aux; ++A) {
+    for (int i = 0; i < o_act; ++i) {
+      const double* s = in_oqe.data() + (Size(i) * aux + A) * ext;
+      double* d = dst + (Size(A) * occ + (f + i)) * ext;
+      std::copy_n(s, ext, d);
+    }
+  }
+}
+
+void pullback_res_oqe_host(const std::vector<double>& bar_res_oqe,
+                           const std::vector<double>& fit_qoe, const double* metric,
+                           double metric_scale, bool sym_metric, int aux, int o_act, int ext,
+                           std::vector<double>& bar_raw_oqe, std::vector<double>& bar_fit_qoe,
+                           double* bar_metric) {
+  if (o_act <= 0) return;
+  const Size n_tot = bar_res_oqe.size();
+  for (Size idx = 0; idx < n_tot; ++idx) bar_raw_oqe[idx] += bar_res_oqe[idx];
+  std::vector<double> bar_res_qoe;
+  transpose_oqe_to_qoe_host(bar_res_oqe, aux, o_act, ext, bar_res_qoe);
+  const int cols = o_act * ext;
+  rm_gemm_host(true, false, aux, cols, aux, -1.0, metric, aux, bar_res_qoe.data(), cols, 1.0,
+               bar_fit_qoe.data(), cols);
+  if (bar_metric) {
+    if (!sym_metric) {
+      rm_gemm_host(false, true, aux, aux, cols, -metric_scale, bar_res_qoe.data(), cols,
+                   fit_qoe.data(), cols, 1.0, bar_metric, aux);
+    } else {
+      std::vector<double> m_tmp(Size(aux) * aux, 0.0);
+      rm_gemm_host(false, true, aux, aux, cols, -0.5 * metric_scale, bar_res_qoe.data(), cols,
+                   fit_qoe.data(), cols, 0.0, m_tmp.data(), aux);
+      for (int p = 0; p < aux; ++p) {
+        for (int q = 0; q < aux; ++q) {
+          bar_metric[Size(p) * aux + q] += m_tmp[Size(p) * aux + q] + m_tmp[Size(q) * aux + p];
+        }
+      }
+    }
+  }
+}
+
+inline void robust_elem_pullback_host(double alpha, int p, int r, int aux, int ext,
+                                      const double* fit_i, const double* raw_i,
+                                      const double* fit_j, const double* res_j, double* bar_fit_i,
+                                      double* bar_raw_i, double* bar_fit_j, double* bar_res_j) {
+  if (alpha == 0.0) return;
+  for (int A = 0; A < aux; ++A) {
+    const Size row = Size(A) * ext;
+    bar_fit_i[row + p] += alpha * res_j[row + r];
+    bar_res_j[row + r] += alpha * fit_i[row + p];
+    bar_raw_i[row + p] += alpha * fit_j[row + r];
+    bar_fit_j[row + r] += alpha * raw_i[row + p];
+  }
+}
+
+void robust_bilin_pullback_host(double alpha, const double* x, const double* y, int aux, int ext,
+                                const double* fit_i, const double* raw_i, const double* fit_j,
+                                const double* res_j, double* bar_fit_i, double* bar_raw_i,
+                                double* bar_fit_j, double* bar_res_j) {
+  if (alpha == 0.0) return;
+  for (int A = 0; A < aux; ++A) {
+    const Size row = Size(A) * ext;
+    const double* fi = fit_i + row;
+    const double* ri = raw_i + row;
+    const double* fj = fit_j + row;
+    const double* sj = res_j + row;
+    double fx = 0.0, rx = 0.0, fy = 0.0, sy = 0.0;
+    for (int p = 0; p < ext; ++p) {
+      const double xp = x[p];
+      const double yp = y[p];
+      fx += fi[p] * xp;
+      rx += ri[p] * xp;
+      fy += fj[p] * yp;
+      sy += sj[p] * yp;
+    }
+    const double a_sy = alpha * sy;
+    const double a_fx = alpha * fx;
+    const double a_fy = alpha * fy;
+    const double a_rx = alpha * rx;
+    double* bfi = bar_fit_i + row;
+    double* bri = bar_raw_i + row;
+    double* bfj = bar_fit_j + row;
+    double* bsj = bar_res_j + row;
+    for (int p = 0; p < ext; ++p) {
+      const double xp = x[p];
+      const double yp = y[p];
+      bfi[p] += a_sy * xp;
+      bsj[p] += a_fx * yp;
+      bri[p] += a_fy * xp;
+      bfj[p] += a_rx * yp;
+    }
+  }
+}
+
+void robust_row_col_pullback_host(double alpha_row, int row_idx, const double* y_row,
+                                  double alpha_col, int col_idx, const double* x_col, int aux,
+                                  int ext, const double* fit_i, const double* raw_i,
+                                  const double* fit_j, const double* res_j, double* bar_fit_i,
+                                  double* bar_raw_i, double* bar_fit_j, double* bar_res_j) {
+  // Accumulates bar_M += alpha_row * e_{row_idx} y_row^T + alpha_col * x_col e_{col_idx}^T.
+  if (alpha_row == 0.0 && alpha_col == 0.0) return;
+  for (int A = 0; A < aux; ++A) {
+    const Size row = Size(A) * ext;
+    const double* fi = fit_i + row;
+    const double* ri = raw_i + row;
+    const double* fj = fit_j + row;
+    const double* sj = res_j + row;
+    double* bfi = bar_fit_i + row;
+    double* bri = bar_raw_i + row;
+    double* bfj = bar_fit_j + row;
+    double* bsj = bar_res_j + row;
+    if (alpha_row != 0.0) {
+      double sy = 0.0, fy = 0.0;
+      for (int p = 0; p < ext; ++p) {
+        const double yp = y_row[p];
+        sy += sj[p] * yp;
+        fy += fj[p] * yp;
+      }
+      bfi[row_idx] += alpha_row * sy;
+      bri[row_idx] += alpha_row * fy;
+      const double afi = alpha_row * fi[row_idx];
+      const double ari = alpha_row * ri[row_idx];
+      for (int p = 0; p < ext; ++p) {
+        const double yp = y_row[p];
+        bsj[p] += afi * yp;
+        bfj[p] += ari * yp;
+      }
+    }
+    if (alpha_col != 0.0) {
+      double fx = 0.0, rx = 0.0;
+      for (int p = 0; p < ext; ++p) {
+        const double xp = x_col[p];
+        fx += fi[p] * xp;
+        rx += ri[p] * xp;
+      }
+      bsj[col_idx] += alpha_col * fx;
+      bfj[col_idx] += alpha_col * rx;
+      const double asj = alpha_col * sj[col_idx];
+      const double afj = alpha_col * fj[col_idx];
+      for (int p = 0; p < ext; ++p) {
+        const double xp = x_col[p];
+        bfi[p] += asj * xp;
+        bri[p] += afj * xp;
+      }
+    }
+  }
+}
+
+void robust_rmatvec_host(const double* fit_i, const double* raw_i, const double* fit_j,
+                         const double* res_j, int aux, int ext, const double* y, double* out) {
+  // out = (fit_i^T res_j + raw_i^T fit_j) y
+  std::fill_n(out, ext, 0.0);
+  for (int A = 0; A < aux; ++A) {
+    const Size row = Size(A) * ext;
+    const double* fi = fit_i + row;
+    const double* ri = raw_i + row;
+    const double* fj = fit_j + row;
+    const double* sj = res_j + row;
+    double sy = 0.0, fy = 0.0;
+    for (int p = 0; p < ext; ++p) {
+      const double yp = y[p];
+      sy += sj[p] * yp;
+      fy += fj[p] * yp;
+    }
+    for (int p = 0; p < ext; ++p) out[p] += fi[p] * sy + ri[p] * fy;
+  }
+}
+
+void robust_lmatvec_host(const double* fit_i, const double* raw_i, const double* fit_j,
+                         const double* res_j, int aux, int ext, const double* x, double* out) {
+  // out = (fit_i^T res_j + raw_i^T fit_j)^T x
+  std::fill_n(out, ext, 0.0);
+  for (int A = 0; A < aux; ++A) {
+    const Size row = Size(A) * ext;
+    const double* fi = fit_i + row;
+    const double* ri = raw_i + row;
+    const double* fj = fit_j + row;
+    const double* sj = res_j + row;
+    double fx = 0.0, rx = 0.0;
+    for (int p = 0; p < ext; ++p) {
+      const double xp = x[p];
+      fx += fi[p] * xp;
+      rx += ri[p] * xp;
+    }
+    for (int p = 0; p < ext; ++p) out[p] += fx * sj[p] + rx * fj[p];
+  }
+}
+
+void robust_row_host(const double* fit_i, const double* raw_i, const double* fit_j,
+                     const double* res_j, int aux, int ext, int row_idx, double* out) {
+  // out[q] = M[row_idx, q]
+  std::fill_n(out, ext, 0.0);
+  for (int A = 0; A < aux; ++A) {
+    const Size row = Size(A) * ext;
+    const double f_val = fit_i[row + row_idx];
+    const double r_val = raw_i[row + row_idx];
+    const double* fj = fit_j + row;
+    const double* sj = res_j + row;
+    for (int p = 0; p < ext; ++p) out[p] += f_val * sj[p] + r_val * fj[p];
+  }
+}
+
+void robust_col_host(const double* fit_i, const double* raw_i, const double* fit_j,
+                     const double* res_j, int aux, int ext, int col_idx, double* out) {
+  // out[p] = M[p, col_idx]
+  std::fill_n(out, ext, 0.0);
+  for (int A = 0; A < aux; ++A) {
+    const Size row = Size(A) * ext;
+    const double s_val = res_j[row + col_idx];
+    const double f_val = fit_j[row + col_idx];
+    const double* fi = fit_i + row;
+    const double* ri = raw_i + row;
+    for (int p = 0; p < ext; ++p) out[p] += fi[p] * s_val + ri[p] * f_val;
+  }
+}
+
+void matvec_host(bool trans, const double* M, int ext, const double* x, double* y) {
+  std::fill_n(y, ext, 0.0);
+  if (!trans) {
+    for (int p = 0; p < ext; ++p) {
+      const double* mp = M + Size(p) * ext;
+      double acc = 0.0;
+      for (int q = 0; q < ext; ++q) acc += mp[q] * x[q];
+      y[p] = acc;
+    }
+  } else {
+    for (int p = 0; p < ext; ++p) {
+      const double xp = x[p];
+      if (xp == 0.0) continue;
+      const double* mp = M + Size(p) * ext;
+      for (int q = 0; q < ext; ++q) y[q] += mp[q] * xp;
+    }
+  }
+}
+
+void add_outer_host(double alpha, const double* x, const double* y, int ext, double* M) {
+  if (alpha == 0.0) return;
+  for (int p = 0; p < ext; ++p) {
+    const double ax = alpha * x[p];
+    if (ax == 0.0) continue;
+    double* mp = M + Size(p) * ext;
+    for (int q = 0; q < ext; ++q) mp[q] += ax * y[q];
+  }
+}
+
+void zero_p_blocks_host(double* M, int oa, int ob, int obs, int ext) {
+  // Zeroes the strong-orthogonality complement P = (obs,obs) U (oa,c) U (c,ob).
+  const int c = ext - obs;
+  for (int p = 0; p < obs; ++p) std::fill_n(M + Size(p) * ext, obs, 0.0);
+  for (int p = 0; p < oa; ++p) std::fill_n(M + Size(p) * ext + obs, c, 0.0);
+  for (int p = obs; p < ext; ++p) std::fill_n(M + Size(p) * ext, ob, 0.0);
+}
+
+void b_overlap_pullback_host(double scale, const double* A, const double* B, const double* F,
+                             const double* K, int o, int obs, int ext, double* bar_A, double* bar_B,
+                             double* bar_F, double* bar_K) {
+  // Exact adjoint of scale * eval_b_overlap_host(compute_b_left(A, F, K), B).
+  if (scale == 0.0) return;
+  const int v = obs - o;
+  const int c = ext - obs;
+  // Term 0: -scale * <A @ K, B>
+  rm_gemm_host(false, true, ext, ext, ext, -scale, B, ext, K, ext, 1.0, bar_A, ext);
+  rm_gemm_host(false, false, ext, ext, ext, -scale, A, ext, K, ext, 1.0, bar_B, ext);
+  rm_gemm_host(true, false, ext, ext, ext, -scale, A, ext, B, ext, 1.0, bar_K, ext);
+  // Term 1: -scale * <A[:o, :] @ F, B[:o, :]>
+  rm_gemm_host(false, true, o, ext, ext, -scale, B, ext, F, ext, 1.0, bar_A, ext);
+  rm_gemm_host(false, false, o, ext, ext, -scale, A, ext, F, ext, 1.0, bar_B, ext);
+  rm_gemm_host(true, false, ext, ext, o, -scale, A, ext, B, ext, 1.0, bar_F, ext);
+  // Term 2: +scale * <A[obs:, :o] @ F[:o, :o], B[obs:, :o]>
+  rm_gemm_host(false, true, c, o, o, scale, B + Size(obs) * ext, ext, F, ext, 1.0,
+               bar_A + Size(obs) * ext, ext);
+  rm_gemm_host(false, false, c, o, o, scale, A + Size(obs) * ext, ext, F, ext, 1.0,
+               bar_B + Size(obs) * ext, ext);
+  rm_gemm_host(true, false, o, o, c, scale, A + Size(obs) * ext, ext, B + Size(obs) * ext, ext, 1.0,
+               bar_F, ext);
+  // Term 3: -scale * <A[o:obs, :obs] @ F[:obs, :obs], B[o:obs, :obs]>
+  rm_gemm_host(false, true, v, obs, obs, -scale, B + Size(o) * ext, ext, F, ext, 1.0,
+               bar_A + Size(o) * ext, ext);
+  rm_gemm_host(false, false, v, obs, obs, -scale, A + Size(o) * ext, ext, F, ext, 1.0,
+               bar_B + Size(o) * ext, ext);
+  rm_gemm_host(true, false, obs, obs, v, -scale, A + Size(o) * ext, ext, B + Size(o) * ext, ext,
+               1.0, bar_F, ext);
+  // Term 4: -2 * scale * <A[obs:, :] @ F[:o, :]^T, B[obs:, :o]>
+  rm_gemm_host(false, false, c, ext, o, -2.0 * scale, B + Size(obs) * ext, ext, F, ext, 1.0,
+               bar_A + Size(obs) * ext, ext);
+  rm_gemm_host(false, true, c, o, ext, -2.0 * scale, A + Size(obs) * ext, ext, F, ext, 1.0,
+               bar_B + Size(obs) * ext, ext);
+  rm_gemm_host(true, false, o, ext, c, -2.0 * scale, B + Size(obs) * ext, ext,
+               A + Size(obs) * ext, ext, 1.0, bar_F, ext);
+  // Term 5: -2 * scale * <A[o:obs, :obs] @ F[:obs, obs:], B[o:obs, obs:]>
+  rm_gemm_host(false, true, v, obs, c, -2.0 * scale, B + Size(o) * ext + obs, ext, F + obs, ext,
+               1.0, bar_A + Size(o) * ext, ext);
+  rm_gemm_host(false, false, v, c, obs, -2.0 * scale, A + Size(o) * ext, ext, F + obs, ext, 1.0,
+               bar_B + Size(o) * ext + obs, ext);
+  rm_gemm_host(true, false, obs, c, v, -2.0 * scale, A + Size(o) * ext, ext,
+               B + Size(o) * ext + obs, ext, 1.0, bar_F + obs, ext);
+}
+
+void weight_rank1_pullback_host(double coeff, const double* x, const double* y, const double* Sab,
+                                int aux, int ext, const double* fit_i, const double* raw_i,
+                                const double* fit_j, const double* res_j, double* bar_fit_i,
+                                double* bar_raw_i, double* bar_fit_j, double* bar_res_j,
+                                double* bar_Sab, std::vector<double>& sy_buf,
+                                std::vector<double>& stx_buf, std::vector<double>& mv1_buf,
+                                std::vector<double>& mv2_buf) {
+  // Exact adjoint of <coeff * x y^T, W(M)> wrt M and Sab, where W(M) = (3/8)M + (1/8) Sab M^T Sab.
+  if (coeff == 0.0) return;
+  matvec_host(false, Sab, ext, y, sy_buf.data());
+  matvec_host(true, Sab, ext, x, stx_buf.data());
+  // bar_M += (3/8) coeff * x y^T + (1/8) coeff * (Sab y)(Sab^T x)^T
+  robust_bilin_pullback_host(0.375 * coeff, x, y, aux, ext, fit_i, raw_i, fit_j, res_j, bar_fit_i,
+                             bar_raw_i, bar_fit_j, bar_res_j);
+  robust_bilin_pullback_host(0.125 * coeff, sy_buf.data(), stx_buf.data(), aux, ext, fit_i, raw_i,
+                             fit_j, res_j, bar_fit_i, bar_raw_i, bar_fit_j, bar_res_j);
+  // bar_Sab += (1/8) coeff * ( x (M^T (Sab y))^T + (M (Sab^T x)) y^T )
+  if (bar_Sab) {
+    robust_lmatvec_host(fit_i, raw_i, fit_j, res_j, aux, ext, sy_buf.data(), mv1_buf.data());
+    robust_rmatvec_host(fit_i, raw_i, fit_j, res_j, aux, ext, stx_buf.data(), mv2_buf.data());
+    add_outer_host(0.125 * coeff, x, mv1_buf.data(), ext, bar_Sab);
+    add_outer_host(0.125 * coeff, mv2_buf.data(), y, ext, bar_Sab);
+  }
+}
+
+void weight_rmatvec_host(const double* Sab, const double* fit_i, const double* raw_i,
+                         const double* fit_j, const double* res_j, int aux, int ext,
+                         const double* y, double* out, std::vector<double>& tmp1,
+                         std::vector<double>& tmp2) {
+  // out = W(M) y = (3/8) M y + (1/8) Sab (M^T (Sab y))
+  robust_rmatvec_host(fit_i, raw_i, fit_j, res_j, aux, ext, y, out);
+  matvec_host(false, Sab, ext, y, tmp1.data());
+  robust_lmatvec_host(fit_i, raw_i, fit_j, res_j, aux, ext, tmp1.data(), tmp2.data());
+  matvec_host(false, Sab, ext, tmp2.data(), tmp1.data());
+  for (int p = 0; p < ext; ++p) out[p] = 0.375 * out[p] + 0.125 * tmp1[p];
+}
+
+void weight_lmatvec_host(const double* Sab, const double* fit_i, const double* raw_i,
+                         const double* fit_j, const double* res_j, int aux, int ext,
+                         const double* x, double* out, std::vector<double>& tmp1,
+                         std::vector<double>& tmp2) {
+  // out = W(M)^T x = (3/8) M^T x + (1/8) Sab^T (M (Sab^T x))
+  robust_lmatvec_host(fit_i, raw_i, fit_j, res_j, aux, ext, x, out);
+  matvec_host(true, Sab, ext, x, tmp1.data());
+  robust_rmatvec_host(fit_i, raw_i, fit_j, res_j, aux, ext, tmp1.data(), tmp2.data());
+  matvec_host(true, Sab, ext, tmp2.data(), tmp1.data());
+  for (int p = 0; p < ext; ++p) out[p] = 0.375 * out[p] + 0.125 * tmp1[p];
+}
+
+int eval_same_spin_or_rhf_pair_response_host(
+    int i, int j, bool compute_both_rhf, bool include_f12, bool include_ordinary, double wij, int o,
+    int obs, int ext, int aux, const double* fit_i, const double* fit_j, const double* raw_coul_i,
+    const double* raw_coul_j, const double* raw_g_i, const double* res_g_j, const double* raw_sq_i,
+    const double* res_sq_j, const double* raw_gc_i, const double* res_gc_j, const double* raw_dc_i,
+    const double* res_dc_j, const double* F, const double* K, const double* H, double& e_f12_ss,
+    double& e_ord_ss, double& e_f12_os, double& e_ord_os, double* bar_fit_i, double* bar_fit_j,
+    double* bar_raw_coul_i, double* bar_raw_coul_j, double* bar_raw_g_i, double* bar_res_g_j,
+    double* bar_res_os_g_j, double* bar_raw_sq_i, double* bar_res_sq_j, double* bar_res_os_sq_j,
+    double* bar_raw_gc_i, double* bar_res_gc_j, double* bar_res_os_gc_j, double* bar_raw_dc_i,
+    double* bar_res_dc_j, double* bar_res_os_dc_j, double* bar_F, double* bar_K,
+    double* bar_cross_overlap) {
+  const int v = obs - o;
+  const int c = ext - obs;
+  const bool diag = (i == j);
+  const Size ee = Size(ext) * ext;
+  e_f12_ss = 0.0;
+  e_ord_ss = 0.0;
+  e_f12_os = 0.0;
+  e_ord_os = 0.0;
+  if (!include_f12 && !include_ordinary) return 0;
+
+  const double s_f12 = include_f12 ? wij : 0.0;
+  const double s_ord = include_ordinary ? wij : 0.0;
+  // For closed-shell RHF diagonal (i == j), AB(i, i) is a single spin pair whose
+  // spin-symmetrized alpha/beta pullback shares 0.5x into alpha (mirrored to beta),
+  // whereas off-diagonal i < j already pairs AA+BB and AB(i,j)+AB(j,i) at 1.0x alpha.
+  const double spin_scale = (compute_both_rhf && diag) ? 0.5 : 1.0;
+
+  const double occ_sum = F[Size(i) * ext + i] + F[Size(j) * ext + j];
+
+  if (!include_f12) {
+    // Ordinary-only fast path (no geminal / Fock / exchange / cross_overlap work).
+    std::vector<double> G_vv(Size(v) * v, 0.0);
+    rm_gemm_host(true, false, v, v, aux, 1.0, fit_i + o, ext, raw_coul_j + o, ext, 0.0,
+                 G_vv.data(), v);
+    std::vector<double> bar_G_vv(Size(v) * v, 0.0);
+    std::vector<double> bar_G_vv_os(compute_both_rhf && !diag ? Size(v) * v : 0, 0.0);
+    double bar_occ_sum = 0.0;
+    if (diag) {
+      double os_gg = 0.0;
+      for (int a = 0; a < v; ++a) {
+        const double ea = F[Size(o + a) * ext + (o + a)];
+        for (int b = 0; b < v; ++b) {
+          const double gap = ea + F[Size(o + b) * ext + (o + b)] - occ_sum;
+          if (!std::isfinite(gap) || gap == 0.0) return -4;
+          const double inv_g = 1.0 / gap;
+          const double gab = G_vv[Size(a) * v + b];
+          os_gg += gab * gab * inv_g;
+          bar_G_vv[Size(a) * v + b] = -2.0 * s_ord * gab * inv_g;
+          const double bar_gap = s_ord * gab * gab * inv_g * inv_g;
+          bar_F[Size(o + a) * ext + (o + a)] += spin_scale * bar_gap;
+          bar_F[Size(o + b) * ext + (o + b)] += spin_scale * bar_gap;
+          bar_occ_sum -= bar_gap;
+        }
+      }
+      e_ord_os = -os_gg;
+      bar_F[Size(i) * ext + i] += spin_scale * 2.0 * bar_occ_sum;
+    } else {
+      double ss_gg = 0.0, os_gg = 0.0;
+      for (int a = 0; a < v; ++a) {
+        const double ea = F[Size(o + a) * ext + (o + a)];
+        for (int b = 0; b < v; ++b) {
+          const double gap = ea + F[Size(o + b) * ext + (o + b)] - occ_sum;
+          if (!std::isfinite(gap) || gap == 0.0) return -4;
+          const double inv_g = 1.0 / gap;
+          const double gab = G_vv[Size(a) * v + b];
+          const double gba = G_vv[Size(b) * v + a];
+          const double ag = gab - gba;
+          ss_gg += ag * ag * inv_g;
+          const double bg_ss = -2.0 * s_ord * ag * inv_g;
+          double bgap = 0.5 * s_ord * ag * ag * inv_g * inv_g;
+          bar_G_vv[Size(a) * v + b] = bg_ss;
+          if (compute_both_rhf) {
+            os_gg += gab * gab * inv_g;
+            bar_G_vv_os[Size(a) * v + b] = -2.0 * s_ord * gab * inv_g;
+            bgap += s_ord * gab * gab * inv_g * inv_g;
+          }
+          bar_F[Size(o + a) * ext + (o + a)] += bgap;
+          bar_F[Size(o + b) * ext + (o + b)] += bgap;
+          bar_occ_sum -= bgap;
+        }
+      }
+      e_ord_ss = -0.5 * ss_gg;
+      if (compute_both_rhf) e_ord_os = -os_gg;
+      bar_F[Size(i) * ext + i] += bar_occ_sum;
+      bar_F[Size(j) * ext + j] += bar_occ_sum;
+    }
+    if (compute_both_rhf && !diag) {
+      for (Size idx = 0; idx < bar_G_vv.size(); ++idx) bar_G_vv[idx] += 0.5 * bar_G_vv_os[idx];
+      rm_gemm_host(false, true, aux, v, v, 1.0, raw_coul_j + o, ext, bar_G_vv.data(), v, 1.0,
+                   bar_fit_i + o, ext);
+      rm_gemm_host(false, false, aux, v, v, 1.0, fit_i + o, ext, bar_G_vv.data(), v, 1.0,
+                   bar_raw_coul_j + o, ext);
+      rm_gemm_host(false, false, aux, v, v, 0.5, raw_coul_i + o, ext, bar_G_vv_os.data(), v, 1.0,
+                   bar_fit_j + o, ext);
+      rm_gemm_host(false, true, aux, v, v, 0.5, fit_j + o, ext, bar_G_vv_os.data(), v, 1.0,
+                   bar_raw_coul_i + o, ext);
+    } else {
+      rm_gemm_host(false, true, aux, v, v, spin_scale, raw_coul_j + o, ext, bar_G_vv.data(), v, 1.0,
+                   bar_fit_i + o, ext);
+      rm_gemm_host(false, false, aux, v, v, spin_scale, fit_i + o, ext, bar_G_vv.data(), v, 1.0,
+                   bar_raw_coul_j + o, ext);
+    }
+    return 0;
+  }
+
+  // Forward pass (identical to eval_same_spin_or_rhf_pair_host).
+  std::vector<double> f0(ee, 0.0);
+  rm_gemm_host(true, false, ext, ext, aux, 1.0, fit_i, ext, res_g_j, ext, 0.0, f0.data(), ext);
+  rm_gemm_host(true, false, ext, ext, aux, 1.0, raw_g_i, ext, fit_j, ext, 1.0, f0.data(), ext);
+
+  std::vector<double> ft;
+  if (!diag) {
+    ft.resize(ee);
+    for (int p = 0; p < ext; ++p) {
+      for (int r = 0; r < ext; ++r) ft[Size(p) * ext + r] = f0[Size(r) * ext + p];
+    }
+  }
+
+  std::vector<double> G_obs(Size(obs) * obs, 0.0);
+  std::vector<double> G_oc(Size(o) * c, 0.0);
+  std::vector<double> G_co(Size(c) * o, 0.0);
+  rm_gemm_host(true, false, obs, obs, aux, 1.0, fit_i, ext, raw_coul_j, ext, 0.0, G_obs.data(),
+               obs);
+  rm_gemm_host(true, false, o, c, aux, 1.0, fit_i, ext, raw_coul_j + obs, ext, 0.0, G_oc.data(), c);
+  rm_gemm_host(true, false, c, o, aux, 1.0, fit_i + obs, ext, raw_coul_j, ext, 0.0, G_co.data(), o);
+
+  const double fg_ij = robust_elem_host(fit_i, raw_gc_i, fit_j, res_gc_j, aux, ext, i, j);
+  const double f2_ij = robust_elem_host(fit_i, raw_sq_i, fit_j, res_sq_j, aux, ext, i, j);
+  const double uf_ij = robust_elem_host(fit_i, raw_dc_i, fit_j, res_dc_j, aux, ext, i, j);
+
+  // Extract rows/columns of M_sq needed for both forward sq_fk and reverse bar_F/bar_K/bar_Sab.
+  std::vector<double> m_row_i(ext), m_col_j(ext), m_row_j(ext), m_col_i(ext);
+  robust_row_host(fit_i, raw_sq_i, fit_j, res_sq_j, aux, ext, i, m_row_i.data());
+  robust_col_host(fit_i, raw_sq_i, fit_j, res_sq_j, aux, ext, j, m_col_j.data());
+  if (!diag) {
+    robust_row_host(fit_i, raw_sq_i, fit_j, res_sq_j, aux, ext, j, m_row_j.data());
+    robust_col_host(fit_i, raw_sq_i, fit_j, res_sq_j, aux, ext, i, m_col_i.data());
+  } else {
+    m_row_j = m_row_i;
+    m_col_i = m_col_j;
+  }
+
+  const double* hi = H + Size(i) * ext;
+  const double* hj = H + Size(j) * ext;
+  double sq_fk_d = 0.0, sq_fk_x = 0.0;
+  for (int p = 0; p < ext; ++p) {
+    sq_fk_d += m_row_i[p] * hj[p] + m_col_j[p] * hi[p];
+    if (!diag) sq_fk_x += m_row_j[p] * hi[p] + m_col_i[p] * hj[p];
+  }
+
+  const double V_d = fg_ij - dot_rect_host(G_obs.data(), obs, f0.data(), ext, obs, obs) -
+                     dot_rect_host(G_oc.data(), c, f0.data() + obs, ext, o, c) -
+                     dot_rect_host(G_co.data(), o, f0.data() + Size(obs) * ext, ext, c, o);
+  const double X_d = f2_ij - sqnorm_rect_host(f0.data(), ext, obs, obs) -
+                     sqnorm_rect_host(f0.data() + obs, ext, o, c) -
+                     sqnorm_rect_host(f0.data() + Size(obs) * ext, ext, c, o);
+
+  BLeftScratchHost Lf, Lft;
+  compute_b_left_host(f0.data(), F, K, o, obs, ext, Lf);
+  double B_d = 0.0, V_x = 0.0, X_x = 0.0, B_x = 0.0;
+  if (diag) {
+    B_d = uf_ij + sq_fk_d + 2.0 * eval_b_overlap_host(Lf, f0.data(), o, obs, ext);
+  } else {
+    const double fg_ji = robust_elem_host(fit_i, raw_gc_i, fit_j, res_gc_j, aux, ext, j, i);
+    const double f2_ji = robust_elem_host(fit_i, raw_sq_i, fit_j, res_sq_j, aux, ext, j, i);
+    const double uf_ji = robust_elem_host(fit_i, raw_dc_i, fit_j, res_dc_j, aux, ext, j, i);
+    V_x = fg_ji - dot_rect_host(G_obs.data(), obs, ft.data(), ext, obs, obs) -
+          dot_rect_host(G_oc.data(), c, ft.data() + obs, ext, o, c) -
+          dot_rect_host(G_co.data(), o, ft.data() + Size(obs) * ext, ext, c, o);
+    X_x = f2_ji - dot_rect_host(f0.data(), ext, ft.data(), ext, obs, obs) -
+          dot_rect_host(f0.data() + obs, ext, ft.data() + obs, ext, o, c) -
+          dot_rect_host(f0.data() + Size(obs) * ext, ext, ft.data() + Size(obs) * ext, ext, c, o);
+    compute_b_left_host(ft.data(), F, K, o, obs, ext, Lft);
+    B_d = uf_ij + sq_fk_d + eval_b_overlap_host(Lf, f0.data(), o, obs, ext) +
+          eval_b_overlap_host(Lft, ft.data(), o, obs, ext);
+    B_x = uf_ji + sq_fk_x + eval_b_overlap_host(Lf, ft.data(), o, obs, ext) +
+          eval_b_overlap_host(Lft, f0.data(), o, obs, ext);
+  }
+
+  std::vector<double> C_d(Size(v) * v, 0.0);
+  rm_gemm_host(false, true, v, v, c, 1.0, f0.data() + Size(o) * ext + obs, ext,
+               F + Size(o) * ext + obs, ext, 0.0, C_d.data(), v);
+  rm_gemm_host(false, false, v, v, c, 1.0, F + Size(o) * ext + obs, ext,
+               f0.data() + Size(obs) * ext + o, ext, 1.0, C_d.data(), v);
+
+  // Reverse Step 1: virtual denominator contraction & scalar weights.
+  std::vector<double> bar_C_d(Size(v) * v, 0.0);
+  std::vector<double> bar_C_os;
+  if (compute_both_rhf) bar_C_os.assign(Size(v) * v, 0.0);
+  std::vector<double> bar_G_obs(Size(obs) * obs, 0.0);
+  std::vector<double> bar_G_oc(Size(o) * c, 0.0);
+  std::vector<double> bar_G_co(Size(c) * o, 0.0);
+  const bool split_rhf_offdiag = (compute_both_rhf && !diag);
+  std::vector<double> bar_G_obs_os(split_rhf_offdiag ? Size(obs) * obs : 0, 0.0);
+  std::vector<double> bar_G_oc_os(split_rhf_offdiag ? Size(o) * c : 0, 0.0);
+  std::vector<double> bar_G_co_os(split_rhf_offdiag ? Size(c) * o : 0, 0.0);
+
+  double bar_V_d = 0.0, bar_V_x = 0.0;
+  double bar_X_d = 0.0, bar_X_x = 0.0;
+  double bar_B_d_ss = 0.0, bar_B_d_os = 0.0, bar_B_x_os = 0.0;
+  double bar_occ_sum = 0.0;
+
+  if (diag) {
+    // Closed-shell RHF diagonal AB(i, i) only.
+    double vd_cg = 0.0, bd_cc = 0.0, os_gg = 0.0;
+    bar_V_d = s_f12;
+    bar_B_d_os = 0.25 * s_f12;
+    bar_X_d = -0.25 * s_f12 * occ_sum;
+    bar_occ_sum = -0.25 * s_f12 * X_d;
+    for (int a = 0; a < v; ++a) {
+      const double ea = F[Size(o + a) * ext + (o + a)];
+      for (int b = 0; b < v; ++b) {
+        const double gap = ea + F[Size(o + b) * ext + (o + b)] - occ_sum;
+        if (!std::isfinite(gap) || gap == 0.0) return -4;
+        const double inv_g = 1.0 / gap;
+        const double gab = G_obs[Size(o + a) * obs + (o + b)];
+        const double cab = C_d[Size(a) * v + b];
+        vd_cg += cab * gab * inv_g;
+        bd_cc += cab * cab * inv_g;
+        if (include_ordinary) os_gg += gab * gab * inv_g;
+
+        const double c_os = 0.5 * cab;
+        const double bc_os = -2.0 * s_f12 * (gab + c_os) * inv_g;
+        bar_C_os[Size(a) * v + b] = bc_os;
+        bar_C_d[Size(a) * v + b] = 0.5 * bc_os;
+        bar_G_obs[Size(o + a) * obs + (o + b)] = (-s_f12 * cab - 2.0 * s_ord * gab) * inv_g;
+        const double bar_inv_g =
+            -s_f12 * (cab * gab + 0.25 * cab * cab) - s_ord * gab * gab;
+        const double bar_gap = -bar_inv_g * inv_g * inv_g;
+        bar_F[Size(o + a) * ext + (o + a)] += spin_scale * bar_gap;
+        bar_F[Size(o + b) * ext + (o + b)] += spin_scale * bar_gap;
+        bar_occ_sum -= bar_gap;
+      }
+    }
+    e_f12_os = (V_d - vd_cg) + 0.25 * (B_d - occ_sum * X_d - bd_cc);
+    if (include_ordinary) e_ord_os = -os_gg;
+    bar_F[Size(i) * ext + i] += spin_scale * 2.0 * bar_occ_sum;
+  } else {
+    double ss_gc = 0.0, ss_cc = 0.0, ss_gg = 0.0;
+    double os_term = 0.0, os_gg = 0.0;
+    bar_V_d = 0.5 * s_f12;
+    bar_V_x = -0.5 * s_f12;
+    bar_B_d_ss = (1.0 / 16.0) * s_f12;
+    bar_X_d = -(1.0 / 16.0) * s_f12 * occ_sum;
+    bar_X_x = (1.0 / 16.0) * s_f12 * occ_sum;
+    bar_occ_sum = -(1.0 / 16.0) * s_f12 * (X_d - X_x);
+    if (compute_both_rhf) {
+      bar_V_d += 0.75 * s_f12;
+      bar_V_x += 0.25 * s_f12;
+      bar_B_d_os = (5.0 / 32.0) * s_f12;
+      bar_B_x_os = (3.0 / 32.0) * s_f12;
+      bar_X_d -= (5.0 / 32.0) * s_f12 * occ_sum;
+      bar_X_x -= (3.0 / 32.0) * s_f12 * occ_sum;
+      bar_occ_sum -= s_f12 * ((5.0 / 32.0) * X_d + (3.0 / 32.0) * X_x);
+    }
+
+    std::vector<double> bar_ag(Size(v) * v, 0.0);
+    std::vector<double> bar_ac(Size(v) * v, 0.0);
+    for (int a = 0; a < v; ++a) {
+      const double ea = F[Size(o + a) * ext + (o + a)];
+      for (int b = 0; b < v; ++b) {
+        const double gap = ea + F[Size(o + b) * ext + (o + b)] - occ_sum;
+        if (!std::isfinite(gap) || gap == 0.0) return -4;
+        const double inv_g = 1.0 / gap;
+        const double gab = G_obs[Size(o + a) * obs + (o + b)];
+        const double gba = G_obs[Size(o + b) * obs + (o + a)];
+        const double cab = C_d[Size(a) * v + b];
+        const double cba = C_d[Size(b) * v + a];
+        const double ag = gab - gba;
+        const double ac = cab - cba;
+        ss_gc += ag * ac * inv_g;
+        ss_cc += ac * ac * inv_g;
+        if (include_ordinary) ss_gg += ag * ag * inv_g;
+
+        bar_ag[Size(a) * v + b] = (-0.25 * s_f12 * ac - s_ord * ag) * inv_g;
+        bar_ac[Size(a) * v + b] = (-0.25 * s_f12 * ag - (1.0 / 16.0) * s_f12 * ac) * inv_g;
+        double bar_inv_g =
+            -0.25 * s_f12 * ag * ac - (1.0 / 32.0) * s_f12 * ac * ac - 0.5 * s_ord * ag * ag;
+
+        if (compute_both_rhf) {
+          const double c_os = 0.375 * cab + 0.125 * cba;
+          os_term += c_os * (2.0 * gab + c_os) * inv_g;
+          if (include_ordinary) os_gg += gab * gab * inv_g;
+
+          bar_C_os[Size(a) * v + b] = -2.0 * s_f12 * (gab + c_os) * inv_g;
+          bar_G_obs_os[Size(o + a) * obs + (o + b)] +=
+              (-2.0 * s_f12 * c_os - 2.0 * s_ord * gab) * inv_g;
+          bar_inv_g += -s_f12 * c_os * (2.0 * gab + c_os) - s_ord * gab * gab;
+        }
+        const double bar_gap = -bar_inv_g * inv_g * inv_g;
+        bar_F[Size(o + a) * ext + (o + a)] += bar_gap;
+        bar_F[Size(o + b) * ext + (o + b)] += bar_gap;
+        bar_occ_sum -= bar_gap;
+      }
+    }
+    for (int a = 0; a < v; ++a) {
+      for (int b = 0; b < v; ++b) {
+        bar_G_obs[Size(o + a) * obs + (o + b)] +=
+            bar_ag[Size(a) * v + b] - bar_ag[Size(b) * v + a];
+        double bc = bar_ac[Size(a) * v + b] - bar_ac[Size(b) * v + a];
+        if (compute_both_rhf) {
+          bc += 0.375 * bar_C_os[Size(a) * v + b] + 0.125 * bar_C_os[Size(b) * v + a];
+        }
+        bar_C_d[Size(a) * v + b] = bc;
+      }
+    }
+    bar_F[Size(i) * ext + i] += bar_occ_sum;
+    bar_F[Size(j) * ext + j] += bar_occ_sum;
+
+    const double lin_ss = (V_d - V_x) - 0.5 * ss_gc;
+    const double quad_ss = ((B_d - B_x) - occ_sum * (X_d - X_x)) - 0.5 * ss_cc;
+    e_f12_ss = 0.5 * lin_ss + (1.0 / 16.0) * quad_ss;
+    if (include_ordinary) e_ord_ss = -0.5 * ss_gg;
+    if (compute_both_rhf) {
+      const double lin_os = 0.375 * V_d + 0.125 * V_x;
+      const double norm_os = (5.0 / 32.0) * X_d + (3.0 / 32.0) * X_x;
+      const double b_os = (5.0 / 32.0) * B_d + (3.0 / 32.0) * B_x;
+      e_f12_os = 2.0 * lin_os + b_os - occ_sum * norm_os - os_term;
+      if (include_ordinary) e_ord_os = -os_gg;
+    }
+  }
+
+  // Reverse Step 2: Coupling C_d pullback -> bar_f0, bar_F[o:obs, obs:].
+  std::vector<double> bar_f0(ee, 0.0);
+  std::vector<double> bar_ft(ee, 0.0);
+  if (!compute_both_rhf) {
+    rm_gemm_host(false, false, v, c, v, 1.0, bar_C_d.data(), v, F + Size(o) * ext + obs, ext, 1.0,
+                 bar_f0.data() + Size(o) * ext + obs, ext);
+    rm_gemm_host(true, false, c, v, v, 1.0, F + Size(o) * ext + obs, ext, bar_C_d.data(), v, 1.0,
+                 bar_f0.data() + Size(obs) * ext + o, ext);
+    rm_gemm_host(true, false, v, c, v, 1.0, bar_C_d.data(), v, f0.data() + Size(o) * ext + obs,
+                 ext, 1.0, bar_F + Size(o) * ext + obs, ext);
+    rm_gemm_host(false, true, v, c, v, 1.0, bar_C_d.data(), v, f0.data() + Size(obs) * ext + o,
+                 ext, 1.0, bar_F + Size(o) * ext + obs, ext);
+  } else {
+    // In RHF spatial, bar_C_d already sums SS + OS for bar_F[o:obs, obs:] (with spin_scale for diag).
+    // For bar_f0: SS uses bar_C_d_ss into bar_f0, while OS accumulates into bar_f_os (also needed for bar_Sab).
+    rm_gemm_host(true, false, v, c, v, spin_scale, bar_C_d.data(), v,
+                 f0.data() + Size(o) * ext + obs, ext, 1.0, bar_F + Size(o) * ext + obs, ext);
+    rm_gemm_host(false, true, v, c, v, spin_scale, bar_C_d.data(), v,
+                 f0.data() + Size(obs) * ext + o, ext, 1.0, bar_F + Size(o) * ext + obs, ext);
+    if (!diag) {
+      // Same-spin only portion of bar_C_d for bar_f0; OS portion is handled cleanly via bar_f_os below.
+      std::vector<double> bar_C_ss(Size(v) * v);
+      for (int a = 0; a < v; ++a) {
+        for (int b = 0; b < v; ++b) {
+          bar_C_ss[Size(a) * v + b] =
+              bar_C_d[Size(a) * v + b] -
+              (0.375 * bar_C_os[Size(a) * v + b] + 0.125 * bar_C_os[Size(b) * v + a]);
+        }
+      }
+      rm_gemm_host(false, false, v, c, v, 1.0, bar_C_ss.data(), v, F + Size(o) * ext + obs, ext,
+                   1.0, bar_f0.data() + Size(o) * ext + obs, ext);
+      rm_gemm_host(true, false, c, v, v, 1.0, F + Size(o) * ext + obs, ext, bar_C_ss.data(), v, 1.0,
+                   bar_f0.data() + Size(obs) * ext + o, ext);
+    }
+  }
+
+  // Reverse Step 3a: Same-spin B_overlap pullback (for i < j):
+  // B_d - B_x overlap part equals B_overlap(f0 - ft, f0 - ft).
+  if (!diag && bar_B_d_ss != 0.0) {
+    std::vector<double> diff_f(ee);
+    for (Size idx = 0; idx < ee; ++idx) diff_f[idx] = f0[idx] - ft[idx];
+    std::vector<double> bar_diff(ee, 0.0);
+    b_overlap_pullback_host(bar_B_d_ss, diff_f.data(), diff_f.data(), F, K, o, obs, ext,
+                            bar_diff.data(), bar_diff.data(), bar_F, bar_K);
+    for (Size idx = 0; idx < ee; ++idx) {
+      bar_f0[idx] += bar_diff[idx];
+      bar_ft[idx] -= bar_diff[idx];
+    }
+  }
+
+  // Reverse Step 3b: Closed-shell RHF opposite-spin pullback (exact f_os, bar_f_os, bar_F, bar_K, bar_Sab).
+  if (compute_both_rhf) {
+    std::vector<double> f_os(ee);
+    if (diag) {
+      for (Size idx = 0; idx < ee; ++idx) f_os[idx] = 0.5 * f0[idx];
+    } else {
+      for (Size idx = 0; idx < ee; ++idx) f_os[idx] = 0.375 * f0[idx] + 0.125 * ft[idx];
+    }
+    std::vector<double> qf_os = f_os;
+    zero_p_blocks_host(qf_os.data(), o, o, obs, ext);
+
+    // bar_F, bar_K from -s_f12 (<f_os, H f_os + f_os H^T>) + s_f12 (<qf_os, F qf_os + qf_os F^T>).
+    // Note for RHF spatial, alpha receives spin_scale * (bar_Fa + bar_Fb).
+    std::vector<double> ff_mat(ee, 0.0);
+    rm_gemm_host(false, true, ext, ext, ext, 1.0, f_os.data(), ext, f_os.data(), ext, 0.0,
+                 ff_mat.data(), ext);
+    rm_gemm_host(true, false, ext, ext, ext, 1.0, f_os.data(), ext, f_os.data(), ext, 1.0,
+                 ff_mat.data(), ext);
+    for (Size idx = 0; idx < ee; ++idx) {
+      const double v_sub = spin_scale * s_f12 * ff_mat[idx];
+      bar_K[idx] -= v_sub;
+      bar_F[idx] -= v_sub;
+    }
+    rm_gemm_host(false, true, ext, ext, ext, spin_scale * s_f12, qf_os.data(), ext, qf_os.data(),
+                 ext, 1.0, bar_F, ext);
+    rm_gemm_host(true, false, ext, ext, ext, spin_scale * s_f12, qf_os.data(), ext, qf_os.data(),
+                 ext, 1.0, bar_F, ext);
+
+    // Build total bar_f_os for AB(i, j) (for both W(bar_f_os)->bar_f0 and bar_Sab!).
+    std::vector<double> bar_f_os(ee, 0.0);
+    // From coupling C_os:
+    rm_gemm_host(false, false, v, c, v, 1.0, bar_C_os.data(), v, F + Size(o) * ext + obs, ext, 1.0,
+                 bar_f_os.data() + Size(o) * ext + obs, ext);
+    rm_gemm_host(true, false, c, v, v, 1.0, F + Size(o) * ext + obs, ext, bar_C_os.data(), v, 1.0,
+                 bar_f_os.data() + Size(obs) * ext + o, ext);
+    // From -s_f12 (<f_os, H f_os + f_os H^T>) (with H = H^T in RHF):
+    rm_gemm_host(false, false, ext, ext, ext, -2.0 * s_f12, H, ext, f_os.data(), ext, 1.0,
+                 bar_f_os.data(), ext);
+    rm_gemm_host(false, false, ext, ext, ext, -2.0 * s_f12, f_os.data(), ext, H, ext, 1.0,
+                 bar_f_os.data(), ext);
+    // From +s_f12 (<qf_os, F qf_os + qf_os F^T>) (with F = F^T in RHF):
+    std::vector<double> bar_qf_os(ee, 0.0);
+    rm_gemm_host(false, false, ext, ext, ext, 2.0 * s_f12, F, ext, qf_os.data(), ext, 0.0,
+                 bar_qf_os.data(), ext);
+    rm_gemm_host(false, false, ext, ext, ext, 2.0 * s_f12, qf_os.data(), ext, F, ext, 1.0,
+                 bar_qf_os.data(), ext);
+    zero_p_blocks_host(bar_qf_os.data(), o, o, obs, ext);
+    for (Size idx = 0; idx < ee; ++idx) bar_f_os[idx] += bar_qf_os[idx];
+    // From linear (-2 * s_f12 * <G, pf_os>) and norm (+2 * s_f12 * occ_sum * <f_os, pf_os>):
+    const double n_coef = 2.0 * s_f12 * occ_sum;
+    for (int p = 0; p < obs; ++p) {
+      for (int r = 0; r < obs; ++r) {
+        bar_f_os[Size(p) * ext + r] +=
+            -2.0 * s_f12 * G_obs[Size(p) * obs + r] + n_coef * f_os[Size(p) * ext + r];
+      }
+    }
+    for (int p = 0; p < o; ++p) {
+      for (int q = 0; q < c; ++q) {
+        bar_f_os[Size(p) * ext + (obs + q)] +=
+            -2.0 * s_f12 * G_oc[Size(p) * c + q] + n_coef * f_os[Size(p) * ext + (obs + q)];
+      }
+    }
+    for (int p = 0; p < c; ++p) {
+      for (int q = 0; q < o; ++q) {
+        bar_f_os[Size(obs + p) * ext + q] +=
+            -2.0 * s_f12 * G_co[Size(p) * o + q] + n_coef * f_os[Size(obs + p) * ext + q];
+      }
+    }
+
+    // Keep bar_f0_os = W(bar_f_os) separate for bar_res_os_g_j (symmetrized AB metric pullback).
+    std::vector<double> bar_f0_os(ee, 0.0);
+    for (int p = 0; p < ext; ++p) {
+      for (int r = 0; r < ext; ++r) {
+        const double v_os =
+            0.375 * bar_f_os[Size(p) * ext + r] + 0.125 * bar_f_os[Size(r) * ext + p];
+        bar_f0_os[Size(p) * ext + r] = v_os;
+      }
+    }
+    rm_gemm_host(false, true, aux, ext, ext, spin_scale, res_g_j, ext, bar_f0_os.data(), ext, 1.0,
+                 bar_fit_i, ext);
+    rm_gemm_host(false, false, aux, ext, ext, spin_scale, fit_i, ext, bar_f0_os.data(), ext, 1.0,
+                 bar_res_os_g_j, ext);
+    rm_gemm_host(false, true, aux, ext, ext, spin_scale, fit_j, ext, bar_f0_os.data(), ext, 1.0,
+                 bar_raw_g_i, ext);
+    rm_gemm_host(false, false, aux, ext, ext, spin_scale, raw_g_i, ext, bar_f0_os.data(), ext, 1.0,
+                 bar_fit_j, ext);
+
+    // Exact bar_cross_overlap at Sab = I for AB(i, j) (and mirrored transpose for AB(j, i) when i < j).
+    if (bar_cross_overlap) {
+      std::vector<double> bar_Sab_ij(ee, 0.0);
+      // 1. From f = W(f0): (1/8) (bar_f_os @ f0 + f0 @ bar_f_os)
+      rm_gemm_host(false, false, ext, ext, ext, 0.125, bar_f_os.data(), ext, f0.data(), ext, 1.0,
+                   bar_Sab_ij.data(), ext);
+      rm_gemm_host(false, false, ext, ext, ext, 0.125, f0.data(), ext, bar_f_os.data(), ext, 1.0,
+                   bar_Sab_ij.data(), ext);
+
+      std::vector<double> bw_v(ext, 0.0), bwT_u(ext, 0.0);
+      // 2. From gc0: bar_w += 2 * s_f12 * gc0
+      std::vector<double> gc_col_i(ext), gc_row_j(ext);
+      robust_col_host(fit_i, raw_gc_i, fit_j, res_gc_j, aux, ext, i, gc_col_i.data());
+      robust_row_host(fit_i, raw_gc_i, fit_j, res_gc_j, aux, ext, j, gc_row_j.data());
+      for (int p = 0; p < ext; ++p) {
+        bw_v[p] += 2.0 * s_f12 * gc_col_i[p];
+        bwT_u[p] += 2.0 * s_f12 * gc_row_j[p];
+      }
+
+      // 3. From uf = W(uf0)
+      std::vector<double> u_col_i(ext), u_row_j(ext), u_col_j(ext), u_row_i(ext);
+      robust_col_host(fit_i, raw_dc_i, fit_j, res_dc_j, aux, ext, i, u_col_i.data());
+      robust_row_host(fit_i, raw_dc_i, fit_j, res_dc_j, aux, ext, j, u_row_j.data());
+      if (!diag) {
+        robust_col_host(fit_i, raw_dc_i, fit_j, res_dc_j, aux, ext, j, u_col_j.data());
+        robust_row_host(fit_i, raw_dc_i, fit_j, res_dc_j, aux, ext, i, u_row_i.data());
+      } else {
+        u_col_j = u_col_i;
+        u_row_i = u_row_j;
+      }
+      const double c3_64 = (3.0 / 64.0) * s_f12;
+      const double c1_64 = (1.0 / 64.0) * s_f12;
+      for (int p = 0; p < ext; ++p) {
+        bar_Sab_ij[Size(i) * ext + p] += c3_64 * u_row_j[p];
+        bar_Sab_ij[Size(p) * ext + j] += c3_64 * u_col_i[p];
+        bar_Sab_ij[Size(j) * ext + p] += c1_64 * u_row_i[p];
+        bar_Sab_ij[Size(p) * ext + i] += c1_64 * u_col_j[p];
+        bw_v[p] += s_f12 * (0.375 * u_col_i[p] + 0.125 * u_row_i[p]);
+        bwT_u[p] += s_f12 * (0.375 * u_row_j[p] + 0.125 * u_col_j[p]);
+      }
+
+      // 4. From ff = W(ff0)
+      std::vector<double> ff0_hi(ext), ff0T_hi(ext), ff0_hj(ext), ff0T_hj(ext);
+      robust_rmatvec_host(fit_i, raw_sq_i, fit_j, res_sq_j, aux, ext, hi, ff0_hi.data());
+      robust_lmatvec_host(fit_i, raw_sq_i, fit_j, res_sq_j, aux, ext, hi, ff0T_hi.data());
+      if (!diag) {
+        robust_rmatvec_host(fit_i, raw_sq_i, fit_j, res_sq_j, aux, ext, hj, ff0_hj.data());
+        robust_lmatvec_host(fit_i, raw_sq_i, fit_j, res_sq_j, aux, ext, hj, ff0T_hj.data());
+      } else {
+        ff0_hj = ff0_hi;
+        ff0T_hj = ff0T_hi;
+      }
+      std::vector<double> x1(ext), x3(ext), y2(ext), y4(ext), ff0_x1(ext), ff0_x3(ext);
+      for (int p = 0; p < ext; ++p) {
+        x1[p] = s_f12 * (hi[p] - (p == i ? occ_sum : 0.0));
+        x3[p] = s_f12 * (hj[p] - (p == j ? occ_sum : 0.0));
+        y2[p] = s_f12 * hj[p];
+        y4[p] = s_f12 * hi[p];
+        ff0_x1[p] = s_f12 * (ff0_hi[p] - occ_sum * m_col_i[p]);
+        ff0_x3[p] = s_f12 * (ff0_hj[p] - occ_sum * m_col_j[p]);
+      }
+      // (3/64) * (x1 m_row_j^T + (ff0 x1) e_j^T + e_i (ff0^T y2)^T + m_col_i y2^T)
+      add_outer_host(3.0 / 64.0, x1.data(), m_row_j.data(), ext, bar_Sab_ij.data());
+      add_outer_host(3.0 / 64.0, m_col_i.data(), y2.data(), ext, bar_Sab_ij.data());
+      // (1/64) * (x3 m_row_i^T + (ff0 x3) e_i^T + e_j (ff0^T y4)^T + m_col_j y4^T)
+      add_outer_host(1.0 / 64.0, x3.data(), m_row_i.data(), ext, bar_Sab_ij.data());
+      add_outer_host(1.0 / 64.0, m_col_j.data(), y4.data(), ext, bar_Sab_ij.data());
+      for (int p = 0; p < ext; ++p) {
+        bar_Sab_ij[Size(p) * ext + j] += (3.0 / 64.0) * ff0_x1[p];
+        bar_Sab_ij[Size(i) * ext + p] += (3.0 / 64.0) * s_f12 * ff0T_hj[p];
+        bar_Sab_ij[Size(p) * ext + i] += (1.0 / 64.0) * ff0_x3[p];
+        bar_Sab_ij[Size(j) * ext + p] += (1.0 / 64.0) * s_f12 * ff0T_hi[p];
+      }
+
+      // bar_w += -s_f12 * occ_sum * ff + s_f12 * (H @ ff + ff @ H)
+      std::vector<double> ff_ei(ext), ffT_ej(ext), h_ff_ei(ext), h_ffT_ej(ext);
+      for (int p = 0; p < ext; ++p) {
+        ff_ei[p] = 0.375 * m_col_i[p] + 0.125 * m_row_i[p];
+        ffT_ej[p] = 0.375 * m_row_j[p] + 0.125 * m_col_j[p];
+      }
+      matvec_host(false, H, ext, ff_ei.data(), h_ff_ei.data());
+      matvec_host(false, H, ext, ffT_ej.data(), h_ffT_ej.data());
+      for (int p = 0; p < ext; ++p) {
+        const double ff_hi_p = 0.375 * ff0_hi[p] + 0.125 * ff0T_hi[p];
+        const double ffT_hj_p = 0.375 * ff0T_hj[p] + 0.125 * ff0_hj[p];
+        bw_v[p] += s_f12 * (-occ_sum * ff_ei[p] + h_ff_ei[p] + ff_hi_p);
+        bwT_u[p] += s_f12 * (-occ_sum * ffT_ej[p] + ffT_hj_p + h_ffT_ej[p]);
+      }
+
+      // Fold bw_v and bwT_u into bar_Sab_ij
+      for (int p = 0; p < ext; ++p) {
+        bar_Sab_ij[Size(p) * ext + j] += 0.125 * bw_v[p];
+        bar_Sab_ij[Size(i) * ext + p] += 0.125 * bwT_u[p];
+      }
+      if (diag) {
+        for (Size idx = 0; idx < ee; ++idx) bar_cross_overlap[idx] += bar_Sab_ij[idx];
+      } else {
+        for (int p = 0; p < ext; ++p) {
+          for (int r = 0; r < ext; ++r) {
+            bar_cross_overlap[Size(p) * ext + r] +=
+                bar_Sab_ij[Size(p) * ext + r] + bar_Sab_ij[Size(r) * ext + p];
+          }
+        }
+      }
+    }
+  }
+
+  // Reverse Step 4: V_d/V_x/X_d/X_x -> bar_G_obs/oc/co and SS part of bar_f0/bar_ft.
+  // (Note: for compute_both_rhf, OS part of bar_f0 was already pulled back via bar_f0_os above.)
+  const double bar_V_d_ss = (!diag) ? (0.5 * s_f12) : 0.0;
+  const double bar_V_x_ss = (!diag) ? (-0.5 * s_f12) : 0.0;
+  const double bar_V_d_os = compute_both_rhf ? (diag ? s_f12 : (0.75 * s_f12)) : 0.0;
+  const double bar_V_x_os = split_rhf_offdiag ? (0.25 * s_f12) : 0.0;
+  const double bar_X_d_ss = (!diag) ? (-(1.0 / 16.0) * s_f12 * occ_sum) : 0.0;
+  const double bar_X_x_ss = (!diag) ? ((1.0 / 16.0) * s_f12 * occ_sum) : 0.0;
+  const double bar_X_d_os =
+      compute_both_rhf ? (-(diag ? 0.25 : (5.0 / 32.0)) * s_f12 * occ_sum) : 0.0;
+  const double bar_X_x_os = split_rhf_offdiag ? (-(3.0 / 32.0) * s_f12 * occ_sum) : 0.0;
+
+  for (int p = 0; p < obs; ++p) {
+    for (int r = 0; r < obs; ++r) {
+      const double fp = f0[Size(p) * ext + r];
+      const double ftp = diag ? fp : ft[Size(p) * ext + r];
+      const double gpr = G_obs[Size(p) * obs + r];
+      if (split_rhf_offdiag) {
+        bar_G_obs[Size(p) * obs + r] -= bar_V_d_ss * fp + bar_V_x_ss * ftp;
+        bar_G_obs_os[Size(p) * obs + r] -= bar_V_d_os * fp + bar_V_x_os * ftp;
+      } else {
+        bar_G_obs[Size(p) * obs + r] -= bar_V_d * fp + bar_V_x * ftp;
+      }
+      if (!diag) {
+        bar_f0[Size(p) * ext + r] -= bar_V_d_ss * gpr + 2.0 * bar_X_d_ss * fp + bar_X_x_ss * ftp;
+        bar_ft[Size(p) * ext + r] -= bar_V_x_ss * gpr + bar_X_x_ss * fp;
+      }
+    }
+  }
+  for (int p = 0; p < o; ++p) {
+    for (int q = 0; q < c; ++q) {
+      const double fp = f0[Size(p) * ext + (obs + q)];
+      const double ftp = diag ? fp : ft[Size(p) * ext + (obs + q)];
+      const double gpq = G_oc[Size(p) * c + q];
+      if (split_rhf_offdiag) {
+        bar_G_oc[Size(p) * c + q] -= bar_V_d_ss * fp + bar_V_x_ss * ftp;
+        bar_G_oc_os[Size(p) * c + q] -= bar_V_d_os * fp + bar_V_x_os * ftp;
+      } else {
+        bar_G_oc[Size(p) * c + q] -= bar_V_d * fp + bar_V_x * ftp;
+      }
+      if (!diag) {
+        bar_f0[Size(p) * ext + (obs + q)] -=
+            bar_V_d_ss * gpq + 2.0 * bar_X_d_ss * fp + bar_X_x_ss * ftp;
+        bar_ft[Size(p) * ext + (obs + q)] -= bar_V_x_ss * gpq + bar_X_x_ss * fp;
+      }
+    }
+  }
+  for (int p = 0; p < c; ++p) {
+    for (int q = 0; q < o; ++q) {
+      const double fp = f0[Size(obs + p) * ext + q];
+      const double ftp = diag ? fp : ft[Size(obs + p) * ext + q];
+      const double gpq = G_co[Size(p) * o + q];
+      if (split_rhf_offdiag) {
+        bar_G_co[Size(p) * o + q] -= bar_V_d_ss * fp + bar_V_x_ss * ftp;
+        bar_G_co_os[Size(p) * o + q] -= bar_V_d_os * fp + bar_V_x_os * ftp;
+      } else {
+        bar_G_co[Size(p) * o + q] -= bar_V_d * fp + bar_V_x * ftp;
+      }
+      if (!diag) {
+        bar_f0[Size(obs + p) * ext + q] -=
+            bar_V_d_ss * gpq + 2.0 * bar_X_d_ss * fp + bar_X_x_ss * ftp;
+        bar_ft[Size(obs + p) * ext + q] -= bar_V_x_ss * gpq + bar_X_x_ss * fp;
+      }
+    }
+  }
+  if (!diag) {
+    for (int p = 0; p < ext; ++p) {
+      for (int r = 0; r < ext; ++r) bar_f0[Size(p) * ext + r] += bar_ft[Size(r) * ext + p];
+    }
+  }
+
+  // Reverse Step 5: Pullback of SS f0, G_obs/G_oc/G_co, and robust-DF scalars into fit/raw/res.
+  if (!diag) {
+    rm_gemm_host(false, true, aux, ext, ext, 1.0, res_g_j, ext, bar_f0.data(), ext, 1.0, bar_fit_i,
+                 ext);
+    rm_gemm_host(false, false, aux, ext, ext, 1.0, fit_i, ext, bar_f0.data(), ext, 1.0, bar_res_g_j,
+                 ext);
+    rm_gemm_host(false, true, aux, ext, ext, 1.0, fit_j, ext, bar_f0.data(), ext, 1.0, bar_raw_g_i,
+                 ext);
+    rm_gemm_host(false, false, aux, ext, ext, 1.0, raw_g_i, ext, bar_f0.data(), ext, 1.0, bar_fit_j,
+                 ext);
+  }
+
+  if (split_rhf_offdiag) {
+    for (Size idx = 0; idx < bar_G_obs.size(); ++idx) bar_G_obs[idx] += 0.5 * bar_G_obs_os[idx];
+    for (Size idx = 0; idx < bar_G_oc.size(); ++idx) bar_G_oc[idx] += 0.5 * bar_G_oc_os[idx];
+    for (Size idx = 0; idx < bar_G_co.size(); ++idx) bar_G_co[idx] += 0.5 * bar_G_co_os[idx];
+    rm_gemm_host(false, true, aux, obs, obs, 1.0, raw_coul_j, ext, bar_G_obs.data(), obs, 1.0,
+                 bar_fit_i, ext);
+    rm_gemm_host(false, false, aux, obs, obs, 1.0, fit_i, ext, bar_G_obs.data(), obs, 1.0,
+                 bar_raw_coul_j, ext);
+    rm_gemm_host(false, true, aux, o, c, 1.0, raw_coul_j + obs, ext, bar_G_oc.data(), c, 1.0,
+                 bar_fit_i, ext);
+    rm_gemm_host(false, false, aux, c, o, 1.0, fit_i, ext, bar_G_oc.data(), c, 1.0,
+                 bar_raw_coul_j + obs, ext);
+    rm_gemm_host(false, true, aux, c, o, 1.0, raw_coul_j, ext, bar_G_co.data(), o, 1.0,
+                 bar_fit_i + obs, ext);
+    rm_gemm_host(false, false, aux, o, c, 1.0, fit_i + obs, ext, bar_G_co.data(), o, 1.0,
+                 bar_raw_coul_j, ext);
+    // Symmetric AB(j, i) half of Coulomb into (fit_j, raw_coul_i):
+    rm_gemm_host(false, false, aux, obs, obs, 0.5, raw_coul_i, ext, bar_G_obs_os.data(), obs, 1.0,
+                 bar_fit_j, ext);
+    rm_gemm_host(false, true, aux, obs, obs, 0.5, fit_j, ext, bar_G_obs_os.data(), obs, 1.0,
+                 bar_raw_coul_i, ext);
+    rm_gemm_host(false, false, aux, o, c, 0.5, raw_coul_i + obs, ext, bar_G_co_os.data(), o, 1.0,
+                 bar_fit_j, ext);
+    rm_gemm_host(false, true, aux, c, o, 0.5, fit_j, ext, bar_G_co_os.data(), o, 1.0,
+                 bar_raw_coul_i + obs, ext);
+    rm_gemm_host(false, false, aux, c, o, 0.5, raw_coul_i, ext, bar_G_oc_os.data(), c, 1.0,
+                 bar_fit_j + obs, ext);
+    rm_gemm_host(false, true, aux, o, c, 0.5, fit_j + obs, ext, bar_G_oc_os.data(), c, 1.0,
+                 bar_raw_coul_i, ext);
+  } else {
+    rm_gemm_host(false, true, aux, obs, obs, spin_scale, raw_coul_j, ext, bar_G_obs.data(), obs,
+                 1.0, bar_fit_i, ext);
+    rm_gemm_host(false, false, aux, obs, obs, spin_scale, fit_i, ext, bar_G_obs.data(), obs, 1.0,
+                 bar_raw_coul_j, ext);
+    rm_gemm_host(false, true, aux, o, c, spin_scale, raw_coul_j + obs, ext, bar_G_oc.data(), c, 1.0,
+                 bar_fit_i, ext);
+    rm_gemm_host(false, false, aux, c, o, spin_scale, fit_i, ext, bar_G_oc.data(), c, 1.0,
+                 bar_raw_coul_j + obs, ext);
+    rm_gemm_host(false, true, aux, c, o, spin_scale, raw_coul_j, ext, bar_G_co.data(), o, 1.0,
+                 bar_fit_i + obs, ext);
+    rm_gemm_host(false, false, aux, o, c, spin_scale, fit_i + obs, ext, bar_G_co.data(), o, 1.0,
+                 bar_raw_coul_j, ext);
+  }
+
+  // gc, dc, sq scalar elements & sq_fk: split SS (-> bar_res_*) and OS (-> bar_res_os_*).
+  if (!diag) {
+    robust_elem_pullback_host(bar_V_d_ss, i, j, aux, ext, fit_i, raw_gc_i, fit_j, res_gc_j,
+                              bar_fit_i, bar_raw_gc_i, bar_fit_j, bar_res_gc_j);
+    robust_elem_pullback_host(bar_V_x_ss, j, i, aux, ext, fit_i, raw_gc_i, fit_j, res_gc_j,
+                              bar_fit_i, bar_raw_gc_i, bar_fit_j, bar_res_gc_j);
+    robust_elem_pullback_host(bar_B_d_ss, i, j, aux, ext, fit_i, raw_dc_i, fit_j, res_dc_j,
+                              bar_fit_i, bar_raw_dc_i, bar_fit_j, bar_res_dc_j);
+    robust_elem_pullback_host(-bar_B_d_ss, j, i, aux, ext, fit_i, raw_dc_i, fit_j, res_dc_j,
+                              bar_fit_i, bar_raw_dc_i, bar_fit_j, bar_res_dc_j);
+    robust_elem_pullback_host(bar_X_d_ss, i, j, aux, ext, fit_i, raw_sq_i, fit_j, res_sq_j,
+                              bar_fit_i, bar_raw_sq_i, bar_fit_j, bar_res_sq_j);
+    robust_elem_pullback_host(bar_X_x_ss, j, i, aux, ext, fit_i, raw_sq_i, fit_j, res_sq_j,
+                              bar_fit_i, bar_raw_sq_i, bar_fit_j, bar_res_sq_j);
+    robust_row_col_pullback_host(bar_B_d_ss, i, hj, bar_B_d_ss, j, hi, aux, ext, fit_i, raw_sq_i,
+                                 fit_j, res_sq_j, bar_fit_i, bar_raw_sq_i, bar_fit_j, bar_res_sq_j);
+    robust_row_col_pullback_host(-bar_B_d_ss, j, hi, -bar_B_d_ss, i, hj, aux, ext, fit_i, raw_sq_i,
+                                 fit_j, res_sq_j, bar_fit_i, bar_raw_sq_i, bar_fit_j, bar_res_sq_j);
+  }
+  if (compute_both_rhf) {
+    robust_elem_pullback_host(spin_scale * bar_V_d_os, i, j, aux, ext, fit_i, raw_gc_i, fit_j,
+                              res_gc_j, bar_fit_i, bar_raw_gc_i, bar_fit_j, bar_res_os_gc_j);
+    robust_elem_pullback_host(spin_scale * bar_B_d_os, i, j, aux, ext, fit_i, raw_dc_i, fit_j,
+                              res_dc_j, bar_fit_i, bar_raw_dc_i, bar_fit_j, bar_res_os_dc_j);
+    robust_elem_pullback_host(spin_scale * bar_X_d_os, i, j, aux, ext, fit_i, raw_sq_i, fit_j,
+                              res_sq_j, bar_fit_i, bar_raw_sq_i, bar_fit_j, bar_res_os_sq_j);
+    robust_row_col_pullback_host(spin_scale * bar_B_d_os, i, hj, spin_scale * bar_B_d_os, j, hi,
+                                 aux, ext, fit_i, raw_sq_i, fit_j, res_sq_j, bar_fit_i,
+                                 bar_raw_sq_i, bar_fit_j, bar_res_os_sq_j);
+    if (!diag) {
+      robust_elem_pullback_host(bar_V_x_os, j, i, aux, ext, fit_i, raw_gc_i, fit_j, res_gc_j,
+                                bar_fit_i, bar_raw_gc_i, bar_fit_j, bar_res_os_gc_j);
+      robust_elem_pullback_host(bar_B_x_os, j, i, aux, ext, fit_i, raw_dc_i, fit_j, res_dc_j,
+                                bar_fit_i, bar_raw_dc_i, bar_fit_j, bar_res_os_dc_j);
+      robust_elem_pullback_host(bar_X_x_os, j, i, aux, ext, fit_i, raw_sq_i, fit_j, res_sq_j,
+                                bar_fit_i, bar_raw_sq_i, bar_fit_j, bar_res_os_sq_j);
+      robust_row_col_pullback_host(bar_B_x_os, j, hi, bar_B_x_os, i, hj, aux, ext, fit_i, raw_sq_i,
+                                   fit_j, res_sq_j, bar_fit_i, bar_raw_sq_i, bar_fit_j,
+                                   bar_res_os_sq_j);
+    }
+  }
+  // Exact row vs column orientation for bar_F, bar_K:
+  // - Same-spin (AA) writes to ROWS i, j
+  // - Opposite-spin (AB) writes to COLUMNS i, j
+  if (!diag && bar_B_d_ss != 0.0) {
+    for (int p = 0; p < ext; ++p) {
+      const double ri_val = bar_B_d_ss * (m_col_j[p] - m_row_j[p]);
+      const double rj_val = bar_B_d_ss * (m_row_i[p] - m_col_i[p]);
+      bar_F[Size(i) * ext + p] += ri_val;
+      bar_K[Size(i) * ext + p] += ri_val;
+      bar_F[Size(j) * ext + p] += rj_val;
+      bar_K[Size(j) * ext + p] += rj_val;
+    }
+  }
+  if (compute_both_rhf) {
+    if (diag) {
+      // AB(i, i): 0.5 * (0.25 * m_col_i + 0.25 * m_row_i) into column i
+      for (int p = 0; p < ext; ++p) {
+        const double ci_val = 0.125 * s_f12 * (m_col_i[p] + m_row_i[p]);
+        bar_F[Size(p) * ext + i] += ci_val;
+        bar_K[Size(p) * ext + i] += ci_val;
+      }
+    } else {
+      for (int p = 0; p < ext; ++p) {
+        const double ci_val = bar_B_d_os * m_col_j[p] + bar_B_x_os * m_row_j[p];
+        const double cj_val = bar_B_d_os * m_row_i[p] + bar_B_x_os * m_col_i[p];
+        bar_F[Size(p) * ext + i] += ci_val;
+        bar_K[Size(p) * ext + i] += ci_val;
+        bar_F[Size(p) * ext + j] += cj_val;
+        bar_K[Size(p) * ext + j] += cj_val;
+      }
+    }
+  }
+  return 0;
+}
+
+int eval_uhf_opp_spin_channel_response_host(
+    bool include_f12, bool include_ordinary, bool has_occ_weights, int oa, int ob, int fa, int fb,
+    int obs, int ext, int aux, const double* occ_w_a, const double* occ_w_b,
+    const std::vector<double>& fit_a_oqe, const std::vector<double>& fit_b_oqe,
+    const std::vector<double>& raw_coul_b_oqe, const std::vector<double>& raw_g_a_oqe,
+    const std::vector<double>& res_g_b_oqe, const std::vector<double>& raw_sq_a_oqe,
+    const std::vector<double>& res_sq_b_oqe, const std::vector<double>& raw_gc_a_oqe,
+    const std::vector<double>& res_gc_b_oqe, const std::vector<double>& raw_dc_a_oqe,
+    const std::vector<double>& res_dc_b_oqe, const double* Fa, const double* Fb, const double* Ka,
+    const double* Kb, const double* Sab, double& e_f12_tot, double& e_ord_tot, double* pair_f12_ab,
+    double* pair_ord_ab, std::vector<double>& bar_fit_a_oqe, std::vector<double>& bar_fit_b_oqe,
+    std::vector<double>& bar_raw_coul_b_oqe, std::vector<double>& bar_raw_g_a_oqe,
+    std::vector<double>& bar_res_g_b_oqe, std::vector<double>& bar_raw_sq_a_oqe,
+    std::vector<double>& bar_res_sq_b_oqe, std::vector<double>& bar_raw_gc_a_oqe,
+    std::vector<double>& bar_res_gc_b_oqe, std::vector<double>& bar_raw_dc_a_oqe,
+    std::vector<double>& bar_res_dc_b_oqe, double* bar_Fa, double* bar_Fb, double* bar_Ka,
+    double* bar_Kb, double* bar_Sab) {
+  e_f12_tot = 0.0;
+  e_ord_tot = 0.0;
+  const int oa_act = oa - fa;
+  const int ob_act = ob - fb;
+  if (oa_act <= 0 || ob_act <= 0 || (!include_f12 && !include_ordinary)) return 0;
+
+  const int va = obs - oa;
+  const int vb = obs - ob;
+  const int c = ext - obs;
+  const Size ee = Size(ext) * ext;
+  const Size qe = Size(aux) * ext;
+
+  if (!include_f12) {
+    // Ordinary-only opposite-spin fast path.
+    std::vector<double> G_vv(Size(va) * vb), bar_G_vv(Size(va) * vb);
+    for (int i_loc = 0; i_loc < oa_act; ++i_loc) {
+      const int i = fa + i_loc;
+      const double* fit_i = fit_a_oqe.data() + Size(i_loc) * qe;
+      double* bfit_i = bar_fit_a_oqe.data() + Size(i_loc) * qe;
+      for (int j_loc = 0; j_loc < ob_act; ++j_loc) {
+        const int j = fb + j_loc;
+        const double* raw_coul_j = raw_coul_b_oqe.data() + Size(j_loc) * qe;
+        double* braw_coul_j = bar_raw_coul_b_oqe.data() + Size(j_loc) * qe;
+        rm_gemm_host(true, false, va, vb, aux, 1.0, fit_i + oa, ext, raw_coul_j + ob, ext, 0.0,
+                     G_vv.data(), vb);
+        const double wij = has_occ_weights ? 0.5 * (occ_w_a[i_loc] + occ_w_b[j_loc]) : 1.0;
+        const double occ_sum = Fa[Size(i) * ext + i] + Fb[Size(j) * ext + j];
+        double os_gg = 0.0, bar_occ_sum = 0.0;
+        for (int a = 0; a < va; ++a) {
+          const double ea = Fa[Size(oa + a) * ext + (oa + a)];
+          for (int b = 0; b < vb; ++b) {
+            const double gap = ea + Fb[Size(ob + b) * ext + (ob + b)] - occ_sum;
+            if (!std::isfinite(gap) || gap == 0.0) return -4;
+            const double inv_g = 1.0 / gap;
+            const double gab = G_vv[Size(a) * vb + b];
+            os_gg += gab * gab * inv_g;
+            bar_G_vv[Size(a) * vb + b] = -2.0 * wij * gab * inv_g;
+            const double bar_gap = wij * gab * gab * inv_g * inv_g;
+            bar_Fa[Size(oa + a) * ext + (oa + a)] += bar_gap;
+            bar_Fb[Size(ob + b) * ext + (ob + b)] += bar_gap;
+            bar_occ_sum -= bar_gap;
+          }
+        }
+        bar_Fa[Size(i) * ext + i] += bar_occ_sum;
+        bar_Fb[Size(j) * ext + j] += bar_occ_sum;
+        rm_gemm_host(false, true, aux, va, vb, 1.0, raw_coul_j + ob, ext, bar_G_vv.data(), vb, 1.0,
+                     bfit_i + oa, ext);
+        rm_gemm_host(false, false, aux, vb, va, 1.0, fit_i + oa, ext, bar_G_vv.data(), vb, 1.0,
+                     braw_coul_j + ob, ext);
+        const double e_ord = -os_gg;
+        if (pair_ord_ab) pair_ord_ab[Size(i_loc) * ob_act + j_loc] = e_ord;
+        e_ord_tot += wij * e_ord;
+      }
+    }
+    return 0;
+  }
+
+  // Precompute cross-overlap & symmetrized Fock/exchange helper matrices once for AB channel.
+  std::vector<double> Ha(ee), Hb(ee), Fa_sym(ee), Fb_sym(ee), Ha_sym(ee), Hb_sym(ee);
+  for (int p = 0; p < ext; ++p) {
+    for (int q = 0; q < ext; ++q) {
+      const Size pq = Size(p) * ext + q;
+      const Size qp = Size(q) * ext + p;
+      Ha[pq] = Fa[pq] + Ka[pq];
+      Hb[pq] = Fb[pq] + Kb[pq];
+      Fa_sym[pq] = Fa[pq] + Fa[qp];
+      Fb_sym[pq] = Fb[pq] + Fb[qp];
+      Ha_sym[pq] = Fa_sym[pq] + Ka[pq] + Ka[qp];
+      Hb_sym[pq] = Fb_sym[pq] + Kb[pq] + Kb[qp];
+    }
+  }
+  std::vector<double> SS_T(ee, 0.0), ST_S(ee, 0.0);
+  std::vector<double> Ha_S(ee, 0.0), Hb_ST(ee, 0.0);
+  std::vector<double> ST_Ha(ee, 0.0), S_Hb(ee, 0.0);
+  std::vector<double> ST_Ha_S(ee, 0.0), S_Hb_ST(ee, 0.0);
+  rm_gemm_host(false, true, ext, ext, ext, 1.0, Sab, ext, Sab, ext, 0.0, SS_T.data(), ext);
+  rm_gemm_host(true, false, ext, ext, ext, 1.0, Sab, ext, Sab, ext, 0.0, ST_S.data(), ext);
+  rm_gemm_host(false, false, ext, ext, ext, 1.0, Ha.data(), ext, Sab, ext, 0.0, Ha_S.data(), ext);
+  rm_gemm_host(false, true, ext, ext, ext, 1.0, Hb.data(), ext, Sab, ext, 0.0, Hb_ST.data(), ext);
+  rm_gemm_host(true, false, ext, ext, ext, 1.0, Sab, ext, Ha.data(), ext, 0.0, ST_Ha.data(), ext);
+  rm_gemm_host(false, false, ext, ext, ext, 1.0, Sab, ext, Hb.data(), ext, 0.0, S_Hb.data(), ext);
+  rm_gemm_host(true, false, ext, ext, ext, 1.0, Sab, ext, Ha_S.data(), ext, 0.0, ST_Ha_S.data(),
+               ext);
+  rm_gemm_host(false, false, ext, ext, ext, 1.0, Sab, ext, Hb_ST.data(), ext, 0.0, S_Hb_ST.data(),
+               ext);
+
+  std::vector<double> u_j(ext), v_i(ext), a_i(ext), b_j(ext);
+  std::vector<double> ha_i(ext), hb_j(ext), comb_rhs_i(ext), comb_lhs_j(ext);
+  std::vector<double> st_ha_s_j(ext), s_hb_st_i(ext);
+  std::vector<double> ha_uj(ext), hb_vi(ext);
+  std::vector<double> e_i_vec(ext, 0.0), e_j_vec(ext, 0.0);
+  std::vector<double> x1(ext), x3(ext), y2(ext), y4(ext);
+  std::vector<double> bw_v(ext), bwT_u(ext);
+  std::vector<double> sy_buf(ext), stx_buf(ext), mv1_buf(ext), mv2_buf(ext);
+  std::vector<double> tmp_v1(ext), tmp_v2(ext), ff_ej(ext), ff_vi(ext), ffT_ei(ext), ffT_uj(ext);
+  std::vector<double> tmp_aux1(aux), tmp_aux2(aux);
+
+  std::vector<double> f0(ee), tmp_f(ee), f(ee), qf(ee);
+  std::vector<double> bar_f(ee), bar_qf(ee), bar_f0(ee), ff_tmp(ee);
+  std::vector<double> G_obs(Size(obs) * obs), G_oc(Size(oa) * c), G_co(Size(c) * ob);
+  std::vector<double> bar_G_obs(Size(obs) * obs), bar_G_oc(Size(oa) * c), bar_G_co(Size(c) * ob);
+  std::vector<double> C_vv(Size(va) * vb), bar_C_vv(Size(va) * vb);
+
+  for (int i_loc = 0; i_loc < oa_act; ++i_loc) {
+    const int i = fa + i_loc;
+    const double* fit_i = fit_a_oqe.data() + Size(i_loc) * qe;
+    const double* raw_g_i = raw_g_a_oqe.data() + Size(i_loc) * qe;
+    const double* raw_sq_i = raw_sq_a_oqe.data() + Size(i_loc) * qe;
+    const double* raw_gc_i = raw_gc_a_oqe.data() + Size(i_loc) * qe;
+    const double* raw_dc_i = raw_dc_a_oqe.data() + Size(i_loc) * qe;
+    double* bfit_i = bar_fit_a_oqe.data() + Size(i_loc) * qe;
+    double* braw_g_i = bar_raw_g_a_oqe.data() + Size(i_loc) * qe;
+    double* braw_sq_i = bar_raw_sq_a_oqe.data() + Size(i_loc) * qe;
+    double* braw_gc_i = bar_raw_gc_a_oqe.data() + Size(i_loc) * qe;
+    double* braw_dc_i = bar_raw_dc_a_oqe.data() + Size(i_loc) * qe;
+
+    std::fill_n(e_i_vec.data(), ext, 0.0);
+    e_i_vec[i] = 1.0;
+    for (int p = 0; p < ext; ++p) {
+      v_i[p] = Sab[Size(i) * ext + p];
+      a_i[p] = SS_T[Size(p) * ext + i];
+      ha_i[p] = Ha[Size(p) * ext + i];
+      comb_rhs_i[p] = ST_Ha[Size(p) * ext + i] + Hb_ST[Size(p) * ext + i];
+      s_hb_st_i[p] = S_Hb_ST[Size(p) * ext + i];
+      hb_vi[p] = Hb_ST[Size(p) * ext + i];
+    }
+
+    for (int j_loc = 0; j_loc < ob_act; ++j_loc) {
+      const int j = fb + j_loc;
+      const double* fit_j = fit_b_oqe.data() + Size(j_loc) * qe;
+      const double* raw_coul_j = raw_coul_b_oqe.data() + Size(j_loc) * qe;
+      const double* res_g_j = res_g_b_oqe.data() + Size(j_loc) * qe;
+      const double* res_sq_j = res_sq_b_oqe.data() + Size(j_loc) * qe;
+      const double* res_gc_j = res_gc_b_oqe.data() + Size(j_loc) * qe;
+      const double* res_dc_j = res_dc_b_oqe.data() + Size(j_loc) * qe;
+      double* bfit_j = bar_fit_b_oqe.data() + Size(j_loc) * qe;
+      double* braw_coul_j = bar_raw_coul_b_oqe.data() + Size(j_loc) * qe;
+      double* bres_g_j = bar_res_g_b_oqe.data() + Size(j_loc) * qe;
+      double* bres_sq_j = bar_res_sq_b_oqe.data() + Size(j_loc) * qe;
+      double* bres_gc_j = bar_res_gc_b_oqe.data() + Size(j_loc) * qe;
+      double* bres_dc_j = bar_res_dc_b_oqe.data() + Size(j_loc) * qe;
+
+      std::fill_n(e_j_vec.data(), ext, 0.0);
+      e_j_vec[j] = 1.0;
+      for (int p = 0; p < ext; ++p) {
+        u_j[p] = Sab[Size(p) * ext + j];
+        b_j[p] = ST_S[Size(j) * ext + p];
+        hb_j[p] = Hb[Size(p) * ext + j];
+        comb_lhs_j[p] = S_Hb[Size(p) * ext + j] + Ha_S[Size(p) * ext + j];
+        st_ha_s_j[p] = ST_Ha_S[Size(p) * ext + j];
+        ha_uj[p] = Ha_S[Size(p) * ext + j];
+      }
+
+      // Forward Step 1: O(aux * ext) rank-structured scalars.
+      const double gc_val =
+          0.375 * robust_elem_host(fit_i, raw_gc_i, fit_j, res_gc_j, aux, ext, i, j) +
+          0.125 * robust_bilin_host(fit_i, raw_gc_i, fit_j, res_gc_j, aux, ext, u_j.data(),
+                                    v_i.data(), tmp_aux1, tmp_aux2);
+      const double dc_val =
+          (9.0 / 64.0) * robust_elem_host(fit_i, raw_dc_i, fit_j, res_dc_j, aux, ext, i, j) +
+          (6.0 / 64.0) * robust_bilin_host(fit_i, raw_dc_i, fit_j, res_dc_j, aux, ext, u_j.data(),
+                                           v_i.data(), tmp_aux1, tmp_aux2) +
+          (1.0 / 64.0) * robust_bilin_host(fit_i, raw_dc_i, fit_j, res_dc_j, aux, ext, a_i.data(),
+                                           b_j.data(), tmp_aux1, tmp_aux2);
+      const double sq_norm_val =
+          (9.0 / 64.0) * robust_elem_host(fit_i, raw_sq_i, fit_j, res_sq_j, aux, ext, i, j) +
+          (6.0 / 64.0) * robust_bilin_host(fit_i, raw_sq_i, fit_j, res_sq_j, aux, ext, u_j.data(),
+                                           v_i.data(), tmp_aux1, tmp_aux2) +
+          (1.0 / 64.0) * robust_bilin_host(fit_i, raw_sq_i, fit_j, res_sq_j, aux, ext, a_i.data(),
+                                           b_j.data(), tmp_aux1, tmp_aux2);
+
+      double sq_t1 = 0.0, sq_t3 = 0.0;
+      for (int A = 0; A < aux; ++A) {
+        const double* fi = fit_i + Size(A) * ext;
+        const double* ri = raw_sq_i + Size(A) * ext;
+        const double* fj = fit_j + Size(A) * ext;
+        const double* sj = res_sq_j + Size(A) * ext;
+        double fi_ha = 0.0, ri_ha = 0.0, sj_hb = 0.0, fj_hb = 0.0;
+        for (int p = 0; p < ext; ++p) {
+          fi_ha += fi[p] * ha_i[p];
+          ri_ha += ri[p] * ha_i[p];
+          sj_hb += sj[p] * hb_j[p];
+          fj_hb += fj[p] * hb_j[p];
+        }
+        sq_t1 += fi_ha * sj[j] + ri_ha * fj[j];
+        sq_t3 += fi[i] * sj_hb + ri[i] * fj_hb;
+      }
+      const double sq_fk_val =
+          (9.0 / 64.0) * (sq_t1 + sq_t3) +
+          (3.0 / 64.0) * robust_bilin_host(fit_i, raw_sq_i, fit_j, res_sq_j, aux, ext, u_j.data(),
+                                           comb_rhs_i.data(), tmp_aux1, tmp_aux2) +
+          (3.0 / 64.0) * robust_bilin_host(fit_i, raw_sq_i, fit_j, res_sq_j, aux, ext,
+                                           comb_lhs_j.data(), v_i.data(), tmp_aux1, tmp_aux2) +
+          (1.0 / 64.0) * robust_bilin_host(fit_i, raw_sq_i, fit_j, res_sq_j, aux, ext, a_i.data(),
+                                           st_ha_s_j.data(), tmp_aux1, tmp_aux2) +
+          (1.0 / 64.0) * robust_bilin_host(fit_i, raw_sq_i, fit_j, res_sq_j, aux, ext,
+                                           s_hb_st_i.data(), b_j.data(), tmp_aux1, tmp_aux2);
+
+      // Forward Step 2: f0, f = W(f0), qf = Q(f), Coulomb blocks.
+      rm_gemm_host(true, false, ext, ext, aux, 1.0, fit_i, ext, res_g_j, ext, 0.0, f0.data(), ext);
+      rm_gemm_host(true, false, ext, ext, aux, 1.0, raw_g_i, ext, fit_j, ext, 1.0, f0.data(), ext);
+      rm_gemm_host(false, true, ext, ext, ext, 1.0, Sab, ext, f0.data(), ext, 0.0, tmp_f.data(),
+                   ext);
+      std::copy_n(f0.data(), ee, f.data());
+      rm_gemm_host(false, false, ext, ext, ext, 0.125, tmp_f.data(), ext, Sab, ext, 0.375, f.data(),
+                   ext);
+      std::copy_n(f.data(), ee, qf.data());
+      zero_p_blocks_host(qf.data(), oa, ob, obs, ext);
+
+      rm_gemm_host(true, false, obs, obs, aux, 1.0, fit_i, ext, raw_coul_j, ext, 0.0, G_obs.data(),
+                   obs);
+      rm_gemm_host(true, false, oa, c, aux, 1.0, fit_i, ext, raw_coul_j + obs, ext, 0.0,
+                   G_oc.data(), c);
+      rm_gemm_host(true, false, c, ob, aux, 1.0, fit_i + obs, ext, raw_coul_j, ext, 0.0,
+                   G_co.data(), ob);
+
+      const double linear =
+          gc_val - dot_rect_host(G_obs.data(), obs, f.data(), ext, obs, obs) -
+          dot_rect_host(G_oc.data(), c, f.data() + obs, ext, oa, c) -
+          dot_rect_host(G_co.data(), ob, f.data() + Size(obs) * ext, ext, c, ob);
+      const double norm = sq_norm_val - sqnorm_rect_host(f.data(), ext, obs, obs) -
+                          sqnorm_rect_host(f.data() + obs, ext, oa, c) -
+                          sqnorm_rect_host(f.data() + Size(obs) * ext, ext, c, ob);
+
+      // Forward Step 3: b_val = dc_val + sq_fk_val - <f, Ha f + f Hb^T> + <qf, Fa qf + qf Fb^T>
+      double b_val = dc_val + sq_fk_val;
+      rm_gemm_host(false, false, ext, ext, ext, 1.0, Ha.data(), ext, f.data(), ext, 0.0,
+                   tmp_f.data(), ext);
+      b_val -= dot_rect_host(f.data(), ext, tmp_f.data(), ext, ext, ext);
+      rm_gemm_host(false, true, ext, ext, ext, 1.0, f.data(), ext, Hb.data(), ext, 0.0,
+                   tmp_f.data(), ext);
+      b_val -= dot_rect_host(f.data(), ext, tmp_f.data(), ext, ext, ext);
+      rm_gemm_host(false, false, ext, ext, ext, 1.0, Fa, ext, qf.data(), ext, 0.0, tmp_f.data(),
+                   ext);
+      b_val += dot_rect_host(qf.data(), ext, tmp_f.data(), ext, ext, ext);
+      rm_gemm_host(false, true, ext, ext, ext, 1.0, qf.data(), ext, Fb, ext, 0.0, tmp_f.data(),
+                   ext);
+      b_val += dot_rect_host(qf.data(), ext, tmp_f.data(), ext, ext, ext);
+
+      // Forward Step 4: Coupling C_vv[a, b] = Fa[oa+a, obs:] f[obs:, ob+b] + f[oa+a, obs:] Fb[ob+b, obs:]^T
+      rm_gemm_host(false, false, va, vb, c, 1.0, Fa + Size(oa) * ext + obs, ext,
+                   f.data() + Size(obs) * ext + ob, ext, 0.0, C_vv.data(), vb);
+      rm_gemm_host(false, true, va, vb, c, 1.0, f.data() + Size(oa) * ext + obs, ext,
+                   Fb + Size(ob) * ext + obs, ext, 1.0, C_vv.data(), vb);
+
+      const double wij = has_occ_weights ? 0.5 * (occ_w_a[i_loc] + occ_w_b[j_loc]) : 1.0;
+      const double s_f12 = wij;
+      const double s_ord = include_ordinary ? wij : 0.0;
+      const double occ_sum = Fa[Size(i) * ext + i] + Fb[Size(j) * ext + j];
+
+      // Reverse Step U1: energy & denominator contraction.
+      std::fill(bar_G_obs.begin(), bar_G_obs.end(), 0.0);
+      std::fill(bar_G_oc.begin(), bar_G_oc.end(), 0.0);
+      std::fill(bar_G_co.begin(), bar_G_co.end(), 0.0);
+      double os_term = 0.0, os_gg = 0.0;
+      double bar_occ_sum = -s_f12 * norm;
+      for (int a = 0; a < va; ++a) {
+        const double ea = Fa[Size(oa + a) * ext + (oa + a)];
+        for (int b = 0; b < vb; ++b) {
+          const double gap = ea + Fb[Size(ob + b) * ext + (ob + b)] - occ_sum;
+          if (!std::isfinite(gap) || gap == 0.0) return -4;
+          const double inv_g = 1.0 / gap;
+          const double cab = C_vv[Size(a) * vb + b];
+          const double gab = G_obs[Size(oa + a) * obs + (ob + b)];
+          os_term += cab * (2.0 * gab + cab) * inv_g;
+          if (include_ordinary) os_gg += gab * gab * inv_g;
+
+          bar_C_vv[Size(a) * vb + b] = -2.0 * s_f12 * (gab + cab) * inv_g;
+          bar_G_obs[Size(oa + a) * obs + (ob + b)] =
+              (-2.0 * s_f12 * cab - 2.0 * s_ord * gab) * inv_g;
+          const double bar_inv_g =
+              -s_f12 * cab * (2.0 * gab + cab) - s_ord * gab * gab;
+          const double bar_gap = -bar_inv_g * inv_g * inv_g;
+          bar_Fa[Size(oa + a) * ext + (oa + a)] += bar_gap;
+          bar_Fb[Size(ob + b) * ext + (ob + b)] += bar_gap;
+          bar_occ_sum -= bar_gap;
+        }
+      }
+      bar_Fa[Size(i) * ext + i] += bar_occ_sum;
+      bar_Fb[Size(j) * ext + j] += bar_occ_sum;
+
+      const double e_f12 = 2.0 * linear + b_val - occ_sum * norm - os_term;
+      const double e_ord = include_ordinary ? (-os_gg) : 0.0;
+      const Size idx = Size(i_loc) * ob_act + j_loc;
+      if (pair_f12_ab) pair_f12_ab[idx] = e_f12;
+      if (include_ordinary && pair_ord_ab) pair_ord_ab[idx] = e_ord;
+      e_f12_tot += wij * e_f12;
+      if (include_ordinary) e_ord_tot += wij * e_ord;
+
+      // Reverse Step U2: Coupling C_vv -> bar_f, bar_Fa, bar_Fb.
+      std::fill(bar_f.begin(), bar_f.end(), 0.0);
+      rm_gemm_host(false, true, va, c, vb, 1.0, bar_C_vv.data(), vb,
+                   f.data() + Size(obs) * ext + ob, ext, 1.0, bar_Fa + Size(oa) * ext + obs, ext);
+      rm_gemm_host(true, false, c, vb, va, 1.0, Fa + Size(oa) * ext + obs, ext, bar_C_vv.data(), vb,
+                   1.0, bar_f.data() + Size(obs) * ext + ob, ext);
+      rm_gemm_host(false, false, va, c, vb, 1.0, bar_C_vv.data(), vb, Fb + Size(ob) * ext + obs,
+                   ext, 1.0, bar_f.data() + Size(oa) * ext + obs, ext);
+      rm_gemm_host(true, false, vb, c, va, 1.0, bar_C_vv.data(), vb,
+                   f.data() + Size(oa) * ext + obs, ext, 1.0, bar_Fb + Size(ob) * ext + obs, ext);
+
+      // Reverse Step U3: b terms in f and qf -> bar_Fa, bar_Fb, bar_Ka, bar_Kb, bar_f.
+      rm_gemm_host(false, true, ext, ext, ext, 1.0, f.data(), ext, f.data(), ext, 0.0,
+                   ff_tmp.data(), ext);
+      for (Size p = 0; p < ee; ++p) {
+        const double v_sub = s_f12 * ff_tmp[p];
+        bar_Ka[p] -= v_sub;
+        bar_Fa[p] -= v_sub;
+      }
+      rm_gemm_host(true, false, ext, ext, ext, 1.0, f.data(), ext, f.data(), ext, 0.0,
+                   ff_tmp.data(), ext);
+      for (Size p = 0; p < ee; ++p) {
+        const double v_sub = s_f12 * ff_tmp[p];
+        bar_Kb[p] -= v_sub;
+        bar_Fb[p] -= v_sub;
+      }
+      rm_gemm_host(false, true, ext, ext, ext, s_f12, qf.data(), ext, qf.data(), ext, 1.0, bar_Fa,
+                   ext);
+      rm_gemm_host(true, false, ext, ext, ext, s_f12, qf.data(), ext, qf.data(), ext, 1.0, bar_Fb,
+                   ext);
+
+      rm_gemm_host(false, false, ext, ext, ext, -s_f12, Ha_sym.data(), ext, f.data(), ext, 1.0,
+                   bar_f.data(), ext);
+      rm_gemm_host(false, false, ext, ext, ext, -s_f12, f.data(), ext, Hb_sym.data(), ext, 1.0,
+                   bar_f.data(), ext);
+
+      rm_gemm_host(false, false, ext, ext, ext, s_f12, Fa_sym.data(), ext, qf.data(), ext, 0.0,
+                   bar_qf.data(), ext);
+      rm_gemm_host(false, false, ext, ext, ext, s_f12, qf.data(), ext, Fb_sym.data(), ext, 1.0,
+                   bar_qf.data(), ext);
+      zero_p_blocks_host(bar_qf.data(), oa, ob, obs, ext);
+      for (Size p = 0; p < ee; ++p) bar_f[p] += bar_qf[p];
+
+      // Reverse Step U4: linear and norm terms in g and f.
+      const double bar_linear = 2.0 * s_f12;
+      const double bar_norm = -s_f12 * occ_sum;
+      for (int p = 0; p < obs; ++p) {
+        for (int r = 0; r < obs; ++r) {
+          const double fpr = f[Size(p) * ext + r];
+          bar_G_obs[Size(p) * obs + r] -= bar_linear * fpr;
+          bar_f[Size(p) * ext + r] -= bar_linear * G_obs[Size(p) * obs + r] + 2.0 * bar_norm * fpr;
+        }
+      }
+      for (int p = 0; p < oa; ++p) {
+        for (int q = 0; q < c; ++q) {
+          const double fpq = f[Size(p) * ext + (obs + q)];
+          bar_G_oc[Size(p) * c + q] -= bar_linear * fpq;
+          bar_f[Size(p) * ext + (obs + q)] -=
+              bar_linear * G_oc[Size(p) * c + q] + 2.0 * bar_norm * fpq;
+        }
+      }
+      for (int p = 0; p < c; ++p) {
+        for (int q = 0; q < ob; ++q) {
+          const double fpq = f[Size(obs + p) * ext + q];
+          bar_G_co[Size(p) * ob + q] -= bar_linear * fpq;
+          bar_f[Size(obs + p) * ext + q] -=
+              bar_linear * G_co[Size(p) * ob + q] + 2.0 * bar_norm * fpq;
+        }
+      }
+
+      // Reverse Step U5: Pullback of f = W(f0) -> bar_f0, bar_Sab.
+      rm_gemm_host(false, true, ext, ext, ext, 1.0, Sab, ext, bar_f.data(), ext, 0.0, tmp_f.data(),
+                   ext);
+      std::copy_n(bar_f.data(), ee, bar_f0.data());
+      rm_gemm_host(false, false, ext, ext, ext, 0.125, tmp_f.data(), ext, Sab, ext, 0.375,
+                   bar_f0.data(), ext);
+      if (bar_Sab) {
+        // bar_Sab += (1/8) * ((bar_f @ Sab^T) @ f0 + (f0 @ Sab^T) @ bar_f)
+        rm_gemm_host(false, true, ext, ext, ext, 1.0, bar_f.data(), ext, Sab, ext, 0.0,
+                     tmp_f.data(), ext);
+        rm_gemm_host(false, false, ext, ext, ext, 0.125, tmp_f.data(), ext, f0.data(), ext, 1.0,
+                     bar_Sab, ext);
+        rm_gemm_host(false, true, ext, ext, ext, 1.0, f0.data(), ext, Sab, ext, 0.0, tmp_f.data(),
+                     ext);
+        rm_gemm_host(false, false, ext, ext, ext, 0.125, tmp_f.data(), ext, bar_f.data(), ext, 1.0,
+                     bar_Sab, ext);
+      }
+
+      // Reverse Step U6: Pullback of f0 and G_obs/G_oc/G_co into fit/raw/res.
+      rm_gemm_host(false, true, aux, ext, ext, 1.0, res_g_j, ext, bar_f0.data(), ext, 1.0, bfit_i,
+                   ext);
+      rm_gemm_host(false, false, aux, ext, ext, 1.0, fit_i, ext, bar_f0.data(), ext, 1.0, bres_g_j,
+                   ext);
+      rm_gemm_host(false, true, aux, ext, ext, 1.0, fit_j, ext, bar_f0.data(), ext, 1.0, braw_g_i,
+                   ext);
+      rm_gemm_host(false, false, aux, ext, ext, 1.0, raw_g_i, ext, bar_f0.data(), ext, 1.0, bfit_j,
+                   ext);
+
+      rm_gemm_host(false, true, aux, obs, obs, 1.0, raw_coul_j, ext, bar_G_obs.data(), obs, 1.0,
+                   bfit_i, ext);
+      rm_gemm_host(false, false, aux, obs, obs, 1.0, fit_i, ext, bar_G_obs.data(), obs, 1.0,
+                   braw_coul_j, ext);
+      rm_gemm_host(false, true, aux, oa, c, 1.0, raw_coul_j + obs, ext, bar_G_oc.data(), c, 1.0,
+                   bfit_i, ext);
+      rm_gemm_host(false, false, aux, c, oa, 1.0, fit_i, ext, bar_G_oc.data(), c, 1.0,
+                   braw_coul_j + obs, ext);
+      rm_gemm_host(false, true, aux, c, ob, 1.0, raw_coul_j, ext, bar_G_co.data(), ob, 1.0,
+                   bfit_i + obs, ext);
+      rm_gemm_host(false, false, aux, ob, c, 1.0, fit_i + obs, ext, bar_G_co.data(), ob, 1.0,
+                   braw_coul_j, ext);
+
+      // Reverse Step U7: Exact O(aux * ext) rank-structured pullback of gc0, uf, ff, Ha, Hb, w_mat.
+      std::fill(bw_v.begin(), bw_v.end(), 0.0);
+      std::fill(bwT_u.begin(), bwT_u.end(), 0.0);
+
+      // 7a. gc0: bar_gc0 = bar_linear * w_mat, bar_w += bar_linear * gc0
+      robust_elem_pullback_host(0.375 * bar_linear, i, j, aux, ext, fit_i, raw_gc_i, fit_j,
+                                res_gc_j, bfit_i, braw_gc_i, bfit_j, bres_gc_j);
+      robust_bilin_pullback_host(0.125 * bar_linear, u_j.data(), v_i.data(), aux, ext, fit_i,
+                                 raw_gc_i, fit_j, res_gc_j, bfit_i, braw_gc_i, bfit_j, bres_gc_j);
+      if (bar_Sab) {
+        robust_rmatvec_host(fit_i, raw_gc_i, fit_j, res_gc_j, aux, ext, v_i.data(), tmp_v1.data());
+        robust_lmatvec_host(fit_i, raw_gc_i, fit_j, res_gc_j, aux, ext, u_j.data(), tmp_v2.data());
+        for (int p = 0; p < ext; ++p) {
+          bw_v[p] += bar_linear * tmp_v1[p];
+          bwT_u[p] += bar_linear * tmp_v2[p];
+        }
+      }
+
+      // 7b. uf = W(uf0): bar_uf = s_f12 * w_mat, bar_w += s_f12 * uf
+      weight_rank1_pullback_host(0.375 * s_f12, e_i_vec.data(), e_j_vec.data(), Sab, aux, ext,
+                                 fit_i, raw_dc_i, fit_j, res_dc_j, bfit_i, braw_dc_i, bfit_j,
+                                 bres_dc_j, bar_Sab, sy_buf, stx_buf, mv1_buf, mv2_buf);
+      weight_rank1_pullback_host(0.125 * s_f12, u_j.data(), v_i.data(), Sab, aux, ext, fit_i,
+                                 raw_dc_i, fit_j, res_dc_j, bfit_i, braw_dc_i, bfit_j, bres_dc_j,
+                                 bar_Sab, sy_buf, stx_buf, mv1_buf, mv2_buf);
+      if (bar_Sab) {
+        weight_rmatvec_host(Sab, fit_i, raw_dc_i, fit_j, res_dc_j, aux, ext, v_i.data(),
+                            mv1_buf.data(), tmp_v1, tmp_v2);
+        weight_lmatvec_host(Sab, fit_i, raw_dc_i, fit_j, res_dc_j, aux, ext, u_j.data(),
+                            mv2_buf.data(), tmp_v1, tmp_v2);
+        for (int p = 0; p < ext; ++p) {
+          bw_v[p] += s_f12 * mv1_buf[p];
+          bwT_u[p] += s_f12 * mv2_buf[p];
+        }
+      }
+
+      // 7c. ff = W(ff0): bar_ff = bar_norm * w_mat + s_f12 * (Ha @ w_mat + w_mat @ Hb^T)
+      for (int p = 0; p < ext; ++p) {
+        x1[p] = s_f12 * ha_i[p] + (p == i ? bar_norm : 0.0);
+        y2[p] = s_f12 * hb_j[p];
+        x3[p] = s_f12 * ha_uj[p] + bar_norm * u_j[p];
+        y4[p] = s_f12 * hb_vi[p];
+      }
+      weight_rank1_pullback_host(0.375, x1.data(), e_j_vec.data(), Sab, aux, ext, fit_i, raw_sq_i,
+                                 fit_j, res_sq_j, bfit_i, braw_sq_i, bfit_j, bres_sq_j, bar_Sab,
+                                 sy_buf, stx_buf, mv1_buf, mv2_buf);
+      weight_rank1_pullback_host(0.375, e_i_vec.data(), y2.data(), Sab, aux, ext, fit_i, raw_sq_i,
+                                 fit_j, res_sq_j, bfit_i, braw_sq_i, bfit_j, bres_sq_j, bar_Sab,
+                                 sy_buf, stx_buf, mv1_buf, mv2_buf);
+      weight_rank1_pullback_host(0.125, x3.data(), v_i.data(), Sab, aux, ext, fit_i, raw_sq_i,
+                                 fit_j, res_sq_j, bfit_i, braw_sq_i, bfit_j, bres_sq_j, bar_Sab,
+                                 sy_buf, stx_buf, mv1_buf, mv2_buf);
+      weight_rank1_pullback_host(0.125, u_j.data(), y4.data(), Sab, aux, ext, fit_i, raw_sq_i,
+                                 fit_j, res_sq_j, bfit_i, braw_sq_i, bfit_j, bres_sq_j, bar_Sab,
+                                 sy_buf, stx_buf, mv1_buf, mv2_buf);
+
+      // bar_Ha += s_f12 * (ff @ w_mat^T), bar_Hb += s_f12 * (ff^T @ w_mat)
+      weight_rmatvec_host(Sab, fit_i, raw_sq_i, fit_j, res_sq_j, aux, ext, e_j_vec.data(),
+                          ff_ej.data(), tmp_v1, tmp_v2);
+      weight_rmatvec_host(Sab, fit_i, raw_sq_i, fit_j, res_sq_j, aux, ext, v_i.data(), ff_vi.data(),
+                          tmp_v1, tmp_v2);
+      weight_lmatvec_host(Sab, fit_i, raw_sq_i, fit_j, res_sq_j, aux, ext, e_i_vec.data(),
+                          ffT_ei.data(), tmp_v1, tmp_v2);
+      weight_lmatvec_host(Sab, fit_i, raw_sq_i, fit_j, res_sq_j, aux, ext, u_j.data(),
+                          ffT_uj.data(), tmp_v1, tmp_v2);
+      for (int p = 0; p < ext; ++p) {
+        const double ha_col_i = 0.375 * s_f12 * ff_ej[p];
+        const double hb_col_j = 0.375 * s_f12 * ffT_ei[p];
+        bar_Fa[Size(p) * ext + i] += ha_col_i;
+        bar_Ka[Size(p) * ext + i] += ha_col_i;
+        bar_Fb[Size(p) * ext + j] += hb_col_j;
+        bar_Kb[Size(p) * ext + j] += hb_col_j;
+      }
+      add_outer_host(0.125 * s_f12, ff_vi.data(), u_j.data(), ext, bar_Fa);
+      add_outer_host(0.125 * s_f12, ff_vi.data(), u_j.data(), ext, bar_Ka);
+      add_outer_host(0.125 * s_f12, ffT_uj.data(), v_i.data(), ext, bar_Fb);
+      add_outer_host(0.125 * s_f12, ffT_uj.data(), v_i.data(), ext, bar_Kb);
+
+      // bar_w += bar_norm * ff + s_f12 * (Ha^T @ ff + ff @ Hb) -> bar_Sab
+      if (bar_Sab) {
+        matvec_host(true, Ha.data(), ext, ff_vi.data(), mv1_buf.data());
+        weight_rmatvec_host(Sab, fit_i, raw_sq_i, fit_j, res_sq_j, aux, ext, hb_vi.data(),
+                            mv2_buf.data(), tmp_v1, tmp_v2);
+        for (int p = 0; p < ext; ++p) {
+          bw_v[p] += bar_norm * ff_vi[p] + s_f12 * (mv1_buf[p] + mv2_buf[p]);
+        }
+        matvec_host(true, Hb.data(), ext, ffT_uj.data(), mv1_buf.data());
+        weight_lmatvec_host(Sab, fit_i, raw_sq_i, fit_j, res_sq_j, aux, ext, ha_uj.data(),
+                            mv2_buf.data(), tmp_v1, tmp_v2);
+        for (int p = 0; p < ext; ++p) {
+          bwT_u[p] += bar_norm * ffT_uj[p] + s_f12 * (mv1_buf[p] + mv2_buf[p]);
+        }
+        for (int p = 0; p < ext; ++p) {
+          bar_Sab[Size(p) * ext + j] += 0.125 * bw_v[p];
+          bar_Sab[Size(i) * ext + p] += 0.125 * bwT_u[p];
+        }
+      }
     }
   }
   return 0;
@@ -4236,6 +6004,2522 @@ int run_ab_stage2_gpu(
   return (cudaGetLastError() == cudaSuccess) ? 0 : 7;
 }
 
+// -------------------------------------------------------------------------
+// GPU MP2-F12 Reverse Pair Response (V / B / X / C, 3C(FIX) SP, RHF + UHF)
+// -------------------------------------------------------------------------
+
+inline cublasStatus_t rm_gemv(cublasHandle_t h, bool trans, int M, int N, double alpha,
+                              const double* A, int lda, const double* x, int incx, double beta,
+                              double* y, int incy) {
+  if (M <= 0 || N <= 0) return CUBLAS_STATUS_SUCCESS;
+  return cublasDgemv(h, trans ? CUBLAS_OP_N : CUBLAS_OP_T, N, M, &alpha, A, lda, x, incx, &beta, y,
+                     incy);
+}
+
+inline cublasStatus_t rm_ger(cublasHandle_t h, int M, int N, double alpha, const double* u,
+                             int incu, const double* v, int incv, double* A, int lda) {
+  if (M <= 0 || N <= 0 || alpha == 0.0) return CUBLAS_STATUS_SUCCESS;
+  return cublasDger(h, N, M, &alpha, v, incv, u, incu, A, lda);
+}
+
+__global__ void k_oqe_to_qoe(int aux, int o_act, int ext, const double* __restrict__ oqe,
+                             double* __restrict__ qoe) {
+  const Size total = Size(aux) * Size(o_act) * Size(ext);
+  const Size idx = Size(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  const int p = static_cast<int>(idx % ext);
+  const Size ia = idx / ext;
+  const int A = static_cast<int>(ia % aux);
+  const int i = static_cast<int>(ia / aux);
+  qoe[(Size(A) * o_act + i) * ext + p] = oqe[idx];
+}
+
+__global__ void k_axpy(Size total, double alpha, const double* __restrict__ x,
+                       double* __restrict__ y) {
+  const Size idx = Size(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < total) y[idx] += alpha * x[idx];
+}
+
+__global__ void k_lincomb2(Size total, double alpha, const double* __restrict__ a, double beta,
+                           const double* __restrict__ b, double* __restrict__ out) {
+  const Size idx = Size(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < total) out[idx] = alpha * a[idx] + beta * b[idx];
+}
+
+__global__ void k_lincomb2_inplace(Size total, double alpha, double beta,
+                                   const double* __restrict__ x, double* __restrict__ y) {
+  const Size idx = Size(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < total) y[idx] = alpha * y[idx] + beta * x[idx];
+}
+
+__global__ void k_sub_scale_both(Size total, double alpha, const double* __restrict__ M,
+                                 double* __restrict__ out1, double* __restrict__ out2) {
+  const Size idx = Size(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < total) {
+    const double v = alpha * M[idx];
+    out1[idx] -= v;
+    out2[idx] -= v;
+  }
+}
+
+__global__ void k_zero_p_blocks(int oa, int ob, int obs, int ext, double* __restrict__ M) {
+  const Size total = Size(ext) * ext;
+  const Size idx = Size(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  const int p = static_cast<int>(idx / ext);
+  const int r = static_cast<int>(idx % ext);
+  if ((p < obs && r < obs) || (p < oa && r >= obs) || (p >= obs && r < ob)) {
+    M[idx] = 0.0;
+  }
+}
+
+__global__ void k_sym_add_transpose(int n, double alpha, const double* __restrict__ src,
+                                    double* __restrict__ dst) {
+  const Size total = Size(n) * n;
+  const Size idx = Size(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  const int p = static_cast<int>(idx / n);
+  const int r = static_cast<int>(idx % n);
+  dst[idx] += alpha * (src[idx] + src[Size(r) * n + p]);
+}
+
+__global__ void k_add_transpose_scaled(int n, double alpha, const double* __restrict__ src,
+                                       double* __restrict__ dst) {
+  const Size total = Size(n) * n;
+  const Size idx = Size(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  const int p = static_cast<int>(idx / n);
+  const int r = static_cast<int>(idx % n);
+  dst[idx] += alpha * src[Size(r) * n + p];
+}
+
+__global__ void k_w_sym_mat(int ext, double alpha, double beta, const double* __restrict__ src,
+                            double* __restrict__ dst) {
+  const Size total = Size(ext) * ext;
+  const Size idx = Size(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  const int p = static_cast<int>(idx / ext);
+  const int r = static_cast<int>(idx % ext);
+  dst[idx] = alpha * src[idx] + beta * src[Size(r) * ext + p];
+}
+
+__global__ void k_build_ab_sym_mats(int ext, const double* __restrict__ Fa,
+                                    const double* __restrict__ Fb, const double* __restrict__ Ka,
+                                    const double* __restrict__ Kb, double* __restrict__ Ha,
+                                    double* __restrict__ Hb, double* __restrict__ Fa_sym,
+                                    double* __restrict__ Fb_sym, double* __restrict__ Ha_sym,
+                                    double* __restrict__ Hb_sym) {
+  const Size total = Size(ext) * ext;
+  const Size idx = Size(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  const int p = static_cast<int>(idx / ext);
+  const int r = static_cast<int>(idx % ext);
+  const Size qp = Size(r) * ext + p;
+  Ha[idx] = Fa[idx] + Ka[idx];
+  Hb[idx] = Fb[idx] + Kb[idx];
+  const double fas = Fa[idx] + Fa[qp];
+  const double fbs = Fb[idx] + Fb[qp];
+  Fa_sym[idx] = fas;
+  Fb_sym[idx] = fbs;
+  Ha_sym[idx] = fas + Ka[idx] + Ka[qp];
+  Hb_sym[idx] = fbs + Kb[idx] + Kb[qp];
+}
+
+__global__ void k_add_col_scaled_vec(int rows, int cols, int col_idx, double alpha,
+                                     const double* __restrict__ vec, double* __restrict__ M) {
+  const int p = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (p < rows) M[Size(p) * cols + col_idx] += alpha * vec[p];
+}
+
+__global__ void k_add_row_scaled_vec(int cols, int row_idx, double alpha,
+                                     const double* __restrict__ vec, double* __restrict__ M) {
+  const int p = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (p < cols) M[Size(row_idx) * cols + p] += alpha * vec[p];
+}
+
+__global__ void k_set_unit_vec(int ext, int pos, double* __restrict__ v) {
+  const int p = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (p < ext) v[p] = (p == pos) ? 1.0 : 0.0;
+}
+
+__global__ void k_extract_col(int rows, int cols, int col_idx, const double* __restrict__ M,
+                              double* __restrict__ out) {
+  const int p = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (p < rows) out[p] = M[Size(p) * cols + col_idx];
+}
+
+__global__ void k_robust_elem_pullback(double alpha, int p, int r, int aux, int ext,
+                                       const double* fit_i, const double* raw_i,
+                                       const double* fit_j, const double* res_j,
+                                       double* bar_fit_i, double* bar_raw_i,
+                                       double* bar_fit_j, double* bar_res_j) {
+  const int A = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (A >= aux) return;
+  const Size row = Size(A) * ext;
+  const double fi = fit_i[row + p];
+  const double ri = raw_i[row + p];
+  const double fj = fit_j[row + r];
+  const double sj = res_j[row + r];
+  if (bar_fit_i == bar_fit_j && p == r) {
+    bar_fit_i[row + p] = (bar_fit_i[row + p] + alpha * sj) + alpha * ri;
+    bar_res_j[row + r] += alpha * fi;
+    bar_raw_i[row + p] += alpha * fj;
+  } else {
+    bar_fit_i[row + p] += alpha * sj;
+    bar_res_j[row + r] += alpha * fi;
+    bar_raw_i[row + p] += alpha * fj;
+    bar_fit_j[row + r] += alpha * ri;
+  }
+}
+
+__global__ void k_add_scaled_two_vecs_to_row_both(int ext, int row_idx, double a1,
+                                                  const double* __restrict__ v1, double a2,
+                                                  const double* __restrict__ v2,
+                                                  double* __restrict__ M1,
+                                                  double* __restrict__ M2) {
+  const int p = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (p < ext) {
+    const double val = a1 * v1[p] + a2 * v2[p];
+    M1[Size(row_idx) * ext + p] += val;
+    M2[Size(row_idx) * ext + p] += val;
+  }
+}
+
+__global__ void k_add_scaled_two_vecs_to_col_both(int ext, int col_idx, double a1,
+                                                  const double* __restrict__ v1, double a2,
+                                                  const double* __restrict__ v2,
+                                                  double* __restrict__ M1,
+                                                  double* __restrict__ M2) {
+  const int p = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (p < ext) {
+    const double val = a1 * v1[p] + a2 * v2[p];
+    M1[Size(p) * ext + col_idx] += val;
+    M2[Size(p) * ext + col_idx] += val;
+  }
+}
+
+__global__ void k_rhf_sq_sab_build_vecs(int ext, int i, int j, double s_f12, double occ_sum,
+                                        const double* __restrict__ hi,
+                                        const double* __restrict__ hj,
+                                        const double* __restrict__ m_col_i,
+                                        const double* __restrict__ m_col_j,
+                                        const double* __restrict__ m_row_i,
+                                        const double* __restrict__ m_row_j,
+                                        const double* __restrict__ ff0_hi,
+                                        const double* __restrict__ ff0_hj,
+                                        double* __restrict__ x1, double* __restrict__ x3,
+                                        double* __restrict__ y2, double* __restrict__ y4,
+                                        double* __restrict__ ff0_x1, double* __restrict__ ff0_x3,
+                                        double* __restrict__ ff_ei, double* __restrict__ ffT_ej) {
+  const int p = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (p >= ext) return;
+  x1[p] = s_f12 * (hi[p] - (p == i ? occ_sum : 0.0));
+  x3[p] = s_f12 * (hj[p] - (p == j ? occ_sum : 0.0));
+  y2[p] = s_f12 * hj[p];
+  y4[p] = s_f12 * hi[p];
+  ff0_x1[p] = s_f12 * (ff0_hi[p] - occ_sum * m_col_i[p]);
+  ff0_x3[p] = s_f12 * (ff0_hj[p] - occ_sum * m_col_j[p]);
+  ff_ei[p] = 0.375 * m_col_i[p] + 0.125 * m_row_i[p];
+  ffT_ej[p] = 0.375 * m_row_j[p] + 0.125 * m_col_j[p];
+}
+
+// Two sequential race-free 1D passes: pass 1 writes columns j & i (unique row p per thread),
+// pass 2 writes rows i & j (unique col p per thread), eliminating all (i,j)/(j,i)/(i,i)/(j,j) races.
+__global__ void k_rhf_sq_sab_fold_cols(int ext, int i, int j, double s_f12, double occ_sum,
+                                       const double* __restrict__ ff0_x1,
+                                       const double* __restrict__ ff0_x3,
+                                       const double* __restrict__ ff0_hi,
+                                       const double* __restrict__ ff0T_hi,
+                                       const double* __restrict__ ff_ei,
+                                       const double* __restrict__ h_ff_ei,
+                                       double* __restrict__ bar_Sab_ij) {
+  const int p = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (p >= ext) return;
+  const double ff_hi_p = 0.375 * ff0_hi[p] + 0.125 * ff0T_hi[p];
+  const double bw_v = s_f12 * (-occ_sum * ff_ei[p] + h_ff_ei[p] + ff_hi_p);
+  const double col_j = (3.0 / 64.0) * ff0_x1[p] + 0.125 * bw_v;
+  const double col_i = (1.0 / 64.0) * ff0_x3[p];
+  if (i == j) {
+    bar_Sab_ij[Size(p) * ext + j] = (bar_Sab_ij[Size(p) * ext + j] + col_j) + col_i;
+  } else {
+    bar_Sab_ij[Size(p) * ext + j] += col_j;
+    bar_Sab_ij[Size(p) * ext + i] += col_i;
+  }
+}
+
+__global__ void k_rhf_sq_sab_fold_rows(int ext, int i, int j, double s_f12, double occ_sum,
+                                       const double* __restrict__ ff0T_hi,
+                                       const double* __restrict__ ff0_hj,
+                                       const double* __restrict__ ff0T_hj,
+                                       const double* __restrict__ ffT_ej,
+                                       const double* __restrict__ h_ffT_ej,
+                                       double* __restrict__ bar_Sab_ij) {
+  const int p = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (p >= ext) return;
+  const double ffT_hj_p = 0.375 * ff0T_hj[p] + 0.125 * ff0_hj[p];
+  const double bwT_u = s_f12 * (-occ_sum * ffT_ej[p] + ffT_hj_p + h_ffT_ej[p]);
+  const double row_i = (3.0 / 64.0) * s_f12 * ff0T_hj[p] + 0.125 * bwT_u;
+  const double row_j = (1.0 / 64.0) * s_f12 * ff0T_hi[p];
+  if (i == j) {
+    bar_Sab_ij[Size(i) * ext + p] = (bar_Sab_ij[Size(i) * ext + p] + row_i) + row_j;
+  } else {
+    bar_Sab_ij[Size(i) * ext + p] += row_i;
+    bar_Sab_ij[Size(j) * ext + p] += row_j;
+  }
+}
+
+__global__ void k_rhf_dc_sab_fold_cols(int ext, int i, int j, double s_f12,
+                                       const double* __restrict__ u_col_i,
+                                       const double* __restrict__ u_col_j,
+                                       const double* __restrict__ u_row_i,
+                                       double* __restrict__ bar_Sab_ij) {
+  const int p = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (p >= ext) return;
+  const double c3_64 = (3.0 / 64.0) * s_f12;
+  const double c1_64 = (1.0 / 64.0) * s_f12;
+  const double bw_v = s_f12 * (0.375 * u_col_i[p] + 0.125 * u_row_i[p]);
+  const double col_j = c3_64 * u_col_i[p] + 0.125 * bw_v;
+  const double col_i = c1_64 * u_col_j[p];
+  if (i == j) {
+    bar_Sab_ij[Size(p) * ext + j] = (bar_Sab_ij[Size(p) * ext + j] + col_j) + col_i;
+  } else {
+    bar_Sab_ij[Size(p) * ext + j] += col_j;
+    bar_Sab_ij[Size(p) * ext + i] += col_i;
+  }
+}
+
+__global__ void k_rhf_dc_sab_fold_rows(int ext, int i, int j, double s_f12,
+                                       const double* __restrict__ u_row_j,
+                                       const double* __restrict__ u_col_j,
+                                       const double* __restrict__ u_row_i,
+                                       double* __restrict__ bar_Sab_ij) {
+  const int p = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (p >= ext) return;
+  const double c3_64 = (3.0 / 64.0) * s_f12;
+  const double c1_64 = (1.0 / 64.0) * s_f12;
+  const double bwT_u = s_f12 * (0.375 * u_row_j[p] + 0.125 * u_col_j[p]);
+  const double row_i = c3_64 * u_row_j[p] + 0.125 * bwT_u;
+  const double row_j = c1_64 * u_row_i[p];
+  if (i == j) {
+    bar_Sab_ij[Size(i) * ext + p] = (bar_Sab_ij[Size(i) * ext + p] + row_i) + row_j;
+  } else {
+    bar_Sab_ij[Size(i) * ext + p] += row_i;
+    bar_Sab_ij[Size(j) * ext + p] += row_j;
+  }
+}
+
+__global__ void k_ab_sq_build_vecs(int ext, int i, double s_f12, double bar_norm,
+                                   const double* __restrict__ ha_i,
+                                   const double* __restrict__ hb_j,
+                                   const double* __restrict__ ha_uj,
+                                   const double* __restrict__ hb_vi,
+                                   const double* __restrict__ u_j, double* __restrict__ x1,
+                                   double* __restrict__ y2, double* __restrict__ x3,
+                                   double* __restrict__ y4) {
+  const int p = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (p >= ext) return;
+  x1[p] = s_f12 * ha_i[p] + (p == i ? bar_norm : 0.0);
+  y2[p] = s_f12 * hb_j[p];
+  x3[p] = s_f12 * ha_uj[p] + bar_norm * u_j[p];
+  y4[p] = s_f12 * hb_vi[p];
+}
+
+__global__ void k_ab_sq_bar_sab_bw_col(int ext, int j, double s_f12, double bar_norm,
+                                       const double* __restrict__ ff_vi,
+                                       const double* __restrict__ mv1_v,
+                                       const double* __restrict__ mv2_v,
+                                       double* __restrict__ bar_Sab) {
+  const int p = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (p >= ext) return;
+  const double bw_v = bar_norm * ff_vi[p] + s_f12 * (mv1_v[p] + mv2_v[p]);
+  bar_Sab[Size(p) * ext + j] += 0.125 * bw_v;
+}
+
+__global__ void k_ab_sq_bar_sab_bw_row(int ext, int i, double s_f12, double bar_norm,
+                                       const double* __restrict__ ffT_uj,
+                                       const double* __restrict__ mv1_u,
+                                       const double* __restrict__ mv2_u,
+                                       double* __restrict__ bar_Sab) {
+  const int p = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (p >= ext) return;
+  const double bwT_u = bar_norm * ffT_uj[p] + s_f12 * (mv1_u[p] + mv2_u[p]);
+  bar_Sab[Size(i) * ext + p] += 0.125 * bwT_u;
+}
+
+int robust_bilin_pullback_gpu(cublasHandle_t h, double alpha, const double* d_x, const double* d_y,
+                              int aux, int ext, const double* d_fit_i, const double* d_raw_i,
+                              const double* d_fit_j, const double* d_res_j, double* d_bfit_i,
+                              double* d_braw_i, double* d_bfit_j, double* d_bres_j, double* d_fx,
+                              double* d_rx, double* d_sy, double* d_fy) {
+  if (alpha == 0.0) return 0;
+  if (rm_gemv(h, false, aux, ext, 1.0, d_fit_i, ext, d_x, 1, 0.0, d_fx, 1) !=
+          CUBLAS_STATUS_SUCCESS ||
+      rm_gemv(h, false, aux, ext, 1.0, d_raw_i, ext, d_x, 1, 0.0, d_rx, 1) !=
+          CUBLAS_STATUS_SUCCESS ||
+      rm_gemv(h, false, aux, ext, 1.0, d_res_j, ext, d_y, 1, 0.0, d_sy, 1) !=
+          CUBLAS_STATUS_SUCCESS ||
+      rm_gemv(h, false, aux, ext, 1.0, d_fit_j, ext, d_y, 1, 0.0, d_fy, 1) !=
+          CUBLAS_STATUS_SUCCESS) {
+    return 4;
+  }
+  if (rm_ger(h, aux, ext, alpha, d_sy, 1, d_x, 1, d_bfit_i, ext) != CUBLAS_STATUS_SUCCESS ||
+      rm_ger(h, aux, ext, alpha, d_fy, 1, d_x, 1, d_braw_i, ext) != CUBLAS_STATUS_SUCCESS ||
+      rm_ger(h, aux, ext, alpha, d_fx, 1, d_y, 1, d_bres_j, ext) != CUBLAS_STATUS_SUCCESS ||
+      rm_ger(h, aux, ext, alpha, d_rx, 1, d_y, 1, d_bfit_j, ext) != CUBLAS_STATUS_SUCCESS) {
+    return 4;
+  }
+  return 0;
+}
+
+int robust_row_col_pullback_gpu(cublasHandle_t h, double alpha_row, int row_idx,
+                                const double* d_y_row, double alpha_col, int col_idx,
+                                const double* d_x_col, int aux, int ext, const double* d_fit_i,
+                                const double* d_raw_i, const double* d_fit_j,
+                                const double* d_res_j, double* d_bfit_i, double* d_braw_i,
+                                double* d_bfit_j, double* d_bres_j, double* d_aux1,
+                                double* d_aux2) {
+  if (alpha_row != 0.0) {
+    if (rm_gemv(h, false, aux, ext, 1.0, d_res_j, ext, d_y_row, 1, 0.0, d_aux1, 1) !=
+            CUBLAS_STATUS_SUCCESS ||
+        rm_gemv(h, false, aux, ext, 1.0, d_fit_j, ext, d_y_row, 1, 0.0, d_aux2, 1) !=
+            CUBLAS_STATUS_SUCCESS) {
+      return 4;
+    }
+    k_add_col_scaled_vec<<<grid_for(aux), 256>>>(aux, ext, row_idx, alpha_row, d_aux1, d_bfit_i);
+    k_add_col_scaled_vec<<<grid_for(aux), 256>>>(aux, ext, row_idx, alpha_row, d_aux2, d_braw_i);
+    if (rm_ger(h, aux, ext, alpha_row, d_fit_i + row_idx, ext, d_y_row, 1, d_bres_j, ext) !=
+            CUBLAS_STATUS_SUCCESS ||
+        rm_ger(h, aux, ext, alpha_row, d_raw_i + row_idx, ext, d_y_row, 1, d_bfit_j, ext) !=
+            CUBLAS_STATUS_SUCCESS) {
+      return 4;
+    }
+  }
+  if (alpha_col != 0.0) {
+    if (rm_gemv(h, false, aux, ext, 1.0, d_fit_i, ext, d_x_col, 1, 0.0, d_aux1, 1) !=
+            CUBLAS_STATUS_SUCCESS ||
+        rm_gemv(h, false, aux, ext, 1.0, d_raw_i, ext, d_x_col, 1, 0.0, d_aux2, 1) !=
+            CUBLAS_STATUS_SUCCESS) {
+      return 4;
+    }
+    k_add_col_scaled_vec<<<grid_for(aux), 256>>>(aux, ext, col_idx, alpha_col, d_aux1, d_bres_j);
+    k_add_col_scaled_vec<<<grid_for(aux), 256>>>(aux, ext, col_idx, alpha_col, d_aux2, d_bfit_j);
+    if (rm_ger(h, aux, ext, alpha_col, d_res_j + col_idx, ext, d_x_col, 1, d_bfit_i, ext) !=
+            CUBLAS_STATUS_SUCCESS ||
+        rm_ger(h, aux, ext, alpha_col, d_fit_j + col_idx, ext, d_x_col, 1, d_braw_i, ext) !=
+            CUBLAS_STATUS_SUCCESS) {
+      return 4;
+    }
+  }
+  return 0;
+}
+
+int robust_rmatvec_gpu(cublasHandle_t h, const double* d_fit_i, const double* d_raw_i,
+                       const double* d_fit_j, const double* d_res_j, int aux, int ext,
+                       const double* d_y, double* d_out, double* d_sy, double* d_fy) {
+  if (rm_gemv(h, false, aux, ext, 1.0, d_res_j, ext, d_y, 1, 0.0, d_sy, 1) !=
+          CUBLAS_STATUS_SUCCESS ||
+      rm_gemv(h, false, aux, ext, 1.0, d_fit_j, ext, d_y, 1, 0.0, d_fy, 1) !=
+          CUBLAS_STATUS_SUCCESS ||
+      rm_gemv(h, true, aux, ext, 1.0, d_fit_i, ext, d_sy, 1, 0.0, d_out, 1) !=
+          CUBLAS_STATUS_SUCCESS ||
+      rm_gemv(h, true, aux, ext, 1.0, d_raw_i, ext, d_fy, 1, 1.0, d_out, 1) !=
+          CUBLAS_STATUS_SUCCESS) {
+    return 4;
+  }
+  return 0;
+}
+
+int robust_lmatvec_gpu(cublasHandle_t h, const double* d_fit_i, const double* d_raw_i,
+                       const double* d_fit_j, const double* d_res_j, int aux, int ext,
+                       const double* d_x, double* d_out, double* d_fx, double* d_rx) {
+  if (rm_gemv(h, false, aux, ext, 1.0, d_fit_i, ext, d_x, 1, 0.0, d_fx, 1) !=
+          CUBLAS_STATUS_SUCCESS ||
+      rm_gemv(h, false, aux, ext, 1.0, d_raw_i, ext, d_x, 1, 0.0, d_rx, 1) !=
+          CUBLAS_STATUS_SUCCESS ||
+      rm_gemv(h, true, aux, ext, 1.0, d_res_j, ext, d_fx, 1, 0.0, d_out, 1) !=
+          CUBLAS_STATUS_SUCCESS ||
+      rm_gemv(h, true, aux, ext, 1.0, d_fit_j, ext, d_rx, 1, 1.0, d_out, 1) !=
+          CUBLAS_STATUS_SUCCESS) {
+    return 4;
+  }
+  return 0;
+}
+
+int robust_row_gpu(cublasHandle_t h, const double* d_fit_i, const double* d_raw_i,
+                   const double* d_fit_j, const double* d_res_j, int aux, int ext, int row_idx,
+                   double* d_out) {
+  if (rm_gemv(h, true, aux, ext, 1.0, d_res_j, ext, d_fit_i + row_idx, ext, 0.0, d_out, 1) !=
+          CUBLAS_STATUS_SUCCESS ||
+      rm_gemv(h, true, aux, ext, 1.0, d_fit_j, ext, d_raw_i + row_idx, ext, 1.0, d_out, 1) !=
+          CUBLAS_STATUS_SUCCESS) {
+    return 4;
+  }
+  return 0;
+}
+
+int robust_col_gpu(cublasHandle_t h, const double* d_fit_i, const double* d_raw_i,
+                   const double* d_fit_j, const double* d_res_j, int aux, int ext, int col_idx,
+                   double* d_out) {
+  if (rm_gemv(h, true, aux, ext, 1.0, d_fit_i, ext, d_res_j + col_idx, ext, 0.0, d_out, 1) !=
+          CUBLAS_STATUS_SUCCESS ||
+      rm_gemv(h, true, aux, ext, 1.0, d_raw_i, ext, d_fit_j + col_idx, ext, 1.0, d_out, 1) !=
+          CUBLAS_STATUS_SUCCESS) {
+    return 4;
+  }
+  return 0;
+}
+
+int weight_rank1_pullback_gpu(cublasHandle_t h, double coeff, const double* d_x, const double* d_y,
+                              const double* d_Sab, int aux, int ext, const double* d_fit_i,
+                              const double* d_raw_i, const double* d_fit_j, const double* d_res_j,
+                              double* d_bfit_i, double* d_braw_i, double* d_bfit_j,
+                              double* d_bres_j, double* d_bar_Sab, double* d_sy_v, double* d_stx_v,
+                              double* d_mv1, double* d_mv2, double* d_a1, double* d_a2,
+                              double* d_a3, double* d_a4) {
+  if (coeff == 0.0) return 0;
+  if (rm_gemv(h, false, ext, ext, 1.0, d_Sab, ext, d_y, 1, 0.0, d_sy_v, 1) !=
+          CUBLAS_STATUS_SUCCESS ||
+      rm_gemv(h, true, ext, ext, 1.0, d_Sab, ext, d_x, 1, 0.0, d_stx_v, 1) !=
+          CUBLAS_STATUS_SUCCESS) {
+    return 4;
+  }
+  if (int rc = robust_bilin_pullback_gpu(h, 0.375 * coeff, d_x, d_y, aux, ext, d_fit_i, d_raw_i,
+                                         d_fit_j, d_res_j, d_bfit_i, d_braw_i, d_bfit_j, d_bres_j,
+                                         d_a1, d_a2, d_a3, d_a4);
+      rc != 0) {
+    return rc;
+  }
+  if (int rc = robust_bilin_pullback_gpu(h, 0.125 * coeff, d_sy_v, d_stx_v, aux, ext, d_fit_i,
+                                         d_raw_i, d_fit_j, d_res_j, d_bfit_i, d_braw_i, d_bfit_j,
+                                         d_bres_j, d_a1, d_a2, d_a3, d_a4);
+      rc != 0) {
+    return rc;
+  }
+  if (d_bar_Sab) {
+    if (int rc = robust_lmatvec_gpu(h, d_fit_i, d_raw_i, d_fit_j, d_res_j, aux, ext, d_sy_v, d_mv1,
+                                    d_a1, d_a2);
+        rc != 0) {
+      return rc;
+    }
+    if (int rc = robust_rmatvec_gpu(h, d_fit_i, d_raw_i, d_fit_j, d_res_j, aux, ext, d_stx_v, d_mv2,
+                                    d_a1, d_a2);
+        rc != 0) {
+      return rc;
+    }
+    if (rm_ger(h, ext, ext, 0.125 * coeff, d_x, 1, d_mv1, 1, d_bar_Sab, ext) !=
+            CUBLAS_STATUS_SUCCESS ||
+        rm_ger(h, ext, ext, 0.125 * coeff, d_mv2, 1, d_y, 1, d_bar_Sab, ext) !=
+            CUBLAS_STATUS_SUCCESS) {
+      return 4;
+    }
+  }
+  return 0;
+}
+
+int weight_rmatvec_gpu(cublasHandle_t h, const double* d_Sab, const double* d_fit_i,
+                       const double* d_raw_i, const double* d_fit_j, const double* d_res_j,
+                       int aux, int ext, const double* d_y, double* d_out, double* d_tmp1,
+                       double* d_tmp2, double* d_a1, double* d_a2) {
+  if (int rc = robust_rmatvec_gpu(h, d_fit_i, d_raw_i, d_fit_j, d_res_j, aux, ext, d_y, d_out, d_a1,
+                                  d_a2);
+      rc != 0) {
+    return rc;
+  }
+  if (rm_gemv(h, false, ext, ext, 1.0, d_Sab, ext, d_y, 1, 0.0, d_tmp1, 1) !=
+      CUBLAS_STATUS_SUCCESS) {
+    return 4;
+  }
+  if (int rc = robust_lmatvec_gpu(h, d_fit_i, d_raw_i, d_fit_j, d_res_j, aux, ext, d_tmp1, d_tmp2,
+                                  d_a1, d_a2);
+      rc != 0) {
+    return rc;
+  }
+  if (rm_gemv(h, false, ext, ext, 1.0, d_Sab, ext, d_tmp2, 1, 0.0, d_tmp1, 1) !=
+      CUBLAS_STATUS_SUCCESS) {
+    return 4;
+  }
+  k_lincomb2_inplace<<<grid_for(ext), 256>>>(ext, 0.375, 0.125, d_tmp1, d_out);
+  return 0;
+}
+
+int weight_lmatvec_gpu(cublasHandle_t h, const double* d_Sab, const double* d_fit_i,
+                       const double* d_raw_i, const double* d_fit_j, const double* d_res_j,
+                       int aux, int ext, const double* d_x, double* d_out, double* d_tmp1,
+                       double* d_tmp2, double* d_a1, double* d_a2) {
+  if (int rc = robust_lmatvec_gpu(h, d_fit_i, d_raw_i, d_fit_j, d_res_j, aux, ext, d_x, d_out, d_a1,
+                                  d_a2);
+      rc != 0) {
+    return rc;
+  }
+  if (rm_gemv(h, true, ext, ext, 1.0, d_Sab, ext, d_x, 1, 0.0, d_tmp1, 1) !=
+      CUBLAS_STATUS_SUCCESS) {
+    return 4;
+  }
+  if (int rc = robust_rmatvec_gpu(h, d_fit_i, d_raw_i, d_fit_j, d_res_j, aux, ext, d_tmp1, d_tmp2,
+                                  d_a1, d_a2);
+      rc != 0) {
+    return rc;
+  }
+  if (rm_gemv(h, true, ext, ext, 1.0, d_Sab, ext, d_tmp2, 1, 0.0, d_tmp1, 1) !=
+      CUBLAS_STATUS_SUCCESS) {
+    return 4;
+  }
+  k_lincomb2_inplace<<<grid_for(ext), 256>>>(ext, 0.375, 0.125, d_tmp1, d_out);
+  return 0;
+}
+
+int pullback_res_oqe_gpu(cublasHandle_t h, const double* d_bar_res_oqe, const double* d_fit_qoe,
+                         const double* d_metric, double metric_scale, bool sym_metric, int aux,
+                         int o_act, int ext, double* d_bar_raw_oqe, double* d_bar_fit_qoe,
+                         double* d_bar_metric, double* d_qoe_tmp, double* d_m_tmp) {
+  if (o_act <= 0) return 0;
+  const Size n_tot = Size(aux) * Size(o_act) * ext;
+  const int cols = o_act * ext;
+  k_axpy<<<grid_for(n_tot), 256>>>(n_tot, 1.0, d_bar_res_oqe, d_bar_raw_oqe);
+  k_oqe_to_qoe<<<grid_for(n_tot), 256>>>(aux, o_act, ext, d_bar_res_oqe, d_qoe_tmp);
+  if (rm_gemm(h, true, false, aux, cols, aux, -1.0, d_metric, aux, d_qoe_tmp, cols, 1.0,
+              d_bar_fit_qoe, cols) != CUBLAS_STATUS_SUCCESS) {
+    return 4;
+  }
+  if (d_bar_metric) {
+    if (!sym_metric) {
+      if (rm_gemm(h, false, true, aux, aux, cols, -metric_scale, d_qoe_tmp, cols, d_fit_qoe, cols,
+                  1.0, d_bar_metric, aux) != CUBLAS_STATUS_SUCCESS) {
+        return 4;
+      }
+    } else {
+      if (rm_gemm(h, false, true, aux, aux, cols, -0.5 * metric_scale, d_qoe_tmp, cols, d_fit_qoe,
+                  cols, 0.0, d_m_tmp, aux) != CUBLAS_STATUS_SUCCESS) {
+        return 4;
+      }
+      k_sym_add_transpose<<<grid_for(Size(aux) * aux), 256>>>(aux, 1.0, d_m_tmp, d_bar_metric);
+    }
+  }
+  return (cudaGetLastError() == cudaSuccess) ? 0 : 7;
+}
+
+int scatter_active_qoe_cuda_host(const double* d_qoe, int aux, int occ, int f, int o_act, int ext,
+                                 double* dst_host, std::vector<double>& h_qoe) {
+  if (!dst_host || o_act <= 0) return 0;
+  const Size n_tot = Size(aux) * Size(o_act) * ext;
+  h_qoe.resize(n_tot);
+  if (cudaMemcpy(h_qoe.data(), d_qoe, n_tot * sizeof(double), cudaMemcpyDeviceToHost) !=
+      cudaSuccess) {
+    return 6;
+  }
+  for (int A = 0; A < aux; ++A) {
+    const double* s = h_qoe.data() + Size(A) * o_act * ext;
+    double* d = dst_host + (Size(A) * occ + f) * ext;
+    std::copy_n(s, Size(o_act) * ext, d);
+  }
+  return 0;
+}
+
+int scatter_active_oqe_cuda_host(const double* d_oqe, int aux, int occ, int f, int o_act, int ext,
+                                 double* dst_host, std::vector<double>& h_qoe, double* d_qoe_tmp) {
+  if (!dst_host || o_act <= 0) return 0;
+  const Size n_tot = Size(aux) * Size(o_act) * ext;
+  k_oqe_to_qoe<<<grid_for(n_tot), 256>>>(aux, o_act, ext, d_oqe, d_qoe_tmp);
+  if (cudaGetLastError() != cudaSuccess) return 7;
+  return scatter_active_qoe_cuda_host(d_qoe_tmp, aux, occ, f, o_act, ext, dst_host, h_qoe);
+}
+
+int b_overlap_pullback_gpu(cublasHandle_t h, double scale, const double* d_A, const double* d_B,
+                           const double* d_F, const double* d_K, int o, int obs, int ext,
+                           double* d_bar_A, double* d_bar_B, double* d_bar_F, double* d_bar_K) {
+  if (scale == 0.0) return 0;
+  const int v = obs - o;
+  const int c = ext - obs;
+  // Term 0: -scale * <A @ K, B>
+  if (rm_gemm(h, false, true, ext, ext, ext, -scale, d_B, ext, d_K, ext, 1.0, d_bar_A, ext) !=
+          CUBLAS_STATUS_SUCCESS ||
+      rm_gemm(h, false, false, ext, ext, ext, -scale, d_A, ext, d_K, ext, 1.0, d_bar_B, ext) !=
+          CUBLAS_STATUS_SUCCESS ||
+      rm_gemm(h, true, false, ext, ext, ext, -scale, d_A, ext, d_B, ext, 1.0, d_bar_K, ext) !=
+          CUBLAS_STATUS_SUCCESS) {
+    return 4;
+  }
+  // Term 1: -scale * <A[:o, :] @ F, B[:o, :]>
+  if (rm_gemm(h, false, true, o, ext, ext, -scale, d_B, ext, d_F, ext, 1.0, d_bar_A, ext) !=
+          CUBLAS_STATUS_SUCCESS ||
+      rm_gemm(h, false, false, o, ext, ext, -scale, d_A, ext, d_F, ext, 1.0, d_bar_B, ext) !=
+          CUBLAS_STATUS_SUCCESS ||
+      rm_gemm(h, true, false, ext, ext, o, -scale, d_A, ext, d_B, ext, 1.0, d_bar_F, ext) !=
+          CUBLAS_STATUS_SUCCESS) {
+    return 4;
+  }
+  // Term 2: +scale * <A[obs:, :o] @ F[:o, :o], B[obs:, :o]>
+  if (rm_gemm(h, false, true, c, o, o, scale, d_B + Size(obs) * ext, ext, d_F, ext, 1.0,
+              d_bar_A + Size(obs) * ext, ext) != CUBLAS_STATUS_SUCCESS ||
+      rm_gemm(h, false, false, c, o, o, scale, d_A + Size(obs) * ext, ext, d_F, ext, 1.0,
+              d_bar_B + Size(obs) * ext, ext) != CUBLAS_STATUS_SUCCESS ||
+      rm_gemm(h, true, false, o, o, c, scale, d_A + Size(obs) * ext, ext, d_B + Size(obs) * ext,
+              ext, 1.0, d_bar_F, ext) != CUBLAS_STATUS_SUCCESS) {
+    return 4;
+  }
+  // Term 3: -scale * <A[o:obs, :obs] @ F[:obs, :obs], B[o:obs, :obs]>
+  if (rm_gemm(h, false, true, v, obs, obs, -scale, d_B + Size(o) * ext, ext, d_F, ext, 1.0,
+              d_bar_A + Size(o) * ext, ext) != CUBLAS_STATUS_SUCCESS ||
+      rm_gemm(h, false, false, v, obs, obs, -scale, d_A + Size(o) * ext, ext, d_F, ext, 1.0,
+              d_bar_B + Size(o) * ext, ext) != CUBLAS_STATUS_SUCCESS ||
+      rm_gemm(h, true, false, obs, obs, v, -scale, d_A + Size(o) * ext, ext, d_B + Size(o) * ext,
+              ext, 1.0, d_bar_F, ext) != CUBLAS_STATUS_SUCCESS) {
+    return 4;
+  }
+  // Term 4: -2 * scale * <A[obs:, :] @ F[:o, :]^T, B[obs:, :o]>
+  if (rm_gemm(h, false, false, c, ext, o, -2.0 * scale, d_B + Size(obs) * ext, ext, d_F, ext, 1.0,
+              d_bar_A + Size(obs) * ext, ext) != CUBLAS_STATUS_SUCCESS ||
+      rm_gemm(h, false, true, c, o, ext, -2.0 * scale, d_A + Size(obs) * ext, ext, d_F, ext, 1.0,
+              d_bar_B + Size(obs) * ext, ext) != CUBLAS_STATUS_SUCCESS ||
+      rm_gemm(h, true, false, o, ext, c, -2.0 * scale, d_B + Size(obs) * ext, ext,
+              d_A + Size(obs) * ext, ext, 1.0, d_bar_F, ext) != CUBLAS_STATUS_SUCCESS) {
+    return 4;
+  }
+  // Term 5: -2 * scale * <A[o:obs, :obs] @ F[:obs, obs:], B[o:obs, obs:]>
+  if (rm_gemm(h, false, true, v, obs, c, -2.0 * scale, d_B + Size(o) * ext + obs, ext, d_F + obs,
+              ext, 1.0, d_bar_A + Size(o) * ext, ext) != CUBLAS_STATUS_SUCCESS ||
+      rm_gemm(h, false, false, v, c, obs, -2.0 * scale, d_A + Size(o) * ext, ext, d_F + obs, ext,
+              1.0, d_bar_B + Size(o) * ext + obs, ext) != CUBLAS_STATUS_SUCCESS ||
+      rm_gemm(h, true, false, obs, c, v, -2.0 * scale, d_A + Size(o) * ext, ext,
+              d_B + Size(o) * ext + obs, ext, 1.0, d_bar_F + obs, ext) != CUBLAS_STATUS_SUCCESS) {
+    return 4;
+  }
+  return 0;
+}
+
+// Stage 1 Reverse for one operator (op_kind: 0=gc, 1=dc, 2=sq) on SS or RHF spatial channel.
+int run_ss_or_rhf_stage1_op_rev_gpu(
+    cublasHandle_t h, int op_kind, bool compute_both_rhf, bool has_occ_weights, int o, int f,
+    int ext, int aux, const double* occ_w_host, const double* fock_host, const double* d_fit_oqe,
+    const double* d_raw_op_oqe, const double* d_res_op_oqe, const double* d_H,
+    double* d_bar_fit_oqe, double* d_bar_raw_op_oqe, double* d_bar_res_op_oqe,
+    double* d_bar_res_os_op_oqe, double* d_bar_F, double* d_bar_K, double* d_bar_Sab) {
+  const int o_act = o - f;
+  if (compute_both_rhf ? (o_act <= 0) : (o_act < 2)) return 0;
+  const Size qe = Size(aux) * ext;
+  const Size ee = Size(ext) * ext;
+
+  DeviceBuf d_a1, d_a2, d_v1, d_v2, d_v3, d_v4, d_v5, d_v6, d_v7, d_v8, d_v9, d_sab_ij;
+  if (d_a1.alloc(aux) != cudaSuccess || d_a2.alloc(aux) != cudaSuccess ||
+      d_v1.alloc(ext) != cudaSuccess || d_v2.alloc(ext) != cudaSuccess ||
+      d_v3.alloc(ext) != cudaSuccess || d_v4.alloc(ext) != cudaSuccess) {
+    return 2;
+  }
+  if (op_kind == 2 || (compute_both_rhf && d_bar_Sab != nullptr)) {
+    if (d_v5.alloc(ext) != cudaSuccess || d_v6.alloc(ext) != cudaSuccess ||
+        d_v7.alloc(ext) != cudaSuccess || d_v8.alloc(ext) != cudaSuccess ||
+        d_v9.alloc(Size(10) * ext) != cudaSuccess || d_sab_ij.alloc(ee) != cudaSuccess) {
+      return 2;
+    }
+  }
+
+  for (int i_loc = 0; i_loc < o_act; ++i_loc) {
+    const int i = f + i_loc;
+    const int j_start = compute_both_rhf ? i_loc : (i_loc + 1);
+    const double* fit_i = d_fit_oqe + Size(i_loc) * qe;
+    const double* raw_i = d_raw_op_oqe + Size(i_loc) * qe;
+    double* bfit_i = d_bar_fit_oqe + Size(i_loc) * qe;
+    double* braw_i = d_bar_raw_op_oqe + Size(i_loc) * qe;
+    const double* d_hi = d_H + Size(i) * ext;
+
+    for (int j_loc = j_start; j_loc < o_act; ++j_loc) {
+      const int j = f + j_loc;
+      const bool diag = (i_loc == j_loc);
+      const double s_f12 = has_occ_weights ? 0.5 * (occ_w_host[i_loc] + occ_w_host[j_loc]) : 1.0;
+      const double spin_scale = (compute_both_rhf && diag) ? 0.5 : 1.0;
+      const double occ_sum = fock_host[Size(i) * ext + i] + fock_host[Size(j) * ext + j];
+      const double* fit_j = d_fit_oqe + Size(j_loc) * qe;
+      const double* res_j = d_res_op_oqe + Size(j_loc) * qe;
+      double* bfit_j = d_bar_fit_oqe + Size(j_loc) * qe;
+      double* bres_j = d_bar_res_op_oqe + Size(j_loc) * qe;
+      double* bres_os_j = compute_both_rhf ? (d_bar_res_os_op_oqe + Size(j_loc) * qe) : nullptr;
+      const double* d_hj = d_H + Size(j) * ext;
+
+      if (op_kind == 0) {
+        // geminal_coulomb (gc)
+        if (!diag) {
+          k_robust_elem_pullback<<<grid_for(aux), 256>>>(0.5 * s_f12, i, j, aux, ext, fit_i, raw_i,
+                                                         fit_j, res_j, bfit_i, braw_i, bfit_j,
+                                                         bres_j);
+          k_robust_elem_pullback<<<grid_for(aux), 256>>>(-0.5 * s_f12, j, i, aux, ext, fit_i, raw_i,
+                                                         fit_j, res_j, bfit_i, braw_i, bfit_j,
+                                                         bres_j);
+        }
+        if (compute_both_rhf) {
+          const double bar_V_d_os = diag ? s_f12 : (0.75 * s_f12);
+          k_robust_elem_pullback<<<grid_for(aux), 256>>>(spin_scale * bar_V_d_os, i, j, aux, ext,
+                                                         fit_i, raw_i, fit_j, res_j, bfit_i, braw_i,
+                                                         bfit_j, bres_os_j);
+          if (!diag) {
+            k_robust_elem_pullback<<<grid_for(aux), 256>>>(0.25 * s_f12, j, i, aux, ext, fit_i,
+                                                           raw_i, fit_j, res_j, bfit_i, braw_i,
+                                                           bfit_j, bres_os_j);
+          }
+          if (d_bar_Sab) {
+            if (int rc = robust_col_gpu(h, fit_i, raw_i, fit_j, res_j, aux, ext, i, d_v1.ptr);
+                rc != 0)
+              return rc;
+            if (int rc = robust_row_gpu(h, fit_i, raw_i, fit_j, res_j, aux, ext, j, d_v2.ptr);
+                rc != 0)
+              return rc;
+            const double c_gc = 0.25 * s_f12;
+            k_add_col_scaled_vec<<<grid_for(ext), 256>>>(ext, ext, j, c_gc, d_v1.ptr, d_bar_Sab);
+            k_add_row_scaled_vec<<<grid_for(ext), 256>>>(ext, i, c_gc, d_v2.ptr, d_bar_Sab);
+            if (!diag) {
+              k_add_row_scaled_vec<<<grid_for(ext), 256>>>(ext, j, c_gc, d_v1.ptr, d_bar_Sab);
+              k_add_col_scaled_vec<<<grid_for(ext), 256>>>(ext, ext, i, c_gc, d_v2.ptr, d_bar_Sab);
+            }
+          }
+        }
+      } else if (op_kind == 1) {
+        // double_commutator (dc)
+        const double bar_B_d_ss = (!diag) ? ((1.0 / 16.0) * s_f12) : 0.0;
+        const double bar_B_d_os = (diag ? 0.25 : (5.0 / 32.0)) * s_f12;
+        const double bar_B_x_os = (!diag) ? ((3.0 / 32.0) * s_f12) : 0.0;
+        if (!diag) {
+          k_robust_elem_pullback<<<grid_for(aux), 256>>>(bar_B_d_ss, i, j, aux, ext, fit_i, raw_i,
+                                                         fit_j, res_j, bfit_i, braw_i, bfit_j,
+                                                         bres_j);
+          k_robust_elem_pullback<<<grid_for(aux), 256>>>(-bar_B_d_ss, j, i, aux, ext, fit_i, raw_i,
+                                                         fit_j, res_j, bfit_i, braw_i, bfit_j,
+                                                         bres_j);
+        }
+        if (compute_both_rhf) {
+          k_robust_elem_pullback<<<grid_for(aux), 256>>>(spin_scale * bar_B_d_os, i, j, aux, ext,
+                                                         fit_i, raw_i, fit_j, res_j, bfit_i, braw_i,
+                                                         bfit_j, bres_os_j);
+          if (!diag) {
+            k_robust_elem_pullback<<<grid_for(aux), 256>>>(bar_B_x_os, j, i, aux, ext, fit_i, raw_i,
+                                                           fit_j, res_j, bfit_i, braw_i, bfit_j,
+                                                           bres_os_j);
+          }
+          if (d_bar_Sab) {
+            if (int rc = robust_col_gpu(h, fit_i, raw_i, fit_j, res_j, aux, ext, i, d_v1.ptr);
+                rc != 0)
+              return rc;
+            if (int rc = robust_row_gpu(h, fit_i, raw_i, fit_j, res_j, aux, ext, j, d_v2.ptr);
+                rc != 0)
+              return rc;
+            const double* u_col_j = d_v1.ptr;
+            const double* u_row_i = d_v2.ptr;
+            if (!diag) {
+              if (int rc = robust_col_gpu(h, fit_i, raw_i, fit_j, res_j, aux, ext, j, d_v3.ptr);
+                  rc != 0)
+                return rc;
+              if (int rc = robust_row_gpu(h, fit_i, raw_i, fit_j, res_j, aux, ext, i, d_v4.ptr);
+                  rc != 0)
+                return rc;
+              u_col_j = d_v3.ptr;
+              u_row_i = d_v4.ptr;
+            }
+            if (cudaMemset(d_sab_ij.ptr, 0, ee * sizeof(double)) != cudaSuccess) return 2;
+            k_rhf_dc_sab_fold_cols<<<grid_for(ext), 256>>>(ext, i, j, s_f12, d_v1.ptr, u_col_j,
+                                                           u_row_i, d_sab_ij.ptr);
+            k_rhf_dc_sab_fold_rows<<<grid_for(ext), 256>>>(ext, i, j, s_f12, d_v2.ptr, u_col_j,
+                                                           u_row_i, d_sab_ij.ptr);
+            if (diag) {
+              k_axpy<<<grid_for(ee), 256>>>(ee, 1.0, d_sab_ij.ptr, d_bar_Sab);
+            } else {
+              k_sym_add_transpose<<<grid_for(ee), 256>>>(ext, 1.0, d_sab_ij.ptr, d_bar_Sab);
+            }
+          }
+        }
+      } else {
+        // squared_geminal (sq)
+        const double bar_B_d_ss = (!diag) ? ((1.0 / 16.0) * s_f12) : 0.0;
+        const double bar_B_d_os = (diag ? 0.25 : (5.0 / 32.0)) * s_f12;
+        const double bar_B_x_os = (!diag) ? ((3.0 / 32.0) * s_f12) : 0.0;
+        const double bar_X_d_ss = (!diag) ? (-(1.0 / 16.0) * s_f12 * occ_sum) : 0.0;
+        const double bar_X_x_ss = (!diag) ? ((1.0 / 16.0) * s_f12 * occ_sum) : 0.0;
+        const double bar_X_d_os = -(diag ? 0.25 : (5.0 / 32.0)) * s_f12 * occ_sum;
+        const double bar_X_x_os = (!diag) ? (-(3.0 / 32.0) * s_f12 * occ_sum) : 0.0;
+
+        // m_row_i -> d_v1, m_col_j -> d_v2, m_row_j -> d_v3 (or d_v1), m_col_i -> d_v4 (or d_v2)
+        if (int rc = robust_row_gpu(h, fit_i, raw_i, fit_j, res_j, aux, ext, i, d_v1.ptr); rc != 0)
+          return rc;
+        if (int rc = robust_col_gpu(h, fit_i, raw_i, fit_j, res_j, aux, ext, j, d_v2.ptr); rc != 0)
+          return rc;
+        const double* m_row_j = d_v1.ptr;
+        const double* m_col_i = d_v2.ptr;
+        if (!diag) {
+          if (int rc = robust_row_gpu(h, fit_i, raw_i, fit_j, res_j, aux, ext, j, d_v3.ptr);
+              rc != 0)
+            return rc;
+          if (int rc = robust_col_gpu(h, fit_i, raw_i, fit_j, res_j, aux, ext, i, d_v4.ptr);
+              rc != 0)
+            return rc;
+          m_row_j = d_v3.ptr;
+          m_col_i = d_v4.ptr;
+        }
+
+        if (!diag) {
+          k_robust_elem_pullback<<<grid_for(aux), 256>>>(bar_X_d_ss, i, j, aux, ext, fit_i, raw_i,
+                                                         fit_j, res_j, bfit_i, braw_i, bfit_j,
+                                                         bres_j);
+          k_robust_elem_pullback<<<grid_for(aux), 256>>>(bar_X_x_ss, j, i, aux, ext, fit_i, raw_i,
+                                                         fit_j, res_j, bfit_i, braw_i, bfit_j,
+                                                         bres_j);
+          if (int rc = robust_row_col_pullback_gpu(h, bar_B_d_ss, i, d_hj, bar_B_d_ss, j, d_hi, aux,
+                                                   ext, fit_i, raw_i, fit_j, res_j, bfit_i, braw_i,
+                                                   bfit_j, bres_j, d_a1.ptr, d_a2.ptr);
+              rc != 0)
+            return rc;
+          if (int rc = robust_row_col_pullback_gpu(h, -bar_B_d_ss, j, d_hi, -bar_B_d_ss, i, d_hj,
+                                                   aux, ext, fit_i, raw_i, fit_j, res_j, bfit_i,
+                                                   braw_i, bfit_j, bres_j, d_a1.ptr, d_a2.ptr);
+              rc != 0)
+            return rc;
+          // bar_F, bar_K rows i, j
+          k_add_scaled_two_vecs_to_row_both<<<grid_for(ext), 256>>>(
+              ext, i, bar_B_d_ss, d_v2.ptr, -bar_B_d_ss, m_row_j, d_bar_F, d_bar_K);
+          k_add_scaled_two_vecs_to_row_both<<<grid_for(ext), 256>>>(
+              ext, j, bar_B_d_ss, d_v1.ptr, -bar_B_d_ss, m_col_i, d_bar_F, d_bar_K);
+        }
+
+        if (compute_both_rhf) {
+          k_robust_elem_pullback<<<grid_for(aux), 256>>>(spin_scale * bar_X_d_os, i, j, aux, ext,
+                                                         fit_i, raw_i, fit_j, res_j, bfit_i, braw_i,
+                                                         bfit_j, bres_os_j);
+          if (int rc = robust_row_col_pullback_gpu(
+                  h, spin_scale * bar_B_d_os, i, d_hj, spin_scale * bar_B_d_os, j, d_hi, aux, ext,
+                  fit_i, raw_i, fit_j, res_j, bfit_i, braw_i, bfit_j, bres_os_j, d_a1.ptr,
+                  d_a2.ptr);
+              rc != 0)
+            return rc;
+          if (!diag) {
+            k_robust_elem_pullback<<<grid_for(aux), 256>>>(bar_X_x_os, j, i, aux, ext, fit_i, raw_i,
+                                                           fit_j, res_j, bfit_i, braw_i, bfit_j,
+                                                           bres_os_j);
+            if (int rc = robust_row_col_pullback_gpu(
+                    h, bar_B_x_os, j, d_hi, bar_B_x_os, i, d_hj, aux, ext, fit_i, raw_i, fit_j,
+                    res_j, bfit_i, braw_i, bfit_j, bres_os_j, d_a1.ptr, d_a2.ptr);
+                rc != 0)
+              return rc;
+            k_add_scaled_two_vecs_to_col_both<<<grid_for(ext), 256>>>(
+                ext, i, bar_B_d_os, d_v2.ptr, bar_B_x_os, m_row_j, d_bar_F, d_bar_K);
+            k_add_scaled_two_vecs_to_col_both<<<grid_for(ext), 256>>>(
+                ext, j, bar_B_d_os, d_v1.ptr, bar_B_x_os, m_col_i, d_bar_F, d_bar_K);
+          } else {
+            k_add_scaled_two_vecs_to_col_both<<<grid_for(ext), 256>>>(
+                ext, i, 0.125 * s_f12, m_col_i, 0.125 * s_f12, d_v1.ptr, d_bar_F, d_bar_K);
+          }
+
+          if (d_bar_Sab) {
+            // ff0_hi -> d_v5, ff0T_hi -> d_v6, ff0_hj -> d_v7 (or d_v5), ff0T_hj -> d_v8 (or d_v6)
+            if (int rc = robust_rmatvec_gpu(h, fit_i, raw_i, fit_j, res_j, aux, ext, d_hi, d_v5.ptr,
+                                            d_a1.ptr, d_a2.ptr);
+                rc != 0)
+              return rc;
+            if (int rc = robust_lmatvec_gpu(h, fit_i, raw_i, fit_j, res_j, aux, ext, d_hi, d_v6.ptr,
+                                            d_a1.ptr, d_a2.ptr);
+                rc != 0)
+              return rc;
+            const double* ff0_hj = d_v5.ptr;
+            const double* ff0T_hj = d_v6.ptr;
+            if (!diag) {
+              if (int rc = robust_rmatvec_gpu(h, fit_i, raw_i, fit_j, res_j, aux, ext, d_hj,
+                                              d_v7.ptr, d_a1.ptr, d_a2.ptr);
+                  rc != 0)
+                return rc;
+              if (int rc = robust_lmatvec_gpu(h, fit_i, raw_i, fit_j, res_j, aux, ext, d_hj,
+                                              d_v8.ptr, d_a1.ptr, d_a2.ptr);
+                  rc != 0)
+                return rc;
+              ff0_hj = d_v7.ptr;
+              ff0T_hj = d_v8.ptr;
+            }
+            if (cudaMemset(d_sab_ij.ptr, 0, ee * sizeof(double)) != cudaSuccess) return 2;
+            double* d_x1 = d_v9.ptr + Size(0) * ext;
+            double* d_x3 = d_v9.ptr + Size(1) * ext;
+            double* d_y2 = d_v9.ptr + Size(2) * ext;
+            double* d_y4 = d_v9.ptr + Size(3) * ext;
+            double* d_ff0_x1 = d_v9.ptr + Size(4) * ext;
+            double* d_ff0_x3 = d_v9.ptr + Size(5) * ext;
+            double* d_ff_ei = d_v9.ptr + Size(6) * ext;
+            double* d_ffT_ej = d_v9.ptr + Size(7) * ext;
+            double* d_h_ff_ei = d_v9.ptr + Size(8) * ext;
+            double* d_h_ffT_ej = d_v9.ptr + Size(9) * ext;
+            k_rhf_sq_sab_build_vecs<<<grid_for(ext), 256>>>(
+                ext, i, j, s_f12, occ_sum, d_hi, d_hj, m_col_i, d_v2.ptr, d_v1.ptr, m_row_j,
+                d_v5.ptr, ff0_hj, d_x1, d_x3, d_y2, d_y4, d_ff0_x1, d_ff0_x3, d_ff_ei, d_ffT_ej);
+            if (rm_ger(h, ext, ext, 3.0 / 64.0, d_x1, 1, m_row_j, 1, d_sab_ij.ptr, ext) !=
+                    CUBLAS_STATUS_SUCCESS ||
+                rm_ger(h, ext, ext, 3.0 / 64.0, m_col_i, 1, d_y2, 1, d_sab_ij.ptr, ext) !=
+                    CUBLAS_STATUS_SUCCESS ||
+                rm_ger(h, ext, ext, 1.0 / 64.0, d_x3, 1, d_v1.ptr, 1, d_sab_ij.ptr, ext) !=
+                    CUBLAS_STATUS_SUCCESS ||
+                rm_ger(h, ext, ext, 1.0 / 64.0, d_v2.ptr, 1, d_y4, 1, d_sab_ij.ptr, ext) !=
+                    CUBLAS_STATUS_SUCCESS ||
+                rm_gemv(h, false, ext, ext, 1.0, d_H, ext, d_ff_ei, 1, 0.0, d_h_ff_ei, 1) !=
+                    CUBLAS_STATUS_SUCCESS ||
+                rm_gemv(h, false, ext, ext, 1.0, d_H, ext, d_ffT_ej, 1, 0.0, d_h_ffT_ej, 1) !=
+                    CUBLAS_STATUS_SUCCESS) {
+              return 4;
+            }
+            k_rhf_sq_sab_fold_cols<<<grid_for(ext), 256>>>(
+                ext, i, j, s_f12, occ_sum, d_ff0_x1, d_ff0_x3, d_v5.ptr, d_v6.ptr, d_ff_ei,
+                d_h_ff_ei, d_sab_ij.ptr);
+            k_rhf_sq_sab_fold_rows<<<grid_for(ext), 256>>>(
+                ext, i, j, s_f12, occ_sum, d_v6.ptr, ff0_hj, ff0T_hj, d_ffT_ej, d_h_ffT_ej,
+                d_sab_ij.ptr);
+            if (diag) {
+              k_axpy<<<grid_for(ee), 256>>>(ee, 1.0, d_sab_ij.ptr, d_bar_Sab);
+            } else {
+              k_sym_add_transpose<<<grid_for(ee), 256>>>(ext, 1.0, d_sab_ij.ptr, d_bar_Sab);
+            }
+          }
+        }
+      }
+    }
+  }
+  return (cudaGetLastError() == cudaSuccess) ? 0 : 7;
+}
+
+// Stage 1 Reverse for one operator (op_kind: 0=gc, 1=dc, 2=sq) on UHF Opposite-Spin (AB) channel.
+int run_ab_stage1_op_rev_gpu(
+    cublasHandle_t h, int op_kind, bool has_occ_weights, int oa, int ob, int fa, int fb, int ext,
+    int aux, const double* occ_w_a_host, const double* occ_w_b_host, const double* fock_a_host,
+    const double* fock_b_host, const double* d_fit_a_oqe, const double* d_fit_b_oqe,
+    const double* d_raw_op_a_oqe, const double* d_res_op_b_oqe, const double* d_Ha,
+    const double* d_Hb, const double* d_Sab, const double* d_Ha_S, const double* d_Hb_ST,
+    double* d_bar_fit_a_oqe, double* d_bar_fit_b_oqe, double* d_bar_raw_op_a_oqe,
+    double* d_bar_res_op_b_oqe, double* d_bar_Fa, double* d_bar_Fb, double* d_bar_Ka,
+    double* d_bar_Kb, double* d_bar_Sab) {
+  const int oa_act = oa - fa;
+  const int ob_act = ob - fb;
+  if (oa_act <= 0 || ob_act <= 0) return 0;
+  const Size qe = Size(aux) * ext;
+
+  // Allocate all scratch vectors ONCE before pair loops.
+  DeviceBuf d_a, d_v;
+  if (d_a.alloc(Size(4) * aux) != cudaSuccess || d_v.alloc(Size(22) * ext) != cudaSuccess) {
+    return 2;
+  }
+  double* d_a1 = d_a.ptr + Size(0) * aux;
+  double* d_a2 = d_a.ptr + Size(1) * aux;
+  double* d_a3 = d_a.ptr + Size(2) * aux;
+  double* d_a4 = d_a.ptr + Size(3) * aux;
+
+  double* d_ei = d_v.ptr + Size(0) * ext;
+  double* d_ej = d_v.ptr + Size(1) * ext;
+  double* d_vi = d_v.ptr + Size(2) * ext;
+  double* d_uj = d_v.ptr + Size(3) * ext;
+  double* d_ha_i = d_v.ptr + Size(4) * ext;
+  double* d_hb_j = d_v.ptr + Size(5) * ext;
+  double* d_ha_uj = d_v.ptr + Size(6) * ext;
+  double* d_hb_vi = d_v.ptr + Size(7) * ext;
+  double* d_x1 = d_v.ptr + Size(8) * ext;
+  double* d_y2 = d_v.ptr + Size(9) * ext;
+  double* d_x3 = d_v.ptr + Size(10) * ext;
+  double* d_y4 = d_v.ptr + Size(11) * ext;
+  double* d_sy_v = d_v.ptr + Size(12) * ext;
+  double* d_stx_v = d_v.ptr + Size(13) * ext;
+  double* d_mv1 = d_v.ptr + Size(14) * ext;
+  double* d_mv2 = d_v.ptr + Size(15) * ext;
+  double* d_tmp1 = d_v.ptr + Size(16) * ext;
+  double* d_tmp2 = d_v.ptr + Size(17) * ext;
+  double* d_ff_ej = d_v.ptr + Size(18) * ext;
+  double* d_ff_vi = d_v.ptr + Size(19) * ext;
+  double* d_ffT_ei = d_v.ptr + Size(20) * ext;
+  double* d_ffT_uj = d_v.ptr + Size(21) * ext;
+
+  for (int i_loc = 0; i_loc < oa_act; ++i_loc) {
+    const int i = fa + i_loc;
+    const double* fit_i = d_fit_a_oqe + Size(i_loc) * qe;
+    const double* raw_i = d_raw_op_a_oqe + Size(i_loc) * qe;
+    double* bfit_i = d_bar_fit_a_oqe + Size(i_loc) * qe;
+    double* braw_i = d_bar_raw_op_a_oqe + Size(i_loc) * qe;
+
+    k_set_unit_vec<<<grid_for(ext), 256>>>(ext, i, d_ei);
+    // v_i = Sab[i, :] (row i of Sab)
+    if (cudaMemcpy(d_vi, d_Sab + Size(i) * ext, Size(ext) * sizeof(double),
+                   cudaMemcpyDeviceToDevice) != cudaSuccess) {
+      return 3;
+    }
+    if (op_kind == 2) {
+      k_extract_col<<<grid_for(ext), 256>>>(ext, ext, i, d_Ha, d_ha_i);
+      k_extract_col<<<grid_for(ext), 256>>>(ext, ext, i, d_Hb_ST, d_hb_vi);
+    }
+
+    for (int j_loc = 0; j_loc < ob_act; ++j_loc) {
+      const int j = fb + j_loc;
+      const double* fit_j = d_fit_b_oqe + Size(j_loc) * qe;
+      const double* res_j = d_res_op_b_oqe + Size(j_loc) * qe;
+      double* bfit_j = d_bar_fit_b_oqe + Size(j_loc) * qe;
+      double* bres_j = d_bar_res_op_b_oqe + Size(j_loc) * qe;
+
+      const double s_f12 =
+          has_occ_weights ? 0.5 * (occ_w_a_host[i_loc] + occ_w_b_host[j_loc]) : 1.0;
+      const double occ_sum = fock_a_host[Size(i) * ext + i] + fock_b_host[Size(j) * ext + j];
+      const double bar_linear = 2.0 * s_f12;
+      const double bar_norm = -s_f12 * occ_sum;
+
+      k_set_unit_vec<<<grid_for(ext), 256>>>(ext, j, d_ej);
+      k_extract_col<<<grid_for(ext), 256>>>(ext, ext, j, d_Sab, d_uj);
+
+      if (op_kind == 0) {
+        // 7a. gc0
+        k_robust_elem_pullback<<<grid_for(aux), 256>>>(0.375 * bar_linear, i, j, aux, ext, fit_i,
+                                                       raw_i, fit_j, res_j, bfit_i, braw_i, bfit_j,
+                                                       bres_j);
+        if (int rc = robust_bilin_pullback_gpu(h, 0.125 * bar_linear, d_uj, d_vi, aux, ext, fit_i,
+                                               raw_i, fit_j, res_j, bfit_i, braw_i, bfit_j, bres_j,
+                                               d_a1, d_a2, d_a3, d_a4);
+            rc != 0)
+          return rc;
+        if (d_bar_Sab) {
+          if (int rc = robust_rmatvec_gpu(h, fit_i, raw_i, fit_j, res_j, aux, ext, d_vi, d_tmp1,
+                                          d_a1, d_a2);
+              rc != 0)
+            return rc;
+          if (int rc = robust_lmatvec_gpu(h, fit_i, raw_i, fit_j, res_j, aux, ext, d_uj, d_tmp2,
+                                          d_a1, d_a2);
+              rc != 0)
+            return rc;
+          k_add_col_scaled_vec<<<grid_for(ext), 256>>>(ext, ext, j, 0.125 * bar_linear, d_tmp1,
+                                                       d_bar_Sab);
+          k_add_row_scaled_vec<<<grid_for(ext), 256>>>(ext, i, 0.125 * bar_linear, d_tmp2,
+                                                       d_bar_Sab);
+        }
+      } else if (op_kind == 1) {
+        // 7b. dc (uf = W(uf0))
+        if (int rc = weight_rank1_pullback_gpu(h, 0.375 * s_f12, d_ei, d_ej, d_Sab, aux, ext, fit_i,
+                                               raw_i, fit_j, res_j, bfit_i, braw_i, bfit_j, bres_j,
+                                               d_bar_Sab, d_sy_v, d_stx_v, d_mv1, d_mv2, d_a1, d_a2,
+                                               d_a3, d_a4);
+            rc != 0)
+          return rc;
+        if (int rc = weight_rank1_pullback_gpu(h, 0.125 * s_f12, d_uj, d_vi, d_Sab, aux, ext, fit_i,
+                                               raw_i, fit_j, res_j, bfit_i, braw_i, bfit_j, bres_j,
+                                               d_bar_Sab, d_sy_v, d_stx_v, d_mv1, d_mv2, d_a1, d_a2,
+                                               d_a3, d_a4);
+            rc != 0)
+          return rc;
+        if (d_bar_Sab) {
+          if (int rc = weight_rmatvec_gpu(h, d_Sab, fit_i, raw_i, fit_j, res_j, aux, ext, d_vi,
+                                          d_mv1, d_tmp1, d_tmp2, d_a1, d_a2);
+              rc != 0)
+            return rc;
+          if (int rc = weight_lmatvec_gpu(h, d_Sab, fit_i, raw_i, fit_j, res_j, aux, ext, d_uj,
+                                          d_mv2, d_tmp1, d_tmp2, d_a1, d_a2);
+              rc != 0)
+            return rc;
+          k_add_col_scaled_vec<<<grid_for(ext), 256>>>(ext, ext, j, 0.125 * s_f12, d_mv1,
+                                                       d_bar_Sab);
+          k_add_row_scaled_vec<<<grid_for(ext), 256>>>(ext, i, 0.125 * s_f12, d_mv2, d_bar_Sab);
+        }
+      } else {
+        // 7c. sq (ff = W(ff0))
+        k_extract_col<<<grid_for(ext), 256>>>(ext, ext, j, d_Hb, d_hb_j);
+        k_extract_col<<<grid_for(ext), 256>>>(ext, ext, j, d_Ha_S, d_ha_uj);
+        k_ab_sq_build_vecs<<<grid_for(ext), 256>>>(ext, i, s_f12, bar_norm, d_ha_i, d_hb_j, d_ha_uj,
+                                                   d_hb_vi, d_uj, d_x1, d_y2, d_x3, d_y4);
+        if (int rc = weight_rank1_pullback_gpu(h, 0.375, d_x1, d_ej, d_Sab, aux, ext, fit_i, raw_i,
+                                               fit_j, res_j, bfit_i, braw_i, bfit_j, bres_j,
+                                               d_bar_Sab, d_sy_v, d_stx_v, d_mv1, d_mv2, d_a1, d_a2,
+                                               d_a3, d_a4);
+            rc != 0)
+          return rc;
+        if (int rc = weight_rank1_pullback_gpu(h, 0.375, d_ei, d_y2, d_Sab, aux, ext, fit_i, raw_i,
+                                               fit_j, res_j, bfit_i, braw_i, bfit_j, bres_j,
+                                               d_bar_Sab, d_sy_v, d_stx_v, d_mv1, d_mv2, d_a1, d_a2,
+                                               d_a3, d_a4);
+            rc != 0)
+          return rc;
+        if (int rc = weight_rank1_pullback_gpu(h, 0.125, d_x3, d_vi, d_Sab, aux, ext, fit_i, raw_i,
+                                               fit_j, res_j, bfit_i, braw_i, bfit_j, bres_j,
+                                               d_bar_Sab, d_sy_v, d_stx_v, d_mv1, d_mv2, d_a1, d_a2,
+                                               d_a3, d_a4);
+            rc != 0)
+          return rc;
+        if (int rc = weight_rank1_pullback_gpu(h, 0.125, d_uj, d_y4, d_Sab, aux, ext, fit_i, raw_i,
+                                               fit_j, res_j, bfit_i, braw_i, bfit_j, bres_j,
+                                               d_bar_Sab, d_sy_v, d_stx_v, d_mv1, d_mv2, d_a1, d_a2,
+                                               d_a3, d_a4);
+            rc != 0)
+          return rc;
+
+        if (int rc = weight_rmatvec_gpu(h, d_Sab, fit_i, raw_i, fit_j, res_j, aux, ext, d_ej,
+                                        d_ff_ej, d_tmp1, d_tmp2, d_a1, d_a2);
+            rc != 0)
+          return rc;
+        if (int rc = weight_rmatvec_gpu(h, d_Sab, fit_i, raw_i, fit_j, res_j, aux, ext, d_vi,
+                                        d_ff_vi, d_tmp1, d_tmp2, d_a1, d_a2);
+            rc != 0)
+          return rc;
+        if (int rc = weight_lmatvec_gpu(h, d_Sab, fit_i, raw_i, fit_j, res_j, aux, ext, d_ei,
+                                        d_ffT_ei, d_tmp1, d_tmp2, d_a1, d_a2);
+            rc != 0)
+          return rc;
+        if (int rc = weight_lmatvec_gpu(h, d_Sab, fit_i, raw_i, fit_j, res_j, aux, ext, d_uj,
+                                        d_ffT_uj, d_tmp1, d_tmp2, d_a1, d_a2);
+            rc != 0)
+          return rc;
+
+        k_add_scaled_two_vecs_to_col_both<<<grid_for(ext), 256>>>(
+            ext, i, 0.375 * s_f12, d_ff_ej, 0.0, d_ff_ej, d_bar_Fa, d_bar_Ka);
+        k_add_scaled_two_vecs_to_col_both<<<grid_for(ext), 256>>>(
+            ext, j, 0.375 * s_f12, d_ffT_ei, 0.0, d_ffT_ei, d_bar_Fb, d_bar_Kb);
+        if (rm_ger(h, ext, ext, 0.125 * s_f12, d_ff_vi, 1, d_uj, 1, d_bar_Fa, ext) !=
+                CUBLAS_STATUS_SUCCESS ||
+            rm_ger(h, ext, ext, 0.125 * s_f12, d_ff_vi, 1, d_uj, 1, d_bar_Ka, ext) !=
+                CUBLAS_STATUS_SUCCESS ||
+            rm_ger(h, ext, ext, 0.125 * s_f12, d_ffT_uj, 1, d_vi, 1, d_bar_Fb, ext) !=
+                CUBLAS_STATUS_SUCCESS ||
+            rm_ger(h, ext, ext, 0.125 * s_f12, d_ffT_uj, 1, d_vi, 1, d_bar_Kb, ext) !=
+                CUBLAS_STATUS_SUCCESS) {
+          return 4;
+        }
+        if (d_bar_Sab) {
+          if (rm_gemv(h, true, ext, ext, 1.0, d_Ha, ext, d_ff_vi, 1, 0.0, d_mv1, 1) !=
+              CUBLAS_STATUS_SUCCESS)
+            return 4;
+          if (int rc = weight_rmatvec_gpu(h, d_Sab, fit_i, raw_i, fit_j, res_j, aux, ext, d_hb_vi,
+                                          d_mv2, d_tmp1, d_tmp2, d_a1, d_a2);
+              rc != 0)
+            return rc;
+          if (rm_gemv(h, true, ext, ext, 1.0, d_Hb, ext, d_ffT_uj, 1, 0.0, d_x1, 1) !=
+              CUBLAS_STATUS_SUCCESS)
+            return 4;
+          if (int rc = weight_lmatvec_gpu(h, d_Sab, fit_i, raw_i, fit_j, res_j, aux, ext, d_ha_uj,
+                                          d_y2, d_tmp1, d_tmp2, d_a1, d_a2);
+              rc != 0)
+            return rc;
+          k_ab_sq_bar_sab_bw_col<<<grid_for(ext), 256>>>(ext, j, s_f12, bar_norm, d_ff_vi, d_mv1,
+                                                         d_mv2, d_bar_Sab);
+          k_ab_sq_bar_sab_bw_row<<<grid_for(ext), 256>>>(ext, i, s_f12, bar_norm, d_ffT_uj, d_x1,
+                                                         d_y2, d_bar_Sab);
+        }
+      }
+    }
+  }
+  return (cudaGetLastError() == cudaSuccess) ? 0 : 7;
+}
+
+// -------------------------------------------------------------------------
+// Stage 2 Reverse Kernels & Drivers (SS/RHF Spatial + UHF Opposite-Spin AB)
+// -------------------------------------------------------------------------
+
+__global__ void k_ss_rhf_ord_only_step(
+    int i_loc, int j_loc, int o_act, int o, int f, int obs, int ext, bool compute_both_rhf,
+    double wij, Size out_pair_offset, int scalar_ord_idx, const double* __restrict__ F,
+    const double* __restrict__ G_vv, double* __restrict__ bar_G_vv,
+    double* __restrict__ bar_G_vv_os, double* __restrict__ bar_F,
+    double* __restrict__ d_out_scalars, double* __restrict__ d_pair_ord, int* __restrict__ d_err) {
+  __shared__ double s0[256];
+  __shared__ double s1[256];
+  __shared__ double s2[256];
+  const int v = obs - o;
+  const int i = f + i_loc;
+  const int j = f + j_loc;
+  const bool diag = (i_loc == j_loc);
+  const double spin_scale = (compute_both_rhf && diag) ? 0.5 : 1.0;
+  const double occ_sum = F[Size(i) * ext + i] + F[Size(j) * ext + j];
+  const Size vv = Size(v) * v;
+
+  double ss_gg = 0.0, os_gg = 0.0, sum_bgap = 0.0;
+  for (Size idx = threadIdx.x; idx < vv; idx += blockDim.x) {
+    const int a = static_cast<int>(idx / v);
+    const int b = static_cast<int>(idx % v);
+    const double gap = F[Size(o + a) * ext + (o + a)] + F[Size(o + b) * ext + (o + b)] - occ_sum;
+    if (!isfinite(gap) || gap == 0.0) {
+      atomicExch(d_err, -4);
+      continue;
+    }
+    const double inv_g = 1.0 / gap;
+    const double gab = G_vv[idx];
+    if (diag) {
+      os_gg += gab * gab * inv_g;
+      bar_G_vv[idx] = -2.0 * wij * gab * inv_g;
+      const double bgap = wij * gab * gab * inv_g * inv_g;
+      atomicAdd(&bar_F[Size(o + a) * ext + (o + a)], spin_scale * bgap);
+      atomicAdd(&bar_F[Size(o + b) * ext + (o + b)], spin_scale * bgap);
+      sum_bgap += bgap;
+    } else {
+      const double gba = G_vv[Size(b) * v + a];
+      const double ag = gab - gba;
+      ss_gg += ag * ag * inv_g;
+      bar_G_vv[idx] = -2.0 * wij * ag * inv_g;
+      double bgap = 0.5 * wij * ag * ag * inv_g * inv_g;
+      if (compute_both_rhf) {
+        os_gg += gab * gab * inv_g;
+        bar_G_vv_os[idx] = -2.0 * wij * gab * inv_g;
+        bgap += wij * gab * gab * inv_g * inv_g;
+      }
+      atomicAdd(&bar_F[Size(o + a) * ext + (o + a)], bgap);
+      atomicAdd(&bar_F[Size(o + b) * ext + (o + b)], bgap);
+      sum_bgap += bgap;
+    }
+  }
+  s0[threadIdx.x] = ss_gg;
+  s1[threadIdx.x] = os_gg;
+  s2[threadIdx.x] = sum_bgap;
+  __syncthreads();
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      s0[threadIdx.x] += s0[threadIdx.x + stride];
+      s1[threadIdx.x] += s1[threadIdx.x + stride];
+      s2[threadIdx.x] += s2[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    const double bar_occ_sum = -s2[0];
+    if (diag) {
+      bar_F[Size(i) * ext + i] += spin_scale * 2.0 * bar_occ_sum;
+      const double eo_os = -s1[0];
+      const Size n_aa = (o_act >= 2) ? (Size(o_act) * (o_act - 1)) / 2 : 0;
+      const Size ab_idx = n_aa + Size(i_loc) * o_act + i_loc;
+      if (d_pair_ord) d_pair_ord[ab_idx] = eo_os;
+      d_out_scalars[4] += wij * eo_os;
+    } else {
+      bar_F[Size(i) * ext + i] += bar_occ_sum;
+      bar_F[Size(j) * ext + j] += bar_occ_sum;
+      const double eo_ss = -0.5 * s0[0];
+      const double eo_os = compute_both_rhf ? (-s1[0]) : 0.0;
+      if (compute_both_rhf) {
+        const Size n_aa = (Size(o_act) * (o_act - 1)) / 2;
+        const Size n_ab = Size(o_act) * o_act;
+        const Size tri = strict_tri_index(i_loc, j_loc, o_act);
+        if (d_pair_ord) {
+          d_pair_ord[tri] = eo_ss;
+          d_pair_ord[n_aa + Size(i_loc) * o_act + j_loc] = eo_os;
+          d_pair_ord[n_aa + Size(j_loc) * o_act + i_loc] = eo_os;
+          d_pair_ord[n_aa + n_ab + tri] = eo_ss;
+        }
+        d_out_scalars[3] += wij * eo_ss;
+        d_out_scalars[5] += wij * eo_ss;
+        d_out_scalars[4] += 2.0 * wij * eo_os;
+      } else {
+        if (d_pair_ord) d_pair_ord[out_pair_offset + strict_tri_index(i_loc, j_loc, o_act)] = eo_ss;
+        d_out_scalars[scalar_ord_idx] += wij * eo_ss;
+      }
+    }
+  }
+}
+
+__global__ void k_rhf_diag_rev_step1_denom(
+    int i_loc, int o_act, int o, int f, int obs, int ext, bool include_ordinary, double wij,
+    const double* __restrict__ F, const double* __restrict__ d_uf_d,
+    const double* __restrict__ d_sq_fk_d, const double* __restrict__ d_vx,
+    const double* __restrict__ d_b_ov, const double* __restrict__ G_obs,
+    const double* __restrict__ C_d, double* __restrict__ bar_C_d, double* __restrict__ bar_C_os,
+    double* __restrict__ bar_G_obs, double* __restrict__ bar_F, double* __restrict__ d_out_scalars,
+    double* __restrict__ d_pair_f12, double* __restrict__ d_pair_ord, int* __restrict__ d_err) {
+  __shared__ double s0[256];
+  __shared__ double s1[256];
+  __shared__ double s2[256];
+  __shared__ double s3[256];
+
+  const int v = obs - o;
+  const int i = f + i_loc;
+  const double s_f12 = wij;
+  const double s_ord = include_ordinary ? wij : 0.0;
+  const double spin_scale = 0.5;
+  const double occ_sum = 2.0 * F[Size(i) * ext + i];
+  const Size vv = Size(v) * v;
+
+  double vd_cg = 0.0, bd_cc = 0.0, os_gg = 0.0, sum_bgap = 0.0;
+  for (Size idx = threadIdx.x; idx < vv; idx += blockDim.x) {
+    const int a = static_cast<int>(idx / v);
+    const int b = static_cast<int>(idx % v);
+    const double gap = F[Size(o + a) * ext + (o + a)] + F[Size(o + b) * ext + (o + b)] - occ_sum;
+    if (!isfinite(gap) || gap == 0.0) {
+      atomicExch(d_err, -4);
+      continue;
+    }
+    const double inv_g = 1.0 / gap;
+    const double gab = G_obs[Size(o + a) * obs + (o + b)];
+    const double cab = C_d[idx];
+    vd_cg += cab * gab * inv_g;
+    bd_cc += cab * cab * inv_g;
+    if (include_ordinary) os_gg += gab * gab * inv_g;
+
+    const double c_os = 0.5 * cab;
+    const double bc_os = -2.0 * s_f12 * (gab + c_os) * inv_g;
+    bar_C_os[idx] = bc_os;
+    bar_C_d[idx] = 0.5 * bc_os;
+    bar_G_obs[Size(o + a) * obs + (o + b)] = (-s_f12 * cab - 2.0 * s_ord * gab) * inv_g;
+    const double bar_inv_g = -s_f12 * (cab * gab + 0.25 * cab * cab) - s_ord * gab * gab;
+    const double bar_gap = -bar_inv_g * inv_g * inv_g;
+    atomicAdd(&bar_F[Size(o + a) * ext + (o + a)], spin_scale * bar_gap);
+    atomicAdd(&bar_F[Size(o + b) * ext + (o + b)], spin_scale * bar_gap);
+    sum_bgap += bar_gap;
+  }
+  s0[threadIdx.x] = vd_cg;
+  s1[threadIdx.x] = bd_cc;
+  s2[threadIdx.x] = os_gg;
+  s3[threadIdx.x] = sum_bgap;
+  __syncthreads();
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      s0[threadIdx.x] += s0[threadIdx.x + stride];
+      s1[threadIdx.x] += s1[threadIdx.x + stride];
+      s2[threadIdx.x] += s2[threadIdx.x + stride];
+      s3[threadIdx.x] += s3[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    const int pid = i_loc * o_act + i_loc;
+    const double V_d = d_vx[0];
+    const double X_d = d_vx[2];
+    const double B_d = d_uf_d[pid] + d_sq_fk_d[pid] + 2.0 * d_b_ov[0];
+    const double ef_os = (V_d - s0[0]) + 0.25 * (B_d - occ_sum * X_d - s1[0]);
+    const double eo_os = include_ordinary ? (-s2[0]) : 0.0;
+    const double bar_occ_sum = -0.25 * s_f12 * X_d - s3[0];
+    bar_F[Size(i) * ext + i] += spin_scale * 2.0 * bar_occ_sum;
+    const Size n_aa = (o_act >= 2) ? (Size(o_act) * (o_act - 1)) / 2 : 0;
+    const Size ab_idx = n_aa + Size(i_loc) * o_act + i_loc;
+    if (d_pair_f12) d_pair_f12[ab_idx] = ef_os;
+    if (include_ordinary && d_pair_ord) d_pair_ord[ab_idx] = eo_os;
+    d_out_scalars[1] += wij * ef_os;
+    if (include_ordinary) d_out_scalars[4] += wij * eo_os;
+  }
+}
+
+__global__ void k_ss_rhf_rev_step1_denom(
+    int i_loc, int j_loc, int o_act, int o, int f, int obs, int ext, bool compute_both_rhf,
+    bool include_ordinary, double wij, Size out_pair_offset, int scalar_f12_idx, int scalar_ord_idx,
+    const double* __restrict__ F, const double* __restrict__ d_uf_d,
+    const double* __restrict__ d_uf_x, const double* __restrict__ d_sq_fk_d,
+    const double* __restrict__ d_sq_fk_x, const double* __restrict__ d_vx,
+    const double* __restrict__ d_b_ov, const double* __restrict__ G_obs,
+    const double* __restrict__ C_d, double* __restrict__ bar_ag, double* __restrict__ bar_ac,
+    double* __restrict__ bar_C_os, double* __restrict__ bar_G_obs_os, double* __restrict__ bar_F,
+    double* __restrict__ d_out_scalars, double* __restrict__ d_pair_f12,
+    double* __restrict__ d_pair_ord, int* __restrict__ d_err) {
+  __shared__ double s0[256];
+  __shared__ double s1[256];
+  __shared__ double s2[256];
+  __shared__ double s3[256];
+  __shared__ double s4[256];
+  __shared__ double s5[256];
+
+  const int v = obs - o;
+  const int i = f + i_loc;
+  const int j = f + j_loc;
+  const double s_f12 = wij;
+  const double s_ord = include_ordinary ? wij : 0.0;
+  const double occ_sum = F[Size(i) * ext + i] + F[Size(j) * ext + j];
+  const Size vv = Size(v) * v;
+
+  double ss_gc = 0.0, ss_cc = 0.0, ss_gg = 0.0, os_term = 0.0, os_gg = 0.0, sum_bgap = 0.0;
+  for (Size idx = threadIdx.x; idx < vv; idx += blockDim.x) {
+    const int a = static_cast<int>(idx / v);
+    const int b = static_cast<int>(idx % v);
+    const double gap = F[Size(o + a) * ext + (o + a)] + F[Size(o + b) * ext + (o + b)] - occ_sum;
+    if (!isfinite(gap) || gap == 0.0) {
+      atomicExch(d_err, -4);
+      continue;
+    }
+    const double inv_g = 1.0 / gap;
+    const double gab = G_obs[Size(o + a) * obs + (o + b)];
+    const double gba = G_obs[Size(o + b) * obs + (o + a)];
+    const double cab = C_d[idx];
+    const double cba = C_d[Size(b) * v + a];
+    const double ag = gab - gba;
+    const double ac = cab - cba;
+    ss_gc += ag * ac * inv_g;
+    ss_cc += ac * ac * inv_g;
+    if (include_ordinary) ss_gg += ag * ag * inv_g;
+
+    bar_ag[idx] = (-0.25 * s_f12 * ac - s_ord * ag) * inv_g;
+    bar_ac[idx] = (-0.25 * s_f12 * ag - (1.0 / 16.0) * s_f12 * ac) * inv_g;
+    double bar_inv_g =
+        -0.25 * s_f12 * ag * ac - (1.0 / 32.0) * s_f12 * ac * ac - 0.5 * s_ord * ag * ag;
+    if (compute_both_rhf) {
+      const double c_os = 0.375 * cab + 0.125 * cba;
+      os_term += c_os * (2.0 * gab + c_os) * inv_g;
+      if (include_ordinary) os_gg += gab * gab * inv_g;
+      bar_C_os[idx] = -2.0 * s_f12 * (gab + c_os) * inv_g;
+      bar_G_obs_os[Size(o + a) * obs + (o + b)] = (-2.0 * s_f12 * c_os - 2.0 * s_ord * gab) * inv_g;
+      bar_inv_g += -s_f12 * c_os * (2.0 * gab + c_os) - s_ord * gab * gab;
+    }
+    const double bar_gap = -bar_inv_g * inv_g * inv_g;
+    atomicAdd(&bar_F[Size(o + a) * ext + (o + a)], bar_gap);
+    atomicAdd(&bar_F[Size(o + b) * ext + (o + b)], bar_gap);
+    sum_bgap += bar_gap;
+  }
+  s0[threadIdx.x] = ss_gc;
+  s1[threadIdx.x] = ss_cc;
+  s2[threadIdx.x] = ss_gg;
+  s3[threadIdx.x] = os_term;
+  s4[threadIdx.x] = os_gg;
+  s5[threadIdx.x] = sum_bgap;
+  __syncthreads();
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      s0[threadIdx.x] += s0[threadIdx.x + stride];
+      s1[threadIdx.x] += s1[threadIdx.x + stride];
+      s2[threadIdx.x] += s2[threadIdx.x + stride];
+      s3[threadIdx.x] += s3[threadIdx.x + stride];
+      s4[threadIdx.x] += s4[threadIdx.x + stride];
+      s5[threadIdx.x] += s5[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    const int pid = i_loc * o_act + j_loc;
+    const double V_d = d_vx[0];
+    const double V_x = d_vx[1];
+    const double X_d = d_vx[2];
+    const double X_x = d_vx[3];
+    const double B_d = d_uf_d[pid] + d_sq_fk_d[pid] + d_b_ov[0];
+    const double B_x = d_uf_x[pid] + d_sq_fk_x[pid] + d_b_ov[1];
+    double bar_occ_sum = -(1.0 / 16.0) * s_f12 * (X_d - X_x) - s5[0];
+    if (compute_both_rhf) {
+      bar_occ_sum -= s_f12 * ((5.0 / 32.0) * X_d + (3.0 / 32.0) * X_x);
+    }
+    bar_F[Size(i) * ext + i] += bar_occ_sum;
+    bar_F[Size(j) * ext + j] += bar_occ_sum;
+
+    const double lin_ss = (V_d - V_x) - 0.5 * s0[0];
+    const double quad_ss = ((B_d - B_x) - occ_sum * (X_d - X_x)) - 0.5 * s1[0];
+    const double ef_ss = 0.5 * lin_ss + (1.0 / 16.0) * quad_ss;
+    const double eo_ss = include_ordinary ? (-0.5 * s2[0]) : 0.0;
+    if (compute_both_rhf) {
+      const double lin_os = 0.375 * V_d + 0.125 * V_x;
+      const double norm_os = (5.0 / 32.0) * X_d + (3.0 / 32.0) * X_x;
+      const double b_os = (5.0 / 32.0) * B_d + (3.0 / 32.0) * B_x;
+      const double ef_os = 2.0 * lin_os + b_os - occ_sum * norm_os - s3[0];
+      const double eo_os = include_ordinary ? (-s4[0]) : 0.0;
+      const Size n_aa = (Size(o_act) * (o_act - 1)) / 2;
+      const Size n_ab = Size(o_act) * o_act;
+      const Size tri = strict_tri_index(i_loc, j_loc, o_act);
+      if (d_pair_f12) {
+        d_pair_f12[tri] = ef_ss;
+        d_pair_f12[n_aa + Size(i_loc) * o_act + j_loc] = ef_os;
+        d_pair_f12[n_aa + Size(j_loc) * o_act + i_loc] = ef_os;
+        d_pair_f12[n_aa + n_ab + tri] = ef_ss;
+      }
+      if (include_ordinary && d_pair_ord) {
+        d_pair_ord[tri] = eo_ss;
+        d_pair_ord[n_aa + Size(i_loc) * o_act + j_loc] = eo_os;
+        d_pair_ord[n_aa + Size(j_loc) * o_act + i_loc] = eo_os;
+        d_pair_ord[n_aa + n_ab + tri] = eo_ss;
+      }
+      d_out_scalars[0] += wij * ef_ss;
+      d_out_scalars[2] += wij * ef_ss;
+      d_out_scalars[1] += 2.0 * wij * ef_os;
+      if (include_ordinary) {
+        d_out_scalars[3] += wij * eo_ss;
+        d_out_scalars[5] += wij * eo_ss;
+        d_out_scalars[4] += 2.0 * wij * eo_os;
+      }
+    } else {
+      const Size idx = out_pair_offset + strict_tri_index(i_loc, j_loc, o_act);
+      if (d_pair_f12) d_pair_f12[idx] = ef_ss;
+      if (include_ordinary && d_pair_ord) d_pair_ord[idx] = eo_ss;
+      d_out_scalars[scalar_f12_idx] += wij * ef_ss;
+      if (include_ordinary) d_out_scalars[scalar_ord_idx] += wij * eo_ss;
+    }
+  }
+}
+
+__global__ void k_ss_rhf_rev_step1_fold(int o, int obs, bool compute_both_rhf,
+                                        const double* __restrict__ bar_ag,
+                                        const double* __restrict__ bar_ac,
+                                        const double* __restrict__ bar_C_os,
+                                        double* __restrict__ bar_G_obs,
+                                        double* __restrict__ bar_C_d,
+                                        double* __restrict__ bar_C_ss) {
+  const int v = obs - o;
+  const Size vv = Size(v) * v;
+  const Size idx = Size(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= vv) return;
+  const int a = static_cast<int>(idx / v);
+  const int b = static_cast<int>(idx % v);
+  const Size ba = Size(b) * v + a;
+  bar_G_obs[Size(o + a) * obs + (o + b)] = bar_ag[idx] - bar_ag[ba];
+  const double bcss = bar_ac[idx] - bar_ac[ba];
+  bar_C_ss[idx] = bcss;
+  double bcd = bcss;
+  if (compute_both_rhf) bcd += 0.375 * bar_C_os[idx] + 0.125 * bar_C_os[ba];
+  bar_C_d[idx] = bcd;
+}
+
+__global__ void k_rhf_bar_f_os_p_blocks(int o, int obs, int ext, double s_f12, double occ_sum,
+                                        const double* __restrict__ G_obs,
+                                        const double* __restrict__ G_oc,
+                                        const double* __restrict__ G_co,
+                                        const double* __restrict__ f_os,
+                                        double* __restrict__ bar_f_os) {
+  const int c = ext - obs;
+  const Size n_obs2 = Size(obs) * obs;
+  const Size n_oc = Size(o) * c;
+  const Size total = n_obs2 + 2 * n_oc;
+  const Size idx = Size(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  const double n_coef = 2.0 * s_f12 * occ_sum;
+  if (idx < n_obs2) {
+    const int p = static_cast<int>(idx / obs);
+    const int r = static_cast<int>(idx % obs);
+    const Size pr = Size(p) * ext + r;
+    bar_f_os[pr] += -2.0 * s_f12 * G_obs[idx] + n_coef * f_os[pr];
+  } else if (idx < n_obs2 + n_oc) {
+    const Size rem = idx - n_obs2;
+    const int p = static_cast<int>(rem / c);
+    const int q = static_cast<int>(rem % c);
+    const Size pq = Size(p) * ext + (obs + q);
+    bar_f_os[pq] += -2.0 * s_f12 * G_oc[rem] + n_coef * f_os[pq];
+  } else {
+    const Size rem = idx - n_obs2 - n_oc;
+    const int p = static_cast<int>(rem / o);
+    const int q = static_cast<int>(rem % o);
+    const Size pq = Size(obs + p) * ext + q;
+    bar_f_os[pq] += -2.0 * s_f12 * G_co[rem] + n_coef * f_os[pq];
+  }
+}
+
+__global__ void k_ss_rhf_rev_step4_vx(
+    int o, int obs, int ext, bool diag, bool split_rhf_offdiag, double bar_V_d, double bar_V_x,
+    double bar_V_d_ss, double bar_V_x_ss, double bar_V_d_os, double bar_V_x_os, double bar_X_d_ss,
+    double bar_X_x_ss, const double* __restrict__ f0, const double* __restrict__ ft,
+    const double* __restrict__ G_obs, const double* __restrict__ G_oc,
+    const double* __restrict__ G_co, double* __restrict__ bar_G_obs, double* __restrict__ bar_G_oc,
+    double* __restrict__ bar_G_co, double* __restrict__ bar_G_obs_os,
+    double* __restrict__ bar_G_oc_os, double* __restrict__ bar_G_co_os,
+    double* __restrict__ bar_f0, double* __restrict__ bar_ft) {
+  const int c = ext - obs;
+  const Size n_obs2 = Size(obs) * obs;
+  const Size n_oc = Size(o) * c;
+  const Size total = n_obs2 + 2 * n_oc;
+  const Size idx = Size(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  if (idx < n_obs2) {
+    const int p = static_cast<int>(idx / obs);
+    const int r = static_cast<int>(idx % obs);
+    const Size pr = Size(p) * ext + r;
+    const double fp = f0[pr];
+    const double ftp = diag ? fp : ft[pr];
+    const double gpr = G_obs[idx];
+    if (split_rhf_offdiag) {
+      bar_G_obs[idx] -= bar_V_d_ss * fp + bar_V_x_ss * ftp;
+      bar_G_obs_os[idx] -= bar_V_d_os * fp + bar_V_x_os * ftp;
+    } else {
+      bar_G_obs[idx] -= bar_V_d * fp + bar_V_x * ftp;
+    }
+    if (!diag) {
+      bar_f0[pr] -= bar_V_d_ss * gpr + 2.0 * bar_X_d_ss * fp + bar_X_x_ss * ftp;
+      bar_ft[pr] -= bar_V_x_ss * gpr + bar_X_x_ss * fp;
+    }
+  } else if (idx < n_obs2 + n_oc) {
+    const Size rem = idx - n_obs2;
+    const int p = static_cast<int>(rem / c);
+    const int q = static_cast<int>(rem % c);
+    const Size pq = Size(p) * ext + (obs + q);
+    const double fp = f0[pq];
+    const double ftp = diag ? fp : ft[pq];
+    const double gpq = G_oc[rem];
+    if (split_rhf_offdiag) {
+      bar_G_oc[rem] -= bar_V_d_ss * fp + bar_V_x_ss * ftp;
+      bar_G_oc_os[rem] -= bar_V_d_os * fp + bar_V_x_os * ftp;
+    } else {
+      bar_G_oc[rem] -= bar_V_d * fp + bar_V_x * ftp;
+    }
+    if (!diag) {
+      bar_f0[pq] -= bar_V_d_ss * gpq + 2.0 * bar_X_d_ss * fp + bar_X_x_ss * ftp;
+      bar_ft[pq] -= bar_V_x_ss * gpq + bar_X_x_ss * fp;
+    }
+  } else {
+    const Size rem = idx - n_obs2 - n_oc;
+    const int p = static_cast<int>(rem / o);
+    const int q = static_cast<int>(rem % o);
+    const Size pq = Size(obs + p) * ext + q;
+    const double fp = f0[pq];
+    const double ftp = diag ? fp : ft[pq];
+    const double gpq = G_co[rem];
+    if (split_rhf_offdiag) {
+      bar_G_co[rem] -= bar_V_d_ss * fp + bar_V_x_ss * ftp;
+      bar_G_co_os[rem] -= bar_V_d_os * fp + bar_V_x_os * ftp;
+    } else {
+      bar_G_co[rem] -= bar_V_d * fp + bar_V_x * ftp;
+    }
+    if (!diag) {
+      bar_f0[pq] -= bar_V_d_ss * gpq + 2.0 * bar_X_d_ss * fp + bar_X_x_ss * ftp;
+      bar_ft[pq] -= bar_V_x_ss * gpq + bar_X_x_ss * fp;
+    }
+  }
+}
+
+int run_ss_or_rhf_stage2_response_gpu(
+    cublasHandle_t h, bool compute_both_rhf, bool include_f12, bool include_ordinary,
+    bool has_occ_weights, int o, int f, int obs, int ext, int aux, Size out_pair_offset,
+    int scalar_f12_idx, int scalar_ord_idx, const double* occ_w_host, const double* fock_host,
+    const double* d_fit_oqe, const double* d_raw_coul_oqe, const double* d_raw_g_oqe,
+    const double* d_res_g_oqe, const double* d_F, const double* d_K, const double* d_H,
+    const double* d_fg_d, const double* d_fg_x, const double* d_f2_d, const double* d_f2_x,
+    const double* d_uf_d, const double* d_uf_x, const double* d_sq_fk_d, const double* d_sq_fk_x,
+    double* d_out_scalars, double* d_pair_f12, double* d_pair_ord, double* d_bar_fit_oqe,
+    double* d_bar_raw_coul_oqe, double* d_bar_raw_g_oqe, double* d_bar_res_g_oqe,
+    double* d_bar_res_os_g_oqe, double* d_bar_F, double* d_bar_K, double* d_bar_Sab, int* d_err) {
+  const int o_act = o - f;
+  if ((compute_both_rhf ? (o_act <= 0) : (o_act < 2)) || (!include_f12 && !include_ordinary)) {
+    return 0;
+  }
+  const int v = obs - o;
+  const int c = ext - obs;
+  const Size ee = Size(ext) * ext;
+  const Size qe = Size(aux) * ext;
+  const Size obs2 = Size(obs) * obs;
+  const Size oc = Size(o) * c;
+  const Size vv = Size(v) * v;
+
+  if (!include_f12) {
+    DeviceBuf d_G_vv, d_bar_G_vv, d_bar_G_vv_os;
+    if (d_G_vv.alloc(vv) != cudaSuccess || d_bar_G_vv.alloc(vv) != cudaSuccess ||
+        (compute_both_rhf && d_bar_G_vv_os.alloc(vv) != cudaSuccess)) {
+      return 2;
+    }
+    for (int i_loc = 0; i_loc < o_act; ++i_loc) {
+      const int j_start = compute_both_rhf ? i_loc : (i_loc + 1);
+      const double* fit_i = d_fit_oqe + Size(i_loc) * qe;
+      const double* raw_coul_i = d_raw_coul_oqe + Size(i_loc) * qe;
+      double* bfit_i = d_bar_fit_oqe + Size(i_loc) * qe;
+      double* braw_coul_i = d_bar_raw_coul_oqe + Size(i_loc) * qe;
+      for (int j_loc = j_start; j_loc < o_act; ++j_loc) {
+        const bool diag = (i_loc == j_loc);
+        const double wij = has_occ_weights ? 0.5 * (occ_w_host[i_loc] + occ_w_host[j_loc]) : 1.0;
+        const double spin_scale = (compute_both_rhf && diag) ? 0.5 : 1.0;
+        const double* fit_j = d_fit_oqe + Size(j_loc) * qe;
+        const double* raw_coul_j = d_raw_coul_oqe + Size(j_loc) * qe;
+        double* bfit_j = d_bar_fit_oqe + Size(j_loc) * qe;
+        double* braw_coul_j = d_bar_raw_coul_oqe + Size(j_loc) * qe;
+        if (rm_gemm(h, true, false, v, v, aux, 1.0, fit_i + o, ext, raw_coul_j + o, ext, 0.0,
+                    d_G_vv.ptr, v) != CUBLAS_STATUS_SUCCESS) {
+          return 4;
+        }
+        k_ss_rhf_ord_only_step<<<1, 256>>>(
+            i_loc, j_loc, o_act, o, f, obs, ext, compute_both_rhf, wij, out_pair_offset,
+            scalar_ord_idx, d_F, d_G_vv.ptr, d_bar_G_vv.ptr, d_bar_G_vv_os.ptr, d_bar_F,
+            d_out_scalars, d_pair_ord, d_err);
+        if (compute_both_rhf && !diag) {
+          k_axpy<<<grid_for(vv), 256>>>(vv, 0.5, d_bar_G_vv_os.ptr, d_bar_G_vv.ptr);
+          if (rm_gemm(h, false, true, aux, v, v, 1.0, raw_coul_j + o, ext, d_bar_G_vv.ptr, v, 1.0,
+                      bfit_i + o, ext) != CUBLAS_STATUS_SUCCESS ||
+              rm_gemm(h, false, false, aux, v, v, 1.0, fit_i + o, ext, d_bar_G_vv.ptr, v, 1.0,
+                      braw_coul_j + o, ext) != CUBLAS_STATUS_SUCCESS ||
+              rm_gemm(h, false, false, aux, v, v, 0.5, raw_coul_i + o, ext, d_bar_G_vv_os.ptr, v,
+                      1.0, bfit_j + o, ext) != CUBLAS_STATUS_SUCCESS ||
+              rm_gemm(h, false, true, aux, v, v, 0.5, fit_j + o, ext, d_bar_G_vv_os.ptr, v, 1.0,
+                      braw_coul_i + o, ext) != CUBLAS_STATUS_SUCCESS) {
+            return 4;
+          }
+        } else {
+          if (rm_gemm(h, false, true, aux, v, v, spin_scale, raw_coul_j + o, ext, d_bar_G_vv.ptr, v,
+                      1.0, bfit_i + o, ext) != CUBLAS_STATUS_SUCCESS ||
+              rm_gemm(h, false, false, aux, v, v, spin_scale, fit_i + o, ext, d_bar_G_vv.ptr, v,
+                      1.0, braw_coul_j + o, ext) != CUBLAS_STATUS_SUCCESS) {
+            return 4;
+          }
+        }
+      }
+    }
+    return (cudaGetLastError() == cudaSuccess) ? 0 : 7;
+  }
+
+  // Allocate ALL single-pair scratch buffers ONCE before the loop (zero inner-loop allocations).
+  const Size sub_a_per = std::max<Size>({Size(o) * ext, Size(v) * obs, Size(c) * ext, Size(v) * c});
+  const Size sub_l_per = std::max<Size>({Size(o) * ext, Size(c) * o, Size(v) * ext});
+  DeviceBuf d_f0, d_ft, d_L0, d_sub_A, d_sub_L, d_G_obs, d_G_oc, d_G_co, d_C_d;
+  DeviceBuf d_bar_C_d, d_bar_C_ss, d_bar_C_os, d_bar_ag, d_bar_ac;
+  DeviceBuf d_bar_G_obs, d_bar_G_oc, d_bar_G_co, d_bar_G_obs_os, d_bar_G_oc_os, d_bar_G_co_os;
+  DeviceBuf d_bar_f0, d_bar_ft, d_diff_f, d_bar_diff;
+  DeviceBuf d_f_os, d_qf_os, d_bar_f_os, d_bar_qf_os, d_bar_f0_os, d_ff_mat;
+  DeviceBuf d_vx, d_b_ov;
+
+  if (d_f0.alloc(ee) != cudaSuccess || d_ft.alloc(ee) != cudaSuccess ||
+      d_L0.alloc(ee) != cudaSuccess || d_sub_A.alloc(sub_a_per) != cudaSuccess ||
+      d_sub_L.alloc(sub_l_per) != cudaSuccess || d_G_obs.alloc(obs2) != cudaSuccess ||
+      d_G_oc.alloc(oc) != cudaSuccess || d_G_co.alloc(oc) != cudaSuccess ||
+      d_C_d.alloc(vv) != cudaSuccess || d_bar_C_d.alloc(vv) != cudaSuccess ||
+      d_bar_C_ss.alloc(vv) != cudaSuccess || d_bar_ag.alloc(vv) != cudaSuccess ||
+      d_bar_ac.alloc(vv) != cudaSuccess || d_bar_G_obs.alloc(obs2) != cudaSuccess ||
+      d_bar_G_oc.alloc(oc) != cudaSuccess || d_bar_G_co.alloc(oc) != cudaSuccess ||
+      d_bar_f0.alloc(ee) != cudaSuccess || d_bar_ft.alloc(ee) != cudaSuccess ||
+      d_diff_f.alloc(ee) != cudaSuccess || d_bar_diff.alloc(ee) != cudaSuccess ||
+      d_vx.alloc(4) != cudaSuccess || d_b_ov.alloc(2) != cudaSuccess) {
+    return 2;
+  }
+  if (compute_both_rhf) {
+    if (d_bar_C_os.alloc(vv) != cudaSuccess || d_bar_G_obs_os.alloc(obs2) != cudaSuccess ||
+        d_bar_G_oc_os.alloc(oc) != cudaSuccess || d_bar_G_co_os.alloc(oc) != cudaSuccess ||
+        d_f_os.alloc(ee) != cudaSuccess || d_qf_os.alloc(ee) != cudaSuccess ||
+        d_bar_f_os.alloc(ee) != cudaSuccess || d_bar_qf_os.alloc(ee) != cudaSuccess ||
+        d_bar_f0_os.alloc(ee) != cudaSuccess || d_ff_mat.alloc(ee) != cudaSuccess) {
+      return 2;
+    }
+  }
+
+  for (int i_loc = 0; i_loc < o_act; ++i_loc) {
+    const int i = f + i_loc;
+    const int j_start = compute_both_rhf ? i_loc : (i_loc + 1);
+    const double* fit_i = d_fit_oqe + Size(i_loc) * qe;
+    const double* raw_coul_i = d_raw_coul_oqe + Size(i_loc) * qe;
+    const double* raw_g_i = d_raw_g_oqe + Size(i_loc) * qe;
+    double* bfit_i = d_bar_fit_oqe + Size(i_loc) * qe;
+    double* braw_coul_i = d_bar_raw_coul_oqe + Size(i_loc) * qe;
+    double* braw_g_i = d_bar_raw_g_oqe + Size(i_loc) * qe;
+
+    for (int j_loc = j_start; j_loc < o_act; ++j_loc) {
+      const int j = f + j_loc;
+      const bool diag = (i_loc == j_loc);
+      const bool split_rhf_offdiag = (compute_both_rhf && !diag);
+      const double wij = has_occ_weights ? 0.5 * (occ_w_host[i_loc] + occ_w_host[j_loc]) : 1.0;
+      const double s_f12 = wij;
+      const double spin_scale = (compute_both_rhf && diag) ? 0.5 : 1.0;
+      const double occ_sum = fock_host[Size(i) * ext + i] + fock_host[Size(j) * ext + j];
+
+      const double* fit_j = d_fit_oqe + Size(j_loc) * qe;
+      const double* raw_coul_j = d_raw_coul_oqe + Size(j_loc) * qe;
+      const double* res_g_j = d_res_g_oqe + Size(j_loc) * qe;
+      double* bfit_j = d_bar_fit_oqe + Size(j_loc) * qe;
+      double* braw_coul_j = d_bar_raw_coul_oqe + Size(j_loc) * qe;
+      double* bres_g_j = d_bar_res_g_oqe + Size(j_loc) * qe;
+      double* bres_os_g_j = compute_both_rhf ? (d_bar_res_os_g_oqe + Size(j_loc) * qe) : nullptr;
+
+      // Forward 1: f0, ft, Coulomb blocks.
+      if (rm_gemm(h, true, false, ext, ext, aux, 1.0, fit_i, ext, res_g_j, ext, 0.0, d_f0.ptr,
+                  ext) != CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, true, false, ext, ext, aux, 1.0, raw_g_i, ext, fit_j, ext, 1.0, d_f0.ptr,
+                  ext) != CUBLAS_STATUS_SUCCESS) {
+        return 4;
+      }
+      if (!diag) launch_transpose_2d(ext, ext, d_f0.ptr, d_ft.ptr);
+      const double* d_ft_eff = diag ? d_f0.ptr : d_ft.ptr;
+
+      if (rm_gemm(h, true, false, obs, obs, aux, 1.0, fit_i, ext, raw_coul_j, ext, 0.0, d_G_obs.ptr,
+                  obs) != CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, true, false, o, c, aux, 1.0, fit_i, ext, raw_coul_j + obs, ext, 0.0,
+                  d_G_oc.ptr, c) != CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, true, false, c, o, aux, 1.0, fit_i + obs, ext, raw_coul_j, ext, 0.0,
+                  d_G_co.ptr, o) != CUBLAS_STATUS_SUCCESS) {
+        return 4;
+      }
+
+      // Forward 2: V_d, V_x, X_d, X_x (also zeroes d_b_ov[0..1]).
+      k_ss_vx_reduce<<<1, 256>>>(i_loc, j_loc, o_act, o, obs, ext, d_fg_d, d_fg_x, d_f2_d, d_f2_x,
+                                 d_f0.ptr, d_ft_eff, d_G_obs.ptr, d_G_oc.ptr, d_G_co.ptr, d_vx.ptr,
+                                 d_b_ov.ptr);
+
+      // Forward 3: b_overlap (pass=0 only for diag, since diag doubles d_b_ov[0]).
+      const int n_passes = diag ? 1 : 2;
+      for (int pass = 0; pass < n_passes; ++pass) {
+        const double* A_b = (pass == 0) ? d_f0.ptr : d_ft.ptr;
+        const double* B_dir = (pass == 0) ? d_f0.ptr : d_ft.ptr;
+        const double* B_exc = (pass == 0) ? d_ft_eff : d_f0.ptr;
+        if (rm_gemm(h, false, false, ext, ext, ext, 1.0, A_b, ext, d_K, ext, 0.0, d_L0.ptr, ext) !=
+            CUBLAS_STATUS_SUCCESS)
+          return 4;
+        k_accum_dot_pair_rect<<<1, 256>>>(ext, ext, ext, ext, 0, 0, 0, ext, -1.0, d_L0.ptr, B_dir,
+                                          B_exc, d_b_ov.ptr);
+        launch_pack_rect_batch(1, ext, ext, 0, 0, o, ext, A_b, d_sub_A.ptr);
+        if (rm_gemm(h, false, false, o, ext, ext, 1.0, d_sub_A.ptr, ext, d_F, ext, 0.0, d_sub_L.ptr,
+                    ext) != CUBLAS_STATUS_SUCCESS)
+          return 4;
+        k_accum_dot_pair_rect<<<1, 256>>>(o, ext, ext, o, 0, 0, 0, ext, -1.0, d_sub_L.ptr, B_dir,
+                                          B_exc, d_b_ov.ptr);
+        launch_pack_rect_batch(1, ext, ext, obs, 0, c, o, A_b, d_sub_A.ptr);
+        if (rm_gemm(h, false, false, c, o, o, 1.0, d_sub_A.ptr, o, d_F, ext, 0.0, d_sub_L.ptr, o) !=
+            CUBLAS_STATUS_SUCCESS)
+          return 4;
+        k_accum_dot_pair_rect<<<1, 256>>>(c, o, o, c, 0, obs, 0, ext, 1.0, d_sub_L.ptr, B_dir,
+                                          B_exc, d_b_ov.ptr);
+        launch_pack_rect_batch(1, ext, ext, o, 0, v, obs, A_b, d_sub_A.ptr);
+        if (rm_gemm(h, false, false, v, ext, obs, 1.0, d_sub_A.ptr, obs, d_F, ext, 0.0, d_sub_L.ptr,
+                    ext) != CUBLAS_STATUS_SUCCESS)
+          return 4;
+        k_accum_dot_pair_rect<<<1, 256>>>(v, obs, ext, v, 0, o, 0, ext, -1.0, d_sub_L.ptr, B_dir,
+                                          B_exc, d_b_ov.ptr);
+        k_accum_dot_pair_rect<<<1, 256>>>(v, c, ext, v, obs, o, obs, ext, -2.0, d_sub_L.ptr, B_dir,
+                                          B_exc, d_b_ov.ptr);
+        launch_pack_rect_batch(1, ext, ext, obs, 0, c, ext, A_b, d_sub_A.ptr);
+        if (rm_gemm(h, false, true, c, o, ext, 1.0, d_sub_A.ptr, ext, d_F, ext, 0.0, d_sub_L.ptr,
+                    o) != CUBLAS_STATUS_SUCCESS)
+          return 4;
+        k_accum_dot_pair_rect<<<1, 256>>>(c, o, o, c, 0, obs, 0, ext, -2.0, d_sub_L.ptr, B_dir,
+                                          B_exc, d_b_ov.ptr);
+      }
+
+      // Forward 4: C_d.
+      if (rm_gemm(h, false, true, v, v, c, 1.0, d_f0.ptr + Size(o) * ext + obs, ext,
+                  d_F + Size(o) * ext + obs, ext, 0.0, d_C_d.ptr, v) != CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, false, false, v, v, c, 1.0, d_F + Size(o) * ext + obs, ext,
+                  d_f0.ptr + Size(obs) * ext + o, ext, 1.0, d_C_d.ptr, v) !=
+              CUBLAS_STATUS_SUCCESS) {
+        return 4;
+      }
+
+      // Zero per-pair bar buffers.
+      if (cudaMemset(d_bar_G_obs.ptr, 0, obs2 * sizeof(double)) != cudaSuccess ||
+          cudaMemset(d_bar_G_oc.ptr, 0, oc * sizeof(double)) != cudaSuccess ||
+          cudaMemset(d_bar_G_co.ptr, 0, oc * sizeof(double)) != cudaSuccess ||
+          cudaMemset(d_bar_f0.ptr, 0, ee * sizeof(double)) != cudaSuccess ||
+          cudaMemset(d_bar_ft.ptr, 0, ee * sizeof(double)) != cudaSuccess) {
+        return 2;
+      }
+      if (split_rhf_offdiag) {
+        if (cudaMemset(d_bar_G_obs_os.ptr, 0, obs2 * sizeof(double)) != cudaSuccess ||
+            cudaMemset(d_bar_G_oc_os.ptr, 0, oc * sizeof(double)) != cudaSuccess ||
+            cudaMemset(d_bar_G_co_os.ptr, 0, oc * sizeof(double)) != cudaSuccess) {
+          return 2;
+        }
+      }
+
+      // Reverse Step 1: denominator contraction.
+      if (diag) {
+        k_rhf_diag_rev_step1_denom<<<1, 256>>>(
+            i_loc, o_act, o, f, obs, ext, include_ordinary, wij, d_F, d_uf_d, d_sq_fk_d, d_vx.ptr,
+            d_b_ov.ptr, d_G_obs.ptr, d_C_d.ptr, d_bar_C_d.ptr, d_bar_C_os.ptr, d_bar_G_obs.ptr,
+            d_bar_F, d_out_scalars, d_pair_f12, d_pair_ord, d_err);
+      } else {
+        k_ss_rhf_rev_step1_denom<<<1, 256>>>(
+            i_loc, j_loc, o_act, o, f, obs, ext, compute_both_rhf, include_ordinary, wij,
+            out_pair_offset, scalar_f12_idx, scalar_ord_idx, d_F, d_uf_d, d_uf_x, d_sq_fk_d,
+            d_sq_fk_x, d_vx.ptr, d_b_ov.ptr, d_G_obs.ptr, d_C_d.ptr, d_bar_ag.ptr, d_bar_ac.ptr,
+            d_bar_C_os.ptr, d_bar_G_obs_os.ptr, d_bar_F, d_out_scalars, d_pair_f12, d_pair_ord,
+            d_err);
+        k_ss_rhf_rev_step1_fold<<<grid_for(vv), 256>>>(
+            o, obs, compute_both_rhf, d_bar_ag.ptr, d_bar_ac.ptr, d_bar_C_os.ptr, d_bar_G_obs.ptr,
+            d_bar_C_d.ptr, d_bar_C_ss.ptr);
+      }
+
+      // Reverse Step 2: Coupling C_d pullback.
+      if (!compute_both_rhf) {
+        if (rm_gemm(h, false, false, v, c, v, 1.0, d_bar_C_d.ptr, v, d_F + Size(o) * ext + obs, ext,
+                    1.0, d_bar_f0.ptr + Size(o) * ext + obs, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, true, false, c, v, v, 1.0, d_F + Size(o) * ext + obs, ext, d_bar_C_d.ptr, v,
+                    1.0, d_bar_f0.ptr + Size(obs) * ext + o, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, true, false, v, c, v, 1.0, d_bar_C_d.ptr, v, d_f0.ptr + Size(o) * ext + obs,
+                    ext, 1.0, d_bar_F + Size(o) * ext + obs, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, true, v, c, v, 1.0, d_bar_C_d.ptr, v, d_f0.ptr + Size(obs) * ext + o,
+                    ext, 1.0, d_bar_F + Size(o) * ext + obs, ext) != CUBLAS_STATUS_SUCCESS) {
+          return 4;
+        }
+      } else {
+        if (rm_gemm(h, true, false, v, c, v, spin_scale, d_bar_C_d.ptr, v,
+                    d_f0.ptr + Size(o) * ext + obs, ext, 1.0, d_bar_F + Size(o) * ext + obs,
+                    ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, true, v, c, v, spin_scale, d_bar_C_d.ptr, v,
+                    d_f0.ptr + Size(obs) * ext + o, ext, 1.0, d_bar_F + Size(o) * ext + obs,
+                    ext) != CUBLAS_STATUS_SUCCESS) {
+          return 4;
+        }
+        if (!diag) {
+          if (rm_gemm(h, false, false, v, c, v, 1.0, d_bar_C_ss.ptr, v, d_F + Size(o) * ext + obs,
+                      ext, 1.0, d_bar_f0.ptr + Size(o) * ext + obs, ext) != CUBLAS_STATUS_SUCCESS ||
+              rm_gemm(h, true, false, c, v, v, 1.0, d_F + Size(o) * ext + obs, ext, d_bar_C_ss.ptr,
+                      v, 1.0, d_bar_f0.ptr + Size(obs) * ext + o, ext) != CUBLAS_STATUS_SUCCESS) {
+            return 4;
+          }
+        }
+      }
+
+      // Reverse Step 3a: Same-spin B_overlap pullback (for i < j).
+      if (!diag && s_f12 != 0.0) {
+        const double bar_B_d_ss = (1.0 / 16.0) * s_f12;
+        k_lincomb2<<<grid_for(ee), 256>>>(ee, 1.0, d_f0.ptr, -1.0, d_ft.ptr, d_diff_f.ptr);
+        if (cudaMemset(d_bar_diff.ptr, 0, ee * sizeof(double)) != cudaSuccess) return 2;
+        if (int rc = b_overlap_pullback_gpu(h, bar_B_d_ss, d_diff_f.ptr, d_diff_f.ptr, d_F, d_K, o,
+                                            obs, ext, d_bar_diff.ptr, d_bar_diff.ptr, d_bar_F,
+                                            d_bar_K);
+            rc != 0)
+          return rc;
+        k_axpy<<<grid_for(ee), 256>>>(ee, 1.0, d_bar_diff.ptr, d_bar_f0.ptr);
+        k_axpy<<<grid_for(ee), 256>>>(ee, -1.0, d_bar_diff.ptr, d_bar_ft.ptr);
+      }
+
+      // Reverse Step 3b: Closed-shell RHF opposite-spin pullback.
+      if (compute_both_rhf) {
+        if (diag) {
+          k_lincomb2<<<grid_for(ee), 256>>>(ee, 0.5, d_f0.ptr, 0.0, d_f0.ptr, d_f_os.ptr);
+        } else {
+          k_lincomb2<<<grid_for(ee), 256>>>(ee, 0.375, d_f0.ptr, 0.125, d_ft.ptr, d_f_os.ptr);
+        }
+        if (cudaMemcpy(d_qf_os.ptr, d_f_os.ptr, ee * sizeof(double), cudaMemcpyDeviceToDevice) !=
+            cudaSuccess)
+          return 3;
+        k_zero_p_blocks<<<grid_for(ee), 256>>>(o, o, obs, ext, d_qf_os.ptr);
+
+        if (rm_gemm(h, false, true, ext, ext, ext, 1.0, d_f_os.ptr, ext, d_f_os.ptr, ext, 0.0,
+                    d_ff_mat.ptr, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, true, false, ext, ext, ext, 1.0, d_f_os.ptr, ext, d_f_os.ptr, ext, 1.0,
+                    d_ff_mat.ptr, ext) != CUBLAS_STATUS_SUCCESS) {
+          return 4;
+        }
+        k_sub_scale_both<<<grid_for(ee), 256>>>(ee, spin_scale * s_f12, d_ff_mat.ptr, d_bar_K,
+                                                d_bar_F);
+        if (rm_gemm(h, false, true, ext, ext, ext, spin_scale * s_f12, d_qf_os.ptr, ext,
+                    d_qf_os.ptr, ext, 1.0, d_bar_F, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, true, false, ext, ext, ext, spin_scale * s_f12, d_qf_os.ptr, ext,
+                    d_qf_os.ptr, ext, 1.0, d_bar_F, ext) != CUBLAS_STATUS_SUCCESS) {
+          return 4;
+        }
+
+        if (cudaMemset(d_bar_f_os.ptr, 0, ee * sizeof(double)) != cudaSuccess) return 2;
+        if (rm_gemm(h, false, false, v, c, v, 1.0, d_bar_C_os.ptr, v, d_F + Size(o) * ext + obs,
+                    ext, 1.0, d_bar_f_os.ptr + Size(o) * ext + obs, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, true, false, c, v, v, 1.0, d_F + Size(o) * ext + obs, ext, d_bar_C_os.ptr, v,
+                    1.0, d_bar_f_os.ptr + Size(obs) * ext + o, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, false, ext, ext, ext, -2.0 * s_f12, d_H, ext, d_f_os.ptr, ext, 1.0,
+                    d_bar_f_os.ptr, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, false, ext, ext, ext, -2.0 * s_f12, d_f_os.ptr, ext, d_H, ext, 1.0,
+                    d_bar_f_os.ptr, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, false, ext, ext, ext, 2.0 * s_f12, d_F, ext, d_qf_os.ptr, ext, 0.0,
+                    d_bar_qf_os.ptr, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, false, ext, ext, ext, 2.0 * s_f12, d_qf_os.ptr, ext, d_F, ext, 1.0,
+                    d_bar_qf_os.ptr, ext) != CUBLAS_STATUS_SUCCESS) {
+          return 4;
+        }
+        k_zero_p_blocks<<<grid_for(ee), 256>>>(o, o, obs, ext, d_bar_qf_os.ptr);
+        k_axpy<<<grid_for(ee), 256>>>(ee, 1.0, d_bar_qf_os.ptr, d_bar_f_os.ptr);
+        k_rhf_bar_f_os_p_blocks<<<grid_for(obs2 + 2 * oc), 256>>>(
+            o, obs, ext, s_f12, occ_sum, d_G_obs.ptr, d_G_oc.ptr, d_G_co.ptr, d_f_os.ptr,
+            d_bar_f_os.ptr);
+
+        k_w_sym_mat<<<grid_for(ee), 256>>>(ext, 0.375, 0.125, d_bar_f_os.ptr, d_bar_f0_os.ptr);
+        if (rm_gemm(h, false, true, aux, ext, ext, spin_scale, res_g_j, ext, d_bar_f0_os.ptr, ext,
+                    1.0, bfit_i, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, false, aux, ext, ext, spin_scale, fit_i, ext, d_bar_f0_os.ptr, ext,
+                    1.0, bres_os_g_j, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, true, aux, ext, ext, spin_scale, fit_j, ext, d_bar_f0_os.ptr, ext,
+                    1.0, braw_g_i, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, false, aux, ext, ext, spin_scale, raw_g_i, ext, d_bar_f0_os.ptr, ext,
+                    1.0, bfit_j, ext) != CUBLAS_STATUS_SUCCESS) {
+          return 4;
+        }
+        if (d_bar_Sab) {
+          // Reuse d_ff_mat for bar_Sab_ij = 0.125 * (bar_f_os @ f0 + f0 @ bar_f_os)
+          if (rm_gemm(h, false, false, ext, ext, ext, 0.125, d_bar_f_os.ptr, ext, d_f0.ptr, ext,
+                      0.0, d_ff_mat.ptr, ext) != CUBLAS_STATUS_SUCCESS ||
+              rm_gemm(h, false, false, ext, ext, ext, 0.125, d_f0.ptr, ext, d_bar_f_os.ptr, ext,
+                      1.0, d_ff_mat.ptr, ext) != CUBLAS_STATUS_SUCCESS) {
+            return 4;
+          }
+          if (diag) {
+            k_axpy<<<grid_for(ee), 256>>>(ee, 1.0, d_ff_mat.ptr, d_bar_Sab);
+          } else {
+            k_sym_add_transpose<<<grid_for(ee), 256>>>(ext, 1.0, d_ff_mat.ptr, d_bar_Sab);
+          }
+        }
+      }
+
+      // Reverse Step 4: V/X pullback into bar_G and SS bar_f0/bar_ft.
+      const double bar_V_d_ss = (!diag) ? (0.5 * s_f12) : 0.0;
+      const double bar_V_x_ss = (!diag) ? (-0.5 * s_f12) : 0.0;
+      const double bar_V_d_os = compute_both_rhf ? (diag ? s_f12 : (0.75 * s_f12)) : 0.0;
+      const double bar_V_x_os = split_rhf_offdiag ? (0.25 * s_f12) : 0.0;
+      const double bar_V_d = bar_V_d_ss + bar_V_d_os;
+      const double bar_V_x = bar_V_x_ss + bar_V_x_os;
+      const double bar_X_d_ss = (!diag) ? (-(1.0 / 16.0) * s_f12 * occ_sum) : 0.0;
+      const double bar_X_x_ss = (!diag) ? ((1.0 / 16.0) * s_f12 * occ_sum) : 0.0;
+
+      k_ss_rhf_rev_step4_vx<<<grid_for(obs2 + 2 * oc), 256>>>(
+          o, obs, ext, diag, split_rhf_offdiag, bar_V_d, bar_V_x, bar_V_d_ss, bar_V_x_ss,
+          bar_V_d_os, bar_V_x_os, bar_X_d_ss, bar_X_x_ss, d_f0.ptr, d_ft_eff, d_G_obs.ptr,
+          d_G_oc.ptr, d_G_co.ptr, d_bar_G_obs.ptr, d_bar_G_oc.ptr, d_bar_G_co.ptr,
+          d_bar_G_obs_os.ptr, d_bar_G_oc_os.ptr, d_bar_G_co_os.ptr, d_bar_f0.ptr, d_bar_ft.ptr);
+      if (!diag) {
+        k_add_transpose_scaled<<<grid_for(ee), 256>>>(ext, 1.0, d_bar_ft.ptr, d_bar_f0.ptr);
+      }
+
+      // Reverse Step 5: Pullback of SS f0 and G_obs/oc/co into fit/raw/res.
+      if (!diag) {
+        if (rm_gemm(h, false, true, aux, ext, ext, 1.0, res_g_j, ext, d_bar_f0.ptr, ext, 1.0,
+                    bfit_i, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, false, aux, ext, ext, 1.0, fit_i, ext, d_bar_f0.ptr, ext, 1.0,
+                    bres_g_j, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, true, aux, ext, ext, 1.0, fit_j, ext, d_bar_f0.ptr, ext, 1.0,
+                    braw_g_i, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, false, aux, ext, ext, 1.0, raw_g_i, ext, d_bar_f0.ptr, ext, 1.0,
+                    bfit_j, ext) != CUBLAS_STATUS_SUCCESS) {
+          return 4;
+        }
+      }
+      if (split_rhf_offdiag) {
+        k_axpy<<<grid_for(obs2), 256>>>(obs2, 0.5, d_bar_G_obs_os.ptr, d_bar_G_obs.ptr);
+        k_axpy<<<grid_for(oc), 256>>>(oc, 0.5, d_bar_G_oc_os.ptr, d_bar_G_oc.ptr);
+        k_axpy<<<grid_for(oc), 256>>>(oc, 0.5, d_bar_G_co_os.ptr, d_bar_G_co.ptr);
+        if (rm_gemm(h, false, true, aux, obs, obs, 1.0, raw_coul_j, ext, d_bar_G_obs.ptr, obs, 1.0,
+                    bfit_i, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, false, aux, obs, obs, 1.0, fit_i, ext, d_bar_G_obs.ptr, obs, 1.0,
+                    braw_coul_j, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, true, aux, o, c, 1.0, raw_coul_j + obs, ext, d_bar_G_oc.ptr, c, 1.0,
+                    bfit_i, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, false, aux, c, o, 1.0, fit_i, ext, d_bar_G_oc.ptr, c, 1.0,
+                    braw_coul_j + obs, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, true, aux, c, o, 1.0, raw_coul_j, ext, d_bar_G_co.ptr, o, 1.0,
+                    bfit_i + obs, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, false, aux, o, c, 1.0, fit_i + obs, ext, d_bar_G_co.ptr, o, 1.0,
+                    braw_coul_j, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, false, aux, obs, obs, 0.5, raw_coul_i, ext, d_bar_G_obs_os.ptr, obs,
+                    1.0, bfit_j, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, true, aux, obs, obs, 0.5, fit_j, ext, d_bar_G_obs_os.ptr, obs, 1.0,
+                    braw_coul_i, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, false, aux, o, c, 0.5, raw_coul_i + obs, ext, d_bar_G_co_os.ptr, o,
+                    1.0, bfit_j, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, true, aux, c, o, 0.5, fit_j, ext, d_bar_G_co_os.ptr, o, 1.0,
+                    braw_coul_i + obs, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, false, aux, c, o, 0.5, raw_coul_i, ext, d_bar_G_oc_os.ptr, c, 1.0,
+                    bfit_j + obs, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, true, aux, o, c, 0.5, fit_j + obs, ext, d_bar_G_oc_os.ptr, c, 1.0,
+                    braw_coul_i, ext) != CUBLAS_STATUS_SUCCESS) {
+          return 4;
+        }
+      } else {
+        if (rm_gemm(h, false, true, aux, obs, obs, spin_scale, raw_coul_j, ext, d_bar_G_obs.ptr,
+                    obs, 1.0, bfit_i, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, false, aux, obs, obs, spin_scale, fit_i, ext, d_bar_G_obs.ptr, obs,
+                    1.0, braw_coul_j, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, true, aux, o, c, spin_scale, raw_coul_j + obs, ext, d_bar_G_oc.ptr, c,
+                    1.0, bfit_i, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, false, aux, c, o, spin_scale, fit_i, ext, d_bar_G_oc.ptr, c, 1.0,
+                    braw_coul_j + obs, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, true, aux, c, o, spin_scale, raw_coul_j, ext, d_bar_G_co.ptr, o, 1.0,
+                    bfit_i + obs, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, false, aux, o, c, spin_scale, fit_i + obs, ext, d_bar_G_co.ptr, o,
+                    1.0, braw_coul_j, ext) != CUBLAS_STATUS_SUCCESS) {
+          return 4;
+        }
+      }
+    }
+  }
+  return (cudaGetLastError() == cudaSuccess) ? 0 : 7;
+}
+
+__global__ void k_ab_ord_only_step(
+    int i_loc, int j_loc, int ob_act, int oa, int ob, int fa, int fb, int obs, int ext, double wij,
+    Size off_ab, const double* __restrict__ Fa, const double* __restrict__ Fb,
+    const double* __restrict__ G_vv, double* __restrict__ bar_G_vv, double* __restrict__ bar_Fa,
+    double* __restrict__ bar_Fb, double* __restrict__ d_out_scalars, double* __restrict__ d_pair_ord,
+    int* __restrict__ d_err) {
+  __shared__ double s0[256];
+  __shared__ double s1[256];
+  const int va = obs - oa;
+  const int vb = obs - ob;
+  const int i = fa + i_loc;
+  const int j = fb + j_loc;
+  const double occ_sum = Fa[Size(i) * ext + i] + Fb[Size(j) * ext + j];
+  const Size vab = Size(va) * vb;
+
+  double os_gg = 0.0, sum_bgap = 0.0;
+  for (Size idx = threadIdx.x; idx < vab; idx += blockDim.x) {
+    const int a = static_cast<int>(idx / vb);
+    const int b = static_cast<int>(idx % vb);
+    const double gap =
+        Fa[Size(oa + a) * ext + (oa + a)] + Fb[Size(ob + b) * ext + (ob + b)] - occ_sum;
+    if (!isfinite(gap) || gap == 0.0) {
+      atomicExch(d_err, -4);
+      continue;
+    }
+    const double inv_g = 1.0 / gap;
+    const double gab = G_vv[idx];
+    os_gg += gab * gab * inv_g;
+    bar_G_vv[idx] = -2.0 * wij * gab * inv_g;
+    const double bgap = wij * gab * gab * inv_g * inv_g;
+    atomicAdd(&bar_Fa[Size(oa + a) * ext + (oa + a)], bgap);
+    atomicAdd(&bar_Fb[Size(ob + b) * ext + (ob + b)], bgap);
+    sum_bgap += bgap;
+  }
+  s0[threadIdx.x] = os_gg;
+  s1[threadIdx.x] = sum_bgap;
+  __syncthreads();
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      s0[threadIdx.x] += s0[threadIdx.x + stride];
+      s1[threadIdx.x] += s1[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    bar_Fa[Size(i) * ext + i] -= s1[0];
+    bar_Fb[Size(j) * ext + j] -= s1[0];
+    const double eo = -s0[0];
+    if (d_pair_ord) d_pair_ord[off_ab + Size(i_loc) * ob_act + j_loc] = eo;
+    d_out_scalars[4] += wij * eo;
+  }
+}
+
+__global__ void k_ab_rev_step1_denom(
+    int i_loc, int j_loc, int ob_act, int oa, int ob, int fa, int fb, int obs, int ext,
+    bool include_ordinary, double wij, Size off_ab, const double* __restrict__ Fa,
+    const double* __restrict__ Fb, const double* __restrict__ d_lin_norm,
+    const double* __restrict__ d_b_acc, const double* __restrict__ G_obs,
+    const double* __restrict__ C_vv, double* __restrict__ bar_C_vv, double* __restrict__ bar_G_obs,
+    double* __restrict__ bar_Fa, double* __restrict__ bar_Fb, double* __restrict__ d_out_scalars,
+    double* __restrict__ d_pair_f12, double* __restrict__ d_pair_ord, int* __restrict__ d_err) {
+  __shared__ double s0[256];
+  __shared__ double s1[256];
+  __shared__ double s2[256];
+
+  const int va = obs - oa;
+  const int vb = obs - ob;
+  const int i = fa + i_loc;
+  const int j = fb + j_loc;
+  const double s_f12 = wij;
+  const double s_ord = include_ordinary ? wij : 0.0;
+  const double occ_sum = Fa[Size(i) * ext + i] + Fb[Size(j) * ext + j];
+  const Size vab = Size(va) * vb;
+
+  double os_term = 0.0, os_gg = 0.0, sum_bgap = 0.0;
+  for (Size idx = threadIdx.x; idx < vab; idx += blockDim.x) {
+    const int a = static_cast<int>(idx / vb);
+    const int b = static_cast<int>(idx % vb);
+    const double gap =
+        Fa[Size(oa + a) * ext + (oa + a)] + Fb[Size(ob + b) * ext + (ob + b)] - occ_sum;
+    if (!isfinite(gap) || gap == 0.0) {
+      atomicExch(d_err, -4);
+      continue;
+    }
+    const double inv_g = 1.0 / gap;
+    const double cab = C_vv[idx];
+    const double gab = G_obs[Size(oa + a) * obs + (ob + b)];
+    os_term += cab * (2.0 * gab + cab) * inv_g;
+    if (include_ordinary) os_gg += gab * gab * inv_g;
+
+    bar_C_vv[idx] = -2.0 * s_f12 * (gab + cab) * inv_g;
+    bar_G_obs[Size(oa + a) * obs + (ob + b)] = (-2.0 * s_f12 * cab - 2.0 * s_ord * gab) * inv_g;
+    const double bar_inv_g = -s_f12 * cab * (2.0 * gab + cab) - s_ord * gab * gab;
+    const double bar_gap = -bar_inv_g * inv_g * inv_g;
+    atomicAdd(&bar_Fa[Size(oa + a) * ext + (oa + a)], bar_gap);
+    atomicAdd(&bar_Fb[Size(ob + b) * ext + (ob + b)], bar_gap);
+    sum_bgap += bar_gap;
+  }
+  s0[threadIdx.x] = os_term;
+  s1[threadIdx.x] = os_gg;
+  s2[threadIdx.x] = sum_bgap;
+  __syncthreads();
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      s0[threadIdx.x] += s0[threadIdx.x + stride];
+      s1[threadIdx.x] += s1[threadIdx.x + stride];
+      s2[threadIdx.x] += s2[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    const double lin = d_lin_norm[0];
+    const double norm = d_lin_norm[1];
+    const double b_val = d_b_acc[0];
+    const double bar_occ_sum = -s_f12 * norm - s2[0];
+    bar_Fa[Size(i) * ext + i] += bar_occ_sum;
+    bar_Fb[Size(j) * ext + j] += bar_occ_sum;
+    const double ef = 2.0 * lin + b_val - occ_sum * norm - s0[0];
+    const double eo = include_ordinary ? (-s1[0]) : 0.0;
+    const Size idx = off_ab + Size(i_loc) * ob_act + j_loc;
+    if (d_pair_f12) d_pair_f12[idx] = ef;
+    if (include_ordinary && d_pair_ord) d_pair_ord[idx] = eo;
+    d_out_scalars[1] += wij * ef;
+    if (include_ordinary) d_out_scalars[4] += wij * eo;
+  }
+}
+
+__global__ void k_ab_rev_step4_lin_norm(int oa, int ob, int obs, int ext, double bar_linear,
+                                        double bar_norm, const double* __restrict__ f,
+                                        const double* __restrict__ G_obs,
+                                        const double* __restrict__ G_oc,
+                                        const double* __restrict__ G_co,
+                                        double* __restrict__ bar_G_obs,
+                                        double* __restrict__ bar_G_oc,
+                                        double* __restrict__ bar_G_co,
+                                        double* __restrict__ bar_f) {
+  const int c = ext - obs;
+  const Size n_obs2 = Size(obs) * obs;
+  const Size n_oc = Size(oa) * c;
+  const Size n_co = Size(c) * ob;
+  const Size total = n_obs2 + n_oc + n_co;
+  const Size idx = Size(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  if (idx < n_obs2) {
+    const int p = static_cast<int>(idx / obs);
+    const int r = static_cast<int>(idx % obs);
+    const Size pr = Size(p) * ext + r;
+    const double fpr = f[pr];
+    bar_G_obs[idx] -= bar_linear * fpr;
+    bar_f[pr] -= bar_linear * G_obs[idx] + 2.0 * bar_norm * fpr;
+  } else if (idx < n_obs2 + n_oc) {
+    const Size rem = idx - n_obs2;
+    const int p = static_cast<int>(rem / c);
+    const int q = static_cast<int>(rem % c);
+    const Size pq = Size(p) * ext + (obs + q);
+    const double fpq = f[pq];
+    bar_G_oc[rem] -= bar_linear * fpq;
+    bar_f[pq] -= bar_linear * G_oc[rem] + 2.0 * bar_norm * fpq;
+  } else {
+    const Size rem = idx - n_obs2 - n_oc;
+    const int p = static_cast<int>(rem / ob);
+    const int q = static_cast<int>(rem % ob);
+    const Size pq = Size(obs + p) * ext + q;
+    const double fpq = f[pq];
+    bar_G_co[rem] -= bar_linear * fpq;
+    bar_f[pq] -= bar_linear * G_co[rem] + 2.0 * bar_norm * fpq;
+  }
+}
+
+int run_ab_stage2_response_gpu(
+    cublasHandle_t h, bool include_f12, bool include_ordinary, bool has_occ_weights, int oa, int ob,
+    int fa, int fb, int obs, int ext, int aux, Size off_ab, const double* occ_w_a_host,
+    const double* occ_w_b_host, const double* fock_a_host, const double* fock_b_host,
+    const double* d_fit_a_oqe, const double* d_fit_b_oqe, const double* d_raw_coul_b_oqe,
+    const double* d_raw_g_a_oqe, const double* d_res_g_b_oqe, const double* d_Fa,
+    const double* d_Fb, const double* d_Ha, const double* d_Hb, const double* d_Fa_sym,
+    const double* d_Fb_sym, const double* d_Ha_sym, const double* d_Hb_sym, const double* d_Sab,
+    const double* d_gc_ab, const double* d_dc_ab, const double* d_sq_norm_ab,
+    const double* d_sq_fk_ab, double* d_out_scalars, double* d_pair_f12, double* d_pair_ord,
+    double* d_bar_fit_a_oqe, double* d_bar_fit_b_oqe, double* d_bar_raw_coul_b_oqe,
+    double* d_bar_raw_g_a_oqe, double* d_bar_res_g_b_oqe, double* d_bar_Fa, double* d_bar_Fb,
+    double* d_bar_Ka, double* d_bar_Kb, double* d_bar_Sab, int* d_err) {
+  const int oa_act = oa - fa;
+  const int ob_act = ob - fb;
+  if (oa_act <= 0 || ob_act <= 0 || (!include_f12 && !include_ordinary)) return 0;
+
+  const int va = obs - oa;
+  const int vb = obs - ob;
+  const int c = ext - obs;
+  const Size ee = Size(ext) * ext;
+  const Size qe = Size(aux) * ext;
+  const Size obs2 = Size(obs) * obs;
+  const Size oac = Size(oa) * c;
+  const Size cob = Size(c) * ob;
+  const Size vab = Size(va) * vb;
+
+  if (!include_f12) {
+    DeviceBuf d_G_vv, d_bar_G_vv;
+    if (d_G_vv.alloc(vab) != cudaSuccess || d_bar_G_vv.alloc(vab) != cudaSuccess) return 2;
+    for (int i_loc = 0; i_loc < oa_act; ++i_loc) {
+      const double* fit_i = d_fit_a_oqe + Size(i_loc) * qe;
+      double* bfit_i = d_bar_fit_a_oqe + Size(i_loc) * qe;
+      for (int j_loc = 0; j_loc < ob_act; ++j_loc) {
+        const double wij =
+            has_occ_weights ? 0.5 * (occ_w_a_host[i_loc] + occ_w_b_host[j_loc]) : 1.0;
+        const double* raw_coul_j = d_raw_coul_b_oqe + Size(j_loc) * qe;
+        double* braw_coul_j = d_bar_raw_coul_b_oqe + Size(j_loc) * qe;
+        if (rm_gemm(h, true, false, va, vb, aux, 1.0, fit_i + oa, ext, raw_coul_j + ob, ext, 0.0,
+                    d_G_vv.ptr, vb) != CUBLAS_STATUS_SUCCESS)
+          return 4;
+        k_ab_ord_only_step<<<1, 256>>>(i_loc, j_loc, ob_act, oa, ob, fa, fb, obs, ext, wij, off_ab,
+                                       d_Fa, d_Fb, d_G_vv.ptr, d_bar_G_vv.ptr, d_bar_Fa, d_bar_Fb,
+                                       d_out_scalars, d_pair_ord, d_err);
+        if (rm_gemm(h, false, true, aux, va, vb, 1.0, raw_coul_j + ob, ext, d_bar_G_vv.ptr, vb, 1.0,
+                    bfit_i + oa, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, false, aux, vb, va, 1.0, fit_i + oa, ext, d_bar_G_vv.ptr, vb, 1.0,
+                    braw_coul_j + ob, ext) != CUBLAS_STATUS_SUCCESS) {
+          return 4;
+        }
+      }
+    }
+    return (cudaGetLastError() == cudaSuccess) ? 0 : 7;
+  }
+
+  DeviceBuf d_f0, d_tmp_f, d_f, d_qf, d_bar_f, d_bar_qf, d_bar_f0, d_ff_tmp;
+  DeviceBuf d_G_obs, d_G_oc, d_G_co, d_bar_G_obs, d_bar_G_oc, d_bar_G_co, d_C_vv, d_bar_C_vv;
+  DeviceBuf d_lin_norm, d_b_acc;
+  if (d_f0.alloc(ee) != cudaSuccess || d_tmp_f.alloc(ee) != cudaSuccess ||
+      d_f.alloc(ee) != cudaSuccess || d_qf.alloc(ee) != cudaSuccess ||
+      d_bar_f.alloc(ee) != cudaSuccess || d_bar_qf.alloc(ee) != cudaSuccess ||
+      d_bar_f0.alloc(ee) != cudaSuccess || d_ff_tmp.alloc(ee) != cudaSuccess ||
+      d_G_obs.alloc(obs2) != cudaSuccess || d_G_oc.alloc(oac) != cudaSuccess ||
+      d_G_co.alloc(cob) != cudaSuccess || d_bar_G_obs.alloc(obs2) != cudaSuccess ||
+      d_bar_G_oc.alloc(oac) != cudaSuccess || d_bar_G_co.alloc(cob) != cudaSuccess ||
+      d_C_vv.alloc(vab) != cudaSuccess || d_bar_C_vv.alloc(vab) != cudaSuccess ||
+      d_lin_norm.alloc(2) != cudaSuccess || d_b_acc.alloc(1) != cudaSuccess) {
+    return 2;
+  }
+
+  for (int i_loc = 0; i_loc < oa_act; ++i_loc) {
+    const int i = fa + i_loc;
+    const double* fit_i = d_fit_a_oqe + Size(i_loc) * qe;
+    const double* raw_g_i = d_raw_g_a_oqe + Size(i_loc) * qe;
+    double* bfit_i = d_bar_fit_a_oqe + Size(i_loc) * qe;
+    double* braw_g_i = d_bar_raw_g_a_oqe + Size(i_loc) * qe;
+
+    for (int j_loc = 0; j_loc < ob_act; ++j_loc) {
+      const int j = fb + j_loc;
+      const double wij =
+          has_occ_weights ? 0.5 * (occ_w_a_host[i_loc] + occ_w_b_host[j_loc]) : 1.0;
+      const double s_f12 = wij;
+      const double occ_sum = fock_a_host[Size(i) * ext + i] + fock_b_host[Size(j) * ext + j];
+      const double* fit_j = d_fit_b_oqe + Size(j_loc) * qe;
+      const double* raw_coul_j = d_raw_coul_b_oqe + Size(j_loc) * qe;
+      const double* res_g_j = d_res_g_b_oqe + Size(j_loc) * qe;
+      double* bfit_j = d_bar_fit_b_oqe + Size(j_loc) * qe;
+      double* braw_coul_j = d_bar_raw_coul_b_oqe + Size(j_loc) * qe;
+      double* bres_g_j = d_bar_res_g_b_oqe + Size(j_loc) * qe;
+
+      // Forward Step 2: f0, f = W(f0), qf = Q(f), Coulomb blocks.
+      if (rm_gemm(h, true, false, ext, ext, aux, 1.0, fit_i, ext, res_g_j, ext, 0.0, d_f0.ptr,
+                  ext) != CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, true, false, ext, ext, aux, 1.0, raw_g_i, ext, fit_j, ext, 1.0, d_f0.ptr,
+                  ext) != CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, false, true, ext, ext, ext, 1.0, d_Sab, ext, d_f0.ptr, ext, 0.0, d_tmp_f.ptr,
+                  ext) != CUBLAS_STATUS_SUCCESS) {
+        return 4;
+      }
+      if (cudaMemcpy(d_f.ptr, d_f0.ptr, ee * sizeof(double), cudaMemcpyDeviceToDevice) !=
+          cudaSuccess)
+        return 3;
+      if (rm_gemm(h, false, false, ext, ext, ext, 0.125, d_tmp_f.ptr, ext, d_Sab, ext, 0.375,
+                  d_f.ptr, ext) != CUBLAS_STATUS_SUCCESS)
+        return 4;
+      if (cudaMemcpy(d_qf.ptr, d_f.ptr, ee * sizeof(double), cudaMemcpyDeviceToDevice) !=
+          cudaSuccess)
+        return 3;
+      k_zero_p_blocks<<<grid_for(ee), 256>>>(oa, ob, obs, ext, d_qf.ptr);
+
+      if (rm_gemm(h, true, false, obs, obs, aux, 1.0, fit_i, ext, raw_coul_j, ext, 0.0, d_G_obs.ptr,
+                  obs) != CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, true, false, oa, c, aux, 1.0, fit_i, ext, raw_coul_j + obs, ext, 0.0,
+                  d_G_oc.ptr, c) != CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, true, false, c, ob, aux, 1.0, fit_i + obs, ext, raw_coul_j, ext, 0.0,
+                  d_G_co.ptr, ob) != CUBLAS_STATUS_SUCCESS) {
+        return 4;
+      }
+
+      // Linear, norm, and b_val = dc_ab + sq_fk_ab - <f, Ha f + f Hb^T> + <qf, Fa qf + qf Fb^T>.
+      k_ab_lin_norm_init<<<1, 256>>>(i_loc, j_loc, ob_act, oa, ob, obs, ext, d_gc_ab, d_dc_ab,
+                                     d_sq_norm_ab, d_sq_fk_ab, d_f.ptr, d_G_obs.ptr, d_G_oc.ptr,
+                                     d_G_co.ptr, d_lin_norm.ptr, d_b_acc.ptr);
+      if (rm_gemm(h, false, false, ext, ext, ext, 1.0, d_Ha, ext, d_f.ptr, ext, 0.0, d_tmp_f.ptr,
+                  ext) != CUBLAS_STATUS_SUCCESS)
+        return 4;
+      k_accum_dot_single_rect<<<1, 256>>>(ext, ext, ext, ext, 0, 0, ext, ext, 0, 0, -1.0, d_f.ptr,
+                                          d_tmp_f.ptr, d_b_acc.ptr);
+      if (rm_gemm(h, false, true, ext, ext, ext, 1.0, d_f.ptr, ext, d_Hb, ext, 0.0, d_tmp_f.ptr,
+                  ext) != CUBLAS_STATUS_SUCCESS)
+        return 4;
+      k_accum_dot_single_rect<<<1, 256>>>(ext, ext, ext, ext, 0, 0, ext, ext, 0, 0, -1.0, d_f.ptr,
+                                          d_tmp_f.ptr, d_b_acc.ptr);
+      if (rm_gemm(h, false, false, ext, ext, ext, 1.0, d_Fa, ext, d_qf.ptr, ext, 0.0, d_tmp_f.ptr,
+                  ext) != CUBLAS_STATUS_SUCCESS)
+        return 4;
+      k_accum_dot_single_rect<<<1, 256>>>(ext, ext, ext, ext, 0, 0, ext, ext, 0, 0, 1.0, d_qf.ptr,
+                                          d_tmp_f.ptr, d_b_acc.ptr);
+      if (rm_gemm(h, false, true, ext, ext, ext, 1.0, d_qf.ptr, ext, d_Fb, ext, 0.0, d_tmp_f.ptr,
+                  ext) != CUBLAS_STATUS_SUCCESS)
+        return 4;
+      k_accum_dot_single_rect<<<1, 256>>>(ext, ext, ext, ext, 0, 0, ext, ext, 0, 0, 1.0, d_qf.ptr,
+                                          d_tmp_f.ptr, d_b_acc.ptr);
+
+      // Forward Step 4: C_vv.
+      if (rm_gemm(h, false, false, va, vb, c, 1.0, d_Fa + Size(oa) * ext + obs, ext,
+                  d_f.ptr + Size(obs) * ext + ob, ext, 0.0, d_C_vv.ptr, vb) !=
+              CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, false, true, va, vb, c, 1.0, d_f.ptr + Size(oa) * ext + obs, ext,
+                  d_Fb + Size(ob) * ext + obs, ext, 1.0, d_C_vv.ptr, vb) != CUBLAS_STATUS_SUCCESS) {
+        return 4;
+      }
+
+      // Reverse U1: energy & denominator contraction.
+      if (cudaMemset(d_bar_G_obs.ptr, 0, obs2 * sizeof(double)) != cudaSuccess ||
+          cudaMemset(d_bar_G_oc.ptr, 0, oac * sizeof(double)) != cudaSuccess ||
+          cudaMemset(d_bar_G_co.ptr, 0, cob * sizeof(double)) != cudaSuccess ||
+          cudaMemset(d_bar_f.ptr, 0, ee * sizeof(double)) != cudaSuccess) {
+        return 2;
+      }
+      k_ab_rev_step1_denom<<<1, 256>>>(i_loc, j_loc, ob_act, oa, ob, fa, fb, obs, ext,
+                                       include_ordinary, wij, off_ab, d_Fa, d_Fb, d_lin_norm.ptr,
+                                       d_b_acc.ptr, d_G_obs.ptr, d_C_vv.ptr, d_bar_C_vv.ptr,
+                                       d_bar_G_obs.ptr, d_bar_Fa, d_bar_Fb, d_out_scalars,
+                                       d_pair_f12, d_pair_ord, d_err);
+
+      // Reverse U2: C_vv pullback.
+      if (rm_gemm(h, false, true, va, c, vb, 1.0, d_bar_C_vv.ptr, vb,
+                  d_f.ptr + Size(obs) * ext + ob, ext, 1.0, d_bar_Fa + Size(oa) * ext + obs, ext) !=
+              CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, true, false, c, vb, va, 1.0, d_Fa + Size(oa) * ext + obs, ext, d_bar_C_vv.ptr,
+                  vb, 1.0, d_bar_f.ptr + Size(obs) * ext + ob, ext) != CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, false, false, va, c, vb, 1.0, d_bar_C_vv.ptr, vb, d_Fb + Size(ob) * ext + obs,
+                  ext, 1.0, d_bar_f.ptr + Size(oa) * ext + obs, ext) != CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, true, false, vb, c, va, 1.0, d_bar_C_vv.ptr, vb,
+                  d_f.ptr + Size(oa) * ext + obs, ext, 1.0, d_bar_Fb + Size(ob) * ext + obs, ext) !=
+              CUBLAS_STATUS_SUCCESS) {
+        return 4;
+      }
+
+      // Reverse U3: b terms in f and qf.
+      if (rm_gemm(h, false, true, ext, ext, ext, 1.0, d_f.ptr, ext, d_f.ptr, ext, 0.0, d_ff_tmp.ptr,
+                  ext) != CUBLAS_STATUS_SUCCESS)
+        return 4;
+      k_sub_scale_both<<<grid_for(ee), 256>>>(ee, s_f12, d_ff_tmp.ptr, d_bar_Ka, d_bar_Fa);
+      if (rm_gemm(h, true, false, ext, ext, ext, 1.0, d_f.ptr, ext, d_f.ptr, ext, 0.0, d_ff_tmp.ptr,
+                  ext) != CUBLAS_STATUS_SUCCESS)
+        return 4;
+      k_sub_scale_both<<<grid_for(ee), 256>>>(ee, s_f12, d_ff_tmp.ptr, d_bar_Kb, d_bar_Fb);
+
+      if (rm_gemm(h, false, true, ext, ext, ext, s_f12, d_qf.ptr, ext, d_qf.ptr, ext, 1.0, d_bar_Fa,
+                  ext) != CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, true, false, ext, ext, ext, s_f12, d_qf.ptr, ext, d_qf.ptr, ext, 1.0, d_bar_Fb,
+                  ext) != CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, false, false, ext, ext, ext, -s_f12, d_Ha_sym, ext, d_f.ptr, ext, 1.0,
+                  d_bar_f.ptr, ext) != CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, false, false, ext, ext, ext, -s_f12, d_f.ptr, ext, d_Hb_sym, ext, 1.0,
+                  d_bar_f.ptr, ext) != CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, false, false, ext, ext, ext, s_f12, d_Fa_sym, ext, d_qf.ptr, ext, 0.0,
+                  d_bar_qf.ptr, ext) != CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, false, false, ext, ext, ext, s_f12, d_qf.ptr, ext, d_Fb_sym, ext, 1.0,
+                  d_bar_qf.ptr, ext) != CUBLAS_STATUS_SUCCESS) {
+        return 4;
+      }
+      k_zero_p_blocks<<<grid_for(ee), 256>>>(oa, ob, obs, ext, d_bar_qf.ptr);
+      k_axpy<<<grid_for(ee), 256>>>(ee, 1.0, d_bar_qf.ptr, d_bar_f.ptr);
+
+      // Reverse U4: linear and norm P-block terms.
+      k_ab_rev_step4_lin_norm<<<grid_for(obs2 + oac + cob), 256>>>(
+          oa, ob, obs, ext, 2.0 * s_f12, -s_f12 * occ_sum, d_f.ptr, d_G_obs.ptr, d_G_oc.ptr,
+          d_G_co.ptr, d_bar_G_obs.ptr, d_bar_G_oc.ptr, d_bar_G_co.ptr, d_bar_f.ptr);
+
+      // Reverse U5: f = W(f0) -> bar_f0, bar_Sab.
+      if (rm_gemm(h, false, true, ext, ext, ext, 1.0, d_Sab, ext, d_bar_f.ptr, ext, 0.0,
+                  d_tmp_f.ptr, ext) != CUBLAS_STATUS_SUCCESS)
+        return 4;
+      if (cudaMemcpy(d_bar_f0.ptr, d_bar_f.ptr, ee * sizeof(double), cudaMemcpyDeviceToDevice) !=
+          cudaSuccess)
+        return 3;
+      if (rm_gemm(h, false, false, ext, ext, ext, 0.125, d_tmp_f.ptr, ext, d_Sab, ext, 0.375,
+                  d_bar_f0.ptr, ext) != CUBLAS_STATUS_SUCCESS)
+        return 4;
+      if (d_bar_Sab) {
+        if (rm_gemm(h, false, true, ext, ext, ext, 1.0, d_bar_f.ptr, ext, d_Sab, ext, 0.0,
+                    d_tmp_f.ptr, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, false, ext, ext, ext, 0.125, d_tmp_f.ptr, ext, d_f0.ptr, ext, 1.0,
+                    d_bar_Sab, ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, true, ext, ext, ext, 1.0, d_f0.ptr, ext, d_Sab, ext, 0.0, d_tmp_f.ptr,
+                    ext) != CUBLAS_STATUS_SUCCESS ||
+            rm_gemm(h, false, false, ext, ext, ext, 0.125, d_tmp_f.ptr, ext, d_bar_f.ptr, ext, 1.0,
+                    d_bar_Sab, ext) != CUBLAS_STATUS_SUCCESS) {
+          return 4;
+        }
+      }
+
+      // Reverse U6: f0 & G pullback into fit/raw/res.
+      if (rm_gemm(h, false, true, aux, ext, ext, 1.0, res_g_j, ext, d_bar_f0.ptr, ext, 1.0, bfit_i,
+                  ext) != CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, false, false, aux, ext, ext, 1.0, fit_i, ext, d_bar_f0.ptr, ext, 1.0, bres_g_j,
+                  ext) != CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, false, true, aux, ext, ext, 1.0, fit_j, ext, d_bar_f0.ptr, ext, 1.0, braw_g_i,
+                  ext) != CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, false, false, aux, ext, ext, 1.0, raw_g_i, ext, d_bar_f0.ptr, ext, 1.0, bfit_j,
+                  ext) != CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, false, true, aux, obs, obs, 1.0, raw_coul_j, ext, d_bar_G_obs.ptr, obs, 1.0,
+                  bfit_i, ext) != CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, false, false, aux, obs, obs, 1.0, fit_i, ext, d_bar_G_obs.ptr, obs, 1.0,
+                  braw_coul_j, ext) != CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, false, true, aux, oa, c, 1.0, raw_coul_j + obs, ext, d_bar_G_oc.ptr, c, 1.0,
+                  bfit_i, ext) != CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, false, false, aux, c, oa, 1.0, fit_i, ext, d_bar_G_oc.ptr, c, 1.0,
+                  braw_coul_j + obs, ext) != CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, false, true, aux, c, ob, 1.0, raw_coul_j, ext, d_bar_G_co.ptr, ob, 1.0,
+                  bfit_i + obs, ext) != CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, false, false, aux, ob, c, 1.0, fit_i + obs, ext, d_bar_G_co.ptr, ob, 1.0,
+                  braw_coul_j, ext) != CUBLAS_STATUS_SUCCESS) {
+        return 4;
+      }
+    }
+  }
+  return (cudaGetLastError() == cudaSuccess) ? 0 : 7;
+}
+
 #endif
 
 }  // namespace
@@ -4560,6 +8844,571 @@ int gqc_f12_ordinary_df_mp2_host_reference(
       return -5;
     }
     if (!same_spin && (!all_finite_host(fock_b, nn) || !all_finite_host(bar_coeff_b, nn))) {
+      return -5;
+    }
+  }
+  return 0;
+  } catch (const std::bad_alloc&) {
+    return kErrOom;
+  } catch (const std::length_error&) {
+    return kErrOom;
+  } catch (...) {
+    return kErrInternal;
+  }
+}
+
+int gqc_f12_mp2_pair_response_host_reference(
+    int rhf_spatial_int, int include_f12_int, int include_ordinary_int, int has_occ_weights_int,
+    int oa, int ob, int fa, int fb, int obs, int ext, int aux, int raw_coul_n1_a,
+    int raw_coul_n1_b, std::uint64_t budget_bytes, const double* occ_w_a, const double* occ_w_b,
+    const double* fit_a, const double* fit_b, const double* raw_coul_a, const double* raw_coul_b,
+    const double* raw_g_a, const double* raw_g_b, const double* raw_sq_a, const double* raw_sq_b,
+    const double* raw_gc_a, const double* raw_gc_b, const double* raw_dc_a, const double* raw_dc_b,
+    const double* metric_g, const double* metric_sq, const double* metric_gc,
+    const double* metric_dc, const double* fock_a, const double* fock_b, const double* exch_a,
+    const double* exch_b, const double* cross_overlap, double* out_scalars, double* pair_f12_out,
+    double* pair_ord_out, double* bar_fit_a, double* bar_fit_b, double* bar_raw_coul_a,
+    double* bar_raw_coul_b, double* bar_raw_g_a, double* bar_raw_g_b, double* bar_raw_sq_a,
+    double* bar_raw_sq_b, double* bar_raw_gc_a, double* bar_raw_gc_b, double* bar_raw_dc_a,
+    double* bar_raw_dc_b, double* bar_metric_g, double* bar_metric_sq, double* bar_metric_gc,
+    double* bar_metric_dc, double* bar_fock_a, double* bar_fock_b, double* bar_exch_a,
+    double* bar_exch_b, double* bar_cross_overlap) {
+  try {
+  const bool rhf_spatial = (rhf_spatial_int != 0);
+  const bool include_f12 = (include_f12_int != 0);
+  const bool include_ordinary = (include_ordinary_int != 0);
+  const bool has_occ_weights = (has_occ_weights_int != 0);
+
+  if (fa < 0 || fa > oa || oa >= obs || fb < 0 || fb > ob || ob >= obs || obs >= ext || aux < 1) {
+    return -1;
+  }
+  if (rhf_spatial && (oa != ob || fa != fb)) return -1;
+  if (!metric_g || !metric_sq || !metric_gc || !metric_dc || !fock_a || !exch_a) return -1;
+  if (!rhf_spatial && (!fock_b || !exch_b)) return -1;
+  if (!bar_fock_a || !bar_exch_a) return -1;
+  if (!rhf_spatial && (!bar_fock_b || !bar_exch_b)) return -1;
+  if (include_f12 && (!bar_metric_g || !bar_metric_sq || !bar_metric_gc || !bar_metric_dc)) {
+    return -1;
+  }
+
+  const int oa_act = oa - fa;
+  const int ob_act = ob - fb;
+  if (has_occ_weights) {
+    if (oa_act > 0 && !occ_w_a) return -1;
+    if (!rhf_spatial && ob_act > 0 && !occ_w_b) return -1;
+  }
+  if (oa_act > 0) {
+    if (raw_coul_n1_a < oa || !fit_a || !raw_coul_a || !raw_g_a || !raw_sq_a || !raw_gc_a ||
+        !raw_dc_a) {
+      return -1;
+    }
+    if (!bar_fit_a || !bar_raw_coul_a) return -1;
+    if (include_f12 && (!bar_raw_g_a || !bar_raw_sq_a || !bar_raw_gc_a || !bar_raw_dc_a)) {
+      return -1;
+    }
+  }
+  if (!rhf_spatial && ob_act > 0) {
+    if (raw_coul_n1_b < ob || !fit_b || !raw_coul_b || !raw_g_b || !raw_sq_b || !raw_gc_b ||
+        !raw_dc_b) {
+      return -1;
+    }
+    if (!bar_fit_b || !bar_raw_coul_b) return -1;
+    if (include_f12 && (!bar_raw_g_b || !bar_raw_sq_b || !bar_raw_gc_b || !bar_raw_dc_b)) {
+      return -1;
+    }
+  }
+  if (!rhf_spatial && oa_act > 0 && ob_act > 0 && !cross_overlap) return -1;
+  if (include_f12 && oa_act > 0 && ob_act > 0 && !bar_cross_overlap) return -1;
+
+  const Size qq = Size(aux) * aux;
+  const Size ee = Size(ext) * ext;
+  const Size qoa_e = Size(aux) * Size(oa) * ext;
+  const Size qob_e = Size(aux) * Size(ob) * ext;
+
+  if (!all_finite_host(metric_g, qq) || !all_finite_host(metric_sq, qq) ||
+      !all_finite_host(metric_gc, qq) || !all_finite_host(metric_dc, qq) ||
+      !all_finite_host(fock_a, ee) || !all_finite_host(exch_a, ee)) {
+    return -2;
+  }
+  if (!rhf_spatial && (!all_finite_host(fock_b, ee) || !all_finite_host(exch_b, ee))) {
+    return -2;
+  }
+  if (!rhf_spatial && oa_act > 0 && ob_act > 0 && !all_finite_host(cross_overlap, ee)) {
+    return -2;
+  }
+  if (has_occ_weights) {
+    if (oa_act > 0 && !all_finite_host(occ_w_a, oa_act)) return -2;
+    if (!rhf_spatial && ob_act > 0 && !all_finite_host(occ_w_b, ob_act)) return -2;
+  }
+
+  const Size n_aa = (oa_act >= 2) ? (Size(oa_act) * (oa_act - 1)) / 2 : 0;
+  const Size n_ab = Size(oa_act) * Size(ob_act);
+  const Size n_bb = (ob_act >= 2) ? (Size(ob_act) * (ob_act - 1)) / 2 : 0;
+  const Size n_total = n_aa + n_ab + n_bb;
+
+  // Zero-initialize all provided output buffers before early exits or accumulation.
+  if (out_scalars) std::fill_n(out_scalars, 6, 0.0);
+  if (pair_f12_out && n_total > 0) std::fill_n(pair_f12_out, n_total, 0.0);
+  if (include_ordinary && pair_ord_out && n_total > 0) std::fill_n(pair_ord_out, n_total, 0.0);
+  if (qoa_e > 0) {
+    if (bar_fit_a) std::fill_n(bar_fit_a, qoa_e, 0.0);
+    if (bar_raw_coul_a) std::fill_n(bar_raw_coul_a, qoa_e, 0.0);
+    if (bar_raw_g_a) std::fill_n(bar_raw_g_a, qoa_e, 0.0);
+    if (bar_raw_sq_a) std::fill_n(bar_raw_sq_a, qoa_e, 0.0);
+    if (bar_raw_gc_a) std::fill_n(bar_raw_gc_a, qoa_e, 0.0);
+    if (bar_raw_dc_a) std::fill_n(bar_raw_dc_a, qoa_e, 0.0);
+  }
+  if (qob_e > 0) {
+    if (bar_fit_b && bar_fit_b != bar_fit_a) std::fill_n(bar_fit_b, qob_e, 0.0);
+    if (bar_raw_coul_b && bar_raw_coul_b != bar_raw_coul_a) std::fill_n(bar_raw_coul_b, qob_e, 0.0);
+    if (bar_raw_g_b && bar_raw_g_b != bar_raw_g_a) std::fill_n(bar_raw_g_b, qob_e, 0.0);
+    if (bar_raw_sq_b && bar_raw_sq_b != bar_raw_sq_a) std::fill_n(bar_raw_sq_b, qob_e, 0.0);
+    if (bar_raw_gc_b && bar_raw_gc_b != bar_raw_gc_a) std::fill_n(bar_raw_gc_b, qob_e, 0.0);
+    if (bar_raw_dc_b && bar_raw_dc_b != bar_raw_dc_a) std::fill_n(bar_raw_dc_b, qob_e, 0.0);
+  }
+  if (bar_metric_g) std::fill_n(bar_metric_g, qq, 0.0);
+  if (bar_metric_sq) std::fill_n(bar_metric_sq, qq, 0.0);
+  if (bar_metric_gc) std::fill_n(bar_metric_gc, qq, 0.0);
+  if (bar_metric_dc) std::fill_n(bar_metric_dc, qq, 0.0);
+  std::fill_n(bar_fock_a, ee, 0.0);
+  std::fill_n(bar_exch_a, ee, 0.0);
+  if (bar_fock_b && bar_fock_b != bar_fock_a) std::fill_n(bar_fock_b, ee, 0.0);
+  if (bar_exch_b && bar_exch_b != bar_exch_a) std::fill_n(bar_exch_b, ee, 0.0);
+  if (bar_cross_overlap) std::fill_n(bar_cross_overlap, ee, 0.0);
+
+  if (n_total > 0 && (include_f12 || include_ordinary)) {
+    const Size req_bytes = estimate_mp2_pair_response_device_bytes(
+        rhf_spatial, include_f12, include_ordinary, pair_f12_out != nullptr,
+        pair_ord_out != nullptr, bar_cross_overlap != nullptr, oa, ob, fa, fb, obs, ext, aux);
+    if (req_bytes > effective_device_budget(budget_bytes)) return kErrBudgetExceeded;
+  }
+
+  // Pack active slices & verify finiteness even when n_total == 0.
+  std::vector<double> fit_a_qoe, fit_a_oqe, raw_coul_a_oqe;
+  std::vector<double> raw_g_a_qoe, raw_g_a_oqe, raw_sq_a_qoe, raw_sq_a_oqe;
+  std::vector<double> raw_gc_a_qoe, raw_gc_a_oqe, raw_dc_a_qoe, raw_dc_a_oqe;
+  if (oa_act > 0) {
+    if (!pack_active_oqe_checked_host(fit_a, aux, oa, fa, oa_act, ext, fit_a_oqe, &fit_a_qoe) ||
+        !pack_active_oqe_checked_host(raw_coul_a, aux, raw_coul_n1_a, fa, oa_act, ext,
+                                      raw_coul_a_oqe) ||
+        !pack_active_oqe_checked_host(raw_g_a, aux, oa, fa, oa_act, ext, raw_g_a_oqe,
+                                      &raw_g_a_qoe) ||
+        !pack_active_oqe_checked_host(raw_sq_a, aux, oa, fa, oa_act, ext, raw_sq_a_oqe,
+                                      &raw_sq_a_qoe) ||
+        !pack_active_oqe_checked_host(raw_gc_a, aux, oa, fa, oa_act, ext, raw_gc_a_oqe,
+                                      &raw_gc_a_qoe) ||
+        !pack_active_oqe_checked_host(raw_dc_a, aux, oa, fa, oa_act, ext, raw_dc_a_oqe,
+                                      &raw_dc_a_qoe)) {
+      return -2;
+    }
+  }
+  if (n_total == 0 || (!include_f12 && !include_ordinary)) {
+    if (!rhf_spatial && ob_act > 0) {
+      std::vector<double> chk;
+      if (!pack_active_oqe_checked_host(fit_b, aux, ob, fb, ob_act, ext, chk) ||
+          !pack_active_oqe_checked_host(raw_coul_b, aux, raw_coul_n1_b, fb, ob_act, ext, chk) ||
+          !pack_active_oqe_checked_host(raw_g_b, aux, ob, fb, ob_act, ext, chk) ||
+          !pack_active_oqe_checked_host(raw_sq_b, aux, ob, fb, ob_act, ext, chk) ||
+          !pack_active_oqe_checked_host(raw_gc_b, aux, ob, fb, ob_act, ext, chk) ||
+          !pack_active_oqe_checked_host(raw_dc_b, aux, ob, fb, ob_act, ext, chk)) {
+        return -2;
+      }
+    }
+    return 0;
+  }
+
+  const Size qe = Size(aux) * ext;
+  const Size oaqe = Size(oa_act) * qe;
+  const Size obqe = Size(ob_act) * qe;
+  double e_f12_aa = 0.0, e_f12_ab = 0.0, e_f12_bb = 0.0;
+  double e_ord_aa = 0.0, e_ord_ab = 0.0, e_ord_bb = 0.0;
+
+  std::vector<double> bar_fit_a_oqe(oaqe, 0.0);
+  std::vector<double> bar_raw_coul_a_oqe(oaqe, 0.0);
+  std::vector<double> bar_raw_g_a_oqe(include_f12 ? oaqe : 0, 0.0);
+  std::vector<double> bar_res_g_a_oqe(include_f12 ? oaqe : 0, 0.0);
+  std::vector<double> bar_raw_sq_a_oqe(include_f12 ? oaqe : 0, 0.0);
+  std::vector<double> bar_res_sq_a_oqe(include_f12 ? oaqe : 0, 0.0);
+  std::vector<double> bar_raw_gc_a_oqe(include_f12 ? oaqe : 0, 0.0);
+  std::vector<double> bar_res_gc_a_oqe(include_f12 ? oaqe : 0, 0.0);
+  std::vector<double> bar_raw_dc_a_oqe(include_f12 ? oaqe : 0, 0.0);
+  std::vector<double> bar_res_dc_a_oqe(include_f12 ? oaqe : 0, 0.0);
+
+  if (rhf_spatial) {
+    std::vector<double> res_g_oqe, res_sq_oqe, res_gc_oqe, res_dc_oqe;
+    std::vector<double> bar_res_os_g_oqe(include_f12 ? oaqe : 0, 0.0);
+    std::vector<double> bar_res_os_sq_oqe(include_f12 ? oaqe : 0, 0.0);
+    std::vector<double> bar_res_os_gc_oqe(include_f12 ? oaqe : 0, 0.0);
+    std::vector<double> bar_res_os_dc_oqe(include_f12 ? oaqe : 0, 0.0);
+    std::vector<double> Ha;
+    if (include_f12) {
+      build_res_oqe_host(raw_g_a_qoe, fit_a_qoe, metric_g, aux, oa_act, ext, res_g_oqe);
+      build_res_oqe_host(raw_sq_a_qoe, fit_a_qoe, metric_sq, aux, oa_act, ext, res_sq_oqe);
+      build_res_oqe_host(raw_gc_a_qoe, fit_a_qoe, metric_gc, aux, oa_act, ext, res_gc_oqe);
+      build_res_oqe_host(raw_dc_a_qoe, fit_a_qoe, metric_dc, aux, oa_act, ext, res_dc_oqe);
+      Ha.resize(ee);
+      for (Size p = 0; p < ee; ++p) Ha[p] = fock_a[p] + exch_a[p];
+    }
+
+    const Size off_ab = n_aa;
+    const Size off_bb = n_aa + n_ab;
+    for (int i_loc = 0; i_loc < oa_act; ++i_loc) {
+      const int i = fa + i_loc;
+      for (int j_loc = i_loc; j_loc < oa_act; ++j_loc) {
+        const int j = fa + j_loc;
+        const double wij = has_occ_weights ? 0.5 * (occ_w_a[i_loc] + occ_w_a[j_loc]) : 1.0;
+        double ef_ss = 0.0, eo_ss = 0.0, ef_os = 0.0, eo_os = 0.0;
+        const int rc = eval_same_spin_or_rhf_pair_response_host(
+            i, j, true, include_f12, include_ordinary, wij, oa, obs, ext, aux,
+            fit_a_oqe.data() + Size(i_loc) * qe, fit_a_oqe.data() + Size(j_loc) * qe,
+            raw_coul_a_oqe.data() + Size(i_loc) * qe, raw_coul_a_oqe.data() + Size(j_loc) * qe,
+            include_f12 ? (raw_g_a_oqe.data() + Size(i_loc) * qe) : nullptr,
+            include_f12 ? (res_g_oqe.data() + Size(j_loc) * qe) : nullptr,
+            include_f12 ? (raw_sq_a_oqe.data() + Size(i_loc) * qe) : nullptr,
+            include_f12 ? (res_sq_oqe.data() + Size(j_loc) * qe) : nullptr,
+            include_f12 ? (raw_gc_a_oqe.data() + Size(i_loc) * qe) : nullptr,
+            include_f12 ? (res_gc_oqe.data() + Size(j_loc) * qe) : nullptr,
+            include_f12 ? (raw_dc_a_oqe.data() + Size(i_loc) * qe) : nullptr,
+            include_f12 ? (res_dc_oqe.data() + Size(j_loc) * qe) : nullptr, fock_a, exch_a,
+            include_f12 ? Ha.data() : nullptr, ef_ss, eo_ss, ef_os, eo_os,
+            bar_fit_a_oqe.data() + Size(i_loc) * qe, bar_fit_a_oqe.data() + Size(j_loc) * qe,
+            bar_raw_coul_a_oqe.data() + Size(i_loc) * qe,
+            bar_raw_coul_a_oqe.data() + Size(j_loc) * qe,
+            include_f12 ? (bar_raw_g_a_oqe.data() + Size(i_loc) * qe) : nullptr,
+            include_f12 ? (bar_res_g_a_oqe.data() + Size(j_loc) * qe) : nullptr,
+            include_f12 ? (bar_res_os_g_oqe.data() + Size(j_loc) * qe) : nullptr,
+            include_f12 ? (bar_raw_sq_a_oqe.data() + Size(i_loc) * qe) : nullptr,
+            include_f12 ? (bar_res_sq_a_oqe.data() + Size(j_loc) * qe) : nullptr,
+            include_f12 ? (bar_res_os_sq_oqe.data() + Size(j_loc) * qe) : nullptr,
+            include_f12 ? (bar_raw_gc_a_oqe.data() + Size(i_loc) * qe) : nullptr,
+            include_f12 ? (bar_res_gc_a_oqe.data() + Size(j_loc) * qe) : nullptr,
+            include_f12 ? (bar_res_os_gc_oqe.data() + Size(j_loc) * qe) : nullptr,
+            include_f12 ? (bar_raw_dc_a_oqe.data() + Size(i_loc) * qe) : nullptr,
+            include_f12 ? (bar_res_dc_a_oqe.data() + Size(j_loc) * qe) : nullptr,
+            include_f12 ? (bar_res_os_dc_oqe.data() + Size(j_loc) * qe) : nullptr, bar_fock_a,
+            bar_exch_a, include_f12 ? bar_cross_overlap : nullptr);
+        if (rc != 0) return rc;
+
+        if (i_loc == j_loc) {
+          const Size ab_idx = off_ab + Size(i_loc) * oa_act + i_loc;
+          if (include_f12 && pair_f12_out) pair_f12_out[ab_idx] = ef_os;
+          if (include_ordinary && pair_ord_out) pair_ord_out[ab_idx] = eo_os;
+          if (include_f12) e_f12_ab += wij * ef_os;
+          if (include_ordinary) e_ord_ab += wij * eo_os;
+        } else {
+          const Size tri_idx = strict_tri_index(i_loc, j_loc, oa_act);
+          const Size ab_ij = off_ab + Size(i_loc) * oa_act + j_loc;
+          const Size ab_ji = off_ab + Size(j_loc) * oa_act + i_loc;
+          if (include_f12 && pair_f12_out) {
+            pair_f12_out[tri_idx] = ef_ss;
+            pair_f12_out[ab_ij] = ef_os;
+            pair_f12_out[ab_ji] = ef_os;
+            pair_f12_out[off_bb + tri_idx] = ef_ss;
+          }
+          if (include_ordinary && pair_ord_out) {
+            pair_ord_out[tri_idx] = eo_ss;
+            pair_ord_out[ab_ij] = eo_os;
+            pair_ord_out[ab_ji] = eo_os;
+            pair_ord_out[off_bb + tri_idx] = eo_ss;
+          }
+          if (include_f12) {
+            e_f12_aa += wij * ef_ss;
+            e_f12_bb += wij * ef_ss;
+            e_f12_ab += 2.0 * wij * ef_os;
+          }
+          if (include_ordinary) {
+            e_ord_aa += wij * eo_ss;
+            e_ord_bb += wij * eo_ss;
+            e_ord_ab += 2.0 * wij * eo_os;
+          }
+        }
+      }
+    }
+
+    // Pullback residuals once for the single spatial channel:
+    // - AA+BB residuals contribute -2.0 * (bar_res_ss @ fit^T) (asymmetric)
+    // - AB(i,j)+AB(j,i) and AB(i,i) residuals contribute symmetric -(M_os + M_os^T).
+    std::vector<double> bar_fit_a_qoe;
+    transpose_oqe_to_qoe_host(bar_fit_a_oqe, aux, oa_act, ext, bar_fit_a_qoe);
+    if (include_f12) {
+      pullback_res_oqe_host(bar_res_g_a_oqe, fit_a_qoe, metric_g, 2.0, false, aux, oa_act, ext,
+                            bar_raw_g_a_oqe, bar_fit_a_qoe, bar_metric_g);
+      pullback_res_oqe_host(bar_res_os_g_oqe, fit_a_qoe, metric_g, 2.0, true, aux, oa_act, ext,
+                            bar_raw_g_a_oqe, bar_fit_a_qoe, bar_metric_g);
+      pullback_res_oqe_host(bar_res_sq_a_oqe, fit_a_qoe, metric_sq, 2.0, false, aux, oa_act, ext,
+                            bar_raw_sq_a_oqe, bar_fit_a_qoe, bar_metric_sq);
+      pullback_res_oqe_host(bar_res_os_sq_oqe, fit_a_qoe, metric_sq, 2.0, true, aux, oa_act, ext,
+                            bar_raw_sq_a_oqe, bar_fit_a_qoe, bar_metric_sq);
+      pullback_res_oqe_host(bar_res_gc_a_oqe, fit_a_qoe, metric_gc, 2.0, false, aux, oa_act, ext,
+                            bar_raw_gc_a_oqe, bar_fit_a_qoe, bar_metric_gc);
+      pullback_res_oqe_host(bar_res_os_gc_oqe, fit_a_qoe, metric_gc, 2.0, true, aux, oa_act, ext,
+                            bar_raw_gc_a_oqe, bar_fit_a_qoe, bar_metric_gc);
+      pullback_res_oqe_host(bar_res_dc_a_oqe, fit_a_qoe, metric_dc, 2.0, false, aux, oa_act, ext,
+                            bar_raw_dc_a_oqe, bar_fit_a_qoe, bar_metric_dc);
+      pullback_res_oqe_host(bar_res_os_dc_oqe, fit_a_qoe, metric_dc, 2.0, true, aux, oa_act, ext,
+                            bar_raw_dc_a_oqe, bar_fit_a_qoe, bar_metric_dc);
+    }
+
+    scatter_active_qoe_host(bar_fit_a_qoe, aux, oa, fa, oa_act, ext, bar_fit_a);
+    scatter_active_oqe_host(bar_raw_coul_a_oqe, aux, oa, fa, oa_act, ext, bar_raw_coul_a);
+    if (include_f12) {
+      scatter_active_oqe_host(bar_raw_g_a_oqe, aux, oa, fa, oa_act, ext, bar_raw_g_a);
+      scatter_active_oqe_host(bar_raw_sq_a_oqe, aux, oa, fa, oa_act, ext, bar_raw_sq_a);
+      scatter_active_oqe_host(bar_raw_gc_a_oqe, aux, oa, fa, oa_act, ext, bar_raw_gc_a);
+      scatter_active_oqe_host(bar_raw_dc_a_oqe, aux, oa, fa, oa_act, ext, bar_raw_dc_a);
+    }
+    // Mirror alpha outputs to beta outputs when distinct beta pointers are provided.
+    if (bar_fit_b && bar_fit_b != bar_fit_a) std::copy_n(bar_fit_a, qoa_e, bar_fit_b);
+    if (bar_raw_coul_b && bar_raw_coul_b != bar_raw_coul_a) {
+      std::copy_n(bar_raw_coul_a, qoa_e, bar_raw_coul_b);
+    }
+    if (include_f12) {
+      if (bar_raw_g_b && bar_raw_g_b != bar_raw_g_a) std::copy_n(bar_raw_g_a, qoa_e, bar_raw_g_b);
+      if (bar_raw_sq_b && bar_raw_sq_b != bar_raw_sq_a) {
+        std::copy_n(bar_raw_sq_a, qoa_e, bar_raw_sq_b);
+      }
+      if (bar_raw_gc_b && bar_raw_gc_b != bar_raw_gc_a) {
+        std::copy_n(bar_raw_gc_a, qoa_e, bar_raw_gc_b);
+      }
+      if (bar_raw_dc_b && bar_raw_dc_b != bar_raw_dc_a) {
+        std::copy_n(bar_raw_dc_a, qoa_e, bar_raw_dc_b);
+      }
+    }
+    if (bar_fock_b && bar_fock_b != bar_fock_a) std::copy_n(bar_fock_a, ee, bar_fock_b);
+    if (bar_exch_b && bar_exch_b != bar_exch_a) std::copy_n(bar_exch_a, ee, bar_exch_b);
+  } else {
+    // General UHF dual-spin path: AA, AB, BB.
+    std::vector<double> fit_b_qoe, fit_b_oqe, raw_coul_b_oqe;
+    std::vector<double> raw_g_b_qoe, raw_g_b_oqe, raw_sq_b_qoe, raw_sq_b_oqe;
+    std::vector<double> raw_gc_b_qoe, raw_gc_b_oqe, raw_dc_b_qoe, raw_dc_b_oqe;
+    if (ob_act > 0) {
+      if (!pack_active_oqe_checked_host(fit_b, aux, ob, fb, ob_act, ext, fit_b_oqe, &fit_b_qoe) ||
+          !pack_active_oqe_checked_host(raw_coul_b, aux, raw_coul_n1_b, fb, ob_act, ext,
+                                        raw_coul_b_oqe) ||
+          !pack_active_oqe_checked_host(raw_g_b, aux, ob, fb, ob_act, ext, raw_g_b_oqe,
+                                        &raw_g_b_qoe) ||
+          !pack_active_oqe_checked_host(raw_sq_b, aux, ob, fb, ob_act, ext, raw_sq_b_oqe,
+                                        &raw_sq_b_qoe) ||
+          !pack_active_oqe_checked_host(raw_gc_b, aux, ob, fb, ob_act, ext, raw_gc_b_oqe,
+                                        &raw_gc_b_qoe) ||
+          !pack_active_oqe_checked_host(raw_dc_b, aux, ob, fb, ob_act, ext, raw_dc_b_oqe,
+                                        &raw_dc_b_qoe)) {
+        return -2;
+      }
+    }
+
+    std::vector<double> bar_fit_b_oqe(obqe, 0.0);
+    std::vector<double> bar_raw_coul_b_oqe(obqe, 0.0);
+    std::vector<double> bar_raw_g_b_oqe(include_f12 ? obqe : 0, 0.0);
+    std::vector<double> bar_res_g_b_oqe(include_f12 ? obqe : 0, 0.0);
+    std::vector<double> bar_raw_sq_b_oqe(include_f12 ? obqe : 0, 0.0);
+    std::vector<double> bar_res_sq_b_oqe(include_f12 ? obqe : 0, 0.0);
+    std::vector<double> bar_raw_gc_b_oqe(include_f12 ? obqe : 0, 0.0);
+    std::vector<double> bar_res_gc_b_oqe(include_f12 ? obqe : 0, 0.0);
+    std::vector<double> bar_raw_dc_b_oqe(include_f12 ? obqe : 0, 0.0);
+    std::vector<double> bar_res_dc_b_oqe(include_f12 ? obqe : 0, 0.0);
+
+    // Channel 1: alpha-alpha (i < j)
+    if (oa_act >= 2) {
+      std::vector<double> res_g_a_oqe, res_sq_a_oqe, res_gc_a_oqe, res_dc_a_oqe;
+      std::vector<double> Ha;
+      if (include_f12) {
+        build_res_oqe_host(raw_g_a_qoe, fit_a_qoe, metric_g, aux, oa_act, ext, res_g_a_oqe);
+        build_res_oqe_host(raw_sq_a_qoe, fit_a_qoe, metric_sq, aux, oa_act, ext, res_sq_a_oqe);
+        build_res_oqe_host(raw_gc_a_qoe, fit_a_qoe, metric_gc, aux, oa_act, ext, res_gc_a_oqe);
+        build_res_oqe_host(raw_dc_a_qoe, fit_a_qoe, metric_dc, aux, oa_act, ext, res_dc_a_oqe);
+        Ha.resize(ee);
+        for (Size p = 0; p < ee; ++p) Ha[p] = fock_a[p] + exch_a[p];
+      }
+      for (int i_loc = 0; i_loc < oa_act; ++i_loc) {
+        for (int j_loc = i_loc + 1; j_loc < oa_act; ++j_loc) {
+          const double wij = has_occ_weights ? 0.5 * (occ_w_a[i_loc] + occ_w_a[j_loc]) : 1.0;
+          double ef_ss = 0.0, eo_ss = 0.0, dummy1 = 0.0, dummy2 = 0.0;
+          const int rc = eval_same_spin_or_rhf_pair_response_host(
+              fa + i_loc, fa + j_loc, false, include_f12, include_ordinary, wij, oa, obs, ext, aux,
+              fit_a_oqe.data() + Size(i_loc) * qe, fit_a_oqe.data() + Size(j_loc) * qe, nullptr,
+              raw_coul_a_oqe.data() + Size(j_loc) * qe,
+              include_f12 ? (raw_g_a_oqe.data() + Size(i_loc) * qe) : nullptr,
+              include_f12 ? (res_g_a_oqe.data() + Size(j_loc) * qe) : nullptr,
+              include_f12 ? (raw_sq_a_oqe.data() + Size(i_loc) * qe) : nullptr,
+              include_f12 ? (res_sq_a_oqe.data() + Size(j_loc) * qe) : nullptr,
+              include_f12 ? (raw_gc_a_oqe.data() + Size(i_loc) * qe) : nullptr,
+              include_f12 ? (res_gc_a_oqe.data() + Size(j_loc) * qe) : nullptr,
+              include_f12 ? (raw_dc_a_oqe.data() + Size(i_loc) * qe) : nullptr,
+              include_f12 ? (res_dc_a_oqe.data() + Size(j_loc) * qe) : nullptr, fock_a, exch_a,
+              include_f12 ? Ha.data() : nullptr, ef_ss, eo_ss, dummy1, dummy2,
+              bar_fit_a_oqe.data() + Size(i_loc) * qe, bar_fit_a_oqe.data() + Size(j_loc) * qe,
+              nullptr, bar_raw_coul_a_oqe.data() + Size(j_loc) * qe,
+              include_f12 ? (bar_raw_g_a_oqe.data() + Size(i_loc) * qe) : nullptr,
+              include_f12 ? (bar_res_g_a_oqe.data() + Size(j_loc) * qe) : nullptr, nullptr,
+              include_f12 ? (bar_raw_sq_a_oqe.data() + Size(i_loc) * qe) : nullptr,
+              include_f12 ? (bar_res_sq_a_oqe.data() + Size(j_loc) * qe) : nullptr, nullptr,
+              include_f12 ? (bar_raw_gc_a_oqe.data() + Size(i_loc) * qe) : nullptr,
+              include_f12 ? (bar_res_gc_a_oqe.data() + Size(j_loc) * qe) : nullptr, nullptr,
+              include_f12 ? (bar_raw_dc_a_oqe.data() + Size(i_loc) * qe) : nullptr,
+              include_f12 ? (bar_res_dc_a_oqe.data() + Size(j_loc) * qe) : nullptr, nullptr,
+              bar_fock_a, bar_exch_a, nullptr);
+          if (rc != 0) return rc;
+          const Size idx = strict_tri_index(i_loc, j_loc, oa_act);
+          if (include_f12 && pair_f12_out) pair_f12_out[idx] = ef_ss;
+          if (include_ordinary && pair_ord_out) pair_ord_out[idx] = eo_ss;
+          if (include_f12) e_f12_aa += wij * ef_ss;
+          if (include_ordinary) e_ord_aa += wij * eo_ss;
+        }
+      }
+    }
+
+    // Beta residuals shared by AB and BB channels.
+    std::vector<double> res_g_b_oqe, res_sq_b_oqe, res_gc_b_oqe, res_dc_b_oqe;
+    if (include_f12 && ob_act > 0 && (oa_act > 0 || ob_act >= 2)) {
+      build_res_oqe_host(raw_g_b_qoe, fit_b_qoe, metric_g, aux, ob_act, ext, res_g_b_oqe);
+      build_res_oqe_host(raw_sq_b_qoe, fit_b_qoe, metric_sq, aux, ob_act, ext, res_sq_b_oqe);
+      build_res_oqe_host(raw_gc_b_qoe, fit_b_qoe, metric_gc, aux, ob_act, ext, res_gc_b_oqe);
+      build_res_oqe_host(raw_dc_b_qoe, fit_b_qoe, metric_dc, aux, ob_act, ext, res_dc_b_oqe);
+    }
+
+    // Channel 2: alpha-beta (all i, j)
+    if (oa_act > 0 && ob_act > 0) {
+      const int rc = eval_uhf_opp_spin_channel_response_host(
+          include_f12, include_ordinary, has_occ_weights, oa, ob, fa, fb, obs, ext, aux, occ_w_a,
+          occ_w_b, fit_a_oqe, fit_b_oqe, raw_coul_b_oqe, raw_g_a_oqe, res_g_b_oqe, raw_sq_a_oqe,
+          res_sq_b_oqe, raw_gc_a_oqe, res_gc_b_oqe, raw_dc_a_oqe, res_dc_b_oqe, fock_a, fock_b,
+          exch_a, exch_b, cross_overlap, e_f12_ab, e_ord_ab,
+          (include_f12 && pair_f12_out) ? (pair_f12_out + n_aa) : nullptr,
+          (include_ordinary && pair_ord_out) ? (pair_ord_out + n_aa) : nullptr, bar_fit_a_oqe,
+          bar_fit_b_oqe, bar_raw_coul_b_oqe, bar_raw_g_a_oqe, bar_res_g_b_oqe, bar_raw_sq_a_oqe,
+          bar_res_sq_b_oqe, bar_raw_gc_a_oqe, bar_res_gc_b_oqe, bar_raw_dc_a_oqe, bar_res_dc_b_oqe,
+          bar_fock_a, bar_fock_b, bar_exch_a, bar_exch_b,
+          include_f12 ? bar_cross_overlap : nullptr);
+      if (rc != 0) return rc;
+    }
+
+    // Channel 3: beta-beta (i < j)
+    if (ob_act >= 2) {
+      std::vector<double> Hb;
+      if (include_f12) {
+        Hb.resize(ee);
+        for (Size p = 0; p < ee; ++p) Hb[p] = fock_b[p] + exch_b[p];
+      }
+      const Size off_bb = n_aa + n_ab;
+      for (int i_loc = 0; i_loc < ob_act; ++i_loc) {
+        for (int j_loc = i_loc + 1; j_loc < ob_act; ++j_loc) {
+          const double wij = has_occ_weights ? 0.5 * (occ_w_b[i_loc] + occ_w_b[j_loc]) : 1.0;
+          double ef_ss = 0.0, eo_ss = 0.0, dummy1 = 0.0, dummy2 = 0.0;
+          const int rc = eval_same_spin_or_rhf_pair_response_host(
+              fb + i_loc, fb + j_loc, false, include_f12, include_ordinary, wij, ob, obs, ext, aux,
+              fit_b_oqe.data() + Size(i_loc) * qe, fit_b_oqe.data() + Size(j_loc) * qe, nullptr,
+              raw_coul_b_oqe.data() + Size(j_loc) * qe,
+              include_f12 ? (raw_g_b_oqe.data() + Size(i_loc) * qe) : nullptr,
+              include_f12 ? (res_g_b_oqe.data() + Size(j_loc) * qe) : nullptr,
+              include_f12 ? (raw_sq_b_oqe.data() + Size(i_loc) * qe) : nullptr,
+              include_f12 ? (res_sq_b_oqe.data() + Size(j_loc) * qe) : nullptr,
+              include_f12 ? (raw_gc_b_oqe.data() + Size(i_loc) * qe) : nullptr,
+              include_f12 ? (res_gc_b_oqe.data() + Size(j_loc) * qe) : nullptr,
+              include_f12 ? (raw_dc_b_oqe.data() + Size(i_loc) * qe) : nullptr,
+              include_f12 ? (res_dc_b_oqe.data() + Size(j_loc) * qe) : nullptr, fock_b, exch_b,
+              include_f12 ? Hb.data() : nullptr, ef_ss, eo_ss, dummy1, dummy2,
+              bar_fit_b_oqe.data() + Size(i_loc) * qe, bar_fit_b_oqe.data() + Size(j_loc) * qe,
+              nullptr, bar_raw_coul_b_oqe.data() + Size(j_loc) * qe,
+              include_f12 ? (bar_raw_g_b_oqe.data() + Size(i_loc) * qe) : nullptr,
+              include_f12 ? (bar_res_g_b_oqe.data() + Size(j_loc) * qe) : nullptr, nullptr,
+              include_f12 ? (bar_raw_sq_b_oqe.data() + Size(i_loc) * qe) : nullptr,
+              include_f12 ? (bar_res_sq_b_oqe.data() + Size(j_loc) * qe) : nullptr, nullptr,
+              include_f12 ? (bar_raw_gc_b_oqe.data() + Size(i_loc) * qe) : nullptr,
+              include_f12 ? (bar_res_gc_b_oqe.data() + Size(j_loc) * qe) : nullptr, nullptr,
+              include_f12 ? (bar_raw_dc_b_oqe.data() + Size(i_loc) * qe) : nullptr,
+              include_f12 ? (bar_res_dc_b_oqe.data() + Size(j_loc) * qe) : nullptr, nullptr,
+              bar_fock_b, bar_exch_b, nullptr);
+          if (rc != 0) return rc;
+          const Size idx = off_bb + strict_tri_index(i_loc, j_loc, ob_act);
+          if (include_f12 && pair_f12_out) pair_f12_out[idx] = ef_ss;
+          if (include_ordinary && pair_ord_out) pair_ord_out[idx] = eo_ss;
+          if (include_f12) e_f12_bb += wij * ef_ss;
+          if (include_ordinary) e_ord_bb += wij * eo_ss;
+        }
+      }
+    }
+
+    // Pullback residuals once per spin channel & scatter into full [aux, occ, ext] outputs.
+    if (oa_act > 0) {
+      std::vector<double> bar_fit_a_qoe;
+      transpose_oqe_to_qoe_host(bar_fit_a_oqe, aux, oa_act, ext, bar_fit_a_qoe);
+      if (include_f12 && oa_act >= 2) {
+        pullback_res_oqe_host(bar_res_g_a_oqe, fit_a_qoe, metric_g, 1.0, false, aux, oa_act, ext,
+                              bar_raw_g_a_oqe, bar_fit_a_qoe, bar_metric_g);
+        pullback_res_oqe_host(bar_res_sq_a_oqe, fit_a_qoe, metric_sq, 1.0, false, aux, oa_act, ext,
+                              bar_raw_sq_a_oqe, bar_fit_a_qoe, bar_metric_sq);
+        pullback_res_oqe_host(bar_res_gc_a_oqe, fit_a_qoe, metric_gc, 1.0, false, aux, oa_act, ext,
+                              bar_raw_gc_a_oqe, bar_fit_a_qoe, bar_metric_gc);
+        pullback_res_oqe_host(bar_res_dc_a_oqe, fit_a_qoe, metric_dc, 1.0, false, aux, oa_act, ext,
+                              bar_raw_dc_a_oqe, bar_fit_a_qoe, bar_metric_dc);
+      }
+      scatter_active_qoe_host(bar_fit_a_qoe, aux, oa, fa, oa_act, ext, bar_fit_a);
+      scatter_active_oqe_host(bar_raw_coul_a_oqe, aux, oa, fa, oa_act, ext, bar_raw_coul_a);
+      if (include_f12) {
+        scatter_active_oqe_host(bar_raw_g_a_oqe, aux, oa, fa, oa_act, ext, bar_raw_g_a);
+        scatter_active_oqe_host(bar_raw_sq_a_oqe, aux, oa, fa, oa_act, ext, bar_raw_sq_a);
+        scatter_active_oqe_host(bar_raw_gc_a_oqe, aux, oa, fa, oa_act, ext, bar_raw_gc_a);
+        scatter_active_oqe_host(bar_raw_dc_a_oqe, aux, oa, fa, oa_act, ext, bar_raw_dc_a);
+      }
+    }
+    if (ob_act > 0) {
+      std::vector<double> bar_fit_b_qoe;
+      transpose_oqe_to_qoe_host(bar_fit_b_oqe, aux, ob_act, ext, bar_fit_b_qoe);
+      if (include_f12 && (oa_act > 0 || ob_act >= 2)) {
+        pullback_res_oqe_host(bar_res_g_b_oqe, fit_b_qoe, metric_g, 1.0, false, aux, ob_act, ext,
+                              bar_raw_g_b_oqe, bar_fit_b_qoe, bar_metric_g);
+        pullback_res_oqe_host(bar_res_sq_b_oqe, fit_b_qoe, metric_sq, 1.0, false, aux, ob_act, ext,
+                              bar_raw_sq_b_oqe, bar_fit_b_qoe, bar_metric_sq);
+        pullback_res_oqe_host(bar_res_gc_b_oqe, fit_b_qoe, metric_gc, 1.0, false, aux, ob_act, ext,
+                              bar_raw_gc_b_oqe, bar_fit_b_qoe, bar_metric_gc);
+        pullback_res_oqe_host(bar_res_dc_b_oqe, fit_b_qoe, metric_dc, 1.0, false, aux, ob_act, ext,
+                              bar_raw_dc_b_oqe, bar_fit_b_qoe, bar_metric_dc);
+      }
+      scatter_active_qoe_host(bar_fit_b_qoe, aux, ob, fb, ob_act, ext, bar_fit_b);
+      scatter_active_oqe_host(bar_raw_coul_b_oqe, aux, ob, fb, ob_act, ext, bar_raw_coul_b);
+      if (include_f12) {
+        scatter_active_oqe_host(bar_raw_g_b_oqe, aux, ob, fb, ob_act, ext, bar_raw_g_b);
+        scatter_active_oqe_host(bar_raw_sq_b_oqe, aux, ob, fb, ob_act, ext, bar_raw_sq_b);
+        scatter_active_oqe_host(bar_raw_gc_b_oqe, aux, ob, fb, ob_act, ext, bar_raw_gc_b);
+        scatter_active_oqe_host(bar_raw_dc_b_oqe, aux, ob, fb, ob_act, ext, bar_raw_dc_b);
+      }
+    }
+  }
+
+  if (out_scalars) {
+    out_scalars[0] = e_f12_aa;
+    out_scalars[1] = e_f12_ab;
+    out_scalars[2] = e_f12_bb;
+    out_scalars[3] = e_ord_aa;
+    out_scalars[4] = e_ord_ab;
+    out_scalars[5] = e_ord_bb;
+    if (!all_finite_host(out_scalars, 6)) return -5;
+  }
+  if (include_f12 && pair_f12_out && !all_finite_host(pair_f12_out, n_total)) return -5;
+  if (include_ordinary && pair_ord_out && !all_finite_host(pair_ord_out, n_total)) return -5;
+  if (!all_finite_host(bar_fock_a, ee) || !all_finite_host(bar_exch_a, ee)) return -5;
+  if (!rhf_spatial && (!all_finite_host(bar_fock_b, ee) || !all_finite_host(bar_exch_b, ee))) {
+    return -5;
+  }
+  if (include_f12 && bar_cross_overlap && !all_finite_host(bar_cross_overlap, ee)) return -5;
+  if (include_f12 && (!all_finite_host(bar_metric_g, qq) || !all_finite_host(bar_metric_sq, qq) ||
+                      !all_finite_host(bar_metric_gc, qq) || !all_finite_host(bar_metric_dc, qq))) {
+    return -5;
+  }
+  if (oa_act > 0) {
+    if (!all_finite_host(bar_fit_a, qoa_e) || !all_finite_host(bar_raw_coul_a, qoa_e)) return -5;
+    if (include_f12 &&
+        (!all_finite_host(bar_raw_g_a, qoa_e) || !all_finite_host(bar_raw_sq_a, qoa_e) ||
+         !all_finite_host(bar_raw_gc_a, qoa_e) || !all_finite_host(bar_raw_dc_a, qoa_e))) {
+      return -5;
+    }
+  }
+  if (!rhf_spatial && ob_act > 0) {
+    if (!all_finite_host(bar_fit_b, qob_e) || !all_finite_host(bar_raw_coul_b, qob_e)) return -5;
+    if (include_f12 &&
+        (!all_finite_host(bar_raw_g_b, qob_e) || !all_finite_host(bar_raw_sq_b, qob_e) ||
+         !all_finite_host(bar_raw_gc_b, qob_e) || !all_finite_host(bar_raw_dc_b, qob_e))) {
       return -5;
     }
   }
@@ -5319,6 +10168,974 @@ int gqc_f12_ordinary_df_mp2_cuda(
       return -5;
     }
     if (!same_spin && (!all_finite_host(fock_b, nn) || !all_finite_host(bar_coeff_b, nn))) {
+      return -5;
+    }
+  }
+  return 0;
+  } catch (const DeviceBudgetExceeded&) {
+    return kErrBudgetExceeded;
+  } catch (const std::bad_alloc&) {
+    return kErrOom;
+  } catch (const std::length_error&) {
+    return kErrOom;
+  } catch (...) {
+    return kErrInternal;
+  }
+}
+
+int gqc_f12_mp2_pair_response_cuda(
+    int rhf_spatial_int, int include_f12_int, int include_ordinary_int, int has_occ_weights_int,
+    int oa, int ob, int fa, int fb, int obs, int ext, int aux, int raw_coul_n1_a,
+    int raw_coul_n1_b, std::uint64_t budget_bytes, const double* occ_w_a, const double* occ_w_b,
+    const double* fit_a, const double* fit_b, const double* raw_coul_a, const double* raw_coul_b,
+    const double* raw_g_a, const double* raw_g_b, const double* raw_sq_a, const double* raw_sq_b,
+    const double* raw_gc_a, const double* raw_gc_b, const double* raw_dc_a, const double* raw_dc_b,
+    const double* metric_g, const double* metric_sq, const double* metric_gc,
+    const double* metric_dc, const double* fock_a, const double* fock_b, const double* exch_a,
+    const double* exch_b, const double* cross_overlap, double* out_scalars, double* pair_f12_out,
+    double* pair_ord_out, double* bar_fit_a, double* bar_fit_b, double* bar_raw_coul_a,
+    double* bar_raw_coul_b, double* bar_raw_g_a, double* bar_raw_g_b, double* bar_raw_sq_a,
+    double* bar_raw_sq_b, double* bar_raw_gc_a, double* bar_raw_gc_b, double* bar_raw_dc_a,
+    double* bar_raw_dc_b, double* bar_metric_g, double* bar_metric_sq, double* bar_metric_gc,
+    double* bar_metric_dc, double* bar_fock_a, double* bar_fock_b, double* bar_exch_a,
+    double* bar_exch_b, double* bar_cross_overlap) {
+  try {
+  const bool rhf_spatial = (rhf_spatial_int != 0);
+  const bool include_f12 = (include_f12_int != 0);
+  const bool include_ordinary = (include_ordinary_int != 0);
+  const bool has_occ_weights = (has_occ_weights_int != 0);
+
+  if (fa < 0 || fa > oa || oa >= obs || fb < 0 || fb > ob || ob >= obs || obs >= ext || aux < 1) {
+    return -1;
+  }
+  if (rhf_spatial && (oa != ob || fa != fb)) return -1;
+  if (!metric_g || !metric_sq || !metric_gc || !metric_dc || !fock_a || !exch_a) return -1;
+  if (!rhf_spatial && (!fock_b || !exch_b)) return -1;
+  if (!bar_fock_a || !bar_exch_a) return -1;
+  if (!rhf_spatial && (!bar_fock_b || !bar_exch_b)) return -1;
+  if (include_f12 && (!bar_metric_g || !bar_metric_sq || !bar_metric_gc || !bar_metric_dc)) {
+    return -1;
+  }
+
+  const int oa_act = oa - fa;
+  const int ob_act = ob - fb;
+  if (has_occ_weights) {
+    if (oa_act > 0 && !occ_w_a) return -1;
+    if (!rhf_spatial && ob_act > 0 && !occ_w_b) return -1;
+  }
+  if (oa_act > 0) {
+    if (raw_coul_n1_a < oa || !fit_a || !raw_coul_a || !raw_g_a || !raw_sq_a || !raw_gc_a ||
+        !raw_dc_a) {
+      return -1;
+    }
+    if (!bar_fit_a || !bar_raw_coul_a) return -1;
+    if (include_f12 && (!bar_raw_g_a || !bar_raw_sq_a || !bar_raw_gc_a || !bar_raw_dc_a)) {
+      return -1;
+    }
+  }
+  if (!rhf_spatial && ob_act > 0) {
+    if (raw_coul_n1_b < ob || !fit_b || !raw_coul_b || !raw_g_b || !raw_sq_b || !raw_gc_b ||
+        !raw_dc_b) {
+      return -1;
+    }
+    if (!bar_fit_b || !bar_raw_coul_b) return -1;
+    if (include_f12 && (!bar_raw_g_b || !bar_raw_sq_b || !bar_raw_gc_b || !bar_raw_dc_b)) {
+      return -1;
+    }
+  }
+  if (!rhf_spatial && oa_act > 0 && ob_act > 0 && !cross_overlap) return -1;
+  if (include_f12 && oa_act > 0 && ob_act > 0 && !bar_cross_overlap) return -1;
+
+  const Size qq = Size(aux) * aux;
+  const Size ee = Size(ext) * ext;
+  const Size qoa_e = Size(aux) * Size(oa) * ext;
+  const Size qob_e = Size(aux) * Size(ob) * ext;
+
+  if (!all_finite_host(metric_g, qq) || !all_finite_host(metric_sq, qq) ||
+      !all_finite_host(metric_gc, qq) || !all_finite_host(metric_dc, qq) ||
+      !all_finite_host(fock_a, ee) || !all_finite_host(exch_a, ee)) {
+    return -2;
+  }
+  if (!rhf_spatial && (!all_finite_host(fock_b, ee) || !all_finite_host(exch_b, ee))) {
+    return -2;
+  }
+  if (!rhf_spatial && oa_act > 0 && ob_act > 0 && !all_finite_host(cross_overlap, ee)) {
+    return -2;
+  }
+  if (has_occ_weights) {
+    if (oa_act > 0 && !all_finite_host(occ_w_a, oa_act)) return -2;
+    if (!rhf_spatial && ob_act > 0 && !all_finite_host(occ_w_b, ob_act)) return -2;
+  }
+
+  const Size n_aa = (oa_act >= 2) ? (Size(oa_act) * (oa_act - 1)) / 2 : 0;
+  const Size n_ab = Size(oa_act) * Size(ob_act);
+  const Size n_bb = (ob_act >= 2) ? (Size(ob_act) * (ob_act - 1)) / 2 : 0;
+  const Size n_total = n_aa + n_ab + n_bb;
+
+  // Zero-initialize all provided output buffers.
+  if (out_scalars) std::fill_n(out_scalars, 6, 0.0);
+  if (pair_f12_out && n_total > 0) std::fill_n(pair_f12_out, n_total, 0.0);
+  if (include_ordinary && pair_ord_out && n_total > 0) std::fill_n(pair_ord_out, n_total, 0.0);
+  if (qoa_e > 0) {
+    if (bar_fit_a) std::fill_n(bar_fit_a, qoa_e, 0.0);
+    if (bar_raw_coul_a) std::fill_n(bar_raw_coul_a, qoa_e, 0.0);
+    if (bar_raw_g_a) std::fill_n(bar_raw_g_a, qoa_e, 0.0);
+    if (bar_raw_sq_a) std::fill_n(bar_raw_sq_a, qoa_e, 0.0);
+    if (bar_raw_gc_a) std::fill_n(bar_raw_gc_a, qoa_e, 0.0);
+    if (bar_raw_dc_a) std::fill_n(bar_raw_dc_a, qoa_e, 0.0);
+  }
+  if (qob_e > 0) {
+    if (bar_fit_b && bar_fit_b != bar_fit_a) std::fill_n(bar_fit_b, qob_e, 0.0);
+    if (bar_raw_coul_b && bar_raw_coul_b != bar_raw_coul_a) std::fill_n(bar_raw_coul_b, qob_e, 0.0);
+    if (bar_raw_g_b && bar_raw_g_b != bar_raw_g_a) std::fill_n(bar_raw_g_b, qob_e, 0.0);
+    if (bar_raw_sq_b && bar_raw_sq_b != bar_raw_sq_a) std::fill_n(bar_raw_sq_b, qob_e, 0.0);
+    if (bar_raw_gc_b && bar_raw_gc_b != bar_raw_gc_a) std::fill_n(bar_raw_gc_b, qob_e, 0.0);
+    if (bar_raw_dc_b && bar_raw_dc_b != bar_raw_dc_a) std::fill_n(bar_raw_dc_b, qob_e, 0.0);
+  }
+  if (bar_metric_g) std::fill_n(bar_metric_g, qq, 0.0);
+  if (bar_metric_sq) std::fill_n(bar_metric_sq, qq, 0.0);
+  if (bar_metric_gc) std::fill_n(bar_metric_gc, qq, 0.0);
+  if (bar_metric_dc) std::fill_n(bar_metric_dc, qq, 0.0);
+  std::fill_n(bar_fock_a, ee, 0.0);
+  std::fill_n(bar_exch_a, ee, 0.0);
+  if (bar_fock_b && bar_fock_b != bar_fock_a) std::fill_n(bar_fock_b, ee, 0.0);
+  if (bar_exch_b && bar_exch_b != bar_exch_a) std::fill_n(bar_exch_b, ee, 0.0);
+  if (bar_cross_overlap) std::fill_n(bar_cross_overlap, ee, 0.0);
+
+  // Validate active 3-center inputs even on early exit.
+  std::vector<double> h_qoe;
+  if (n_total == 0 || (!include_f12 && !include_ordinary)) {
+    if (oa_act > 0) {
+      if (!pack_active_qoe_checked_cuda_host(fit_a, aux, oa, fa, oa_act, ext, h_qoe) ||
+          !pack_active_qoe_checked_cuda_host(raw_coul_a, aux, raw_coul_n1_a, fa, oa_act, ext,
+                                             h_qoe) ||
+          !pack_active_qoe_checked_cuda_host(raw_g_a, aux, oa, fa, oa_act, ext, h_qoe) ||
+          !pack_active_qoe_checked_cuda_host(raw_sq_a, aux, oa, fa, oa_act, ext, h_qoe) ||
+          !pack_active_qoe_checked_cuda_host(raw_gc_a, aux, oa, fa, oa_act, ext, h_qoe) ||
+          !pack_active_qoe_checked_cuda_host(raw_dc_a, aux, oa, fa, oa_act, ext, h_qoe)) {
+        return -2;
+      }
+    }
+    if (!rhf_spatial && ob_act > 0) {
+      if (!pack_active_qoe_checked_cuda_host(fit_b, aux, ob, fb, ob_act, ext, h_qoe) ||
+          !pack_active_qoe_checked_cuda_host(raw_coul_b, aux, raw_coul_n1_b, fb, ob_act, ext,
+                                             h_qoe) ||
+          !pack_active_qoe_checked_cuda_host(raw_g_b, aux, ob, fb, ob_act, ext, h_qoe) ||
+          !pack_active_qoe_checked_cuda_host(raw_sq_b, aux, ob, fb, ob_act, ext, h_qoe) ||
+          !pack_active_qoe_checked_cuda_host(raw_gc_b, aux, ob, fb, ob_act, ext, h_qoe) ||
+          !pack_active_qoe_checked_cuda_host(raw_dc_b, aux, ob, fb, ob_act, ext, h_qoe)) {
+        return -2;
+      }
+    }
+    return 0;
+  }
+
+  // Enforce caller-specified hard device VRAM budget BEFORE allocating any device memory.
+  {
+    const Size req_device_bytes = estimate_mp2_pair_response_device_bytes(
+        rhf_spatial, include_f12, include_ordinary, pair_f12_out != nullptr,
+        pair_ord_out != nullptr, bar_cross_overlap != nullptr, oa, ob, fa, fb, obs, ext, aux);
+    if (req_device_bytes > effective_device_budget(budget_bytes)) {
+      return kErrBudgetExceeded;
+    }
+  }
+
+  DeviceWorkspace workspace(budget_bytes);
+  CublasGuard cg;
+  if (cg.init() != CUBLAS_STATUS_SUCCESS) return 1;
+  cublasHandle_t h = cg.handle;
+
+  DeviceBuf d_out_scalars, d_pair_f12, d_pair_ord;
+  DeviceIntBuf d_err;
+  if (d_out_scalars.alloc(6) != cudaSuccess || d_err.alloc(1) != cudaSuccess ||
+      cudaMemset(d_out_scalars.ptr, 0, 6 * sizeof(double)) != cudaSuccess ||
+      cudaMemset(d_err.ptr, 0, sizeof(int)) != cudaSuccess) {
+    return 2;
+  }
+  if (include_f12 && pair_f12_out) {
+    if (d_pair_f12.alloc(n_total) != cudaSuccess ||
+        cudaMemset(d_pair_f12.ptr, 0, n_total * sizeof(double)) != cudaSuccess) {
+      return 2;
+    }
+  }
+  if (include_ordinary && pair_ord_out) {
+    if (d_pair_ord.alloc(n_total) != cudaSuccess ||
+        cudaMemset(d_pair_ord.ptr, 0, n_total * sizeof(double)) != cudaSuccess) {
+      return 2;
+    }
+  }
+
+  const Size qoe_a = Size(aux) * Size(oa_act) * ext;
+  const Size qoe_b = Size(aux) * Size(ob_act) * ext;
+  const Size max_qoe = std::max(qoe_a, qoe_b);
+
+  DeviceBuf d_qoe_scratch, d_metric_buf, d_bar_metric_buf, d_m_tmp;
+  if (d_qoe_scratch.alloc(max_qoe) != cudaSuccess || d_metric_buf.alloc(qq) != cudaSuccess ||
+      d_bar_metric_buf.alloc(qq) != cudaSuccess || d_m_tmp.alloc(qq) != cudaSuccess) {
+    return 2;
+  }
+
+  if (rhf_spatial) {
+    DeviceBuf d_Fa, d_Ka, d_Ha, d_bar_Fa, d_bar_Ka, d_bar_Sab;
+    DeviceBuf d_fit_qoe, d_fit_oqe, d_bar_fit_qoe, d_bar_fit_oqe;
+    if (d_Fa.alloc(ee) != cudaSuccess || d_Ka.alloc(ee) != cudaSuccess ||
+        d_Ha.alloc(ee) != cudaSuccess || d_bar_Fa.alloc(ee) != cudaSuccess ||
+        d_bar_Ka.alloc(ee) != cudaSuccess || d_fit_qoe.alloc(qoe_a) != cudaSuccess ||
+        d_fit_oqe.alloc(qoe_a) != cudaSuccess || d_bar_fit_qoe.alloc(qoe_a) != cudaSuccess ||
+        d_bar_fit_oqe.alloc(qoe_a) != cudaSuccess ||
+        cudaMemcpy(d_Fa.ptr, fock_a, ee * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_Ka.ptr, exch_a, ee * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemset(d_bar_Fa.ptr, 0, ee * sizeof(double)) != cudaSuccess ||
+        cudaMemset(d_bar_Ka.ptr, 0, ee * sizeof(double)) != cudaSuccess ||
+        cudaMemset(d_bar_fit_qoe.ptr, 0, qoe_a * sizeof(double)) != cudaSuccess ||
+        cudaMemset(d_bar_fit_oqe.ptr, 0, qoe_a * sizeof(double)) != cudaSuccess) {
+      return 2;
+    }
+    if (include_f12 && bar_cross_overlap) {
+      if (d_bar_Sab.alloc(ee) != cudaSuccess ||
+          cudaMemset(d_bar_Sab.ptr, 0, ee * sizeof(double)) != cudaSuccess) {
+        return 2;
+      }
+    }
+    k_add_2d<<<grid_for(ee), 256>>>(ee, d_Fa.ptr, d_Ka.ptr, d_Ha.ptr);
+    if (!pack_active_qoe_checked_cuda_host(fit_a, aux, oa, fa, oa_act, ext, h_qoe)) return -2;
+    if (cudaMemcpy(d_fit_qoe.ptr, h_qoe.data(), qoe_a * sizeof(double), cudaMemcpyHostToDevice) !=
+        cudaSuccess) {
+      return 3;
+    }
+    k_qoe_to_oqe<<<grid_for(qoe_a), 256>>>(aux, oa_act, ext, d_fit_qoe.ptr, d_fit_oqe.ptr);
+
+    DeviceBuf d_fg_d, d_fg_x, d_uf_d, d_uf_x, d_f2_d, d_f2_x, d_sq_fk_d, d_sq_fk_x;
+    if (include_f12) {
+      // Stage 1a: Forward scalars for gc, dc, sq (reuses validated build_ss_stage1_scalars_gpu).
+      if (int rc = build_ss_stage1_scalars_gpu(
+              h, oa, fa, ext, aux, d_fit_qoe.ptr, d_Ha.ptr, raw_gc_a, raw_dc_a, raw_sq_a, metric_gc,
+              metric_dc, metric_sq, d_qoe_scratch, d_metric_buf, d_fg_d, d_fg_x, d_uf_d, d_uf_x,
+              d_f2_d, d_f2_x, d_sq_fk_d, d_sq_fk_x);
+          rc != 0) {
+        return rc;
+      }
+      // Stage 1b: Sequential 1-operator-at-a-time reverse pullback (gc, dc, sq) reusing ONE set of buffers.
+      {
+        DeviceBuf d_raw_op_oqe, d_res_op_oqe, d_bar_raw_op_oqe, d_bar_res_op_oqe,
+            d_bar_res_os_op_oqe;
+        if (d_raw_op_oqe.alloc(qoe_a) != cudaSuccess || d_res_op_oqe.alloc(qoe_a) != cudaSuccess ||
+            d_bar_raw_op_oqe.alloc(qoe_a) != cudaSuccess ||
+            d_bar_res_op_oqe.alloc(qoe_a) != cudaSuccess ||
+            d_bar_res_os_op_oqe.alloc(qoe_a) != cudaSuccess) {
+          return 2;
+        }
+        const double* raw_ops[3] = {raw_gc_a, raw_dc_a, raw_sq_a};
+        const double* met_ops[3] = {metric_gc, metric_dc, metric_sq};
+        double* bar_raw_ops[3] = {bar_raw_gc_a, bar_raw_dc_a, bar_raw_sq_a};
+        double* bar_met_ops[3] = {bar_metric_gc, bar_metric_dc, bar_metric_sq};
+        for (int op_kind = 0; op_kind < 3; ++op_kind) {
+          if (!pack_active_qoe_checked_cuda_host(raw_ops[op_kind], aux, oa, fa, oa_act, ext, h_qoe))
+            return -2;
+          if (cudaMemcpy(d_qoe_scratch.ptr, h_qoe.data(), qoe_a * sizeof(double),
+                         cudaMemcpyHostToDevice) != cudaSuccess ||
+              cudaMemcpy(d_metric_buf.ptr, met_ops[op_kind], qq * sizeof(double),
+                         cudaMemcpyHostToDevice) != cudaSuccess ||
+              cudaMemset(d_bar_raw_op_oqe.ptr, 0, qoe_a * sizeof(double)) != cudaSuccess ||
+              cudaMemset(d_bar_res_op_oqe.ptr, 0, qoe_a * sizeof(double)) != cudaSuccess ||
+              cudaMemset(d_bar_res_os_op_oqe.ptr, 0, qoe_a * sizeof(double)) != cudaSuccess ||
+              cudaMemset(d_bar_metric_buf.ptr, 0, qq * sizeof(double)) != cudaSuccess) {
+            return 3;
+          }
+          k_qoe_to_oqe<<<grid_for(qoe_a), 256>>>(aux, oa_act, ext, d_qoe_scratch.ptr,
+                                                 d_raw_op_oqe.ptr);
+          if (rm_gemm(h, false, false, aux, oa_act * ext, aux, -1.0, d_metric_buf.ptr, aux,
+                      d_fit_qoe.ptr, oa_act * ext, 1.0, d_qoe_scratch.ptr,
+                      oa_act * ext) != CUBLAS_STATUS_SUCCESS) {
+            return 4;
+          }
+          k_qoe_to_oqe<<<grid_for(qoe_a), 256>>>(aux, oa_act, ext, d_qoe_scratch.ptr,
+                                                 d_res_op_oqe.ptr);
+          if (int rc = run_ss_or_rhf_stage1_op_rev_gpu(
+                  h, op_kind, true, has_occ_weights, oa, fa, ext, aux, occ_w_a, fock_a,
+                  d_fit_oqe.ptr, d_raw_op_oqe.ptr, d_res_op_oqe.ptr, d_Ha.ptr, d_bar_fit_oqe.ptr,
+                  d_bar_raw_op_oqe.ptr, d_bar_res_op_oqe.ptr, d_bar_res_os_op_oqe.ptr, d_bar_Fa.ptr,
+                  d_bar_Ka.ptr, d_bar_Sab.ptr);
+              rc != 0) {
+            return rc;
+          }
+          if (int rc = pullback_res_oqe_gpu(h, d_bar_res_op_oqe.ptr, d_fit_qoe.ptr,
+                                            d_metric_buf.ptr, 2.0, false, aux, oa_act, ext,
+                                            d_bar_raw_op_oqe.ptr, d_bar_fit_qoe.ptr,
+                                            d_bar_metric_buf.ptr, d_qoe_scratch.ptr, d_m_tmp.ptr);
+              rc != 0) {
+            return rc;
+          }
+          if (int rc = pullback_res_oqe_gpu(h, d_bar_res_os_op_oqe.ptr, d_fit_qoe.ptr,
+                                            d_metric_buf.ptr, 2.0, true, aux, oa_act, ext,
+                                            d_bar_raw_op_oqe.ptr, d_bar_fit_qoe.ptr,
+                                            d_bar_metric_buf.ptr, d_qoe_scratch.ptr, d_m_tmp.ptr);
+              rc != 0) {
+            return rc;
+          }
+          if (int rc = scatter_active_oqe_cuda_host(d_bar_raw_op_oqe.ptr, aux, oa, fa, oa_act, ext,
+                                                    bar_raw_ops[op_kind], h_qoe, d_qoe_scratch.ptr);
+              rc != 0) {
+            return rc;
+          }
+          if (cudaMemcpy(bar_met_ops[op_kind], d_bar_metric_buf.ptr, qq * sizeof(double),
+                         cudaMemcpyDeviceToHost) != cudaSuccess) {
+            return 6;
+          }
+        }
+        if (cudaDeviceSynchronize() != cudaSuccess) return 7;
+      }
+    }
+
+    // Stage 2: Core Coulomb + geminal g response.
+    DeviceBuf d_raw_coul_oqe, d_bar_raw_coul_oqe;
+    DeviceBuf d_raw_g_oqe, d_res_g_oqe, d_bar_raw_g_oqe, d_bar_res_g_oqe, d_bar_res_os_g_oqe;
+    if (d_raw_coul_oqe.alloc(qoe_a) != cudaSuccess ||
+        d_bar_raw_coul_oqe.alloc(qoe_a) != cudaSuccess ||
+        cudaMemset(d_bar_raw_coul_oqe.ptr, 0, qoe_a * sizeof(double)) != cudaSuccess) {
+      return 2;
+    }
+    if (!pack_active_qoe_checked_cuda_host(raw_coul_a, aux, raw_coul_n1_a, fa, oa_act, ext, h_qoe))
+      return -2;
+    if (cudaMemcpy(d_qoe_scratch.ptr, h_qoe.data(), qoe_a * sizeof(double),
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+      return 3;
+    }
+    k_qoe_to_oqe<<<grid_for(qoe_a), 256>>>(aux, oa_act, ext, d_qoe_scratch.ptr, d_raw_coul_oqe.ptr);
+
+    if (include_f12) {
+      if (d_raw_g_oqe.alloc(qoe_a) != cudaSuccess || d_res_g_oqe.alloc(qoe_a) != cudaSuccess ||
+          d_bar_raw_g_oqe.alloc(qoe_a) != cudaSuccess ||
+          d_bar_res_g_oqe.alloc(qoe_a) != cudaSuccess ||
+          d_bar_res_os_g_oqe.alloc(qoe_a) != cudaSuccess ||
+          cudaMemset(d_bar_raw_g_oqe.ptr, 0, qoe_a * sizeof(double)) != cudaSuccess ||
+          cudaMemset(d_bar_res_g_oqe.ptr, 0, qoe_a * sizeof(double)) != cudaSuccess ||
+          cudaMemset(d_bar_res_os_g_oqe.ptr, 0, qoe_a * sizeof(double)) != cudaSuccess ||
+          cudaMemset(d_bar_metric_buf.ptr, 0, qq * sizeof(double)) != cudaSuccess) {
+        return 2;
+      }
+      if (!pack_active_qoe_checked_cuda_host(raw_g_a, aux, oa, fa, oa_act, ext, h_qoe)) return -2;
+      if (cudaMemcpy(d_qoe_scratch.ptr, h_qoe.data(), qoe_a * sizeof(double),
+                     cudaMemcpyHostToDevice) != cudaSuccess ||
+          cudaMemcpy(d_metric_buf.ptr, metric_g, qq * sizeof(double), cudaMemcpyHostToDevice) !=
+              cudaSuccess) {
+        return 3;
+      }
+      k_qoe_to_oqe<<<grid_for(qoe_a), 256>>>(aux, oa_act, ext, d_qoe_scratch.ptr, d_raw_g_oqe.ptr);
+      if (rm_gemm(h, false, false, aux, oa_act * ext, aux, -1.0, d_metric_buf.ptr, aux,
+                  d_fit_qoe.ptr, oa_act * ext, 1.0, d_qoe_scratch.ptr,
+                  oa_act * ext) != CUBLAS_STATUS_SUCCESS) {
+        return 4;
+      }
+      k_qoe_to_oqe<<<grid_for(qoe_a), 256>>>(aux, oa_act, ext, d_qoe_scratch.ptr, d_res_g_oqe.ptr);
+    }
+
+    if (int rc = run_ss_or_rhf_stage2_response_gpu(
+            h, true, include_f12, include_ordinary, has_occ_weights, oa, fa, obs, ext, aux, 0, 0, 3,
+            occ_w_a, fock_a, d_fit_oqe.ptr, d_raw_coul_oqe.ptr, d_raw_g_oqe.ptr, d_res_g_oqe.ptr,
+            d_Fa.ptr, d_Ka.ptr, d_Ha.ptr, d_fg_d.ptr, d_fg_x.ptr, d_f2_d.ptr, d_f2_x.ptr,
+            d_uf_d.ptr, d_uf_x.ptr, d_sq_fk_d.ptr, d_sq_fk_x.ptr, d_out_scalars.ptr, d_pair_f12.ptr,
+            d_pair_ord.ptr, d_bar_fit_oqe.ptr, d_bar_raw_coul_oqe.ptr, d_bar_raw_g_oqe.ptr,
+            d_bar_res_g_oqe.ptr, d_bar_res_os_g_oqe.ptr, d_bar_Fa.ptr, d_bar_Ka.ptr, d_bar_Sab.ptr,
+            d_err.ptr);
+        rc != 0) {
+      return rc;
+    }
+
+    if (include_f12) {
+      if (int rc = pullback_res_oqe_gpu(h, d_bar_res_g_oqe.ptr, d_fit_qoe.ptr, d_metric_buf.ptr,
+                                        2.0, false, aux, oa_act, ext, d_bar_raw_g_oqe.ptr,
+                                        d_bar_fit_qoe.ptr, d_bar_metric_buf.ptr, d_qoe_scratch.ptr,
+                                        d_m_tmp.ptr);
+          rc != 0) {
+        return rc;
+      }
+      if (int rc = pullback_res_oqe_gpu(h, d_bar_res_os_g_oqe.ptr, d_fit_qoe.ptr, d_metric_buf.ptr,
+                                        2.0, true, aux, oa_act, ext, d_bar_raw_g_oqe.ptr,
+                                        d_bar_fit_qoe.ptr, d_bar_metric_buf.ptr, d_qoe_scratch.ptr,
+                                        d_m_tmp.ptr);
+          rc != 0) {
+        return rc;
+      }
+      if (int rc = scatter_active_oqe_cuda_host(d_bar_raw_g_oqe.ptr, aux, oa, fa, oa_act, ext,
+                                                bar_raw_g_a, h_qoe, d_qoe_scratch.ptr);
+          rc != 0) {
+        return rc;
+      }
+      if (cudaMemcpy(bar_metric_g, d_bar_metric_buf.ptr, qq * sizeof(double),
+                     cudaMemcpyDeviceToHost) != cudaSuccess) {
+        return 6;
+      }
+    }
+
+    // Fold d_bar_fit_oqe into d_bar_fit_qoe & scatter all outputs to host.
+    k_oqe_to_qoe<<<grid_for(qoe_a), 256>>>(aux, oa_act, ext, d_bar_fit_oqe.ptr, d_qoe_scratch.ptr);
+    k_axpy<<<grid_for(qoe_a), 256>>>(qoe_a, 1.0, d_qoe_scratch.ptr, d_bar_fit_qoe.ptr);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 7;
+    if (int rc = scatter_active_qoe_cuda_host(d_bar_fit_qoe.ptr, aux, oa, fa, oa_act, ext,
+                                              bar_fit_a, h_qoe);
+        rc != 0) {
+      return rc;
+    }
+    if (int rc = scatter_active_oqe_cuda_host(d_bar_raw_coul_oqe.ptr, aux, oa, fa, oa_act, ext,
+                                              bar_raw_coul_a, h_qoe, d_qoe_scratch.ptr);
+        rc != 0) {
+      return rc;
+    }
+    if (cudaMemcpy(bar_fock_a, d_bar_Fa.ptr, ee * sizeof(double), cudaMemcpyDeviceToHost) !=
+            cudaSuccess ||
+        cudaMemcpy(bar_exch_a, d_bar_Ka.ptr, ee * sizeof(double), cudaMemcpyDeviceToHost) !=
+            cudaSuccess) {
+      return 6;
+    }
+    if (include_f12 && bar_cross_overlap &&
+        cudaMemcpy(bar_cross_overlap, d_bar_Sab.ptr, ee * sizeof(double), cudaMemcpyDeviceToHost) !=
+            cudaSuccess) {
+      return 6;
+    }
+
+    // Mirror alpha outputs to beta outputs when distinct pointers are provided.
+    if (bar_fit_b && bar_fit_b != bar_fit_a) std::copy_n(bar_fit_a, qoa_e, bar_fit_b);
+    if (bar_raw_coul_b && bar_raw_coul_b != bar_raw_coul_a) {
+      std::copy_n(bar_raw_coul_a, qoa_e, bar_raw_coul_b);
+    }
+    if (include_f12) {
+      if (bar_raw_g_b && bar_raw_g_b != bar_raw_g_a) std::copy_n(bar_raw_g_a, qoa_e, bar_raw_g_b);
+      if (bar_raw_sq_b && bar_raw_sq_b != bar_raw_sq_a) {
+        std::copy_n(bar_raw_sq_a, qoa_e, bar_raw_sq_b);
+      }
+      if (bar_raw_gc_b && bar_raw_gc_b != bar_raw_gc_a) {
+        std::copy_n(bar_raw_gc_a, qoa_e, bar_raw_gc_b);
+      }
+      if (bar_raw_dc_b && bar_raw_dc_b != bar_raw_dc_a) {
+        std::copy_n(bar_raw_dc_a, qoa_e, bar_raw_dc_b);
+      }
+    }
+    if (bar_fock_b && bar_fock_b != bar_fock_a) std::copy_n(bar_fock_a, ee, bar_fock_b);
+    if (bar_exch_b && bar_exch_b != bar_exch_a) std::copy_n(bar_exch_a, ee, bar_exch_b);
+  } else {
+    // General UHF dual-spin path: AA, AB, BB.
+    DeviceBuf d_Fa, d_Fb, d_Ka, d_Kb, d_Ha, d_Hb, d_Fa_sym, d_Fb_sym, d_Ha_sym, d_Hb_sym;
+    DeviceBuf d_Sab, d_Ha_S, d_Hb_ST;
+    DeviceBuf d_bar_Fa, d_bar_Fb, d_bar_Ka, d_bar_Kb, d_bar_Sab;
+    DeviceBuf d_fit_a_qoe, d_fit_a_oqe, d_bar_fit_a_qoe, d_bar_fit_a_oqe;
+    DeviceBuf d_fit_b_qoe, d_fit_b_oqe, d_bar_fit_b_qoe, d_bar_fit_b_oqe;
+
+    if (d_Fa.alloc(ee) != cudaSuccess || d_Fb.alloc(ee) != cudaSuccess ||
+        d_Ka.alloc(ee) != cudaSuccess || d_Kb.alloc(ee) != cudaSuccess ||
+        d_Ha.alloc(ee) != cudaSuccess || d_Hb.alloc(ee) != cudaSuccess ||
+        d_Fa_sym.alloc(ee) != cudaSuccess || d_Fb_sym.alloc(ee) != cudaSuccess ||
+        d_Ha_sym.alloc(ee) != cudaSuccess || d_Hb_sym.alloc(ee) != cudaSuccess ||
+        d_bar_Fa.alloc(ee) != cudaSuccess || d_bar_Fb.alloc(ee) != cudaSuccess ||
+        d_bar_Ka.alloc(ee) != cudaSuccess || d_bar_Kb.alloc(ee) != cudaSuccess ||
+        cudaMemcpy(d_Fa.ptr, fock_a, ee * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_Fb.ptr, fock_b, ee * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_Ka.ptr, exch_a, ee * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_Kb.ptr, exch_b, ee * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemset(d_bar_Fa.ptr, 0, ee * sizeof(double)) != cudaSuccess ||
+        cudaMemset(d_bar_Fb.ptr, 0, ee * sizeof(double)) != cudaSuccess ||
+        cudaMemset(d_bar_Ka.ptr, 0, ee * sizeof(double)) != cudaSuccess ||
+        cudaMemset(d_bar_Kb.ptr, 0, ee * sizeof(double)) != cudaSuccess) {
+      return 2;
+    }
+    k_build_ab_sym_mats<<<grid_for(ee), 256>>>(ext, d_Fa.ptr, d_Fb.ptr, d_Ka.ptr, d_Kb.ptr,
+                                               d_Ha.ptr, d_Hb.ptr, d_Fa_sym.ptr, d_Fb_sym.ptr,
+                                               d_Ha_sym.ptr, d_Hb_sym.ptr);
+
+    if (oa_act > 0 && ob_act > 0 && include_f12) {
+      if (d_Sab.alloc(ee) != cudaSuccess || d_Ha_S.alloc(ee) != cudaSuccess ||
+          d_Hb_ST.alloc(ee) != cudaSuccess ||
+          cudaMemcpy(d_Sab.ptr, cross_overlap, ee * sizeof(double), cudaMemcpyHostToDevice) !=
+              cudaSuccess) {
+        return 2;
+      }
+      if (rm_gemm(h, false, false, ext, ext, ext, 1.0, d_Ha.ptr, ext, d_Sab.ptr, ext, 0.0,
+                  d_Ha_S.ptr, ext) != CUBLAS_STATUS_SUCCESS ||
+          rm_gemm(h, false, true, ext, ext, ext, 1.0, d_Hb.ptr, ext, d_Sab.ptr, ext, 0.0,
+                  d_Hb_ST.ptr, ext) != CUBLAS_STATUS_SUCCESS) {
+        return 4;
+      }
+      if (bar_cross_overlap) {
+        if (d_bar_Sab.alloc(ee) != cudaSuccess ||
+            cudaMemset(d_bar_Sab.ptr, 0, ee * sizeof(double)) != cudaSuccess) {
+          return 2;
+        }
+      }
+    }
+
+    if (oa_act > 0) {
+      if (d_fit_a_qoe.alloc(qoe_a) != cudaSuccess || d_fit_a_oqe.alloc(qoe_a) != cudaSuccess ||
+          d_bar_fit_a_qoe.alloc(qoe_a) != cudaSuccess ||
+          d_bar_fit_a_oqe.alloc(qoe_a) != cudaSuccess ||
+          cudaMemset(d_bar_fit_a_qoe.ptr, 0, qoe_a * sizeof(double)) != cudaSuccess ||
+          cudaMemset(d_bar_fit_a_oqe.ptr, 0, qoe_a * sizeof(double)) != cudaSuccess) {
+        return 2;
+      }
+      if (!pack_active_qoe_checked_cuda_host(fit_a, aux, oa, fa, oa_act, ext, h_qoe)) return -2;
+      if (cudaMemcpy(d_fit_a_qoe.ptr, h_qoe.data(), qoe_a * sizeof(double),
+                     cudaMemcpyHostToDevice) != cudaSuccess) {
+        return 3;
+      }
+      k_qoe_to_oqe<<<grid_for(qoe_a), 256>>>(aux, oa_act, ext, d_fit_a_qoe.ptr, d_fit_a_oqe.ptr);
+    }
+    if (ob_act > 0) {
+      if (d_fit_b_qoe.alloc(qoe_b) != cudaSuccess || d_fit_b_oqe.alloc(qoe_b) != cudaSuccess ||
+          d_bar_fit_b_qoe.alloc(qoe_b) != cudaSuccess ||
+          d_bar_fit_b_oqe.alloc(qoe_b) != cudaSuccess ||
+          cudaMemset(d_bar_fit_b_qoe.ptr, 0, qoe_b * sizeof(double)) != cudaSuccess ||
+          cudaMemset(d_bar_fit_b_oqe.ptr, 0, qoe_b * sizeof(double)) != cudaSuccess) {
+        return 2;
+      }
+      if (!pack_active_qoe_checked_cuda_host(fit_b, aux, ob, fb, ob_act, ext, h_qoe)) return -2;
+      if (cudaMemcpy(d_fit_b_qoe.ptr, h_qoe.data(), qoe_b * sizeof(double),
+                     cudaMemcpyHostToDevice) != cudaSuccess) {
+        return 3;
+      }
+      k_qoe_to_oqe<<<grid_for(qoe_b), 256>>>(aux, ob_act, ext, d_fit_b_qoe.ptr, d_fit_b_oqe.ptr);
+    }
+
+    // Stage 1: Forward scalars + 1-operator-at-a-time reverse pullback across AA, AB, BB.
+    DeviceBuf d_fg_d_a, d_fg_x_a, d_uf_d_a, d_uf_x_a, d_f2_d_a, d_f2_x_a, d_sq_fk_d_a, d_sq_fk_x_a;
+    DeviceBuf d_fg_d_b, d_fg_x_b, d_uf_d_b, d_uf_x_b, d_f2_d_b, d_f2_x_b, d_sq_fk_d_b, d_sq_fk_x_b;
+    DeviceBuf d_gc_ab, d_dc_ab, d_sq_norm_ab, d_sq_fk_ab;
+    if (include_f12) {
+      if (oa_act >= 2) {
+        if (int rc = build_ss_stage1_scalars_gpu(
+                h, oa, fa, ext, aux, d_fit_a_qoe.ptr, d_Ha.ptr, raw_gc_a, raw_dc_a, raw_sq_a,
+                metric_gc, metric_dc, metric_sq, d_qoe_scratch, d_metric_buf, d_fg_d_a, d_fg_x_a,
+                d_uf_d_a, d_uf_x_a, d_f2_d_a, d_f2_x_a, d_sq_fk_d_a, d_sq_fk_x_a);
+            rc != 0) {
+          return rc;
+        }
+      }
+      if (oa_act > 0 && ob_act > 0) {
+        if (int rc = build_ab_stage1_scalars_gpu(
+                h, oa, ob, fa, fb, ext, aux, d_fit_a_qoe.ptr, d_fit_b_qoe.ptr, d_Fa.ptr, d_Fb.ptr,
+                d_Ka.ptr, d_Kb.ptr, d_Sab.ptr, raw_gc_a, raw_gc_b, raw_dc_a, raw_dc_b, raw_sq_a,
+                raw_sq_b, metric_gc, metric_dc, metric_sq, d_qoe_scratch, d_metric_buf, d_gc_ab,
+                d_dc_ab, d_sq_norm_ab, d_sq_fk_ab);
+            rc != 0) {
+          return rc;
+        }
+      }
+      if (ob_act >= 2) {
+        if (int rc = build_ss_stage1_scalars_gpu(
+                h, ob, fb, ext, aux, d_fit_b_qoe.ptr, d_Hb.ptr, raw_gc_b, raw_dc_b, raw_sq_b,
+                metric_gc, metric_dc, metric_sq, d_qoe_scratch, d_metric_buf, d_fg_d_b, d_fg_x_b,
+                d_uf_d_b, d_uf_x_b, d_f2_d_b, d_f2_x_b, d_sq_fk_d_b, d_sq_fk_x_b);
+            rc != 0) {
+          return rc;
+        }
+      }
+
+      // Sequential 1-operator-at-a-time reverse pullback for gc, dc, sq across AA, AB, BB.
+      {
+        DeviceBuf d_raw_a, d_res_a, d_braw_a, d_bres_a;
+        DeviceBuf d_raw_b, d_res_b, d_braw_b, d_bres_b;
+        if (oa_act > 0) {
+          if (d_raw_a.alloc(qoe_a) != cudaSuccess || d_braw_a.alloc(qoe_a) != cudaSuccess) return 2;
+          if (oa_act >= 2 &&
+              (d_res_a.alloc(qoe_a) != cudaSuccess || d_bres_a.alloc(qoe_a) != cudaSuccess))
+            return 2;
+        }
+        if (ob_act > 0) {
+          if (d_raw_b.alloc(qoe_b) != cudaSuccess || d_res_b.alloc(qoe_b) != cudaSuccess ||
+              d_braw_b.alloc(qoe_b) != cudaSuccess || d_bres_b.alloc(qoe_b) != cudaSuccess) {
+            return 2;
+          }
+        }
+        const double* raw_ops_a[3] = {raw_gc_a, raw_dc_a, raw_sq_a};
+        const double* raw_ops_b[3] = {raw_gc_b, raw_dc_b, raw_sq_b};
+        const double* met_ops[3] = {metric_gc, metric_dc, metric_sq};
+        double* braw_ops_a[3] = {bar_raw_gc_a, bar_raw_dc_a, bar_raw_sq_a};
+        double* braw_ops_b[3] = {bar_raw_gc_b, bar_raw_dc_b, bar_raw_sq_b};
+        double* bmet_ops[3] = {bar_metric_gc, bar_metric_dc, bar_metric_sq};
+
+        for (int op_kind = 0; op_kind < 3; ++op_kind) {
+          if (cudaMemcpy(d_metric_buf.ptr, met_ops[op_kind], qq * sizeof(double),
+                         cudaMemcpyHostToDevice) != cudaSuccess ||
+              cudaMemset(d_bar_metric_buf.ptr, 0, qq * sizeof(double)) != cudaSuccess) {
+            return 3;
+          }
+          if (oa_act > 0) {
+            if (!pack_active_qoe_checked_cuda_host(raw_ops_a[op_kind], aux, oa, fa, oa_act, ext,
+                                                   h_qoe))
+              return -2;
+            if (cudaMemcpy(d_qoe_scratch.ptr, h_qoe.data(), qoe_a * sizeof(double),
+                           cudaMemcpyHostToDevice) != cudaSuccess ||
+                cudaMemset(d_braw_a.ptr, 0, qoe_a * sizeof(double)) != cudaSuccess) {
+              return 3;
+            }
+            k_qoe_to_oqe<<<grid_for(qoe_a), 256>>>(aux, oa_act, ext, d_qoe_scratch.ptr,
+                                                   d_raw_a.ptr);
+            if (oa_act >= 2) {
+              if (cudaMemset(d_bres_a.ptr, 0, qoe_a * sizeof(double)) != cudaSuccess) return 2;
+              if (rm_gemm(h, false, false, aux, oa_act * ext, aux, -1.0, d_metric_buf.ptr, aux,
+                          d_fit_a_qoe.ptr, oa_act * ext, 1.0, d_qoe_scratch.ptr,
+                          oa_act * ext) != CUBLAS_STATUS_SUCCESS) {
+                return 4;
+              }
+              k_qoe_to_oqe<<<grid_for(qoe_a), 256>>>(aux, oa_act, ext, d_qoe_scratch.ptr,
+                                                     d_res_a.ptr);
+              if (int rc = run_ss_or_rhf_stage1_op_rev_gpu(
+                      h, op_kind, false, has_occ_weights, oa, fa, ext, aux, occ_w_a, fock_a,
+                      d_fit_a_oqe.ptr, d_raw_a.ptr, d_res_a.ptr, d_Ha.ptr, d_bar_fit_a_oqe.ptr,
+                      d_braw_a.ptr, d_bres_a.ptr, nullptr, d_bar_Fa.ptr, d_bar_Ka.ptr, nullptr);
+                  rc != 0) {
+                return rc;
+              }
+            }
+          }
+          if (ob_act > 0) {
+            if (!pack_active_qoe_checked_cuda_host(raw_ops_b[op_kind], aux, ob, fb, ob_act, ext,
+                                                   h_qoe))
+              return -2;
+            if (cudaMemcpy(d_qoe_scratch.ptr, h_qoe.data(), qoe_b * sizeof(double),
+                           cudaMemcpyHostToDevice) != cudaSuccess ||
+                cudaMemset(d_braw_b.ptr, 0, qoe_b * sizeof(double)) != cudaSuccess ||
+                cudaMemset(d_bres_b.ptr, 0, qoe_b * sizeof(double)) != cudaSuccess) {
+              return 3;
+            }
+            k_qoe_to_oqe<<<grid_for(qoe_b), 256>>>(aux, ob_act, ext, d_qoe_scratch.ptr,
+                                                   d_raw_b.ptr);
+            if (rm_gemm(h, false, false, aux, ob_act * ext, aux, -1.0, d_metric_buf.ptr, aux,
+                        d_fit_b_qoe.ptr, ob_act * ext, 1.0, d_qoe_scratch.ptr,
+                        ob_act * ext) != CUBLAS_STATUS_SUCCESS) {
+              return 4;
+            }
+            k_qoe_to_oqe<<<grid_for(qoe_b), 256>>>(aux, ob_act, ext, d_qoe_scratch.ptr,
+                                                   d_res_b.ptr);
+            if (oa_act > 0) {
+              if (int rc = run_ab_stage1_op_rev_gpu(
+                      h, op_kind, has_occ_weights, oa, ob, fa, fb, ext, aux, occ_w_a, occ_w_b,
+                      fock_a, fock_b, d_fit_a_oqe.ptr, d_fit_b_oqe.ptr, d_raw_a.ptr, d_res_b.ptr,
+                      d_Ha.ptr, d_Hb.ptr, d_Sab.ptr, d_Ha_S.ptr, d_Hb_ST.ptr, d_bar_fit_a_oqe.ptr,
+                      d_bar_fit_b_oqe.ptr, d_braw_a.ptr, d_bres_b.ptr, d_bar_Fa.ptr, d_bar_Fb.ptr,
+                      d_bar_Ka.ptr, d_bar_Kb.ptr, d_bar_Sab.ptr);
+                  rc != 0) {
+                return rc;
+              }
+            }
+            if (ob_act >= 2) {
+              if (int rc = run_ss_or_rhf_stage1_op_rev_gpu(
+                      h, op_kind, false, has_occ_weights, ob, fb, ext, aux, occ_w_b, fock_b,
+                      d_fit_b_oqe.ptr, d_raw_b.ptr, d_res_b.ptr, d_Hb.ptr, d_bar_fit_b_oqe.ptr,
+                      d_braw_b.ptr, d_bres_b.ptr, nullptr, d_bar_Fb.ptr, d_bar_Kb.ptr, nullptr);
+                  rc != 0) {
+                return rc;
+              }
+            }
+          }
+
+          if (oa_act >= 2) {
+            if (int rc = pullback_res_oqe_gpu(h, d_bres_a.ptr, d_fit_a_qoe.ptr, d_metric_buf.ptr,
+                                              1.0, false, aux, oa_act, ext, d_braw_a.ptr,
+                                              d_bar_fit_a_qoe.ptr, d_bar_metric_buf.ptr,
+                                              d_qoe_scratch.ptr, d_m_tmp.ptr);
+                rc != 0) {
+              return rc;
+            }
+          }
+          if (ob_act > 0 && (oa_act > 0 || ob_act >= 2)) {
+            if (int rc = pullback_res_oqe_gpu(h, d_bres_b.ptr, d_fit_b_qoe.ptr, d_metric_buf.ptr,
+                                              1.0, false, aux, ob_act, ext, d_braw_b.ptr,
+                                              d_bar_fit_b_qoe.ptr, d_bar_metric_buf.ptr,
+                                              d_qoe_scratch.ptr, d_m_tmp.ptr);
+                rc != 0) {
+              return rc;
+            }
+          }
+          if (oa_act > 0) {
+            if (int rc = scatter_active_oqe_cuda_host(d_braw_a.ptr, aux, oa, fa, oa_act, ext,
+                                                      braw_ops_a[op_kind], h_qoe,
+                                                      d_qoe_scratch.ptr);
+                rc != 0) {
+              return rc;
+            }
+          }
+          if (ob_act > 0) {
+            if (int rc = scatter_active_oqe_cuda_host(d_braw_b.ptr, aux, ob, fb, ob_act, ext,
+                                                      braw_ops_b[op_kind], h_qoe,
+                                                      d_qoe_scratch.ptr);
+                rc != 0) {
+              return rc;
+            }
+          }
+          if (cudaMemcpy(bmet_ops[op_kind], d_bar_metric_buf.ptr, qq * sizeof(double),
+                         cudaMemcpyDeviceToHost) != cudaSuccess) {
+            return 6;
+          }
+        }
+        if (cudaDeviceSynchronize() != cudaSuccess) return 7;
+      }
+    }
+
+    // Stage 2: Core Coulomb + geminal g across AA, AB, BB.
+    DeviceBuf d_raw_coul_a_oqe, d_bar_raw_coul_a_oqe, d_raw_g_a_oqe, d_res_g_a_oqe,
+        d_bar_raw_g_a_oqe, d_bar_res_g_a_oqe;
+    DeviceBuf d_raw_coul_b_oqe, d_bar_raw_coul_b_oqe, d_raw_g_b_oqe, d_res_g_b_oqe,
+        d_bar_raw_g_b_oqe, d_bar_res_g_b_oqe;
+
+    if (include_f12) {
+      if (cudaMemcpy(d_metric_buf.ptr, metric_g, qq * sizeof(double), cudaMemcpyHostToDevice) !=
+              cudaSuccess ||
+          cudaMemset(d_bar_metric_buf.ptr, 0, qq * sizeof(double)) != cudaSuccess) {
+        return 3;
+      }
+    }
+    if (oa_act > 0) {
+      if (d_raw_coul_a_oqe.alloc(qoe_a) != cudaSuccess ||
+          d_bar_raw_coul_a_oqe.alloc(qoe_a) != cudaSuccess ||
+          cudaMemset(d_bar_raw_coul_a_oqe.ptr, 0, qoe_a * sizeof(double)) != cudaSuccess) {
+        return 2;
+      }
+      if (!pack_active_qoe_checked_cuda_host(raw_coul_a, aux, raw_coul_n1_a, fa, oa_act, ext,
+                                             h_qoe))
+        return -2;
+      if (cudaMemcpy(d_qoe_scratch.ptr, h_qoe.data(), qoe_a * sizeof(double),
+                     cudaMemcpyHostToDevice) != cudaSuccess)
+        return 3;
+      k_qoe_to_oqe<<<grid_for(qoe_a), 256>>>(aux, oa_act, ext, d_qoe_scratch.ptr,
+                                             d_raw_coul_a_oqe.ptr);
+      if (include_f12) {
+        if (d_raw_g_a_oqe.alloc(qoe_a) != cudaSuccess ||
+            d_bar_raw_g_a_oqe.alloc(qoe_a) != cudaSuccess ||
+            cudaMemset(d_bar_raw_g_a_oqe.ptr, 0, qoe_a * sizeof(double)) != cudaSuccess) {
+          return 2;
+        }
+        if (!pack_active_qoe_checked_cuda_host(raw_g_a, aux, oa, fa, oa_act, ext, h_qoe)) return -2;
+        if (cudaMemcpy(d_qoe_scratch.ptr, h_qoe.data(), qoe_a * sizeof(double),
+                       cudaMemcpyHostToDevice) != cudaSuccess)
+          return 3;
+        k_qoe_to_oqe<<<grid_for(qoe_a), 256>>>(aux, oa_act, ext, d_qoe_scratch.ptr,
+                                               d_raw_g_a_oqe.ptr);
+        if (oa_act >= 2) {
+          if (d_res_g_a_oqe.alloc(qoe_a) != cudaSuccess ||
+              d_bar_res_g_a_oqe.alloc(qoe_a) != cudaSuccess ||
+              cudaMemset(d_bar_res_g_a_oqe.ptr, 0, qoe_a * sizeof(double)) != cudaSuccess)
+            return 2;
+          if (rm_gemm(h, false, false, aux, oa_act * ext, aux, -1.0, d_metric_buf.ptr, aux,
+                      d_fit_a_qoe.ptr, oa_act * ext, 1.0, d_qoe_scratch.ptr,
+                      oa_act * ext) != CUBLAS_STATUS_SUCCESS)
+            return 4;
+          k_qoe_to_oqe<<<grid_for(qoe_a), 256>>>(aux, oa_act, ext, d_qoe_scratch.ptr,
+                                                 d_res_g_a_oqe.ptr);
+        }
+      }
+    }
+    if (ob_act > 0) {
+      if (d_raw_coul_b_oqe.alloc(qoe_b) != cudaSuccess ||
+          d_bar_raw_coul_b_oqe.alloc(qoe_b) != cudaSuccess ||
+          cudaMemset(d_bar_raw_coul_b_oqe.ptr, 0, qoe_b * sizeof(double)) != cudaSuccess) {
+        return 2;
+      }
+      if (!pack_active_qoe_checked_cuda_host(raw_coul_b, aux, raw_coul_n1_b, fb, ob_act, ext,
+                                             h_qoe))
+        return -2;
+      if (cudaMemcpy(d_qoe_scratch.ptr, h_qoe.data(), qoe_b * sizeof(double),
+                     cudaMemcpyHostToDevice) != cudaSuccess)
+        return 3;
+      k_qoe_to_oqe<<<grid_for(qoe_b), 256>>>(aux, ob_act, ext, d_qoe_scratch.ptr,
+                                             d_raw_coul_b_oqe.ptr);
+      if (include_f12) {
+        if (d_raw_g_b_oqe.alloc(qoe_b) != cudaSuccess ||
+            d_res_g_b_oqe.alloc(qoe_b) != cudaSuccess ||
+            d_bar_raw_g_b_oqe.alloc(qoe_b) != cudaSuccess ||
+            d_bar_res_g_b_oqe.alloc(qoe_b) != cudaSuccess ||
+            cudaMemset(d_bar_raw_g_b_oqe.ptr, 0, qoe_b * sizeof(double)) != cudaSuccess ||
+            cudaMemset(d_bar_res_g_b_oqe.ptr, 0, qoe_b * sizeof(double)) != cudaSuccess) {
+          return 2;
+        }
+        if (!pack_active_qoe_checked_cuda_host(raw_g_b, aux, ob, fb, ob_act, ext, h_qoe)) return -2;
+        if (cudaMemcpy(d_qoe_scratch.ptr, h_qoe.data(), qoe_b * sizeof(double),
+                       cudaMemcpyHostToDevice) != cudaSuccess)
+          return 3;
+        k_qoe_to_oqe<<<grid_for(qoe_b), 256>>>(aux, ob_act, ext, d_qoe_scratch.ptr,
+                                               d_raw_g_b_oqe.ptr);
+        if (rm_gemm(h, false, false, aux, ob_act * ext, aux, -1.0, d_metric_buf.ptr, aux,
+                    d_fit_b_qoe.ptr, ob_act * ext, 1.0, d_qoe_scratch.ptr,
+                    ob_act * ext) != CUBLAS_STATUS_SUCCESS)
+          return 4;
+        k_qoe_to_oqe<<<grid_for(qoe_b), 256>>>(aux, ob_act, ext, d_qoe_scratch.ptr,
+                                               d_res_g_b_oqe.ptr);
+      }
+    }
+
+    // Channel 1: AA
+    if (oa_act >= 2) {
+      if (int rc = run_ss_or_rhf_stage2_response_gpu(
+              h, false, include_f12, include_ordinary, has_occ_weights, oa, fa, obs, ext, aux, 0, 0,
+              3, occ_w_a, fock_a, d_fit_a_oqe.ptr, d_raw_coul_a_oqe.ptr, d_raw_g_a_oqe.ptr,
+              d_res_g_a_oqe.ptr, d_Fa.ptr, d_Ka.ptr, d_Ha.ptr, d_fg_d_a.ptr, d_fg_x_a.ptr,
+              d_f2_d_a.ptr, d_f2_x_a.ptr, d_uf_d_a.ptr, d_uf_x_a.ptr, d_sq_fk_d_a.ptr,
+              d_sq_fk_x_a.ptr, d_out_scalars.ptr, d_pair_f12.ptr, d_pair_ord.ptr,
+              d_bar_fit_a_oqe.ptr, d_bar_raw_coul_a_oqe.ptr, d_bar_raw_g_a_oqe.ptr,
+              d_bar_res_g_a_oqe.ptr, nullptr, d_bar_Fa.ptr, d_bar_Ka.ptr, nullptr, d_err.ptr);
+          rc != 0) {
+        return rc;
+      }
+    }
+    // Channel 2: AB
+    if (oa_act > 0 && ob_act > 0) {
+      if (int rc = run_ab_stage2_response_gpu(
+              h, include_f12, include_ordinary, has_occ_weights, oa, ob, fa, fb, obs, ext, aux,
+              n_aa, occ_w_a, occ_w_b, fock_a, fock_b, d_fit_a_oqe.ptr, d_fit_b_oqe.ptr,
+              d_raw_coul_b_oqe.ptr, d_raw_g_a_oqe.ptr, d_res_g_b_oqe.ptr, d_Fa.ptr, d_Fb.ptr,
+              d_Ha.ptr, d_Hb.ptr, d_Fa_sym.ptr, d_Fb_sym.ptr, d_Ha_sym.ptr, d_Hb_sym.ptr,
+              d_Sab.ptr, d_gc_ab.ptr, d_dc_ab.ptr, d_sq_norm_ab.ptr, d_sq_fk_ab.ptr,
+              d_out_scalars.ptr, d_pair_f12.ptr, d_pair_ord.ptr, d_bar_fit_a_oqe.ptr,
+              d_bar_fit_b_oqe.ptr, d_bar_raw_coul_b_oqe.ptr, d_bar_raw_g_a_oqe.ptr,
+              d_bar_res_g_b_oqe.ptr, d_bar_Fa.ptr, d_bar_Fb.ptr, d_bar_Ka.ptr, d_bar_Kb.ptr,
+              d_bar_Sab.ptr, d_err.ptr);
+          rc != 0) {
+        return rc;
+      }
+    }
+    // Channel 3: BB
+    if (ob_act >= 2) {
+      if (int rc = run_ss_or_rhf_stage2_response_gpu(
+              h, false, include_f12, include_ordinary, has_occ_weights, ob, fb, obs, ext, aux,
+              n_aa + n_ab, 2, 5, occ_w_b, fock_b, d_fit_b_oqe.ptr, d_raw_coul_b_oqe.ptr,
+              d_raw_g_b_oqe.ptr, d_res_g_b_oqe.ptr, d_Fb.ptr, d_Kb.ptr, d_Hb.ptr, d_fg_d_b.ptr,
+              d_fg_x_b.ptr, d_f2_d_b.ptr, d_f2_x_b.ptr, d_uf_d_b.ptr, d_uf_x_b.ptr, d_sq_fk_d_b.ptr,
+              d_sq_fk_x_b.ptr, d_out_scalars.ptr, d_pair_f12.ptr, d_pair_ord.ptr,
+              d_bar_fit_b_oqe.ptr, d_bar_raw_coul_b_oqe.ptr, d_bar_raw_g_b_oqe.ptr,
+              d_bar_res_g_b_oqe.ptr, nullptr, d_bar_Fb.ptr, d_bar_Kb.ptr, nullptr, d_err.ptr);
+          rc != 0) {
+        return rc;
+      }
+    }
+
+    if (include_f12) {
+      if (oa_act >= 2) {
+        if (int rc = pullback_res_oqe_gpu(h, d_bar_res_g_a_oqe.ptr, d_fit_a_qoe.ptr,
+                                          d_metric_buf.ptr, 1.0, false, aux, oa_act, ext,
+                                          d_bar_raw_g_a_oqe.ptr, d_bar_fit_a_qoe.ptr,
+                                          d_bar_metric_buf.ptr, d_qoe_scratch.ptr, d_m_tmp.ptr);
+            rc != 0) {
+          return rc;
+        }
+      }
+      if (ob_act > 0 && (oa_act > 0 || ob_act >= 2)) {
+        if (int rc = pullback_res_oqe_gpu(h, d_bar_res_g_b_oqe.ptr, d_fit_b_qoe.ptr,
+                                          d_metric_buf.ptr, 1.0, false, aux, ob_act, ext,
+                                          d_bar_raw_g_b_oqe.ptr, d_bar_fit_b_qoe.ptr,
+                                          d_bar_metric_buf.ptr, d_qoe_scratch.ptr, d_m_tmp.ptr);
+            rc != 0) {
+          return rc;
+        }
+      }
+      if (cudaMemcpy(bar_metric_g, d_bar_metric_buf.ptr, qq * sizeof(double),
+                     cudaMemcpyDeviceToHost) != cudaSuccess) {
+        return 6;
+      }
+    }
+
+    if (oa_act > 0) {
+      k_oqe_to_qoe<<<grid_for(qoe_a), 256>>>(aux, oa_act, ext, d_bar_fit_a_oqe.ptr,
+                                             d_qoe_scratch.ptr);
+      k_axpy<<<grid_for(qoe_a), 256>>>(qoe_a, 1.0, d_qoe_scratch.ptr, d_bar_fit_a_qoe.ptr);
+      if (cudaDeviceSynchronize() != cudaSuccess) return 7;
+      if (int rc = scatter_active_qoe_cuda_host(d_bar_fit_a_qoe.ptr, aux, oa, fa, oa_act, ext,
+                                                bar_fit_a, h_qoe);
+          rc != 0)
+        return rc;
+      if (int rc = scatter_active_oqe_cuda_host(d_bar_raw_coul_a_oqe.ptr, aux, oa, fa, oa_act, ext,
+                                                bar_raw_coul_a, h_qoe, d_qoe_scratch.ptr);
+          rc != 0)
+        return rc;
+      if (include_f12) {
+        if (int rc = scatter_active_oqe_cuda_host(d_bar_raw_g_a_oqe.ptr, aux, oa, fa, oa_act, ext,
+                                                  bar_raw_g_a, h_qoe, d_qoe_scratch.ptr);
+            rc != 0)
+          return rc;
+      }
+    }
+    if (ob_act > 0) {
+      k_oqe_to_qoe<<<grid_for(qoe_b), 256>>>(aux, ob_act, ext, d_bar_fit_b_oqe.ptr,
+                                             d_qoe_scratch.ptr);
+      k_axpy<<<grid_for(qoe_b), 256>>>(qoe_b, 1.0, d_qoe_scratch.ptr, d_bar_fit_b_qoe.ptr);
+      if (cudaDeviceSynchronize() != cudaSuccess) return 7;
+      if (int rc = scatter_active_qoe_cuda_host(d_bar_fit_b_qoe.ptr, aux, ob, fb, ob_act, ext,
+                                                bar_fit_b, h_qoe);
+          rc != 0)
+        return rc;
+      if (int rc = scatter_active_oqe_cuda_host(d_bar_raw_coul_b_oqe.ptr, aux, ob, fb, ob_act, ext,
+                                                bar_raw_coul_b, h_qoe, d_qoe_scratch.ptr);
+          rc != 0)
+        return rc;
+      if (include_f12) {
+        if (int rc = scatter_active_oqe_cuda_host(d_bar_raw_g_b_oqe.ptr, aux, ob, fb, ob_act, ext,
+                                                  bar_raw_g_b, h_qoe, d_qoe_scratch.ptr);
+            rc != 0)
+          return rc;
+      }
+    }
+    if (cudaMemcpy(bar_fock_a, d_bar_Fa.ptr, ee * sizeof(double), cudaMemcpyDeviceToHost) !=
+            cudaSuccess ||
+        cudaMemcpy(bar_fock_b, d_bar_Fb.ptr, ee * sizeof(double), cudaMemcpyDeviceToHost) !=
+            cudaSuccess ||
+        cudaMemcpy(bar_exch_a, d_bar_Ka.ptr, ee * sizeof(double), cudaMemcpyDeviceToHost) !=
+            cudaSuccess ||
+        cudaMemcpy(bar_exch_b, d_bar_Kb.ptr, ee * sizeof(double), cudaMemcpyDeviceToHost) !=
+            cudaSuccess) {
+      return 6;
+    }
+    if (include_f12 && oa_act > 0 && ob_act > 0 && bar_cross_overlap &&
+        cudaMemcpy(bar_cross_overlap, d_bar_Sab.ptr, ee * sizeof(double), cudaMemcpyDeviceToHost) !=
+            cudaSuccess) {
+      return 6;
+    }
+  }
+
+  if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) return 7;
+  int h_err = 0;
+  if (cudaMemcpy(&h_err, d_err.ptr, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) return 6;
+  if (h_err != 0) return h_err;
+
+  if (out_scalars) {
+    if (cudaMemcpy(out_scalars, d_out_scalars.ptr, 6 * sizeof(double), cudaMemcpyDeviceToHost) !=
+        cudaSuccess) {
+      return 6;
+    }
+    if (!all_finite_host(out_scalars, 6)) return -5;
+  }
+  if (include_f12 && pair_f12_out) {
+    if (cudaMemcpy(pair_f12_out, d_pair_f12.ptr, n_total * sizeof(double),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+      return 6;
+    }
+    if (!all_finite_host(pair_f12_out, n_total)) return -5;
+  }
+  if (include_ordinary && pair_ord_out) {
+    if (cudaMemcpy(pair_ord_out, d_pair_ord.ptr, n_total * sizeof(double),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+      return 6;
+    }
+    if (!all_finite_host(pair_ord_out, n_total)) return -5;
+  }
+  if (!all_finite_host(bar_fock_a, ee) || !all_finite_host(bar_exch_a, ee)) return -5;
+  if (!rhf_spatial && (!all_finite_host(bar_fock_b, ee) || !all_finite_host(bar_exch_b, ee))) {
+    return -5;
+  }
+  if (include_f12 && bar_cross_overlap && !all_finite_host(bar_cross_overlap, ee)) return -5;
+  if (include_f12 && (!all_finite_host(bar_metric_g, qq) || !all_finite_host(bar_metric_sq, qq) ||
+                      !all_finite_host(bar_metric_gc, qq) || !all_finite_host(bar_metric_dc, qq))) {
+    return -5;
+  }
+  if (oa_act > 0) {
+    if (!all_finite_host(bar_fit_a, qoa_e) || !all_finite_host(bar_raw_coul_a, qoa_e)) return -5;
+    if (include_f12 &&
+        (!all_finite_host(bar_raw_g_a, qoa_e) || !all_finite_host(bar_raw_sq_a, qoa_e) ||
+         !all_finite_host(bar_raw_gc_a, qoa_e) || !all_finite_host(bar_raw_dc_a, qoa_e))) {
+      return -5;
+    }
+  }
+  if (!rhf_spatial && ob_act > 0) {
+    if (!all_finite_host(bar_fit_b, qob_e) || !all_finite_host(bar_raw_coul_b, qob_e)) return -5;
+    if (include_f12 &&
+        (!all_finite_host(bar_raw_g_b, qob_e) || !all_finite_host(bar_raw_sq_b, qob_e) ||
+         !all_finite_host(bar_raw_gc_b, qob_e) || !all_finite_host(bar_raw_dc_b, qob_e))) {
       return -5;
     }
   }
