@@ -6,6 +6,7 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <sstream>
 #include <utility>
 
 #include "runtime/cuda_component_trace.hpp"
@@ -54,13 +55,29 @@ struct StreamDrain {
   }
 };
 
-bool symmetric_finite(const std::vector<double>& matrix, std::size_t n) {
-  if (matrix.size() != n * n || !finite_values(matrix)) return false;
+bool check_symmetric_input(const std::vector<double>& matrix, std::size_t n, const char* operand,
+                           std::string& detail) {
+  const auto fail = [&](const std::string& reason) {
+    namespace trace = runtime::host_trace;
+    detail = std::string("ordinary CUDA DF eigensolve requires finite symmetric AO inputs (") +
+             trace::detail::reason_name(trace::active_reason) + ", " + operand + ": " +
+             reason + ")";
+    return false;
+  };
+  if (matrix.size() != n * n) return fail("invalid matrix size");
+  if (!finite_values(matrix)) return fail("nonfinite values");
   for (std::size_t i = 0; i < n; ++i)
-    for (std::size_t j = i + 1; j < n; ++j)
-      if (std::abs(matrix[i * n + j] - matrix[j * n + i]) >
-          1e-12 * std::max({1.0, std::abs(matrix[i * n + j]), std::abs(matrix[j * n + i])}))
-        return false;
+    for (std::size_t j = i + 1; j < n; ++j) {
+      const auto upper = matrix[i * n + j];
+      const auto lower = matrix[j * n + i];
+      const auto skew = std::abs(upper - lower);
+      const auto scale = std::max({1.0, std::abs(upper), std::abs(lower)});
+      if (skew > 1e-12 * scale) {
+        std::ostringstream reason;
+        reason << "normalized skew " << skew / scale << " at AO pair (" << i << ", " << j << ')';
+        return fail(reason.str());
+      }
+    }
   return true;
 }
 
@@ -176,9 +193,9 @@ generativeqc_status solve_cuda_density_fitting_eigen(
     return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
   }
   const auto n = plan->nbf;
-  if (!symmetric_finite(matrix, n) ||
-      (overlap && (!symmetric_finite(*overlap, n) || !symmetric_finite(*orthogonalizer, n)))) {
-    detail = "ordinary CUDA DF eigensolve requires finite symmetric AO inputs";
+  if (!check_symmetric_input(matrix, n, "matrix", detail) ||
+      (overlap && (!check_symmetric_input(*overlap, n, "overlap", detail) ||
+                   !check_symmetric_input(*orthogonalizer, n, "orthogonalizer", detail)))) {
     return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
   }
   auto error = cudaSetDevice(plan->device_id);
