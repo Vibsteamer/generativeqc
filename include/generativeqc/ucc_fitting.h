@@ -236,6 +236,51 @@ GENERATIVEQC_API int generativeqc_cc_context_lambda_telemetry_v1(
     const generativeqc_context* context, double* scalars, size_t scalar_count, uint64_t* counts,
     size_t count_len, char* reason, size_t reason_len);
 
+/** Returns NULL when the experimental Kohn extended-SP (T)-F12 engine is compiled
+ * into this build (-DGENERATIVEQC_ENABLE_EXPLICIT_TF12=ON), or a static detail string
+ * explaining why the entry points return GENERATIVEQC_STATUS_NOT_IMPLEMENTED. */
+GENERATIVEQC_API const char* generativeqc_rcc_explicit_tf12_disabled_detail_v1(void);
+
+/** Evaluate closed-shell spatial DF Kohn extended-SP (T)-F12 energy on CPU.
+ * Set q_f12=0 for exact zero-coupling degeneration to DF-RCCSD(T).
+ * z2_mode: 0=Direct (R_Q g R_Q), 1=FfgCompleted (GeCCo default), 2=Zero.
+ * Optional breakdown_out (count >= 28) returns the term-by-term scalar breakdown.
+ * With count >= 30, slots 28 and 29 hold executed CUDA FP32 and FP64 W GEMM counts. */
+GENERATIVEQC_API generativeqc_status generativeqc_rcc_explicit_tf12_df_cpu_v1(
+    size_t o_full, size_t frozen, size_t obs, size_t ext, size_t q_mp2, size_t q_f12,
+    const double* bov, const double* bvv, const double* ovoo, const double* ovov, const double* fov,
+    const double* t1, const double* t2, const double* eps_o, const double* eps_v,
+    const double* b_g_ext_obs, const double* b_g_ext_ext, const double* fit_ext_obs,
+    const double* r_f_ext_obs, const double* r_fg_obs_obs, const double* r_ff_ext_obs,
+    const double* r_u_obs_obs, const double* f_ext, const double* k_ext, uint32_t z2_mode,
+    double geminal_scale, double* energy_out, double* breakdown_out, size_t breakdown_count);
+
+/** Evaluate closed-shell spatial exact-4-index Kohn extended-SP (T)-F12 energy on CPU
+ * for direct non-DF contract parity (e.g. GeCCo archived BH integrals). */
+GENERATIVEQC_API generativeqc_status generativeqc_rcc_explicit_tf12_exact4_cpu_v1(
+    size_t o_full, size_t frozen, size_t obs, size_t ext, const double* ovvv, const double* ovoo,
+    const double* ovov, const double* fov, const double* t1, const double* t2, const double* eps_o,
+    const double* eps_v, const double* c2_ab, const double* g_obs_obs_ext_ext,
+    const double* g_chem_ext_ext_o_v, const double* g_chem_ext_o_ext_v, const double* f12,
+    const double* fg, const double* ff, const double* ftf, const double* ffbar, const double* f_ext,
+    const double* k_ext, uint32_t z2_mode, double geminal_scale, double* energy_out,
+    double* breakdown_out, size_t breakdown_count);
+
+/** Evaluate closed-shell spatial DF-CUDA Kohn extended-SP (T)-F12 energy on GPU.
+ * Uses on-the-fly 3-index DF C-INT[2] panel augmentation, a caller-provided arena cap,
+ * optional triples_fp32_w mixed precision, and GPU cuBLAS V/X/B/Bh/Z2 contractions.
+ * With >10 active occupied orbitals and nonzero F12 coupling, the unevaluated
+ * conventional diagnostic in breakdown slot 1 is NaN. */
+GENERATIVEQC_API generativeqc_status generativeqc_rcc_explicit_tf12_df_cuda_v1(
+    int device, size_t max_bytes, int triples_fp32_w, size_t o_full, size_t frozen, size_t obs,
+    size_t ext, size_t q_mp2, size_t q_f12, const double* bov, const double* bvv,
+    const double* ovoo, const double* ovov, const double* fov, const double* t1, const double* t2,
+    const double* eps_o, const double* eps_v, const double* b_g_ext_obs, const double* b_g_ext_ext,
+    const double* fit_ext_obs, const double* r_f_ext_obs, const double* r_fg_obs_obs,
+    const double* r_ff_ext_obs, const double* r_u_obs_obs, const double* f_ext, const double* k_ext,
+    uint32_t z2_mode, double geminal_scale, double* energy_out, double* breakdown_out,
+    size_t breakdown_count);
+
 #ifdef __cplusplus
 }
 #endif

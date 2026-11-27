@@ -5,6 +5,8 @@ include_guard(GLOBAL)
 function(generativeqc_add_api_sources target)
   set_property(SOURCE src/api/c_api_ks_hessian.cpp APPEND PROPERTY COMPILE_DEFINITIONS
     "GENERATIVEQC_HAS_NATIVE_HESSIAN=$<BOOL:${GENERATIVEQC_ENABLE_HESSIAN_AOT_LEAVES}>")
+  set_property(SOURCE src/api/c_api_explicit_tf12.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+    "GENERATIVEQC_HAS_EXPLICIT_TF12=$<BOOL:${GENERATIVEQC_ENABLE_EXPLICIT_TF12}>")
   target_sources(${target} PRIVATE
     src/api/c_api_batch.cpp
     src/api/c_api_calculation.cpp
@@ -21,6 +23,7 @@ function(generativeqc_add_api_sources target)
     src/api/c_api_fleet_projection.cpp
     src/api/c_api_hf_physical_audit.cpp
     src/api/c_api_f12_focal_reference.cpp
+    src/api/c_api_explicit_tf12.cpp
     src/api/c_api_response.cpp
     src/api/c_api_saddle.cpp
     src/api/c_api_df_gradient.cpp
@@ -154,6 +157,9 @@ function(generativeqc_add_posthf_cc_sources target)
       src/posthf/canonical_frame_cuda.cu
       src/posthf/cuda_transform.cu
       src/posthf/ri_mp2_cuda.cu)
+    if(GENERATIVEQC_ENABLE_EXPLICIT_TF12)
+      target_sources(${target} PRIVATE src/cc/explicit_tf12_sp_cuda.cu)
+    endif()
   endif()
 endfunction()
 
@@ -423,8 +429,7 @@ function(generativeqc_add_cpu_component_object_targets target)
       generativeqc_method_parameters_codegen
       generativeqc_nonlocal_pair_codegen
       generativeqc_libxc_semilocal_cpu_codegen)
-  generativeqc_add_host_object_component(${target} generativeqc_host_posthf_cc
-    SOURCES
+  set(_generativeqc_host_posthf_cc_sources
       src/cc/solver.cpp
       src/cc/lambda_response.cpp
       src/cc/triples_response.cpp
@@ -447,7 +452,13 @@ function(generativeqc_add_cpu_component_object_targets target)
       src/posthf/mp2_gradient.cpp
       src/posthf/native_provider.cpp
       src/response/native_gmres.cpp
-      src/response/resident_gmres.cpp
+      src/response/resident_gmres.cpp)
+  if(GENERATIVEQC_ENABLE_EXPLICIT_TF12)
+    list(APPEND _generativeqc_host_posthf_cc_sources src/cc/explicit_tf12_sp.cpp)
+  endif()
+  generativeqc_add_host_object_component(${target} generativeqc_host_posthf_cc
+    SOURCES
+      ${_generativeqc_host_posthf_cc_sources}
     CODEGEN
       generativeqc_rccsd_cpu_codegen
       generativeqc_uccsd_cpu_codegen

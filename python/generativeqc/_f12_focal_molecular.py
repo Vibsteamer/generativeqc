@@ -46,6 +46,7 @@ from ._f12_focal_reference import (
 )
 from ._f12_focal_singles import FocalCabsSingles, reference_cabs_singles
 from ._f12_focal_ump2 import FocalCoulombSource, ordinary_df_ump2_unrelaxed, reference_df_ump2
+from ._f12_frozen_core import DEFAULT_PRODUCTION_CORRELATION_SPACE
 from ._f12_triples_w_policy import TriplesWForceAdmission, admit_triples_w_forces
 from ._f12_ram_hygiene import (
     disclose_host_assisted_stage,
@@ -405,6 +406,31 @@ class MolecularFocalProvider:
             ) or request.backend == "cpu_reference"
         return False
 
+    def check_explicit_triples_scope(self, request: FocalRequest, *, forces: bool) -> None:
+        if forces:
+            raise NotImplementedError("Explicit Köhn (T)-F12 production NO-GO for 3N forces")
+        if request.root_id != "rhf" or request.multiplicity != 1:
+            raise NotImplementedError(
+                "Explicit Köhn (T)-F12 energy requires a closed-shell RHF singlet"
+            )
+        if self.triples_w_schedule == "fp32_split3":
+            raise NotImplementedError("Explicit Köhn (T)-F12 has no fp32_split3 W kernel")
+        if any(atom.atomic_number in (35, 53) for atom in request.atoms):
+            from ._f12_frozen_core import resolve_frozen_occupied
+
+            # FfgCompleted is unstable for Br/I semicore correlation in valence OptRI.
+            required = replace(request, correlation_space_id=DEFAULT_PRODUCTION_CORRELATION_SPACE)
+            orbital_basis = request.basis.orbital.by_element
+            electrons = sum(
+                atom.atomic_number - orbital_basis[atom.atomic_number].ecp_core_electrons
+                for atom in request.atoms
+            ) - request.charge
+            occupied = (electrons // 2, electrons // 2)
+            frozen = resolve_frozen_occupied(request, occupied)[0]
+            if frozen < resolve_frozen_occupied(required, occupied)[0]:
+                raise NotImplementedError(
+                    "Explicit FfgCompleted (T)-F12 excludes Br/I semicore correlation"
+                )
 
     def default_triples_models(
         self,
@@ -418,6 +444,20 @@ class MolecularFocalProvider:
         """Evaluate the selected increments on the supplied molecular determinant."""
         by_role = {r.role: r for r in requests}
         results: dict[str, FocalTriplesEvaluation] = {}
+        if "triples_f12" in by_role:
+            from ._f12_focal_explicit_tf12 import spatial_rhf_explicit_tf12_energy
+
+            req = by_role["triples_f12"]
+            self.check_explicit_triples_scope(req, forces=forces)
+            explicit = spatial_rhf_explicit_tf12_energy(
+                self, req, reference, expected_cabs_rank=expected_cabs_rank
+            )
+            results[req.role] = FocalTriplesEvaluation(
+                explicit.energy, None, explicit.cabs_rank,
+                executed_backend=explicit.telemetry["backend"], converged=True,
+                triples_model_id="kohn_extended_sp_rhf_ffg_v1",
+                telemetry={**explicit.telemetry, "ccsd_f12b_energy": explicit.ccsd_f12b_energy},
+            )
         conv_from_tplus: float | None = None
         if "triples_plus" in by_role:
             tplus_req = by_role["triples_plus"]

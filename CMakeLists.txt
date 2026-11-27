@@ -75,6 +75,8 @@ option(GENERATIVEQC_ENABLE_NATIVE_STATIONARY_CUDA
        ${GENERATIVEQC_ENABLE_STATIONARY_FORCE_AOT})
 option(GENERATIVEQC_ENABLE_HESSIAN_AOT_LEAVES
        "Build opt-in native compiler-AD Hessians with full f/g closure by default" OFF)
+option(GENERATIVEQC_ENABLE_EXPLICIT_TF12
+       "Build experimental RHF explicit Kohn (T)-F12 energy engine" OFF)
 set(GENERATIVEQC_HESSIAN_AOT_INVENTORY
     "" CACHE FILEPATH
     "Optional explicit Hessian AOT inventory; empty selects complete factorized orbital-f/auxiliary-g closure")

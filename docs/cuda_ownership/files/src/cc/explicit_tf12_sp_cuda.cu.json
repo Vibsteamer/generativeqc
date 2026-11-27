@@ -1,0 +1,14 @@
+{
+  "path": "src/cc/explicit_tf12_sp_cuda.cu",
+  "reason": "Implements the RHF explicit (T)-F12 extended-SP energy, including F12 dressing, connected Z2 and C2 coupling. Reuses generated occupied-triples panel, moment and energy routines.",
+  "regions": [
+    {
+      "start": "double elapsed_seconds(",
+      "stop": "// ---------------- CUDA Kernels",
+      "role": "runtime",
+      "reason": "Provides timers, owned scratch tracking, CUDA streams, cuBLAS handles and row-major GEMM adapters."
+    }
+  ],
+  "role": "scientific",
+  "subsystem": "focal_cc"
+}
