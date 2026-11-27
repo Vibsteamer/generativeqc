@@ -1,10 +1,13 @@
 #ifndef GENERATIVEQC_TENSOR_CPU_LINALG_HPP
 #define GENERATIVEQC_TENSOR_CPU_LINALG_HPP
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
 #include <vector>
+
+#include "runtime/bounded_workspace.hpp"
 
 namespace generativeqc::tensor {
 
@@ -47,6 +50,36 @@ struct CpuSymmetricEigenResult {
 void cpu_gemm(char a_trans, char b_trans, std::size_t m, std::size_t n, std::size_t k,
               const double* a, const double* b, double* c, double alpha = 1.0, double beta = 0.0,
               const CpuLinalgPlan& plan = {});
+
+namespace detail {
+inline constexpr std::size_t split3_max_inner = 64;
+inline constexpr std::size_t split3_limbs = 3;
+}  // namespace detail
+
+/** Numeric workspace for the packed operands, binary exponents, SGEMM output,
+ * transactional FP64 result and fixed split buffer. */
+[[nodiscard]] inline std::size_t cpu_split3_gemm_workspace_bytes(std::size_t m, std::size_t n,
+                                                                 std::size_t k) {
+  if (!m || !n || !k) return 0;
+  using runtime::size_add;
+  using runtime::size_mul;
+  const auto output = size_mul(m, n);
+  const auto lines = size_mul(detail::split3_limbs, size_add(m, n));
+  const auto floats = size_add(size_mul(lines, std::min(k, detail::split3_max_inner)), output);
+  const auto dynamic = size_add(size_mul(floats, sizeof(float)), size_mul(lines, sizeof(int)));
+  return size_add(dynamic, size_mul(size_add(output, detail::split3_max_inner), sizeof(double)));
+}
+
+/** Three binary32 limbs per operand, contracted by nine OpenBLAS SGEMMs per
+ * inner block of at most 64 rows. Blocks with wide residual exponent ranges
+ * subdivide before any matrix product executes. Factors use separate binary exponents per
+ * row/column and limb. Recombination and publication use binary64.
+ * Returns the number of executed binary32 matrix products.
+ */
+[[nodiscard]] std::size_t cpu_split3_gemm(char a_trans, char b_trans, std::size_t m, std::size_t n,
+                                          std::size_t k, const double* a, const double* b,
+                                          double* c, double alpha = 1.0, double beta = 0.0,
+                                          const CpuLinalgPlan& plan = {});
 
 /** Square rank-2 congruence transform with row-major storage.
  * `coefficient_transpose == 'T'` computes result := C^T * A * C.

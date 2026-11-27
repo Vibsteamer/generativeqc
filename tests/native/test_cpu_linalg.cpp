@@ -70,6 +70,76 @@ bool check_gemm(CpuLinalgProvider provider,
   return close(zero_inner[0], 6.0) && check_zero_scaling(provider, ownership, threads);
 }
 
+bool check_split3_gemm(CpuLinalgThreadOwnership ownership) {
+  using generativeqc::tensor::cpu_split3_gemm;
+  using generativeqc::tensor::cpu_split3_gemm_workspace_bytes;
+  const CpuLinalgPlan plan{CpuLinalgProvider::openblas, ownership, 1};
+  constexpr std::size_t m = 2, n = 3, k = 67;
+  std::array<double, m * k> a;
+  std::array<double, n * k> b;
+  for (std::size_t i = 0; i < a.size(); ++i) a[i] = std::sin(0.371 * (1 + i));
+  for (std::size_t j = 0; j < b.size(); ++j) b[j] = std::cos(0.813 * (1 + j));
+  for (char ta : {'N', 'T'}) {
+    for (char tb : {'N', 'T'}) {
+      std::array<double, m * n> output;
+      output.fill(0.7);
+      if (!cpu_split3_gemm(ta, tb, m, n, k, a.data(), b.data(), output.data(), -1.3, 0.4, plan))
+        return false;
+      for (std::size_t i = 0; i < m; ++i) {
+        for (std::size_t j = 0; j < n; ++j) {
+          long double sum = 0.0L;
+          for (std::size_t z = 0; z < k; ++z) {
+            sum += static_cast<long double>(a[ta == 'T' ? z * m + i : i * k + z]) *
+                   b[tb == 'T' ? j * k + z : z * n + j];
+          }
+          if (!close(output[i * n + j], static_cast<double>(0.28L - 1.3L * sum), 8.e-11))
+            return false;
+        }
+      }
+    }
+  }
+  // Cancellation far outside the FP32 exponent range must retain the small increment.
+  const std::array<double, 2> large{0x1.0000008p+700, -0x1p+700}, small{0x1p-700, 0x1p-700};
+  double value = std::numeric_limits<double>::quiet_NaN();
+  if (!cpu_split3_gemm('N', 'N', 1, 1, 2, large.data(), small.data(), &value, 1, 0, plan) ||
+      value != 0x1p-25) return false;
+  const double denorm = std::numeric_limits<double>::denorm_min();
+  const double two = 2.0;
+  if (!cpu_split3_gemm('N', 'N', 1, 1, 1, &denorm, &two, &value, 1, 0, plan) ||
+      value != 2 * denorm) return false;
+  try {
+    (void)cpu_split3_gemm_workspace_bytes(std::numeric_limits<std::size_t>::max(), n, k);
+    return false;
+  } catch (const std::overflow_error&) {
+  }
+  // Include alpha in the binary scale, since the unscaled dot may overflow.
+  const double coefficient = 0x1p-700;
+  if (!cpu_split3_gemm('N', 'N', 1, 1, 1, &large[1], &large[1], &value, coefficient, 0, plan) ||
+      value != 0x1p+700) return false;
+  // The leading value leaves bits in all three limbs. Its tiny neighbor
+  // would vanish if packed on that same low-limb scale. Both products matter.
+  const std::array<double, 2> wide{0x1.23456789abcp+300, 0x1.23456789abcp-300};
+  const std::array<double, 2> reciprocal_scales{0x1p-300, -0x1.8p+300};
+  value = 1.25;
+  const auto subdivided_calls = cpu_split3_gemm('N', 'N', 1, 1, 2, wide.data(),
+                                                reciprocal_scales.data(), &value, 2.0, 0.25, plan);
+  long double dotted = 0.0L;
+  for (std::size_t i = 0; i < wide.size(); ++i)
+    dotted += static_cast<long double>(wide[i]) * reciprocal_scales[i];
+  if (subdivided_calls <= 9 || !close(value, static_cast<double>(2.0L * dotted + 0.3125L)))
+    return false;
+  std::array<double, m * n> original;
+  original.fill(3.0);
+  auto output = original;
+  a.back() = std::numeric_limits<double>::quiet_NaN();
+  try {
+    (void)cpu_split3_gemm('N', 'N', m, n, k, a.data(), b.data(), output.data(), 1, 0, plan);
+    return false;
+  } catch (const std::domain_error&) {
+  }
+  return output == original;
+}
+
 bool check_congruence(CpuLinalgProvider provider,
                       CpuLinalgThreadOwnership ownership = CpuLinalgThreadOwnership::task_parallel,
                       int threads = 1) {
@@ -543,6 +613,19 @@ int main() {
     return 1;
   }
 
+  {
+    const double factor = 2;
+    double result = 3;
+    try {
+      (void)generativeqc::tensor::cpu_split3_gemm(
+          'N', 'N', 1, 1, 1, &factor, &factor, &result, 1.0, 0.0,
+          {CpuLinalgProvider::scalar, CpuLinalgThreadOwnership::task_parallel, 1});
+      std::cerr << "split3 GEMM accepted a scalar provider\n";
+      return 2;
+    } catch (const std::runtime_error&) {
+      if (result != 3) return 2;
+    }
+  }
   const auto automatic = generativeqc::tensor::cpu_linalg_diagnostic();
   if (automatic.thread_ownership != CpuLinalgThreadOwnership::task_parallel ||
       automatic.provider_threads != 1) {
@@ -566,6 +649,7 @@ int main() {
     const auto ownership = local ? CpuLinalgThreadOwnership::task_parallel
                                  : CpuLinalgThreadOwnership::provider_parallel;
     if ((local || global) && (!check_gemm(CpuLinalgProvider::openblas, ownership) ||
+                              !check_split3_gemm(ownership) ||
                               !check_congruence(CpuLinalgProvider::openblas, ownership) ||
                               !check_gemv(CpuLinalgProvider::openblas, ownership) ||
                               !check_ger(CpuLinalgProvider::openblas, ownership) ||

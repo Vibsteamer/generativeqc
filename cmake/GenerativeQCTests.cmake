@@ -105,6 +105,10 @@ macro(generativeqc_add_native_tests)
                            tests/native/test_f12_fixed_cusp_oracle.cpp NO_GENERATIVEQC)
   target_include_directories(generativeqc_f12_fixed_cusp_host_oracle PRIVATE
                              "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  generativeqc_native_test(generativeqc_ucc_v2_device_capacity_tests
+                           tests/native/test_ucc_v2_device_capacity.cpp NO_GENERATIVEQC)
+  target_include_directories(generativeqc_ucc_v2_device_capacity_tests PRIVATE
+                             "${CMAKE_CURRENT_SOURCE_DIR}/include")
   # Algorithmic tests need no CUDA, native solver, Python, or external oracle.
   generativeqc_native_test(generativeqc_geometry_optimizer_tests
                        tests/native/test_geometry_optimizer.cpp

@@ -1,6 +1,7 @@
 #include "tensor/cpu_linalg.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <mutex>
@@ -42,6 +43,52 @@ extern "C" int openblas_set_num_threads_local(int);
 
 namespace generativeqc::tensor {
 namespace {
+
+using detail::split3_limbs;
+using detail::split3_max_inner;
+
+// An inner block has at most 64 products. A high or middle limb is a signed
+// 8-bit magnitude (rounded up to 256) times one shared power of two. Thus each
+// high/high, high/middle, middle/high and middle/middle partial sum contains
+// at most 64 * 256^2 = 2^22 grid units, exactly representable in binary32.
+#if GENERATIVEQC_HAS_OPENBLAS
+bool split3_pack(const double* source, std::size_t input_stride, std::size_t count,
+                 float* packed, std::size_t output_stride, std::size_t plane, int* exponents) {
+  std::array<double, split3_max_inner> residual;
+  for (std::size_t t = 0; t < count; ++t) {
+    residual[t] = source[t * input_stride];
+    if (!std::isfinite(residual[t])) throw std::domain_error("nonfinite split3 GEMM input");
+  }
+  for (std::size_t limb = 0; limb < split3_limbs; ++limb) {
+    double largest = 0.0;
+    for (std::size_t t = 0; t < count; ++t) largest = std::max(largest, std::abs(residual[t]));
+    int exponent = 0;
+    std::frexp(largest, &exponent);
+    // Lifting the last limb by 60 bits leaves headroom for a sum of 64
+    // products (<= 2^126). Its smallest admitted factors, 2^-63, still
+    // multiply to a normal binary32 value. This prevents flush-to-zero
+    // behavior from erasing a dot of tiny, but physically rescaled, factors.
+    const bool last = limb + 1 == split3_limbs;
+    constexpr int low_lift = 60;
+    exponents[limb] = last ? exponent - low_lift : exponent;
+    for (std::size_t t = 0; t < count; ++t) {
+      const double normalized = std::scalbn(residual[t], -exponent);
+      float value;
+      if (!last) {
+        value = static_cast<float>(std::nearbyint(normalized * 256.0) / 256.0);
+        // Preserve tiny values for the next limb even if scaling rounded them to zero.
+        if (value != 0.0f) residual[t] = std::scalbn(normalized - value, exponent);
+      } else {
+        value = static_cast<float>(std::scalbn(normalized, low_lift));
+        if (residual[t] != 0.0 && std::abs(value) < 0x1p-63f)
+          return false;
+      }
+      packed[limb * plane + t * output_stride] = value;
+    }
+  }
+  return true;
+}
+#endif
 
 bool transpose(char value) {
   if (value == 'N' || value == 'n') return false;
@@ -794,6 +841,101 @@ void cpu_gemm(char a_trans, char b_trans, std::size_t m, std::size_t n, std::siz
   }
 #endif
   scalar_gemm(ta, tb, m, n, k, a, b, c, alpha, beta);
+}
+
+std::size_t cpu_split3_gemm(char a_trans, char b_trans, std::size_t m, std::size_t n,
+                            std::size_t k, const double* a, const double* b, double* c,
+                            double alpha, double beta, const CpuLinalgPlan& plan) {
+  const bool ta = transpose(a_trans);
+  const bool tb = transpose(b_trans);
+  validate_plan(plan);
+  if (!std::isfinite(alpha) || !std::isfinite(beta))
+    throw std::domain_error("nonfinite split3 GEMM coefficient");
+  if (!m || !n) return 0;
+  [[maybe_unused]] const auto output = checked_matrix_elements(m, n);
+  if (!c) throw std::invalid_argument("split3 GEMM received null output");
+  if (!k || alpha == 0.0) {
+    cpu_gemm(a_trans, b_trans, m, n, 0, nullptr, nullptr, c, alpha, beta, plan);
+    return 0;
+  }
+  checked_matrix_elements(m, k);
+  checked_matrix_elements(k, n);
+  if (!a || !b) throw std::invalid_argument("split3 GEMM received null input");
+  if (resolve_cpu_linalg_provider(plan) != CpuLinalgProvider::openblas)
+    throw std::runtime_error("split3 GEMM requires an available OpenBLAS SGEMM provider");
+#if GENERATIVEQC_HAS_OPENBLAS
+  if (!fits_openblas(m, n, split3_max_inner))
+    throw std::length_error("split3 GEMM dimensions exceed OpenBLAS int range");
+  (void)cpu_split3_gemm_workspace_bytes(m, n, k);
+  const auto max_inner = std::min(k, split3_max_inner);
+  const auto a_plane = m * max_inner;
+  const auto b_plane = n * max_inner;
+  std::vector<float> a_parts(split3_limbs * a_plane), b_parts(split3_limbs * b_plane);
+  std::vector<float> partial(output);
+  std::vector<int> a_exponents(split3_limbs * m), b_exponents(split3_limbs * n);
+  std::vector<double> result(output);
+  if (beta != 0.0)
+    for (std::size_t i = 0; i < output; ++i) result[i] = beta * c[i];
+  int alpha_exponent = 0;
+  const double alpha_fraction = std::frexp(alpha, &alpha_exponent);
+  OpenBlasThreadGuard guard(plan);
+  const auto pack_block = [&](std::size_t start, std::size_t inner) {
+    for (std::size_t i = 0; i < m; ++i) {
+      if (!split3_pack(a + (ta ? start * m + i : i * k + start), ta ? m : 1, inner,
+                       a_parts.data() + i * inner, 1, a_plane, a_exponents.data() + i * split3_limbs))
+        return false;
+    }
+    for (std::size_t j = 0; j < n; ++j) {
+      if (!split3_pack(b + (tb ? j * k + start : start * n + j), tb ? 1 : n, inner,
+                       b_parts.data() + j, n, b_plane, b_exponents.data() + j * split3_limbs))
+        return false;
+    }
+    return true;
+  };
+  std::size_t calls = 0;
+  for (std::size_t start = 0; start < k;) {
+    auto inner = std::min(split3_max_inner, k - start);
+    // A wide residual exponent spread can make a block unsafe for FP32.
+    // Repack the left prefix until every nonzero low limb is representable.
+    // At a singleton its own exponent normalizes it, even for FP64 subnormals.
+    while (!pack_block(start, inner)) {
+      if (inner == 1) throw std::logic_error("split3 GEMM failed to normalize a finite singleton");
+      inner = (inner + 1) / 2;
+    }
+    for (std::size_t left = 0; left < split3_limbs; ++left) {
+      for (std::size_t right = 0; right < split3_limbs; ++right) {
+#if GENERATIVEQC_OPENBLAS_SCIPY_PREFIX
+        scipy_cblas_sgemm(
+#else
+        cblas_sgemm(
+#endif
+            CblasRowMajor, CblasNoTrans, CblasNoTrans, static_cast<int>(m), static_cast<int>(n),
+            static_cast<int>(inner), 1.0f, a_parts.data() + left * a_plane, static_cast<int>(inner),
+            b_parts.data() + right * b_plane, static_cast<int>(n), 0.0f, partial.data(),
+            static_cast<int>(n));
+        for (std::size_t i = 0; i < m; ++i) {
+          for (std::size_t j = 0; j < n; ++j) {
+            const auto offset = i * n + j;
+            const int exponent = a_exponents[i * split3_limbs + left] +
+                                 b_exponents[j * split3_limbs + right];
+            result[offset] += std::scalbn(alpha_fraction * static_cast<double>(partial[offset]),
+                                          exponent + alpha_exponent);
+          }
+        }
+      }
+    }
+    calls = runtime::size_add(calls, split3_limbs * split3_limbs);
+    start += inner;
+  }
+  if (!std::all_of(result.begin(), result.end(), [](double value) { return std::isfinite(value); }))
+    throw std::overflow_error("split3 GEMM result exceeds FP64 range");
+  std::copy(result.begin(), result.end(), c);
+  return calls;
+#else
+  (void)ta;
+  (void)tb;
+  throw std::runtime_error("split3 GEMM requires an OpenBLAS build");
+#endif
 }
 
 void cpu_congruence(char coefficient_transpose, std::size_t n, const double* coefficients,
