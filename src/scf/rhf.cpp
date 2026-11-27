@@ -115,10 +115,7 @@ DensityFittingScfData assemble_density_fitting_data(integrals::IntegralData one_
     throw std::runtime_error("DF orbital and one-electron AO dimensions are inconsistent");
   }
   if (build_reference_factors) {
-    const DensityFittingMetricFactor factor =
-        factor_density_fitting_metric(data.raw.metric, data.raw.naux, relative_threshold);
-    data.three_center =
-        orthonormalize_density_fitting_three_center(data.raw.three_center, data.raw.nbf, factor);
+    data.three_center = prepare_cpu_df_scf_three_center(data.raw, relative_threshold);
   } else {
     data.three_center.nbf = data.raw.nbf;
     data.three_center.naux = data.raw.naux;

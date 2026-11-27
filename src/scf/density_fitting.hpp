@@ -88,6 +88,11 @@ struct DensityFittingScfData {
     const std::vector<double>& three_center, std::size_t nbf,
     const DensityFittingMetricFactor& metric_factor);
 
+/** Prepare canonical CPU SCF fit panels while preserving the retained metric branch. */
+[[nodiscard]] DensityFittingThreeCenter prepare_cpu_df_scf_three_center(
+    const integrals::DensityFittingIntegralData& raw, double relative_threshold,
+    bool* metric_response_valid = nullptr);
+
 /** Coulomb and exchange matrices built from one RHF AO density. */
 struct DensityFittingRhfJk {
   std::size_t nbf{};
