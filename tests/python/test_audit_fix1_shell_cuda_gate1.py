@@ -24,7 +24,158 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import numpy as np
+import pytest
+
+from conftest import configured_test_library
+
+from generativeqc._f12_ao_mo_native import (
+    bind_ao_mo_ops,
+    bind_cabs_singles_ops,
+    run_ao_mo_bilin_fwd,
+    run_ao_mo_bilin_rev,
+    run_ao_mo_project_fwd,
+    run_ao_mo_project_rev,
+    run_cabs_cphf_action,
+    run_cabs_frame_kernel_cotangent,
+    run_cabs_whiten_3c,
+    run_coulomb_fit_fwd,
+    run_coulomb_fit_rev,
+)
+
 REPO = Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture(scope="module")
+def host_sink(tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureRequest) -> Path:
+    configured = configured_test_library("GENERATIVEQC_F12_HOST_SINK")
+    if configured is not None:
+        return configured
+    root = Path(__file__).resolve().parents[2]
+    units = (
+        "src/posthf/f12/f12_ao_mo_project_cuda.cu",
+    )
+    output = tmp_path_factory.mktemp("audit_host") / "libaudit_host_fixture.so"
+    compiler = request.getfixturevalue("required_native_cxx")
+    return compiler.build_shared(
+        [root / unit for unit in units],
+        output,
+        compile_args=("-x", "c++", "-std=c++20", "-O3", "-DGQC_SINK_HOST_REFERENCE"),
+    )
+
+
+# =============================================================================
+# M8: Fail-closed NaN inputs & overflow-to-Inf outputs across ALL 3 units
+# =============================================================================
+
+
+def test_m8_ao_mo_and_cabs_fail_closed_on_overflow_to_inf(host_sink: Path):
+    """Finite inputs that overflow to Inf MUST fail closed with status -2."""
+    ao_ops = bind_ao_mo_ops(host_sink, host_reference=True)
+    cabs_ops = bind_cabs_singles_ops(host_sink, host_reference=True)
+    assert ao_ops is not None and cabs_ops is not None
+
+    # Exact audit M8 counterexample: whiten_3c on 1x1 finite inputs (1e308, 2.0) -> Inf!
+    with pytest.raises(ValueError, match="rc=-2"):
+        run_cabs_whiten_3c(
+            cabs_ops,
+            np.array([[1e308]], dtype=np.float64),
+            np.array([[2.0]], dtype=np.float64),
+        )
+
+    # coulomb_fit_fwd overflow -> rc=-2
+    with pytest.raises(ValueError, match="rc=-2"):
+        run_coulomb_fit_fwd(
+            ao_ops,
+            np.array([[1e200]], dtype=np.float64),
+            np.array([[1e200]], dtype=np.float64),
+        )
+
+    # coulomb_fit_rev overflow -> rc=-2
+    with pytest.raises(ValueError, match="rc=-2"):
+        run_coulomb_fit_rev(
+            ao_ops,
+            np.array([[1e160]], dtype=np.float64),
+            np.array([[1e160]], dtype=np.float64),
+            np.array([[1.0]], dtype=np.float64),
+            np.zeros((1, 1), dtype=np.float64),
+        )
+
+    # ao_mo_project_fwd overflow -> rc=-2
+    with pytest.raises(ValueError, match="rc=-2"):
+        run_ao_mo_project_fwd(
+            ao_ops,
+            1,
+            1,
+            1,
+            1,
+            np.array([[1e160]], dtype=np.float64),
+            np.array([[[1e160]]], dtype=np.float64),
+        )
+
+    # ao_mo_project_rev overflow -> rc=-2
+    with pytest.raises(ValueError, match="rc=-2"):
+        run_ao_mo_project_rev(
+            ao_ops,
+            1,
+            1,
+            1,
+            1,
+            np.array([[1e160]], dtype=np.float64),
+            np.array([[[1e160]]], dtype=np.float64),
+            np.array([[[1e160]]], dtype=np.float64),
+            bar_coefficients=np.zeros((1, 1), dtype=np.float64),
+            bar_ao=np.zeros((1, 1, 1), dtype=np.float64),
+            inputs_mode="both",
+        )
+
+    # ao_mo_bilin_fwd overflow -> rc=-2
+    with pytest.raises(ValueError, match="rc=-2"):
+        run_ao_mo_bilin_fwd(
+            ao_ops,
+            np.array([[1e160]], dtype=np.float64),
+            np.array([[1e160]], dtype=np.float64),
+            np.array([[2.0]], dtype=np.float64),
+        )
+
+    # ao_mo_bilin_rev overflow -> rc=-2
+    with pytest.raises(ValueError, match="rc=-2"):
+        run_ao_mo_bilin_rev(
+            ao_ops,
+            np.array([[1e160]], dtype=np.float64),
+            np.array([[1e160]], dtype=np.float64),
+            np.array([[2.0]], dtype=np.float64),
+            np.array([[1.0]], dtype=np.float64),
+            bar_a=np.zeros((1, 1), dtype=np.float64),
+            bar_c_left=np.zeros((1, 1), dtype=np.float64),
+            bar_c_right=np.zeros((1, 1), dtype=np.float64),
+        )
+
+    # cabs_frame_kernel_cotangent overflow -> rc=-2
+    with pytest.raises(ValueError, match="rc=-2"):
+        run_cabs_frame_kernel_cotangent(
+            cabs_ops,
+            np.array([[1e200]], dtype=np.float64),
+            np.array([[1e200]], dtype=np.float64),
+            np.array([[1.0]], dtype=np.float64),
+        )
+
+    # cabs_cphf_action overflow -> rc=-2
+    with pytest.raises(ValueError, match="rc=-2"):
+        run_cabs_cphf_action(
+            cabs_ops,
+            oa=1,
+            ob=1,
+            obs=2,
+            aux=1,
+            is_rhf=True,
+            df_a=np.zeros((1, 2, 2), dtype=np.float64),
+            df_b=None,
+            gap_a=np.array([[1e308]], dtype=np.float64),
+            gap_b=None,
+            trial_a=np.array([[2.0]], dtype=np.float64),
+            trial_b=None,
+        )
 
 
 # =============================================================================

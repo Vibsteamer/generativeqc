@@ -21,6 +21,7 @@ from .. import (
     _f12_focal_one_electron,
     _f12_focal_projector,
     _f12_focal_reference,
+    _f12_focal_singles,
     _f12_frozen_core,
     _native,
 )
@@ -84,6 +85,8 @@ FocalReferenceSeed = _f12_focal_reference.FocalReferenceSeed
 df_reference = _f12_focal_reference.df_reference
 focal_cabs_projector = _f12_focal_projector.focal_cabs_projector
 CompensatedProductWorkLimit = _f12_focal_projector.CompensatedProductWorkLimit
+FocalCabsSingles = _f12_focal_singles.FocalCabsSingles
+reference_cabs_singles = _f12_focal_singles.reference_cabs_singles
 
 
 @dataclass(frozen=True)

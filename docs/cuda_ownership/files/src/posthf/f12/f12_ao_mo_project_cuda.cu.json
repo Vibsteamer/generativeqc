@@ -1,0 +1,14 @@
+{
+  "path": "src/posthf/f12/f12_ao_mo_project_cuda.cu",
+  "reason": "Native AO-to-MO projections and bilinear transforms, Coulomb fit and CABS/CPHF response contractions. Both host and device implementations apply physical primal or adjoint equations.",
+  "regions": [
+    {
+      "reason": "Device allocation, stream, handle and cuBLAS matrix layout helpers.",
+      "role": "runtime",
+      "start": "struct DeviceBuf {",
+      "stop": "__global__ void scale_buffer_kernel"
+    }
+  ],
+  "role": "scientific",
+  "subsystem": "molecular_f12"
+}

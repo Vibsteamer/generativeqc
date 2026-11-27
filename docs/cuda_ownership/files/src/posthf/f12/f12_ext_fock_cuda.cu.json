@@ -1,0 +1,14 @@
+{
+  "path": "src/posthf/f12/f12_ext_fock_cuda.cu",
+  "reason": "Extended AO-space Fock and exchange from whitened and occupied DF factors with the reverse map to raw factors, metric and orbitals.",
+  "regions": [
+    {
+      "reason": "Device buffer ownership, cuBLAS row-major dispatch and handle management.",
+      "role": "runtime",
+      "start": "struct DeviceBuffer {",
+      "stop": "__global__ void k_sym_scale"
+    }
+  ],
+  "role": "scientific",
+  "subsystem": "molecular_f12"
+}

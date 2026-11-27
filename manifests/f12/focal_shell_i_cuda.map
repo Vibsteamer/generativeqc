@@ -1,13 +1,32 @@
 {
   global:
+    gqc_f12_ao_mo_bilin_fwd_cuda;
+    gqc_f12_ao_mo_bilin_rev_cuda;
+    gqc_f12_ao_mo_project_fwd_cuda;
+    gqc_f12_ao_mo_project_rev_cuda;
+    gqc_f12_cabs_cphf_action_cuda;
+    gqc_f12_cabs_fock_fwd_cuda;
+    gqc_f12_cabs_fock_rev_cuda;
+    gqc_f12_cabs_frame_kernel_cotangent_cuda;
     gqc_f12_cabs_i_one_electron;
     gqc_f12_cabs_i_one_electron_batch;
     gqc_f12_cabs_i_one_electron_full_batch;
     gqc_f12_cabs_i_one_electron_weights;
+    gqc_f12_cabs_nuclear_weights_cuda;
+    gqc_f12_cabs_whiten_3c_cuda;
     gqc_f12_cartesian_shells_coulomb;
     gqc_f12_cartesian_shells_coulomb_ex;
     gqc_f12_cartesian_shells_geminal;
     gqc_f12_cartesian_shells_geminal_ex;
+    gqc_f12_coulomb_fit_fwd_cuda;
+    gqc_f12_coulomb_fit_rev_cuda;
+    gqc_f12_ext_fock_congruence_rev_cuda;
+    gqc_f12_ext_fock_fwd_cuda;
+    gqc_f12_ext_fock_half_fwd_cuda;
+    gqc_f12_ext_fock_half_rev_cuda;
+    gqc_f12_ext_fock_j_fwd_cuda;
+    gqc_f12_ext_fock_j_rev_cuda;
+    gqc_f12_ext_fock_rev_cuda;
     gqc_f12_raw_spherical_projection;
     gqc_f12_spherical_forward_coulomb;
     gqc_f12_spherical_forward_geminal;
