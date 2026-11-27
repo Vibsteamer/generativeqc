@@ -4,6 +4,37 @@
 
 namespace generativeqc::cc::triples::detail {
 
+/** One occurrence count for a selected occupied orbital in a canonical tile.
+ * For each fixed occupied orbital, visit all pairs `first >= second`; each
+ * distinct unordered tile containing that orbital is then visited once.
+ * The same overflowing-extent preflight used by visit_occupied_tiles applies.
+ */
+struct OccupiedTileShare {
+  std::size_t index;
+  std::size_t count;
+};
+
+#if defined(__CUDACC__)
+__host__ __device__
+#endif
+constexpr OccupiedTileShare occupied_tile_share(std::size_t orbital, std::size_t first,
+                                                std::size_t second) {
+  const std::size_t count = 1 + (orbital == first) + (orbital == second);
+  const std::size_t high = orbital > first ? orbital : first;
+  const std::size_t low = orbital < second ? orbital : second;
+  const std::size_t mid = orbital >= first ? first : (orbital <= second ? second : orbital);
+  return {high * (high + 1) * (high + 2) / 6 + mid * (mid + 1) / 2 + low, count};
+}
+
+/** Flat canonical tile address for an ordered canonical triple first >= second >= third. */
+#if defined(__CUDACC__)
+__host__ __device__
+#endif
+constexpr std::size_t canonical_tile_index(std::size_t first, std::size_t second,
+                                           std::size_t third) {
+  return first * (first + 1) * (first + 2) / 6 + second * (second + 1) / 2 + third;
+}
+
 /** Visit each triangular occupied tile once without materializing a tile list.
  * The serpentine schedule preserves the maximum occupied index while sharing
  * the lower-index row between adjacent tiles in the three-panel LRU. Return

@@ -1,0 +1,16 @@
+# Directional W precision in molecular DF triples
+
+Status: implemented
+Date: 2026-11-26
+
+The spatial CUDA endpoint reports the arithmetic that actually ran. A fallback flag records a change of provider or schedule independently. The previous precision predicates masked positive FP32 GEMM counts whenever that flag was set. Older versions of the focal ABI also left directional slots unwritten, which a zero-filled Python buffer interpreted as FP64.
+
+The fast spatial path uses pedantic FP32 SGEMMs for the DF panels and forward W products. For forces it also uses SGEMMs for the reverse panel and the corresponding T2 pullback contributions. Other contractions, denominators, W recombination and outer accumulation use FP64. Fast execution requires the admitted mixed cuBLAS provider, the three-panel caller policy and sufficient workspace. The bounded path constructs the panel in FP64 and can retain FP32 forward W with FP64 reverse W. Further resource refusal can select strict FP64 throughout. Zero occupied weights can skip reverse W altogether.
+
+C callers can request 17 doubles from the spatial v2 telemetry interface. Slots 8 through 12 describe any FP32 W work, schedule fallback, forward FP32 work, reverse FP32 work and any reverse W work respectively. Inputs with empty triples spaces have no executed W direction. Slots 13 through 16 record actual split3 work, forward and reverse physical FP32 GEMM counts, and admitted triples workspace bytes. The Python binding requests all 17 slots, checks that the callee wrote them and validates flags against GEMM counts. In the original single-pass schedule, the spin-blocked CPU reference rounds the forward inputs and output around DGEMM and uses a strict reverse. Its forward label is `fp32_emulated`.
+
+Scientific qualification uses independently recomputed displaced mixed and FP64 energies. Each signed energy must identify its actual W precision. The two checks have separate results at each fixed step. The CPU gate exercises the conventional increment and the fixed occupied-weight pullback used by (T+). Its force omits differentiation of geometry-dependent scaling weights, which the molecular (T+) endpoint evaluates separately. A small mixed-versus-strict energy or force difference at a single geometry does not bound the derivative error of a quantized energy surface.
+
+In the frozen CPU build that preceded this change, the original W policy missed the fixed-weight (T+) same-mode force gate on H2O by an absolute error of 3.41090e-8 Eh/bohr and on all-electron HBr by 2.11014e-7 Eh/bohr at a 2e-4 bohr step. The corresponding (T) errors were 2.76053e-8 and 2.08351e-7 Eh/bohr. All eight same-mode comparisons across that step and its half exceeded 1e-8 Eh/bohr. The largest of the eight independently displaced FP64-control errors was 4.12e-11 Eh/bohr. Keep the single-pass policy opt-in and its results distinct from the split3 candidate.
+
+The molecular CPU test is `tests/python/test_rhf_triples_fp32w_gate1.py`. The real-device value and response probes are in `tests/python/test_df_occupied_triples.py` and `tests/python/test_df_occupied_triples_fock.py`. They distinguish fast, bounded mixed, strict and fallback work. A compensated multi-product forward schedule has different panel storage, contraction counts and arithmetic provenance and needs its own qualification.
