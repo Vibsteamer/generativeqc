@@ -1598,6 +1598,9 @@ jobs:
         env:
           GENERATIVEQC_LIBRARY: ${{ github.workspace }}/build/libgenerativeqc.so
           GENERATIVEQC_BUILD_DIR: ${{ github.workspace }}/build
+          # The editable install does not package the host-reference F12 shell;
+          # without this path the host-shell F12 parity tests skip.
+          GENERATIVEQC_F12_HOST_SINK: ${{ github.workspace }}/build/src/posthf/f12/libfocal_shell_i_host.so
           CCACHE_DIR: ${{ runner.temp }}/ccache-python-probes
           CCACHE_MAXSIZE: 256M
           # Capture per-invocation cache decisions only on the measured core-a
