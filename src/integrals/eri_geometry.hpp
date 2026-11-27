@@ -19,14 +19,13 @@ namespace generativeqc::integrals {
  * belong in the callable's weights, exactly once. The Geometry template is
  * the compiler's existing geometry-factored weighted ERI interface.
  *
- * This binder uses the explicit radial operator and never screens. It does
- * not replace the established full-Coulomb native/HF geometry path. Derived
- * overflow is reported to the caller; there is no fallback to another kernel.
+ * All radial operators share these product centers, prefactor and T = rho |P-Q|².
+ * Unit Gaussian slots describe a three-center integral or a two-center metric.
  */
 template <typename Geometry, unsigned MaximumOrder = 13, unsigned UnitGaussianSlots = 0>
-GENERATIVEQC_ERI_HD bool make_eri_geometry(const double* exponents, const double* centers,
-                                           unsigned maximum_order, CoulombRange range, double omega,
-                                           Geometry& geometry) {
+GENERATIVEQC_ERI_HD bool bind_eri_centers(const double* exponents, const double* centers,
+                                          unsigned maximum_order, Geometry& geometry,
+                                          double& argument) {
   // The explicit bound protects both legacy fourteen-moment geometry and
   // second-order geometry. A smaller caller array cannot silently overflow.
   static_assert(std::extent<decltype(geometry.boys)>::value > MaximumOrder,
@@ -74,9 +73,19 @@ GENERATIVEQC_ERI_HD bool make_eri_geometry(const double* exponents, const double
   constexpr double pi = 0x1.921fb54442d18p+1;
   geometry.prefactor =
       (2 * std::pow(pi, 2.5) / p / q / std::sqrt(p + q)) * std::exp(-decay_argument);
-  return std::isfinite(geometry.prefactor) &&
-         bounded_range_moments<MaximumOrder>(maximum_order, geometry.rho * distance, geometry.rho,
-                                             range, omega, geometry.boys);
+  argument = geometry.rho * distance;
+  return std::isfinite(geometry.prefactor) && std::isfinite(argument) && geometry.rho > 0.;
+}
+
+template <typename Geometry, unsigned MaximumOrder = 13, unsigned UnitGaussianSlots = 0>
+GENERATIVEQC_ERI_HD bool make_eri_geometry(const double* exponents, const double* centers,
+                                           unsigned maximum_order, CoulombRange range, double omega,
+                                           Geometry& geometry) {
+  double argument;
+  return bind_eri_centers<Geometry, MaximumOrder, UnitGaussianSlots>(
+             exponents, centers, maximum_order, geometry, argument) &&
+         bounded_range_moments<MaximumOrder>(maximum_order, argument, geometry.rho, range, omega,
+                                             geometry.boys);
 }
 }  // namespace generativeqc::integrals
 #undef GENERATIVEQC_ERI_HD

@@ -76,9 +76,10 @@ alias itself performs no validation.
 local basis data. Shell coefficients are contraction-by-primitive matrices;
 combined SP import groups preserve provenance while expanding angular momenta.
 Primitive exponents must be finite and positive; exact zero coefficients are
-retained. `load_basis` reads canonical JSON and `import_bse` explicitly converts
-a supplied BSE JSON file with caller-declared provenance/license. Neither selects
-a license by guessing or fetches a network basis service. Serialization and
+retained. `load_basis` reads canonical JSON; `import_bse` explicitly converts
+a supplied complete or minimal BSE JSON file and `import_nwchem` an NWChem
+basis/ECP file, with caller-declared provenance/license. None selects a license
+by guessing or fetches a network basis service. Serialization and
 identity include the normalized content and representation, not just a filename.
 
 `Atom` uses atomic numbers 1–118 and three finite Bohr coordinates.
@@ -116,7 +117,9 @@ an interchangeable named basis.
 Malformed types, nonfinite/invalid primitives, ambiguous BSE combined/general
 contractions, inconsistent nuclear/ECP identities and electron/spin parity are
 rejected with validation exceptions. File reads/writes retain filesystem and
-JSON errors. Unsupported execution chemistry is separate from parsing valid
+JSON errors. `import_nwchem` raises `ImportError` when the optional
+`basis_set_exchange` reader is not installed. Unsupported execution chemistry is
+separate from parsing valid
 basis data; do not turn an ineligible capability record into permission to call
 an all-electron ABI with altered ionic charge. No successful basis object is
 returned from a failed load/import.

@@ -98,6 +98,33 @@ def test_source_identity_manifest_expands_recursive_and_explicit_inputs(
     }
 
 
+def test_imported_source_bytecode_is_excluded_from_identity(tmp_path: Path) -> None:
+    from tools.generate_build_identity import _inventory
+
+    source = tmp_path / "src" / "generator.py"
+    source.parent.mkdir()
+    source.write_text("value = 1\n")
+    cache = source.parent / "__pycache__"
+    cache.mkdir()
+    (cache / "generator.cpython-311.pyc").write_bytes(b"local bytecode")
+    _write_manifest(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "recursive_groups": [{"root": "src", "patterns": ["*"]}],
+            "files": [],
+        },
+    )
+    manifest = tmp_path / "cmake/GenerativeQCSourceIdentity.json"
+    expected = {"cmake/GenerativeQCSourceIdentity.json", "src/generator.py"}
+    paths = _source_identity_paths(tmp_path)
+    assert {path.relative_to(tmp_path).as_posix() for path in paths} == expected
+    assert {path.as_posix() for path in _inventory(tmp_path, manifest)} == expected
+    configured = _configure_manifest(tmp_path)
+    assert configured.returncode == 0, configured.stderr
+    assert set((tmp_path / "build/inputs.txt").read_text().split(";")) == expected
+
+
 @pytest.mark.parametrize(
     "payload",
     [

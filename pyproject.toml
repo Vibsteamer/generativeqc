@@ -34,10 +34,12 @@ array-api-test = ["hypothesis>=6.151.0", "ndindex>=1.8", "pytest-json-report>=1.
 reference-test = [
   "scipy>=1.10",
   "pyscf==2.14.0",
+  "basis-set-exchange>=0.11",
   "mpmath>=1.3",
   "threadpoolctl>=3.1",
   "array-api-strict==2.6.1",
 ]
+bse = ["basis-set-exchange>=0.11"]
 torch = ["torch>=2"]
 autotune = ["pyscf>=2.8"]
 # CuPy is only needed by the explicit low-level CUDA development owner, not by
@@ -139,6 +141,8 @@ wheel.py-api = "py3"
 "src/molecule/basis.hpp" = "generativeqc_compiler/assets/src/molecule/basis.hpp"
 "src/core/types.hpp" = "generativeqc_compiler/assets/src/core/types.hpp"
 "src/integrals/eri_geometry.hpp" = "generativeqc_compiler/assets/src/integrals/eri_geometry.hpp"
+"src/integrals/f12_geometry.hpp" = "generativeqc_compiler/assets/src/integrals/f12_geometry.hpp"
+"src/integrals/f12_geminal.hpp" = "generativeqc_compiler/assets/src/integrals/f12_geminal.hpp"
 "src/integrals/first_component_runtime.hpp" = "generativeqc_compiler/assets/src/integrals/first_component_runtime.hpp"
 "src/integrals/factorized_host_runtime.hpp" = "generativeqc_compiler/assets/src/integrals/factorized_host_runtime.hpp"
 "src/integrals/first_directional_runtime.cuh" = "generativeqc_compiler/assets/src/integrals/first_directional_runtime.cuh"

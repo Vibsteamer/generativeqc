@@ -6,7 +6,7 @@ from contextlib import ExitStack, suppress
 from copy import deepcopy
 from dataclasses import replace
 from time import perf_counter
-from typing import Any, Self
+from typing import Any
 
 import numpy as np
 
@@ -15,6 +15,7 @@ from ._api_types import Atom
 from ._observable_comparison import require_observable_comparison
 from ._precision_candidate import require_candidate_classification
 from ._precision_execution import require_precision_schedule
+from ._typing import Self  # noqa: TC001 - used by runtime annotation introspection
 from ._warm_seed_native import require_seed_protocol
 from .batch import BatchResult
 from .checkpoint import _resource_check

@@ -50,6 +50,7 @@ generativeqc_status source_upload(Source& source, const void* host, std::size_t 
   }
   source.device_bytes += bytes;
   error = cudaMemcpy(*device, host, bytes, cudaMemcpyHostToDevice);
+  if (error == cudaSuccess) error = cudaStreamSynchronize(nullptr);
   if (error != cudaSuccess) {
     detail = "CUDA upload failed for bounded DF source metadata";
     return source_cuda_status(error);

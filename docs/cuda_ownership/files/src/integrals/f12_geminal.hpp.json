@@ -1,0 +1,7 @@
+{
+  "path": "src/integrals/f12_geminal.hpp",
+  "reason": "Defines both Slater-fit normalizations and combines six Gaussian factors for factor, factor-over-distance, product and gradient-product radial channels.",
+  "regions": [],
+  "role": "scientific",
+  "subsystem": "molecular_f12"
+}

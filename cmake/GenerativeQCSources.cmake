@@ -143,6 +143,7 @@ function(generativeqc_add_posthf_cc_sources target)
       src/cc/triples_response_cuda.cu
       src/cc/triples_fock_response_cuda.cu
       src/posthf/df_bridge.cu
+      src/posthf/canonical_frame_cuda.cu
       src/posthf/cuda_transform.cu
       src/posthf/ri_mp2_cuda.cu)
   endif()

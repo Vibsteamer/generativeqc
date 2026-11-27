@@ -43,10 +43,10 @@ def _inventory(source_root: Path, manifest_path: Path) -> list[Path]:
         if not patterns:
             raise ValueError(f"source identity root has no patterns: {relative_root}")
         for path in group_root.rglob("*"):
-            if not path.is_file():
+            relative = path.relative_to(group_root)
+            if "__pycache__" in relative.parts or not path.is_file():
                 continue
-            relative_to_group = path.relative_to(group_root).as_posix()
-            if any(fnmatch.fnmatch(relative_to_group, pattern) for pattern in patterns):
+            if any(fnmatch.fnmatch(relative.as_posix(), pattern) for pattern in patterns):
                 inputs.add(path.resolve().relative_to(root))
 
     for relative_text in data.get("files", []):

@@ -30,7 +30,7 @@ __device__ inline Scalar primitive_kinetic(double alpha, const Vec3<Scalar>& fir
          primitive_overlap(alpha, first, beta, second);
 }
 
-template <typename Scalar>
+template <typename Scalar, typename Coefficients = HermiteCoefficients<Scalar>>
 __device__ inline Scalar primitive_overlap_cartesian(double alpha, const Vec3<Scalar>& first,
                                                      const Angular& angular_first, double beta,
                                                      const Vec3<Scalar>& second,
@@ -39,7 +39,7 @@ __device__ inline Scalar primitive_overlap_cartesian(double alpha, const Vec3<Sc
   const Vec3<Scalar> product = product_center(alpha, first, beta, second);
   Scalar result = scalar<Scalar>(pow(kPi / p, 1.5));
   for (int axis = 0; axis < 3; ++axis) {
-    HermiteCoefficients<Scalar> coefficients;
+    Coefficients coefficients;
     const unsigned first_power = angular_axis(angular_first, axis);
     const unsigned second_power = angular_axis(angular_second, axis);
     fill_hermite(first_power, second_power, vec_axis(product, axis), vec_axis(first, axis),
@@ -49,27 +49,27 @@ __device__ inline Scalar primitive_overlap_cartesian(double alpha, const Vec3<Sc
   return result;
 }
 
-template <typename Scalar>
+template <typename Scalar, typename Coefficients = HermiteCoefficients<Scalar>>
 __device__ inline Scalar primitive_kinetic_cartesian(double alpha, const Vec3<Scalar>& first,
                                                      const Angular& angular_first, double beta,
                                                      const Vec3<Scalar>& second,
                                                      const Angular& angular_second) {
-  Scalar result =
-      beta * (2.0 * static_cast<double>(angular_total(angular_second)) + 3.0) *
-      primitive_overlap_cartesian(alpha, first, angular_first, beta, second, angular_second);
+  Scalar result = beta * (2.0 * static_cast<double>(angular_total(angular_second)) + 3.0) *
+                  primitive_overlap_cartesian<Scalar, Coefficients>(alpha, first, angular_first,
+                                                                    beta, second, angular_second);
   for (int axis = 0; axis < 3; ++axis) {
     Angular raised = angular_second;
     add_angular_axis(raised, axis, 2);
-    result =
-        result - 2.0 * beta * beta *
-                     primitive_overlap_cartesian(alpha, first, angular_first, beta, second, raised);
+    result = result - 2.0 * beta * beta *
+                          primitive_overlap_cartesian<Scalar, Coefficients>(
+                              alpha, first, angular_first, beta, second, raised);
     const unsigned power = angular_axis(angular_second, axis);
     if (power >= 2) {
       Angular lowered = angular_second;
       add_angular_axis(lowered, axis, -2);
-      result = result -
-               0.5 * static_cast<double>(power * (power - 1)) *
-                   primitive_overlap_cartesian(alpha, first, angular_first, beta, second, lowered);
+      result = result - 0.5 * static_cast<double>(power * (power - 1)) *
+                            primitive_overlap_cartesian<Scalar, Coefficients>(
+                                alpha, first, angular_first, beta, second, lowered);
     }
   }
   return result;

@@ -1,0 +1,146 @@
+import os
+from unittest.mock import Mock
+
+"""Canonical cotangents against independently re-diagonalized Fock matrices."""
+
+import numpy as np
+import pytest
+from generativeqc._canonical_frame import canonical_frame_seed
+from generativeqc_compiler.method.canonical_frame_response import (
+    canonical_pair_terms,
+    orbital_rotation_cotangent,
+)
+from generativeqc_compiler.tensor import execute
+
+from tools.generate_canonical_frame_reference import all_cases
+
+
+@pytest.mark.parametrize("name,case", all_cases().items())
+def test_canonical_constraints_against_displaced_eigenspaces(
+    name: str, case: dict
+) -> None:
+    c, bar, eps = (case[k] for k in ("coefficients", "frame_bar", "energies"))
+    m = execute(
+        orbital_rotation_cotangent(*c.shape), {"coefficients": c, "frame_bar": bar}
+    ).outputs["rotation_gradient"]
+    np.testing.assert_allclose(m, case["rotation_gradient"], atol=3e-15, rtol=3e-15)
+    diag, response = canonical_pair_terms()
+    o, n = int(case["occupied"]), len(eps)
+    seed = np.zeros_like(m)
+    for p in range(n):
+        for q in range(p + 1, n):
+            if (p < o) != (q < o):
+                continue
+            fields = {
+                "mpq": np.array(m[p, q]),
+                "mqp": np.array(m[q, p]),
+                "ep": np.array(eps[p]),
+                "eq": np.array(eps[q]),
+            }
+            diagnostic = execute(diag, fields).outputs
+            if abs(diagnostic["gap"]) <= 1e-8:
+                assert abs(diagnostic["torque"]) < 1e-12
+            else:
+                seed[p, q] = seed[q, p] = execute(response, fields).outputs["seed"]
+    predicted = np.vdot(seed, case["fock_direction_mo"])
+    np.testing.assert_allclose(
+        case["slopes"], predicted, atol=3e-8, rtol=0, err_msg=name
+    )
+    stationarity = m - m.T + 2 * (eps[:, None] - eps[None, :]) * seed
+    np.testing.assert_allclose(stationarity[:o, :o], 0, atol=3e-15)
+    np.testing.assert_allclose(stationarity[o:, o:], 0, atol=3e-15)
+
+
+@pytest.mark.parametrize("dims", [(0, 3), (3, 0), (2, 3), (True, 1)])
+def test_invalid_orbital_frame_dimensions(dims: tuple[int, int]) -> None:
+    with pytest.raises(ValueError):
+        orbital_rotation_cotangent(*dims)
+
+
+@pytest.mark.parametrize(
+    "case", ["shape", "dtype", "energy", "occupied", "threshold", "budget"]
+)
+def test_native_bridge_rejects_invalid_inputs_before_library_load(case: str) -> None:
+    m, eps, o, options = np.eye(3), np.arange(3, dtype=float), 1, {}
+    if case == "shape":
+        m = np.ones((3, 2))
+    elif case == "dtype":
+        m = m.astype(np.float32)
+    elif case == "energy":
+        eps = eps[:2]
+    elif case == "occupied":
+        o = 3
+    elif case == "threshold":
+        options["gap_threshold"] = float("nan")
+    else:
+        options["maximum_bytes"] = 0
+    with pytest.raises(ValueError):
+        canonical_frame_seed(m, eps, o, **options)
+
+
+@pytest.mark.skipif(
+    os.getenv("GENERATIVEQC_TEST_CUDA") != "1",
+    reason="requires native canonical CUDA kernels",
+)
+def test_full_frame_stationary_degeneracy_is_gauge_covariant() -> None:
+    from generativeqc._canonical_frame import canonical_full_frame_seeds
+
+    rng = np.random.default_rng(153)
+    m = rng.normal(size=(5, 5))
+    m[:3, :3] = (m[:3, :3] + m[:3, :3].T) / 2
+    eps = np.array([-1.0, -1.0, -1.0, 0.3, 0.8])
+    q = np.eye(5)
+    q[:3, :3] = np.linalg.qr(rng.normal(size=(3, 3)))[0]
+    f, s, g, _ = canonical_full_frame_seeds(m, eps, 3)
+    fq, sq, gq, _ = canonical_full_frame_seeds(q.T @ m @ q, eps, 3)
+    np.testing.assert_allclose(fq, q.T @ f @ q, atol=2e-13)
+    np.testing.assert_allclose(sq, q.T @ s @ q, atol=2e-13)
+    assert max(g, gq) < 1e-13 and np.max(abs(f[:3, 3:])) > 1e-3
+    with pytest.raises(RuntimeError, match="frontier"):
+        canonical_full_frame_seeds(m, eps, 2)
+    eps[1] += 4e-9
+    eps[2] += 6e-9
+    with pytest.raises(RuntimeError, match="frontier"):
+        canonical_full_frame_seeds(m, eps, 2)
+    m[0, 1] += 8e-10
+    m[0, 2] += 8e-10
+    with pytest.raises(RuntimeError, match="nonstationary"):
+        canonical_full_frame_seeds(m, eps, 3)
+
+
+def test_empty_spin_dispatches_to_the_all_virtual_native_frame() -> None:
+    library = Mock()
+    library.generativeqc_canonical_full_frame_seeds_cuda_v1.side_effect = RuntimeError(
+        "all-virtual invocation"
+    )
+    with pytest.raises(RuntimeError, match="all-virtual invocation"):
+        canonical_frame_seed(np.eye(3), np.arange(3, dtype=float), 0, library=library)
+    assert library.generativeqc_canonical_full_frame_seeds_cuda_v1.call_args.args[
+        :3
+    ] == (0, 3, 0)
+    library.generativeqc_canonical_frame_seed_cuda_v1.assert_not_called()
+
+
+@pytest.mark.skipif(
+    os.getenv("GENERATIVEQC_TEST_CUDA") != "1",
+    reason="requires native canonical CUDA kernels",
+)
+def test_empty_spin_channel_retains_virtual_frame_response() -> None:
+    eps = np.array([-0.8, -0.1, 1.7])
+    frame_bar = np.array([[0.1, 1.0, -0.2], [-0.3, 0.5, 0.4], [0.9, 0.2, -0.6]])
+    direction = np.array([[0.3, 0.7, -0.2], [0.7, 0.1, 1.0], [-0.2, 1.0, -0.4]])
+    seed, device_bytes = canonical_frame_seed(frame_bar, eps, 0)
+    assert device_bytes > 0
+
+    def displaced_value(t: float) -> float:
+        _, frame = np.linalg.eigh(np.diag(eps) + t * direction)
+        frame *= np.sign(np.diag(frame))
+        return float(np.vdot(frame_bar, frame))
+
+    h = 1e-5
+    derivative = (displaced_value(h) - displaced_value(-h)) / (2 * h)
+    assert abs(derivative) > 0.1
+    np.testing.assert_allclose(np.vdot(seed, direction), derivative, rtol=0, atol=1e-8)
+    eps[1] = eps[0]
+    with pytest.raises(RuntimeError, match="nonstationary"):
+        canonical_frame_seed(frame_bar, eps, 0)

@@ -675,6 +675,13 @@ install(FILES LICENSES/bse-data-BSD-3-Clause.txt
               LICENSES/pyscf-Apache-2.0.txt
               LICENSES/pyscf-NOTICE.txt
         DESTINATION "${CMAKE_INSTALL_DATADIR}/generativeqc/licenses")
+# Native builds also embed LGPL-3.0 data: the Psi4 Slater-geminal fit (CUDA
+# F12) and the DFT-D4 reference tables. The LGPL texts incorporate the GPL.
+install(FILES LICENSES/psi4-COPYING.LESSER.txt
+              LICENSES/psi4-COPYING.txt
+              LICENSES/dftd4-COPYING.LESSER.txt
+              LICENSES/dftd4-COPYING.txt
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/generativeqc/licenses")
 if(GENERATIVEQC_BUILD_CLI)
   install(TARGETS generativeqc_cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
   if(GENERATIVEQC_ENABLE_CUDA)

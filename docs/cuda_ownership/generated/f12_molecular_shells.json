@@ -1,0 +1,8 @@
+{
+  "name": "f12_molecular_shells",
+  "outputs": [
+    "src/posthf/f12/generated/cuda/*/molecular-coulomb.hpp",
+    "src/posthf/f12/generated/cuda/*/molecular-geminal.hpp"
+  ],
+  "owner": "python/generativeqc_compiler/integral/df_derivatives_cuda.py"
+}

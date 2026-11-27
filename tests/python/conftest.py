@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class NativeCxx:
-    """Compile standalone native test probes through ccache, then link normally."""
+    """Compile standalone native test probes through a compiler cache, then link normally."""
 
     compiler: str
     cache: str
@@ -67,7 +67,7 @@ class NativeCxx:
         timeout: int = 120,
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        """Compile one translation unit so ccache can cache it."""
+        """Compile one translation unit through the compiler cache."""
         return subprocess.run(
             [
                 self.cache,
@@ -98,7 +98,7 @@ class NativeCxx:
         timeout: int = 60,
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        """Link cached objects without routing the non-cacheable link through ccache."""
+        """Link cached objects without routing the non-cacheable link through the cache."""
         return subprocess.run(
             [self.compiler, *map(str, objects), *args, "-o", str(output)],
             check=True,
@@ -119,7 +119,7 @@ class NativeCxx:
         link_timeout: int = 60,
         env: dict[str, str] | None = None,
     ) -> Path:
-        """Compile each source independently through ccache and link an executable."""
+        """Compile each source independently through the cache and link an executable."""
         objects = []
         for index, source in enumerate(sources):
             obj = output.parent / f".{output.name}.{index}.o"
@@ -167,21 +167,41 @@ class NativeCxx:
         return output
 
 
+def _compiler_cache() -> tuple[str | None, str]:
+    """Verify ``CCACHE`` if set, else select sccache then ccache as runtime compilation does."""
+    from generativeqc_compiler.common.compiler_cache import (
+        resolve_compiler_cache,
+        verify_compiler_cache,
+    )
+
+    requested = os.environ.get("CCACHE")
+    if requested is not None:
+        executable = shutil.which(requested)
+        if executable is None:
+            return None, f"CCACHE={requested!r} is not an executable"
+        # which() may retain a relative spelling; probes compile from another cwd.
+        return str(verify_compiler_cache(Path(os.path.abspath(executable))).path), ""
+    try:
+        return str(resolve_compiler_cache().path), ""
+    except RuntimeError as error:
+        return None, str(error)
+
+
 def _native_cxx(
     tmp_path_factory: pytest.TempPathFactory, *, required: bool
 ) -> NativeCxx:
     compiler = shutil.which(os.environ.get("CXX", "c++"))
-    cache = shutil.which(os.environ.get("CCACHE", "ccache"))
+    cache, reason = _compiler_cache()
     if compiler is None or cache is None:
-        message = "native probe requires a host C++ compiler and ccache"
+        message = "native probe requires a host C++ compiler and sccache or ccache"
+        if reason:
+            message += f" ({reason})"
         if required:
             pytest.fail(message)
         pytest.skip(message)
     # which() may retain a relative spelling. Preserve the executable basename
     # (e.g. clang++), but make it independent of the probe compilation cwd.
     compiler = os.path.abspath(compiler)
-    cache = os.path.abspath(cache)
-    subprocess.run([cache, "--version"], check=True, capture_output=True, text=True)
     return NativeCxx(compiler, cache, tmp_path_factory.getbasetemp())
 
 

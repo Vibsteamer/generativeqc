@@ -7,6 +7,7 @@
 #include <new>
 #include <numeric>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include "molecule/basis.hpp"
@@ -624,6 +625,31 @@ DensityFittingMetricFactor factor_density_fitting_metric(const std::vector<doubl
   return integrals::factor_density_fitting_metric(metric, dimension, relative_threshold);
 }
 
+namespace {
+bool allocate_auxiliary_major(DensityFittingThreeCenter& result) {
+  constexpr std::size_t kPersistentDenseExchangeMinimum = 16;
+  constexpr std::size_t kScalarExchangeCacheMaximumBytes = 16U << 20;
+  const bool external = tensor::cpu_openblas_built();
+  if (result.nbf < kPersistentDenseExchangeMinimum ||
+      (!external && result.values.size() > kScalarExchangeCacheMaximumBytes / sizeof(double)))
+    return false;
+  try {
+    result.auxiliary_major_values.resize(result.values.size());
+  } catch (const std::bad_alloc&) {
+    if (external) throw;
+    return false;
+  }
+  return true;
+}
+
+void fill_auxiliary_major(DensityFittingThreeCenter& result) {
+  const auto pairs = result.nbf * result.nbf;
+  for (std::size_t pair = 0; pair < pairs; ++pair)
+    for (std::size_t q = 0; q < result.naux; ++q)
+      result.auxiliary_major_values[q * pairs + pair] = result.values[pair * result.naux + q];
+}
+}  // namespace
+
 DensityFittingThreeCenter orthonormalize_density_fitting_three_center(
     const std::vector<double>& three_center, std::size_t nbf,
     const DensityFittingMetricFactor& metric_factor) {
@@ -667,24 +693,88 @@ DensityFittingThreeCenter orthonormalize_density_fitting_three_center(
     }
   }
 
-  constexpr std::size_t kPersistentDenseExchangeMinimum = 16;
-  constexpr std::size_t kScalarExchangeCacheMaximumBytes = 16U << 20;
-  const bool external_provider = tensor::cpu_openblas_built();
-  if (nbf >= kPersistentDenseExchangeMinimum &&
-      (external_provider || tensor_elements <= kScalarExchangeCacheMaximumBytes / sizeof(double))) {
-    // The scalar schedule borrows the same immutable layout as BLAS. Keep its
-    // optional retained copy bounded; absent capacity retains the strided path.
-    try {
-      result.auxiliary_major_values.resize(tensor_elements);
-    } catch (const std::bad_alloc&) {
-      if (external_provider) throw;
-      return result;
+  if (allocate_auxiliary_major(result)) fill_auxiliary_major(result);
+  return result;
+}
+
+DensityFittingThreeCenter prepare_cpu_df_scf_three_center(
+    const integrals::DensityFittingIntegralData& raw, double relative_threshold,
+    bool* metric_response_valid) {
+  const auto naux = raw.naux;
+  const auto tensor_elements = checked_three_center_elements(raw.nbf, naux);
+  if (raw.three_center.size() != tensor_elements)
+    throw std::invalid_argument("DF three-center tensor dimensions are inconsistent");
+  require_finite(raw.three_center, "DF three-center entries must be finite");
+
+  auto classification = factor_density_fitting_metric(raw.metric, naux, relative_threshold);
+  if (metric_response_valid) *metric_response_valid = classification.response_valid;
+  if (classification.effective_rank != naux || !classification.response_valid)
+    return orthonormalize_density_fitting_three_center(raw.three_center, raw.nbf, classification);
+
+  // Preserve the production cutoff classification. Reuse its released square buffer for
+  // the tighter full-rank eigensolve, whose modes are applied before contracting auxiliary indices.
+  auto symmetric = std::move(classification.inverse_square_root);
+  double matrix_scale = 0.0;
+  for (std::size_t i = 0; i < naux; ++i) {
+    for (std::size_t j = 0; j < naux; ++j) {
+      const double value = 0.5 * (raw.metric[i * naux + j] + raw.metric[j * naux + i]);
+      symmetric[i * naux + j] = value;
+      matrix_scale = std::max(matrix_scale, std::abs(value));
     }
-    for (std::size_t mu = 0; mu < nbf; ++mu)
-      for (std::size_t nu = 0; nu < nbf; ++nu)
-        for (std::size_t auxiliary = 0; auxiliary < naux; ++auxiliary)
-          result.auxiliary_major_values[auxiliary * nbf * nbf + index(mu, nu, nbf)] =
-              result.values[three_center_index(mu, nu, auxiliary, nbf, naux)];
+  }
+  const tensor::CpuLinalgPlan scalar{tensor::CpuLinalgProvider::scalar,
+                                     tensor::CpuLinalgThreadOwnership::task_parallel, 1};
+  const double tolerance = std::numeric_limits<double>::epsilon() * matrix_scale /
+                           static_cast<double>(naux);
+  auto eig = tensor::cpu_symmetric_eigen(std::move(symmetric), naux, scalar, tolerance);
+  if (!(eig.values.front() > classification.absolute_threshold)) {
+    // A marginal spectrum must keep the original retained subspace and response decision.
+    eig = {};
+    return orthonormalize_density_fitting_three_center(
+        raw.three_center, raw.nbf, factor_density_fitting_metric(raw.metric, naux, relative_threshold));
+  }
+
+  // With modes A = U diag(lambda^-1/4), (B A) A^T is the canonical symmetric
+  // whitening. Associating the products this way avoids materializing U diag(lambda^-1/2) U^T.
+  auto modes = std::move(eig.vectors);
+  for (std::size_t k = 0; k < naux; ++k) {
+    const double weight = 1.0 / std::sqrt(std::sqrt(eig.values[k]));
+    for (std::size_t i = 0; i < naux; ++i) modes[i * naux + k] *= weight;
+  }
+  eig = {};
+  for (std::size_t i = 0; i < naux; ++i)
+    for (std::size_t j = 0; j < i; ++j) std::swap(modes[i * naux + j], modes[j * naux + i]);
+
+  DensityFittingThreeCenter result{raw.nbf, naux, naux, std::vector<double>(tensor_elements)};
+  const auto pairs = tensor_elements / naux;
+  if (allocate_auxiliary_major(result)) {
+    // The optional persistent exchange layout doubles as B A workspace during setup.
+    const tensor::CpuLinalgPlan plan{tensor::CpuLinalgProvider::automatic,
+                                     tensor::CpuLinalgThreadOwnership::provider_parallel, 1};
+    tensor::cpu_gemm('N', 'T', pairs, naux, naux, raw.three_center.data(), modes.data(),
+                     result.auxiliary_major_values.data(), 1.0, 0.0, plan);
+    tensor::cpu_gemm('N', 'N', pairs, naux, naux, result.auxiliary_major_values.data(),
+                     modes.data(), result.values.data(), 1.0, 0.0, plan);
+    fill_auxiliary_major(result);
+  } else {
+    for (std::size_t pair = 0; pair < pairs; ++pair) {
+      const double* input = raw.three_center.data() + pair * naux;
+      double* output = result.values.data() + pair * naux;
+      for (std::size_t k = 0; k < naux; ++k) {
+        const double* mode = modes.data() + k * naux;
+        const double projection = std::inner_product(input, input + naux, mode, 0.0);
+        for (std::size_t a = 0; a < naux; ++a) output[a] += projection * mode[a];
+      }
+    }
+  }
+  // An eigenmode projection can overflow even when the canonical result is finite.
+  // Restore the established arithmetic for such extreme inputs, releasing its workspace first.
+  if (!std::all_of(result.values.begin(), result.values.end(),
+                   [](double value) { return std::isfinite(value); })) {
+    result = {};
+    std::vector<double>().swap(modes);
+    return orthonormalize_density_fitting_three_center(
+        raw.three_center, raw.nbf, factor_density_fitting_metric(raw.metric, naux, relative_threshold));
   }
   return result;
 }

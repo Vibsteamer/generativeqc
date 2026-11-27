@@ -321,11 +321,8 @@ struct PreparedFockPlan::Impl {
           fitted->df_gradient_auxiliary = *auxiliary;
         }
         fitted->metric_relative_threshold = strategy.metric_relative_threshold;
-        const auto metric = factor_density_fitting_metric(fitted->raw.metric, fitted->raw.naux,
-                                                          strategy.metric_relative_threshold);
-        metric_response_valid = metric.response_valid;
-        fitted->three_center = orthonormalize_density_fitting_three_center(fitted->raw.three_center,
-                                                                           fitted->raw.nbf, metric);
+        fitted->three_center = prepare_cpu_df_scf_three_center(
+            fitted->raw, strategy.metric_relative_threshold, &metric_response_valid);
       } else
         exact = std::move(ints);
       const auto& data = one_electron();

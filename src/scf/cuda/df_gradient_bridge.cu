@@ -329,7 +329,8 @@ struct Arena {
     stats.host_bytes += data.capacity() * sizeof(T);
     if (data.empty()) return nullptr;
     auto* p = static_cast<T*>(allocate(data.size() * sizeof(T)));
-    check(cudaMemcpy(p, data.data(), data.size() * sizeof(T), cudaMemcpyHostToDevice));
+    check(cudaMemcpyAsync(p, data.data(), data.size() * sizeof(T), cudaMemcpyHostToDevice, stream));
+    check(cudaStreamSynchronize(stream));
     stats.host_to_device_bytes += data.size() * sizeof(T);
     ++stats.uploads;
     return p;

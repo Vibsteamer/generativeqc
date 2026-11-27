@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import replace
@@ -45,9 +46,68 @@ def test_missing_tools_preserve_optional_and_required_gates(
     assert ("1 error" if required else "1 skipped") in result.stdout
 
 
+@pytest.mark.parametrize(
+    ("versions", "selected"),
+    (
+        ({"sccache": "sccache 0.16.0", "ccache": "ccache version 4.14"}, "sccache"),
+        ({"sccache": "sccache 0.16.0"}, "sccache"),
+        ({"ccache": "ccache version 4.14"}, "ccache"),
+        ({"sccache": "sccache 0.15.2", "ccache": "ccache version 4.14"}, "ccache"),
+        ({"sccache": "sccache 0.15.2"}, None),
+        ({}, None),
+    ),
+)
+def test_unset_ccache_selects_sccache_then_ccache(
+    tmp_path: Path, versions: dict[str, str], selected: str | None
+) -> None:
+    compiler = shutil.which(os.environ.get("CXX", "c++"))
+    if compiler is None:
+        pytest.skip("launcher selection is observed through a host C++ compiler")
+    toolchain = tmp_path / "toolchain"
+    toolchain.mkdir()
+    for name, version in versions.items():
+        launcher = toolchain / name
+        launcher.write_text(
+            f'#!/bin/sh\nif [ "$1" = --version ]; then echo "{version}"; exit 0; fi\nexit 97\n'
+        )
+        launcher.chmod(0o755)
+    (tmp_path / "conftest.py").write_text(
+        Path(__file__).with_name("conftest.py").read_text()
+    )
+    (tmp_path / "test_probe.py").write_text(
+        "from pathlib import Path\n"
+        "def test_probe(required_native_cxx):\n"
+        f"    assert Path(required_native_cxx.cache) == Path({str(toolchain / str(selected))!r})\n"
+    )
+    env = {key: value for key, value in os.environ.items() if key != "CCACHE"}
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+        cwd=tmp_path,
+        env={
+            **env,
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+            "PATH": str(toolchain),
+            "CXX": os.path.abspath(compiler),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    expected = (0, "1 passed") if selected else (1, "1 error")
+    assert result.returncode == expected[0], result.stdout + result.stderr
+    assert expected[1] in result.stdout
+
+
 def test_cache_reuses_sessions_and_invalidates_changed_inputs(
     tmp_path: Path, native_cxx: NativeCxx
 ) -> None:
+    # Reuse across session directories is ccache's CCACHE_BASEDIR contract;
+    # sccache reads base directories only from its server's configuration.
+    ccache = shutil.which("ccache")
+    if ccache is None:
+        pytest.skip("session-directory reuse is a ccache base-directory contract")
+    native_cxx = replace(native_cxx, cache=os.path.abspath(ccache))
     # A private test cache makes hit/miss evidence independent of other workers.
     env = {"CCACHE_DIR": str(tmp_path / "cache")}
 
@@ -92,8 +152,10 @@ def test_relative_compiler_and_cache_paths_survive_compile_cwd(
 ) -> None:
     toolchain = tmp_path / "toolchain"
     toolchain.mkdir()
+    # sccache treats a link with any other name as a compiler it should wrap.
+    launcher = Path(native_cxx.cache).name
     (toolchain / "c++").symlink_to(native_cxx.compiler)
-    (toolchain / "ccache").symlink_to(native_cxx.cache)
+    (toolchain / launcher).symlink_to(native_cxx.cache)
     (tmp_path / "conftest.py").write_text(
         Path(__file__).with_name("conftest.py").read_text()
     )
@@ -112,7 +174,7 @@ def test_relative_compiler_and_cache_paths_survive_compile_cwd(
             **os.environ,
             "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
             "CXX": "./toolchain/c++",
-            "CCACHE": "./toolchain/ccache",
+            "CCACHE": f"./toolchain/{launcher}",
         },
         capture_output=True,
         text=True,

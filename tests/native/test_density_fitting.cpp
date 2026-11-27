@@ -528,6 +528,66 @@ generativeqc::core::System compact_auxiliary_system() {
 }
 
 #if GENERATIVEQC_HAS_CUDA
+void check_cuda_g_one_electron_derivatives() {
+  using generativeqc::integrals::IntegralData;
+  using generativeqc::scf::build_cuda_one_electron_integrals;
+  using generativeqc::scf::build_cuda_one_electron_integrals_batch;
+  generativeqc::core::System first;
+  first.atoms = {{1, {-0.24, 0.13, 0.27}}, {2, {1.21, -0.73, 0.51}}, {1, {0.63, 0.46, -1.02}}};
+  first.shells = {
+      {0, 4, {{0.83, 1.0}}}, {1, 3, {{0.51, 1.0}}}, {1, 4, {{0.62, 1.0}}}, {2, 0, {{0.76, 1.0}}}};
+  first.basis_representation = GENERATIVEQC_BASIS_CARTESIAN;
+  std::string detail;
+  require(generativeqc::molecule::validate_and_normalize(first, detail, 4) ==
+              GENERATIVEQC_STATUS_SUCCESS,
+          detail.c_str());
+  auto second = first;
+  second.atoms[0].position[1] += 0.31;
+  const std::vector<generativeqc::core::System> systems{first, second};
+  std::vector<IntegralData> batch;
+  require(build_cuda_one_electron_integrals_batch(0, systems, batch, detail, true, false) ==
+              GENERATIVEQC_STATUS_SUCCESS,
+          detail.c_str());
+  require(batch.size() == systems.size(), "incorrect g derivative batch size");
+  constexpr double step = 1.0e-4;
+  for (std::size_t item = 0; item < systems.size(); ++item) {
+    IntegralData single;
+    require(build_cuda_one_electron_integrals(0, systems[item], single, detail, true, false) ==
+                GENERATIVEQC_STATUS_SUCCESS,
+            detail.c_str());
+    const auto elements = single.nbf * single.nbf;
+    const auto coordinates = systems[item].atoms.size() * 3;
+    for (const auto* output : {&single, &batch[item]})
+      require(output->ncoord == coordinates &&
+                  output->overlap_derivative.size() == elements * coordinates &&
+                  output->hcore_derivative.size() == elements * coordinates,
+              "incomplete Cartesian g derivative export");
+    for (std::size_t c = 0; c < coordinates; ++c) {
+      auto plus = systems[item], minus = systems[item];
+      plus.atoms[c / 3].position[c % 3] += step;
+      minus.atoms[c / 3].position[c % 3] -= step;
+      IntegralData ep, em;
+      require(build_cuda_one_electron_integrals(0, plus, ep, detail, false, false) ==
+                  GENERATIVEQC_STATUS_SUCCESS,
+              detail.c_str());
+      require(build_cuda_one_electron_integrals(0, minus, em, detail, false, false) ==
+                  GENERATIVEQC_STATUS_SUCCESS,
+              detail.c_str());
+      for (std::size_t k = 0; k < elements; ++k) {
+        const double ds = (ep.overlap[k] - em.overlap[k]) / (2 * step);
+        const double dh = (ep.hcore[k] - em.hcore[k]) / (2 * step);
+        for (const auto* output : {&single, &batch[item]}) {
+          const auto n = c * elements + k;
+          require(std::abs(output->overlap_derivative[n] - ds) < 3e-7,
+                  "Cartesian g overlap derivative differs from displaced values");
+          require(std::abs(output->hcore_derivative[n] - dh) < 3e-7,
+                  "Cartesian g core derivative differs from displaced values");
+        }
+      }
+    }
+  }
+}
+
 void check_cuda_nuclear_only_derivatives() {
   generativeqc::core::System system;
   system.atoms = {{1, {0.1, -0.3, 0.2}}, {2, {1.2, 0.4, -0.5}}, {3, {-0.6, 1.1, 0.8}}};
@@ -580,10 +640,94 @@ void check_cuda_nuclear_only_derivatives() {
 }
 #endif
 
+void check_full_rank_scf_whitening() {
+  // When each raw row is a row of the Coulomb metric, the whitened tensor is
+  // the symmetric square root and its Gram matrix must reproduce the input metric.
+  constexpr std::size_t naux = 8;
+  constexpr double cutoff = 1e-10;
+  const double pi = std::acos(-1.0);
+  std::vector<double> metric(naux * naux), expected(naux * naux);
+  for (std::size_t mode = 0; mode < naux; ++mode) {
+    const double eig = 1e3 * std::pow(1e-8, static_cast<double>(mode) / (naux - 1));
+    const auto entry = [&](std::size_t i) {
+      const double scale = std::sqrt((mode == 0 ? 1.0 : 2.0) / naux);
+      return scale * std::cos(pi * (i + 0.5) * mode / naux);
+    };
+    for (std::size_t i = 0; i < naux; ++i)
+      for (std::size_t j = 0; j < naux; ++j) {
+        const double dyad = entry(i) * entry(j);
+        metric[i * naux + j] += eig * dyad;
+        expected[i * naux + j] += std::sqrt(eig) * dyad;
+      }
+  }
+  for (std::size_t nbf : {2U, 16U}) {
+    generativeqc::integrals::DensityFittingIntegralData raw;
+    raw.nbf = nbf;
+    raw.naux = naux;
+    raw.metric = metric;
+    const auto pairs = nbf * nbf;
+    for (std::size_t p = 0; p < pairs; ++p) {
+      const auto begin = metric.begin() + (p % naux) * naux;
+      raw.three_center.insert(raw.three_center.end(), begin, begin + naux);
+    }
+    bool response_valid = false;
+    const auto fitted =
+        generativeqc::scf::prepare_cpu_df_scf_three_center(raw, cutoff, &response_valid);
+    require(fitted.effective_rank == naux && response_valid, "Full-rank SCF fit changed branch");
+    for (std::size_t p = 0; p < pairs; ++p) {
+      const double* row = fitted.values.data() + p * naux;
+      for (std::size_t a = 0; a < naux; ++a) {
+        require_close(row[a], expected[(p % naux) * naux + a], 2e-10,
+                      "Full-rank SCF fit changed the symmetric gauge");
+        if (!fitted.auxiliary_major_values.empty())
+          require(row[a] == fitted.auxiliary_major_values[a * pairs + p],
+                  "SCF exchange layout differs from the canonical panel");
+      }
+      for (std::size_t q = 0; q < std::min(naux, pairs); ++q)
+        require_close(std::inner_product(row, row + naux, fitted.values.data() + q * naux, 0.0),
+                      metric[(p % naux) * naux + q], 3e-12,
+                      "Full-rank SCF fit lost precision in the physical Gram matrix");
+    }
+  }
+  for (const std::size_t nbf : {1U, 16U}) {
+    generativeqc::integrals::DensityFittingIntegralData raw;
+    raw.nbf = nbf;
+    raw.naux = 2;
+    raw.metric = {1.0, 0.1, 0.1, 1.0};
+    raw.three_center.assign(nbf * nbf * raw.naux, 1.4e308);
+    const auto factor = generativeqc::scf::factor_density_fitting_metric(raw.metric, raw.naux, cutoff);
+    const auto original = generativeqc::scf::orthonormalize_density_fitting_three_center(
+        raw.three_center, nbf, factor);
+    const auto fitted = generativeqc::scf::prepare_cpu_df_scf_three_center(raw, cutoff);
+    require(std::isfinite(original.values.front()) && fitted.values == original.values &&
+                fitted.auxiliary_major_values == original.auxiliary_major_values,
+            "Extreme finite SCF panels overflowed the intermediate projection");
+  }
+  // A rank crossing and a clipped repeated pair both retain their prior projector,
+  // including an unresolved full-rank legacy classification at the cutoff.
+  for (const double value : {1.0000005e-10, 0.5e-10}) {
+    generativeqc::integrals::DensityFittingIntegralData raw;
+    raw.nbf = 1;
+    raw.naux = 3;
+    raw.metric = {1, 0, 0, 0, value, 1.5e-16, 0, 1.5e-16, value};
+    raw.three_center = {2, -3, 5};
+    const auto factor = generativeqc::scf::factor_density_fitting_metric(raw.metric, 3, cutoff);
+    const auto original = generativeqc::scf::orthonormalize_density_fitting_three_center(
+        raw.three_center, raw.nbf, factor);
+    bool response_valid = !factor.response_valid;
+    const auto fitted =
+        generativeqc::scf::prepare_cpu_df_scf_three_center(raw, cutoff, &response_valid);
+    require(fitted.effective_rank == factor.effective_rank &&
+                response_valid == factor.response_valid && fitted.values == original.values,
+            "SCF whitening changed the clipped or unresolved cutoff branch");
+  }
+}
+
 }  // namespace
 
 int main() {
   try {
+    check_full_rank_scf_whitening();
     check_provider_cache_identity();
     check_scalar_exchange_layouts(false);
     check_scalar_exchange_layouts(true);
@@ -1236,6 +1380,7 @@ int main() {
     }
     if (cuda_device_available()) {
       check_cuda_nuclear_only_derivatives();
+      check_cuda_g_one_electron_derivatives();
       for (std::size_t a : {1U, 2U, 5U}) {
         // Unequal dimensions and nonsymmetric A/D expose any accidental AO
         // transpose in the flattened resident contraction. Physical integral

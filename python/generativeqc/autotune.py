@@ -109,6 +109,7 @@ def _source_identity_paths(source: Path) -> tuple[Path, ...]:
                 candidate
                 for candidate in directory.rglob(pattern.as_posix())
                 if candidate.is_file()
+                and "__pycache__" not in candidate.relative_to(directory).parts
             )
 
     for index, value in enumerate(files):

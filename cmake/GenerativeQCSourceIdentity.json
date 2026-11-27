@@ -162,6 +162,7 @@
     "tools/generate_gfn2_sdq_native.py",
     "tools/generate_gfn2_spin_native.py",
     "tools/generate_integral_ad.py",
+    "tools/generate_canonical_frame_cuda.py",
     "tools/generate_matrix_function_cuda.py",
     "tools/generate_matrix_product_cuda.py",
     "tools/generate_md_j_engine.py",
