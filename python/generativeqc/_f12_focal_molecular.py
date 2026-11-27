@@ -20,6 +20,7 @@ from ._f12_focal_cc_sources import (
     FocalUCCFixedSources,
     molecular_ucc_sources,
 )
+from ._f12_focal_cv import FocalDeltaCVResult, molecular_delta_cv_mp2_energy, molecular_delta_cv_mp2_energy_and_forces
 from ._f12_focal_energy import (
     FocalLowOrderEnergy,
     FocalLowOrderForces,
@@ -658,6 +659,23 @@ class MolecularFocalProvider:
             include_occupied_partitions=include_occupied_partitions,
             reference=reference,
         )
+
+
+    def delta_cv_mp2_energy(
+        self,
+        request_cv: FocalRequest,
+        request_fc: FocalRequest | None = None,
+    ) -> FocalDeltaCVResult:
+        """Return pure conventional DF-MP2 additive core-valence energy (zero CABS, zero F12)."""
+        return molecular_delta_cv_mp2_energy(self, request_cv, request_fc)
+
+    def delta_cv_mp2_energy_and_forces(
+        self,
+        request_cv: FocalRequest,
+        request_fc: FocalRequest | None = None,
+    ) -> FocalDeltaCVResult:
+        """Return pure conventional DF-MP2 additive core-valence energy and analytic 3N forces."""
+        return molecular_delta_cv_mp2_energy_and_forces(self, request_cv, request_fc)
 
 
     def _cached_pair_sources(

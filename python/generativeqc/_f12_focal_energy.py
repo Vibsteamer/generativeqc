@@ -127,6 +127,7 @@ def _ordinary_energies(
     import numpy as np
 
     from ._f12_cphf_relax_native import resolve_cphf_relax, run_whiten_3c_native
+    from ._f12_cv_dfmp2_native import bind_delta_cv_native
     from ._f12_mp2_pair_native import (
         aot_mp2f12_disabled,
         bind_ordinary_df_mp2,
@@ -181,6 +182,13 @@ def _ordinary_energies(
             )[0]
 
     use_aot_factors = not aot_mp2f12_disabled()
+    aot_cv = (
+        bind_delta_cv_native(  # type: ignore[arg-type]
+            shell_library, host_reference=not is_cuda, budget_bytes=budget_mib << 20
+        )
+        if use_aot_factors and shell_library is not None
+        else None
+    )
     whiten_fn = (
         resolve_cphf_relax(
             shell_library,  # type: ignore[arg-type]
@@ -188,7 +196,7 @@ def _ordinary_energies(
             fallback_library=response_library,  # type: ignore[arg-type]
             host_reference=not is_cuda,
         )
-        if use_aot_factors
+        if use_aot_factors and aot_cv is None
         else None
     )
 
@@ -210,7 +218,12 @@ def _ordinary_energies(
         c_mat = reference.coefficients[k]
         co = np.ascontiguousarray(c_mat[:, f:occ], dtype=np.float64)
         cv = np.ascontiguousarray(c_mat[:, occ:], dtype=np.float64)
-        if whiten_fn is not None:
+        if aot_cv is not None:
+            b = aot_cv.run_mp2_factors_fwd(
+                source.three_center, source.whitener, co, cv
+            )
+            used_aot_b = True
+        elif whiten_fn is not None:
             raw_ia = np.einsum(
                 "Auv,ui,va->Aia",
                 source.three_center,

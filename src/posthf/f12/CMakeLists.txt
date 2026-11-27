@@ -13,6 +13,7 @@ set(shell_sources
     f12_pair_pullback_cuda.cu
     f12_ao_mo_project_cuda.cu
     f12_mp2_pair_response_cuda.cu
+    f12_dfmp2_cv_cuda.cu
     f12_spin_fock_1e_cuda.cu
     f12_cphf_relax_cuda.cu
     f12_ext_fock_cuda.cu

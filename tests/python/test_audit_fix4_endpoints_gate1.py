@@ -13,12 +13,20 @@ import numpy as np
 import pytest
 
 from generativeqc import Atom, Primitive, Shell
+from generativeqc._f12_focal_cv import (
+    _paired_cv_fc_mp2_requests,
+    _paired_cv_fc_requests,
+    _solve_df_reference_from_focal_sources,
+    conventional_mp2_request,
+    default_valence_correlation_space_id,
+)
 from generativeqc._f12_focal_molecular import (
     MolecularFocalProvider,
 )
 from generativeqc._f12_focal_rcc_f12b import spatial_rhf_ccsdf12b_v1
 from generativeqc._f12_focal_reference import (
     FocalReference,
+    FocalReferenceSeed,
 )
 from generativeqc._f12_focal_tplus_sources import FocalOccupiedTriples, OccupiedMP2F12
 from generativeqc._f12_ram_hygiene import (
@@ -501,6 +509,214 @@ def test_m11_hybrid_phase_disclosure_and_strict_gpu_only_guard(
             "full_rank_cabs_overlap_bar",
             requested_backend="cuda",
             detail="Ozaki-4 host full-rank CABS overlap bar",
+        )
+
+
+# ---------------------------------------------------------------------------
+# M13 + M14 + M21: Delta-CV Br/I FC9 Default, Narrow ECP Fallback, H2 None Abs
+# ---------------------------------------------------------------------------
+
+
+def test_m13_delta_cv_default_valence_space_bri_fc9_vs_light() -> None:
+    """Verify omitted request_fc resolves frozen-core-spd (FC9) for Br/I ECP10/28 and frozen-core otherwise."""
+    dummy_ecp = json.dumps(
+        [
+            {
+                "ecp_type": "scalar_ecp",
+                "angular_momentum": [0],
+                "r_exponents": [0],
+                "gaussian_exponents": ["1.0"],
+                "coefficients": [["1.0"]],
+            }
+        ]
+    )
+    h_eb = ElementBasis(1, (_shell(0, (1.0,), (1.0,)),))
+    o_eb = ElementBasis(8, (_shell(0, (1.0,), (1.0,)),))
+    br_eb = ElementBasis(35, (_shell(0, (1.0,), (1.0,)),), ecp_core_electrons=10, ecp_data=dummy_ecp)
+    i_eb = ElementBasis(53, (_shell(0, (1.0,), (1.0,)),), ecp_core_electrons=28, ecp_data=dummy_ecp)
+    orb = _make_basis("m13-orb", (h_eb, o_eb, br_eb, i_eb))
+    fb = FocalBasis(2, "m13", orb, jk_fit=orb, mp2_fit=orb, f12_fit=orb, cabs=orb, beta=1.0)
+
+    for sym in ("Br", "I"):
+        atoms = [(sym, (0.0, 0.0, 0.0)), ("H", (0.0, 0.0, 2.7))]
+        r_cv = next(
+            r
+            for r, _ in plan_singlepoint(
+                atoms,
+                FocalSeries(fb),
+                FocalSeries(fb),
+                None,
+                root_id="rhf",
+                correlation_space_id="cv-active",
+                backend="cpu_reference",
+            ).steps
+            if r.role == "mp2_f12_correlation"
+        )
+        assert default_valence_correlation_space_id(r_cv) == "frozen-core-spd"
+        _, r_fc_f12 = _paired_cv_fc_requests(r_cv, None)
+        assert r_fc_f12.correlation_space_id == "frozen-core-spd"
+
+        r_cv_mp2 = conventional_mp2_request(
+            atoms, fb, root_id="rhf", correlation_space_id="cv-active", backend="cpu_reference"
+        )
+        _, r_fc_mp2 = _paired_cv_fc_mp2_requests(r_cv_mp2, None)
+        assert r_fc_mp2.correlation_space_id == "frozen-core-spd"
+
+    r_h2o = conventional_mp2_request(
+        [("O", (0.0, 0.0, 0.0)), ("H", (0.0, 1.4, 1.1)), ("H", (0.0, -1.4, 1.1))],
+        fb,
+        root_id="rhf",
+        correlation_space_id="cv-active",
+        backend="cpu_reference",
+    )
+    assert default_valence_correlation_space_id(r_h2o) == "frozen-core"
+    _, r_fc_h2o = _paired_cv_fc_mp2_requests(r_h2o, None)
+    assert r_fc_h2o.correlation_space_id == "frozen-core"
+
+
+def test_m14_narrow_ecp_fallback_and_strict_seed_checks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify unsupported ECP/spin states NEVER fall back and fallback SCF enforces exact seed checks."""
+    from generativeqc import _f12_focal_cv as cv_mod
+
+    dummy_ecp = json.dumps(
+        [
+            {
+                "ecp_type": "scalar_ecp",
+                "angular_momentum": [0],
+                "r_exponents": [0],
+                "gaussian_exponents": ["1.0"],
+                "coefficients": [["1.0"]],
+            }
+        ]
+    )
+    h_eb = ElementBasis(1, (_shell(0, (1.0,), (1.0,)),))
+    br_sf_eb = ElementBasis(
+        35,
+        (_shell(0, (1.0,), (1.0,)), _shell(3, (0.5,), (1.0,))),
+        ecp_core_electrons=10,
+        ecp_data=dummy_ecp,
+    )
+    orb_sf = _make_basis("m14-hbr-sf", (h_eb, br_sf_eb))
+    br_fit_eb = ElementBasis(35, (_shell(0, (1.0,), (1.0,)), _shell(3, (0.5,), (1.0,))))
+    jk_sf = _make_basis("m14-hbr-jk", (h_eb, br_fit_eb))
+    fb_sf = FocalBasis(2, "m14-sf", orb_sf, jk_fit=jk_sf, mp2_fit=jk_sf)
+    # Audit counterexample: neutral HBr, ECP10MDF, UHF triplet (mult=3), s-f orbitals!
+    req_triplet = conventional_mp2_request(
+        [("Br", (0.0, 0.0, 0.0)), ("H", (0.0, 0.0, 2.7))],
+        fb_sf,
+        root_id="uhf",
+        correlation_space_id="cv-active",
+        charge=0,
+        multiplicity=3,
+        backend="cuda",
+    )
+
+    def boom_fallback(*_a, **_kw):
+        raise AssertionError("Unsupported ECP triplet must NEVER reach focal-source DF-HF fallback")
+
+    from generativeqc import _f12_cv_dfmp2_native as cv_nat_mod
+
+    monkeypatch.setattr(cv_nat_mod, "bind_delta_cv_native", lambda *_a, **_kw: None)
+    monkeypatch.setattr(cv_mod, "_solve_df_reference_from_focal_sources", boom_fallback)
+    prov_cuda = MolecularFocalProvider(
+        shell_library=Path("unused.so"),
+        metric_library=Path("unused.so"),
+        response_library=object(),  # type: ignore[arg-type]
+        run=lambda *a: None,
+    )
+    with pytest.raises(NotImplementedError, match="fitted HF ECP domain"):
+        prov_cuda.delta_cv_mp2_energy(req_triplet)
+
+    with pytest.raises(NotImplementedError, match="fitted HF ECP domain"):
+        prov_cuda.delta_cv_mp2_energy_and_forces(req_triplet)
+
+    # An in-domain high-angular basis does not authorize a different algorithm
+    # when the unavailable operation is, for example, spin-root transport.
+    g_orb = _make_basis("m14-high-l", (ElementBasis(1, (_shell(4, (1.0,), (1.0,)),)),))
+    high_l_req = conventional_mp2_request(
+        [("H", (0., 0., 0.)), ("H", (0., 0., 1.4))],
+        FocalBasis(2, "m14-high-l", g_orb, jk_fit=g_orb, mp2_fit=g_orb),
+        root_id="rhf", correlation_space_id="cv-active", backend="cuda",
+    )
+    orbital_reason = (
+        "orbital atom 0 Z=1 shell 0 contraction 0 l=4: "
+        "cuda/df_three_center derivative 0 supports only l<=3"
+    )
+    assert cv_mod._is_eligible_for_focal_source_df_hf_fallback(
+        high_l_req, NotImplementedError(orbital_reason)
+    )
+    for reason in ("spin-root transport unavailable", orbital_reason + "; seed unavailable"):
+        assert not cv_mod._is_eligible_for_focal_source_df_hf_fallback(
+            high_l_req, NotImplementedError(reason)
+        )
+
+    # Verify _solve_df_reference_from_focal_sources rejects wrong-basis/wrong-state seed of same shape!
+    orb_h2 = _make_basis("m14-h2", (ElementBasis(1, (_shell(0, (1.5,), (1.0,)), _shell(0, (0.3,), (1.0,)))),))
+    fb_a = FocalBasis(2, "m14-a", orb_h2, jk_fit=orb_h2, mp2_fit=orb_h2)
+    orb_h2_b = _make_basis("m14-h2-b", (ElementBasis(1, (_shell(0, (1.6,), (1.0,)), _shell(0, (0.3,), (1.0,)))),))
+    fb_b = FocalBasis(2, "m14-b", orb_h2_b, jk_fit=orb_h2_b, mp2_fit=orb_h2_b)
+    atoms_h2 = [("H", (0.0, 0.0, 0.0)), ("H", (0.0, 0.0, 1.4))]
+    req_a = conventional_mp2_request(atoms_h2, fb_a, root_id="rhf", correlation_space_id="cv-active", backend="cpu_reference")
+    req_b = conventional_mp2_request(atoms_h2, fb_b, root_id="rhf", correlation_space_id="cv-active", backend="cpu_reference")
+    ref_b = _dummy_reference(req_b, n=4, occupied=(1,))
+    seed_b = FocalReferenceSeed(req_b, ref_b)
+    prov_seeded = MolecularFocalProvider(shell_library=Path("unused.so"), reference_seed=seed_b)
+    one_dummy = SimpleNamespace(overlap=np.eye(4), hcore=-np.eye(4))
+    jk_dummy = SimpleNamespace(data={"ao_coulomb": np.zeros((2, 4, 4))}, whitener=np.eye(2))
+    with pytest.raises(ValueError, match="identical OBS and JKFit"):
+        _solve_df_reference_from_focal_sources(prov_seeded, req_a, one_dummy, jk_dummy, run=lambda *a: None, seed=seed_b)
+
+
+def test_m14_displaced_seed_uses_overlap_normalized_spin_density(monkeypatch) -> None:
+    from generativeqc import _f12_cv_dfmp2_native as native
+    from generativeqc import overlap
+
+    basis = _compact_h2o_split_basis(split_mp2=False)
+
+    def request(distance):
+        return conventional_mp2_request(
+            [("H", (0., 0., 0.)), ("H", (0., 0., distance))], basis,
+            root_id="rhf", correlation_space_id="cv-active", backend="cpu_reference",
+        )
+
+    src, target = request(1.4), request(1.4002)
+    metric = np.diag([4., 2., 1., 1.])
+    coeff = np.diag([.5, 2.**-.5, 1., 1.])
+    expected_density = 2. * np.outer(coeff[:, 0], coeff[:, 0])
+    seed = FocalReferenceSeed(src, replace(
+        _dummy_reference(src, n=4, occupied=(1,)),
+        overlap=metric, coefficients=coeff[None, :, :],
+    ))
+    monkeypatch.setattr(overlap, "cross_overlap", lambda *a, **kw: metric)
+
+    def checked_fock(_b, density, ca, _cb, **kwargs):
+        np.testing.assert_allclose(density, expected_density, atol=1e-13)
+        np.testing.assert_allclose(ca.T @ metric @ ca, [[1.]], atol=1e-13)
+        return np.zeros_like(metric), np.zeros_like(metric), None
+
+    monkeypatch.setattr(native, "bind_delta_cv_native", lambda *a, **kw: SimpleNamespace(
+        run_df_jk_fock=checked_fock, host_reference=True
+    ))
+    ref = _solve_df_reference_from_focal_sources(
+        MolecularFocalProvider(shell_library=Path("unused.so")), target,
+        SimpleNamespace(overlap=metric, hcore=np.diag([-8., 0., 1., 2.])),
+        SimpleNamespace(data={"ao_coulomb": np.zeros((1, 4, 4))}, whitener=np.eye(1)),
+        run=None, seed=seed,
+    )
+    assert ref.occupied_overlaps == pytest.approx((1.,))
+    assert ref.execution_mode == "cpu_reference"
+
+    invalid_center = FocalReferenceSeed(target, replace(
+        seed.reference, surface_id=target.surface_id, coefficients=np.eye(4)[None, :, :]
+    ))
+    with pytest.raises(ValueError, match="orthonormal"):
+        _solve_df_reference_from_focal_sources(
+            MolecularFocalProvider(shell_library=Path("unused.so")), target,
+            SimpleNamespace(overlap=metric, hcore=np.diag([-8., 0., 1., 2.])),
+            SimpleNamespace(data={"ao_coulomb": np.zeros((1, 4, 4))}, whitener=np.eye(1)),
+            run=None, seed=invalid_center,
         )
 
 

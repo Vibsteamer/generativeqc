@@ -15,6 +15,8 @@ Covers:
 """
 
 from __future__ import annotations
+
+import ctypes as ct
 import hashlib
 import json
 import os
@@ -42,6 +44,7 @@ from generativeqc._f12_ao_mo_native import (
     run_coulomb_fit_fwd,
     run_coulomb_fit_rev,
 )
+from generativeqc._f12_cv_dfmp2_native import bind_delta_cv_native
 from generativeqc._f12_mp2_pair_native import (
     bind_mp2_f12_pair_energies,
     bind_mp2_f12_pair_response,
@@ -52,6 +55,13 @@ from generativeqc._f12_mp2_pair_native import (
 )
 
 REPO = Path(__file__).resolve().parents[2]
+_D_PTR = ct.POINTER(ct.c_double)
+
+
+def _dptr(arr: np.ndarray | None):
+    if arr is None or arr.size == 0:
+        return ct.cast(0, _D_PTR)
+    return arr.ctypes.data_as(_D_PTR)
 
 
 @pytest.fixture(scope="module")
@@ -63,6 +73,7 @@ def host_sink(tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureR
     units = (
         "src/posthf/f12/f12_ao_mo_project_cuda.cu",
         "src/posthf/f12/f12_mp2_pair_response_cuda.cu",
+        "src/posthf/f12/f12_dfmp2_cv_cuda.cu",
     )
     output = tmp_path_factory.mktemp("audit_host") / "libaudit_host_fixture.so"
     compiler = request.getfixturevalue("required_native_cxx")
@@ -631,6 +642,43 @@ def test_m8_ao_mo_and_cabs_fail_closed_on_overflow_to_inf(host_sink: Path):
             trial_a=np.array([[2.0]], dtype=np.float64),
             trial_b=None,
         )
+
+
+def test_m8_dfmp2_cv_fail_closed_nan_inputs_and_overflow_outputs(host_sink: Path):
+    """Delta-CV host reference fails closed on NaN inputs (even with 0 multipliers) and Inf outputs."""
+    cv = bind_delta_cv_native(host_sink, host_reference=True)
+    assert cv is not None
+
+    # 1. NaN in B_jk with D_tot == 0 and oa == 0 must STILL return status 1 (not silently 0!)
+    B_nan = np.array([[[np.nan, 0.0], [0.0, 1.0]]], dtype=np.float64)
+    D_zero = np.zeros((2, 2), dtype=np.float64)
+    J = np.zeros((2, 2), dtype=np.float64)
+    Ka = np.zeros((2, 2), dtype=np.float64)
+    rc = cv.df_jk_fock(
+        1, 2, 0, 0, 1, 1, 0,
+        _dptr(B_nan), _dptr(D_zero), _dptr(None), _dptr(None),
+        _dptr(J), _dptr(Ka), _dptr(None),
+    )
+    assert rc == 1
+
+    # 2. Finite overflow in mp2_factors_fwd -> status 2 (non-finite output)
+    ao_big = np.array([[[1e200, 0.0], [0.0, 1e200]]], dtype=np.float64)
+    W_big = np.array([[1e200]], dtype=np.float64)
+    co = np.array([[1.0], [0.0]], dtype=np.float64)
+    cv_mat = np.array([[0.0], [1.0]], dtype=np.float64)
+    B_out = np.zeros((1, 1, 1), dtype=np.float64)
+    rc2 = cv.mp2_factors_fwd(
+        1, 2, 1, 1, 1, 0,
+        _dptr(ao_big), _dptr(W_big), _dptr(co), _dptr(cv_mat), _dptr(B_out),
+    )
+    # 0 * 1e200 = 0 on off-diag; use non-zero co/cv overlap to produce Inf
+    co2 = np.array([[1.0], [1.0]], dtype=np.float64)
+    cv2 = np.array([[1.0], [1.0]], dtype=np.float64)
+    rc2 = cv.mp2_factors_fwd(
+        1, 2, 1, 1, 1, 0,
+        _dptr(ao_big), _dptr(W_big), _dptr(co2), _dptr(cv2), _dptr(B_out),
+    )
+    assert rc2 == 2
 
 
 def test_m8_mp2_pair_and_ordinary_mp2_fail_closed_overflow_and_nan(host_sink: Path):

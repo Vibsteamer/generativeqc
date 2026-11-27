@@ -28,6 +28,14 @@
     gqc_f12_coulomb_fit_rev_cuda;
     gqc_f12_cphf_action_cuda;
     gqc_f12_cphf_whiten_3c_cuda;
+    gqc_f12_cv_cphf_matvec_cuda;
+    gqc_f12_cv_df_jk_fock_cuda;
+    gqc_f12_cv_jk_fock_pullback_cuda;
+    gqc_f12_cv_jk_mo_fock_fwd_cuda;
+    gqc_f12_cv_mp2_factors_fwd_cuda;
+    gqc_f12_cv_mp2_factors_rev_cuda;
+    gqc_f12_cv_mp2_pairs_cuda;
+    gqc_f12_cv_nuclear_source_weights_cuda;
     gqc_f12_df_canonical_driver_cuda;
     gqc_f12_df_nuclear_weights_cuda;
     gqc_f12_ext_fock_congruence_rev_cuda;
