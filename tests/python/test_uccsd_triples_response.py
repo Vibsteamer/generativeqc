@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import numpy as np
 import pytest
+from generativeqc._ucc.native_tensor_cpu import NativeCCTensorExecutor
 from generativeqc_compiler.cc.uccsd_layout import BLOCK_NAMES, UCCSDLayout
 from generativeqc_compiler.cc.uccsd_triples import (
     CHANNELS,
@@ -32,7 +33,6 @@ from test_uccsd_t_owner import (
 from test_uccsd_t_owner import small_parent as _small_parent
 from test_uccsd_triples import _tile_feeds
 
-from tools.generativeqc_cc.native_tensor_cpu import NativeCCTensorExecutor
 from tools.generativeqc_cc.solver import SolverOptions
 from tools.generativeqc_cc.uccsd_solver import PreparedUCCSD
 from tools.generativeqc_cc.uccsd_t import PreparedUCCSDT, UCCSDTOptions
@@ -525,10 +525,9 @@ def test_empty_response_domains_publish_exact_zero(nmo: int, oa: int, ob: int) -
 def test_real_cuda_all_source_derivatives_against_independent_triangular_oracle(
     channel: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from generativeqc._ucc.native_tensor_cuda import CudaCCTensorExecutor
     from generativeqc_compiler.common.cuda_adapter import CudaCompilerAdapter
     from generativeqc_compiler.common.cuda_target import cuda_target_info
-
-    from tools.generativeqc_cc.native_tensor_cuda import CudaCCTensorExecutor
 
     assert os.environ.get("SLURM_JOB_ID")
     compiler = CudaCompilerAdapter(
@@ -561,10 +560,9 @@ def test_real_cuda_all_source_derivatives_against_independent_triangular_oracle(
 def test_complete_cuda_response_has_no_cpu_equation_fallback(
     atom: str, spin: int, broken: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from generativeqc._ucc.native_tensor_cuda import CudaCCTensorExecutor
     from generativeqc_compiler.common.cuda_adapter import CudaCompilerAdapter
     from generativeqc_compiler.common.cuda_target import cuda_target_info
-
-    from tools.generativeqc_cc.native_tensor_cuda import CudaCCTensorExecutor
     from tools.generativeqc_posthf.cuda import compile_cuda
 
     assert os.environ.get("SLURM_JOB_ID")

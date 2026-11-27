@@ -143,6 +143,11 @@ function(generativeqc_add_posthf_cc_sources target)
       src/cc/lambda_response_cuda.cu
       src/cc/triples_response_cuda.cu
       src/cc/triples_fock_response_cuda.cu
+      src/cc/df_ucc_v2_source_cuda.cu
+      src/cc/df_ucc_v2_ccsd_cuda.cu
+      src/cc/df_ucc_v2_triples_cuda.cu
+      src/cc/df_ucc_v2_lambda_cuda.cu
+      src/cc/df_ucc_v2_cuda.cu
       src/posthf/df_bridge.cu
       src/posthf/cabs_singles_cuda.cu
       src/posthf/cabs_projector_cuda.cu
@@ -427,6 +432,11 @@ function(generativeqc_add_cpu_component_object_targets target)
       src/cc/rccsdt_force.cpp
       src/cc/uccsd_solver.cpp
       src/cc/uccsd_force.cpp
+      src/cc/df_ucc_v2_source.cpp
+      src/cc/df_ucc_v2_ccsd.cpp
+      src/cc/df_ucc_v2_triples.cpp
+      src/cc/df_ucc_v2_lambda.cpp
+      src/cc/df_ucc_v2.cpp
       src/posthf/mp2_derivative_common.cpp
       src/posthf/mp2_derivative_cpu.cpp
       src/posthf/mp2_energy.cpp

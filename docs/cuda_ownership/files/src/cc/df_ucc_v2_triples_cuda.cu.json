@@ -1,0 +1,20 @@
+{
+  "path": "src/cc/df_ucc_v2_triples_cuda.cu",
+  "reason": "Builds same- and mixed-spin triples moments, denominators and Fock response for the aaa, aab, abb and bbb channels. The occupied response contracts paged X/Y blocks.",
+  "regions": [
+    {
+      "start": "void gemm_counted",
+      "stop": "void build_ovvv_slab_device",
+      "role": "runtime",
+      "reason": "Counts cuBLAS operations and gathers or scatters fixed-occupied B(ov) slices."
+    },
+    {
+      "start": "__global__ void scale_copy_kernel",
+      "stop": "// --- Paged X/Y off-diagonal",
+      "role": "runtime",
+      "reason": "Scales elements, checks workspace headroom and stages occupied response contributions through an existing allocation."
+    }
+  ],
+  "role": "scientific",
+  "subsystem": "focal_cc"
+}

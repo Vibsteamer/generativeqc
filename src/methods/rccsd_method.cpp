@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "cc/df_source.hpp"
+#include "cc/f12_fixed_cusp.hpp"
 #include "cc/rccsdt_force.hpp"
 #include "cc/reference_input.hpp"
 #include "cc/solver.hpp"
@@ -178,7 +179,8 @@ cc::Problem build_problem(
     const core::System* correlation_auxiliary = nullptr,
     cc::DFSourceResult* retained_df_response = nullptr,
     const scf::cuda_execution::CudaDfSourcePolicy* correlation_policy = nullptr,
-    bool df_mp2_mode = false, std::shared_ptr<hf::DFReference> shared_reference = {}) {
+    bool df_mp2_mode = false, std::shared_ptr<hf::DFReference> shared_reference = {},
+    std::size_t frozen_occupied = 0, const cc::FixedCuspF12* f12 = nullptr) {
   // A failed optional source may already have performed real work. Preserve
   // cumulative diagnostics, but validate the compiler schedule for this attempt.
   const auto initial_work = provider_work;
@@ -186,8 +188,14 @@ cc::Problem build_problem(
   // reference. The HF owner remains alive in RccsdNativeState; conventional
   // AO and optional CUDA DF source adapters still use that physical owner.
   const auto canonical = cc::prepare_canonical_reference_input(ref.electronic_reference());
+  if (frozen_occupied >= canonical.occupied)
+    throw std::invalid_argument("frozen_occupied must be strictly less than occupied count");
+  if (frozen_occupied > 0 && !correlation_auxiliary)
+    throw MethodError(GENERATIVEQC_STATUS_NOT_IMPLEMENTED,
+                      "frozen-core RCCSD requires native CUDA density fitting");
   cc::Problem p;
-  p.nocc = canonical.occupied;
+  const auto o_full = canonical.occupied;
+  p.nocc = o_full - frozen_occupied;
   p.reference_retained_bytes = retained_reference_bytes(ref);
   p.nvir = canonical.virtuals;
   p.reference_energy = canonical.reference_energy;
@@ -197,24 +205,33 @@ cc::Problem build_problem(
   p.fov.resize(o * v);
   p.fvv.resize(v * v);
   for (std::size_t i = 0; i < o; ++i) {
-    for (std::size_t j = 0; j < o; ++j) p.foo[i * o + j] = fmo[i * n + j];
-    for (std::size_t a = 0; a < v; ++a) p.fov[i * v + a] = fmo[i * n + o + a];
+    for (std::size_t j = 0; j < o; ++j)
+      p.foo[i * o + j] = fmo[(frozen_occupied + i) * n + (frozen_occupied + j)];
+    for (std::size_t a = 0; a < v; ++a)
+      p.fov[i * v + a] = fmo[(frozen_occupied + i) * n + o_full + a];
   }
   for (std::size_t a = 0; a < v; ++a)
-    for (std::size_t b = 0; b < v; ++b) p.fvv[a * v + b] = fmo[(o + a) * n + o + b];
+    for (std::size_t b = 0; b < v; ++b)
+      p.fvv[a * v + b] = fmo[(o_full + a) * n + o_full + b];
+
+  std::vector<double> active_eps;
+  active_eps.reserve(o + v);
+  active_eps.insert(active_eps.end(),
+                    canonical.orbital_energies.begin() + static_cast<std::ptrdiff_t>(frozen_occupied),
+                    canonical.orbital_energies.end());
 
   const auto n2 = o * o * v * v;
   if (df_mp2_mode) {
     // MP2 differentiates the physical spectrum, not CC preconditioners or
     // initial amplitudes. No doubles-sized denominator is retained here.
-    p.canonical_eps.assign(canonical.orbital_energies.begin(), canonical.orbital_energies.end());
+    p.canonical_eps = active_eps;
     p.minimum_absolute_denominator =
         2 * (*std::min_element(p.canonical_eps.begin() + o, p.canonical_eps.end()) -
              *std::max_element(p.canonical_eps.begin(), p.canonical_eps.begin() + o));
     if (p.minimum_absolute_denominator < options.denominator_threshold)
       throw std::runtime_error("DF-MP2 occupied/virtual denominator gap is too small");
   } else {
-    cc::initialize_canonical_denominators(p, canonical.orbital_energies, options,
+    cc::initialize_canonical_denominators(p, active_eps, options,
                                           cuda && options.derived_denominators);
   }
   if (correlation_auxiliary) {
@@ -227,10 +244,13 @@ cc::Problem build_problem(
       caller_elements = posthf::checked_add(caller_elements, values->capacity());
     // The DF builder already charges the caller's original orbital/auxiliary
     // systems. No compatibility RawSource or duplicate AO expansion is needed.
-    const auto caller_bytes = posthf::checked_mul(caller_elements, sizeof(double));
+    auto caller_bytes = posthf::checked_mul(caller_elements, sizeof(double));
+    if (f12 && f12->active())
+      caller_bytes = posthf::checked_add(caller_bytes, cc::f12::host_bytes(*f12));
     auto fitted = cc::build_df_source_cuda(
         system, *correlation_auxiliary, ref, options.max_bytes, 1e-10, device, caller_bytes,
-        retained_df_response != nullptr, correlation_policy, df_mp2_mode, shared_reference);
+        retained_df_response != nullptr, correlation_policy, df_mp2_mode, shared_reference,
+        frozen_occupied);
     attach_df_source(p, std::move(fitted), provider_work, provider_metrics);
     if (retained_df_response) {
       p.reference_retained_bytes = posthf::checked_add(
@@ -350,18 +370,44 @@ cc::Problem build_problem(
   }
 
   if (df_mp2_mode) return p;
+  if (f12 && f12->active()) {
+    cc::f12::validate(o, v, *f12);
+    p.f12.w_vo = f12->w_vo;
+    p.f12.w_vv = cc::f12::symmetrized_pair_copy(o, v, f12->w_vv);
+    p.f12.c_f12 = cc::f12::symmetrized_pair_copy(o, v, f12->c_f12);
+    p.f12.fixed_geminal_energy = f12->fixed_geminal_energy;
+  }
   p.initial_t1.assign(o * v, 0.0);
   p.initial_t2.resize(n2);
-  for (std::size_t i = 0; i < o; ++i)
-    for (std::size_t j = 0; j < o; ++j)
-      for (std::size_t a = 0; a < v; ++a)
-        for (std::size_t b = 0; b < v; ++b) {
-          const auto t = ((i * o + j) * v + a) * v + b;
-          const auto g = ((i * v + a) * o + j) * v + b;
-          p.initial_t2[t] = p.ovov[g] / cc::doubles_denominator_at(p, t);
-          if (!std::isfinite(p.initial_t2[t]))
-            throw std::runtime_error("nonfinite RCCSD MP2-like initial amplitude");
-        }
+  if (p.f12.active()) {
+    for (std::size_t i = 0; i < o; ++i)
+      for (std::size_t j = 0; j < o; ++j)
+        for (std::size_t a = 0; a < v; ++a)
+          for (std::size_t b = 0; b < v; ++b) {
+            const auto t = ((i * o + j) * v + a) * v + b;
+            const auto mate = ((j * o + i) * v + b) * v + a;
+            if (t > mate) continue;
+            const auto g = ((i * v + a) * o + j) * v + b;
+            const auto g_mate = ((j * v + b) * o + i) * v + a;
+            const double num =
+                0.5 * (p.ovov[g] + p.ovov[g_mate]) + p.f12.w_vv[t] + p.f12.c_f12[t];
+            const double val = num / cc::doubles_denominator_at(p, t);
+            if (!std::isfinite(val))
+              throw std::runtime_error("nonfinite RCCSD-F12b MP2-like initial amplitude");
+            p.initial_t2[t] = p.initial_t2[mate] = val;
+          }
+  } else {
+    for (std::size_t i = 0; i < o; ++i)
+      for (std::size_t j = 0; j < o; ++j)
+        for (std::size_t a = 0; a < v; ++a)
+          for (std::size_t b = 0; b < v; ++b) {
+            const auto t = ((i * o + j) * v + a) * v + b;
+            const auto g = ((i * v + a) * o + j) * v + b;
+            p.initial_t2[t] = p.ovov[g] / cc::doubles_denominator_at(p, t);
+            if (!std::isfinite(p.initial_t2[t]))
+              throw std::runtime_error("nonfinite RCCSD MP2-like initial amplitude");
+          }
+  }
   return p;
 }
 
@@ -374,7 +420,9 @@ RccsdNativeState execute_rccsd_prepared(
     const core::System* correlation_auxiliary = nullptr, bool retain_df_response = false,
     const scf::cuda_execution::CudaDfSourcePolicy* correlation_policy = nullptr,
     scf::CudaRhfBucketPlan** cuda_reference_plan = nullptr, bool df_mp2_mode = false,
-    bool df_reference = false) {
+    bool df_reference = false,
+    const std::shared_ptr<const hf::PhysicalReference>& retained_reference = {},
+    std::size_t frozen_occupied = 0, const cc::FixedCuspF12* f12 = nullptr) {
   const char* allocation_stage = "HF reference";
   try {
     const bool cuda = execution.cuda_requested();
@@ -432,9 +480,21 @@ RccsdNativeState execute_rccsd_prepared(
       reference_plan_reused = false;
       return result;
     };
-    auto hf = warm_reference::solve_reference(initial_density, scf::FockSpin::Restricted,
-                                              warm_start_fallback, run_reference,
-                                              "HF did not converge; no RCCSD energy evaluated");
+    scf::ScfResult hf;
+    if (retained_reference) {
+      if (!cuda || !df_reference || !correlation_auxiliary || prepared_exact ||
+          cuda_reference_plan || df_mp2_mode || initial_density ||
+          retained_reference->nbf != molecule::ao_count(system) ||
+          retained_reference->nocc != static_cast<std::size_t>(system.electron_count / 2))
+        throw std::invalid_argument(
+            "retained RHF requires a matching spatial DF-CC target");
+      hf.reference = retained_reference;
+      hf.converged = true;
+    } else {
+      hf = warm_reference::solve_reference(initial_density, scf::FockSpin::Restricted,
+                                           warm_start_fallback, run_reference,
+                                           "HF did not converge; no RCCSD energy evaluated");
+    }
     const double reference_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - reference_started).count();
     const auto reference = hf.reference;
@@ -465,10 +525,13 @@ RccsdNativeState execute_rccsd_prepared(
     state.reference_density_rms = hf.density_rms;
     state.reference_iterations = static_cast<int>(hf.iterations);
     state.reference_work = hf.precision;
-    const auto o = reference->nocc;
-    state.eps_o.assign(reference->orbital_energies.begin(),
-                       reference->orbital_energies.begin() + static_cast<std::ptrdiff_t>(o));
-    state.eps_v.assign(reference->orbital_energies.begin() + static_cast<std::ptrdiff_t>(o),
+    const auto o_full = reference->nocc;
+    if (frozen_occupied >= o_full)
+      throw std::invalid_argument("RCCSD frozen_occupied must be strictly less than occupied count");
+    state.eps_o.assign(
+        reference->orbital_energies.begin() + static_cast<std::ptrdiff_t>(frozen_occupied),
+        reference->orbital_energies.begin() + static_cast<std::ptrdiff_t>(o_full));
+    state.eps_v.assign(reference->orbital_energies.begin() + static_cast<std::ptrdiff_t>(o_full),
                        reference->orbital_energies.end());
     posthf::ProviderWork provider_work;
     generativeqc_tensor::Metrics provider_metrics{};
@@ -499,7 +562,7 @@ RccsdNativeState execute_rccsd_prepared(
             build_problem(system, source, *reference, source_options, cuda, execution.device_id(),
                           provider_work, provider_metrics, correlation_auxiliary,
                           retain_df_response ? &state.df_source : nullptr, correlation_policy,
-                          df_mp2_mode, fitted_reference);
+                          df_mp2_mode, fitted_reference, frozen_occupied, f12);
         problem.reference_retained_bytes =
             posthf::checked_add(problem.reference_retained_bytes, retained_df);
         problem.provider_peak_bytes = posthf::checked_add(problem.provider_peak_bytes, retained_df);
@@ -974,8 +1037,10 @@ RccsdNativeState run_rccsd_native_state(
     bool retain_df_response, const cc::DFContractionQualification& qualification,
     scf::CudaRhfBucketPlan** cuda_reference_plan, std::size_t df_auxiliary_batch_limit,
     bool derived_denominators, bool packed_diis, std::optional<bool> df_mixed_precision,
-    double df_mixed_precision_switch_residual, bool df_mp2_mode, bool df_reference,
-    core::CorrelationConvergence convergence) {
+    double df_mixed_precision_switch_residual,     bool df_mp2_mode, bool df_reference,
+    core::CorrelationConvergence convergence,
+    const std::shared_ptr<const hf::PhysicalReference>& retained_reference,
+    std::size_t frozen_occupied, const cc::FixedCuspF12* f12) {
   validate_descriptor(descriptor, execution);
   if (retain_df_response && !correlation_auxiliary)
     throw MethodError(GENERATIVEQC_STATUS_INVALID_ARGUMENT,
@@ -1018,11 +1083,14 @@ RccsdNativeState run_rccsd_native_state(
   solver_options.derived_denominators = derived_denominators;
   solver_options.packed_diis = packed_diis;
   const auto nbf = molecule::ao_count(system);
-  const auto nocc = static_cast<std::size_t>(system.electron_count / 2);
+  const auto nocc_full = static_cast<std::size_t>(system.electron_count / 2);
+  if (frozen_occupied >= nocc_full)
+    throw std::invalid_argument("RCCSD frozen_occupied must be strictly less than occupied count");
+  const auto nocc = nocc_full - frozen_occupied;
   solver_options.df_mixed_precision =
       execution.cuda_requested() && correlation_auxiliary &&
-      df_mixed_precision.value_or(nbf > nocc &&
-                                  cc::default_df_ccsd_mixed_precision(nocc, nbf - nocc));
+      df_mixed_precision.value_or(nbf > nocc_full &&
+                                  cc::default_df_ccsd_mixed_precision(nocc, nbf - nocc_full));
   solver_options.df_mixed_precision_switch_residual = df_mixed_precision_switch_residual;
   // Retaining DF response inputs changes source lifetime, not the CC equations.
   // Every observed state and the independent final physical replay stay fresh.
@@ -1063,7 +1131,7 @@ RccsdNativeState run_rccsd_native_state(
       execution, system, reference, solver_options, reference_capacity, prepared_exact,
       initial_density, warm_start_fallback, prepared_exact_cache, correlation_auxiliary,
       retain_df_response, correlation_auxiliary ? &correlation_policy : nullptr,
-      cuda_reference_plan, df_mp2_mode, df_reference);
+      cuda_reference_plan, df_mp2_mode, df_reference, retained_reference, frozen_occupied, f12);
   state.external_reservation_bytes = external_reservation_bytes;
   state.diagnostic.numeric_capacity_bytes =
       posthf::checked_add(state.diagnostic.numeric_capacity_bytes, external_reservation_bytes);

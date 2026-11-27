@@ -22,6 +22,7 @@
 #include "cc/cuda_state.cuh"
 #include "cc/df_pair_projection.cuh"
 #include "cc/df_plan.hpp"
+#include "cc/f12_fixed_cusp_cuda.cuh"
 #include "generated_df_ccsd_core_cpu.hpp"
 #include "generated_df_ccsd_core_cuda.cuh"
 #include "generated_df_ccsd_cuda.cuh"
@@ -102,6 +103,7 @@ struct Layout {
   std::size_t df_arena_elements{};
   std::size_t df_paired_tau{}, df_pair_maxima{};
   std::array<std::size_t, 5> df_mixed_inputs{};
+  std::size_t f12_r1_const{}, f12_w_vo{}, f12_w_vv{}, f12_c_f12{}, f12_partials{}, f12_energy{};
 };
 
 std::size_t reserve(Layout& layout, std::size_t& cursor, std::size_t bytes) {
@@ -142,6 +144,10 @@ struct Owner {
   DFIterationPlan plan;
   double *df_bov{}, *df_bvv{}, *df_sum{};
   std::size_t naux{};
+  bool f12_active{};
+  double f12_fixed_energy{};
+  std::size_t f12_partial_blocks{};
+  double *f12_r1_const{}, *f12_w_vo{}, *f12_w_vv{}, *f12_c_f12{}, *f12_partials{}, *f12_energy{};
   double *last_t1{}, *last_t2{}, *vectors{}, *errors{}, *gram{}, *system{}, *coefficients{};
   double *r1_partials{}, *r2_partials{}, *scalars{};
   int *status{}, *arithmetic{};
@@ -185,6 +191,11 @@ struct Owner {
     }
     history_elements = packed ? checked_add(n1, checked_add(n2, n1) / 2) : elements;
     naux = p.naux;
+    f12_active = p.f12.active();
+    if (f12_active && !naux)
+      throw std::invalid_argument("CUDA RCCSD-F12b requires density-fitted virtual factors");
+    f12_fixed_energy = p.f12.fixed_geminal_energy;
+    f12_partial_blocks = f12_active ? f12_cuda::energy_partial_blocks(n2) : 0;
     conventional_prepared = !naux && generated::iteration_prepared_dimensions_fit(p.nocc, p.nvir);
     if (naux) {
       plan = options.qualification.ordered_iteration
@@ -241,6 +252,15 @@ struct Owner {
         if (plan.hoisted)
           layout.df_prepare =
               reserve(layout, cursor, checked_mul(plan.preparation, sizeof(double)));
+        if (f12_active) {
+          layout.f12_r1_const = reserve(layout, cursor, checked_mul(n1, sizeof(double)));
+          layout.f12_w_vo = reserve(layout, cursor, checked_mul(p.f12.w_vo.size(), sizeof(double)));
+          layout.f12_w_vv = reserve(layout, cursor, checked_mul(n2, sizeof(double)));
+          layout.f12_c_f12 = reserve(layout, cursor, checked_mul(n2, sizeof(double)));
+          layout.f12_partials =
+              reserve(layout, cursor, checked_mul(f12_partial_blocks, sizeof(double)));
+          layout.f12_energy = reserve(layout, cursor, sizeof(double));
+        }
       }
       layout.last_t1 = reserve(layout, cursor, checked_mul(n1, sizeof(double)));
       layout.last_t2 = reserve(layout, cursor, checked_mul(n2, sizeof(double)));
@@ -559,6 +579,27 @@ struct Owner {
         cuda_check(cudaMemcpyAsync(df_bvv, p.df_bvv.data(), p.df_bvv.size() * sizeof(double),
                                    cudaMemcpyHostToDevice, stream));
         diagnostic.setup_h2d_bytes += (p.df_bov.size() + p.df_bvv.size()) * sizeof(double);
+        if (f12_active) {
+          f12_r1_const = reinterpret_cast<double*>(base + layout.f12_r1_const);
+          f12_w_vo = reinterpret_cast<double*>(base + layout.f12_w_vo);
+          f12_w_vv = reinterpret_cast<double*>(base + layout.f12_w_vv);
+          f12_c_f12 = reinterpret_cast<double*>(base + layout.f12_c_f12);
+          f12_partials = reinterpret_cast<double*>(base + layout.f12_partials);
+          f12_energy = reinterpret_cast<double*>(base + layout.f12_energy);
+          cuda_check(cudaMemcpyAsync(f12_w_vo, p.f12.w_vo.data(),
+                                     p.f12.w_vo.size() * sizeof(double), cudaMemcpyHostToDevice,
+                                     stream));
+          cuda_check(cudaMemcpyAsync(f12_w_vv, p.f12.w_vv.data(), n2 * sizeof(double),
+                                     cudaMemcpyHostToDevice, stream));
+          cuda_check(cudaMemcpyAsync(f12_c_f12, p.f12.c_f12.data(), n2 * sizeof(double),
+                                     cudaMemcpyHostToDevice, stream));
+          cuda_check(cudaMemsetAsync(state.error, 0, sizeof(int), stream));
+          f12_cuda::launch_prepare_constants(p.nocc, p.nvir, f12_w_vo, f12_w_vv, f12_c_f12,
+                                             f12_r1_const, state.error, stream);
+          check_generated_error();
+          ++diagnostic.f12_cuda_preparations;
+          diagnostic.setup_h2d_bytes += (p.f12.w_vo.size() + 2 * n2) * sizeof(double);
+        }
         state.df_virtual_singles = df_sum;
         state.df_virtual_doubles = df_sum + n1;
         df_state.o = p.nocc;
@@ -932,6 +973,19 @@ struct Owner {
     return true;
   }
 
+  void add_f12_residuals() {
+    if (!f12_active) return;
+    f12_cuda::launch_add_residuals(state.o, state.v, f12_r1_const, f12_w_vo, f12_w_vv, f12_c_f12,
+                                   state.t1, df_sum, df_sum + n1, state.error, stream);
+  }
+
+  void add_f12_energy(const double* ord_energy) {
+    if (!f12_active) return;
+    f12_cuda::launch_add_energy(state.o, state.v, f12_r1_const, f12_w_vv, f12_c_f12, state.t1,
+                                state.t2, f12_fixed_energy, ord_energy, f12_partials,
+                                f12_partial_blocks, f12_energy, state.error, stream);
+  }
+
   generated::DeviceIterationOutputs iteration(double tolerance) {
     phase_observation::Scope observed_iteration(phase_observation::Site::q_iteration_inclusive,
                                                 diagnostic.iteration_graph_calls, naux);
@@ -1058,6 +1112,7 @@ struct Owner {
         }
       }
       cuda_check(cudaGetLastError());
+      add_f12_residuals();
       ++diagnostic.df_hoisted_evaluations;
       if (plan.contractions.has_value()) {
         // Every explicit transpose reads and writes its full tensor once.
@@ -1071,13 +1126,24 @@ struct Owner {
           diagnostic.df_contraction_terms, checked_add(plan.preparation_terms, plan.core_terms));
       phase_observation::Scope core(phase_observation::Site::ccsd_core_submission, 0, naux,
                                     reinterpret_cast<std::uintptr_t>(stream));
-      return generated::dfhoist::run_iteration_cuda(hoisted_state);
+      auto out = generated::dfhoist::run_iteration_cuda(hoisted_state);
+      if (f12_active) {
+        add_f12_energy(out.energy);
+        out.energy = f12_energy;
+      }
+      return out;
     }
     virtual_corrections();
+    add_f12_residuals();
     diagnostic.df_contraction_terms =
         checked_add(diagnostic.df_contraction_terms,
                     generated::dfhoist::fallback_core_contraction_terms(state.o, state.v));
-    return generated::dfcore::run_iteration_cuda(state);
+    auto out = generated::dfcore::run_iteration_cuda(state);
+    if (f12_active) {
+      add_f12_energy(out.energy);
+      out.energy = f12_energy;
+    }
+    return out;
   }
 
   generated::DeviceReplayOutputs replay() {
@@ -1085,10 +1151,16 @@ struct Owner {
                                              diagnostic.replay_graph_calls, naux);
     if (!naux) return generated::run_replay_cuda(state);
     virtual_corrections(true);
+    add_f12_residuals();
     diagnostic.df_contraction_terms =
         checked_add(diagnostic.df_contraction_terms,
                     generated::dfhoist::fallback_replay_contraction_terms(state.o, state.v));
-    return generated::dfcore::run_replay_cuda(state);
+    auto out = generated::dfcore::run_replay_cuda(state);
+    if (f12_active) {
+      add_f12_energy(out.energy);
+      out.energy = f12_energy;
+    }
+    return out;
   }
 
   void cleanup() noexcept {

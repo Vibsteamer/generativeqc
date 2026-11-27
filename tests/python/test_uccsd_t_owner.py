@@ -511,10 +511,10 @@ def test_invalid_options_fail_closed(kwargs: dict) -> None:
 def test_complete_cuda_energy_matches_independent_pyscf(
     atom: str, spin: int, broken: bool, tmp_path: Path
 ) -> None:
+    from generativeqc._ucc.native_tensor_cuda import CudaCCTensorExecutor
     from generativeqc_compiler.common.cuda_adapter import CudaCompilerAdapter
     from generativeqc_compiler.common.cuda_target import cuda_target_info
 
-    from tools.generativeqc_cc.native_tensor_cuda import CudaCCTensorExecutor
     from tools.generativeqc_posthf.cuda import compile_cuda
 
     assert os.environ.get("SLURM_JOB_ID"), (

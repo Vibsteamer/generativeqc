@@ -12,6 +12,7 @@ import pytest
 from conftest import configured_test_library
 
 from generativeqc._f12_cabs_fock import physical_fock, physical_spin_operators
+from generativeqc._f12_cc_fock_pullback import extended_fock_response
 from generativeqc._f12_ext_fock_native import bind_ext_fock_native
 from generativeqc_compiler.common.compiler_cache import (
     resolve_compiler_cache,
@@ -338,6 +339,80 @@ def test_partial_seeds_and_noncontiguous_raw(
     _assert_parity(mats_ref, bars_ref, mats_s, bars_s, atol=1e-12)
 
 
+@pytest.mark.parametrize("separate_jkfit", [False, True])
+def test_extended_fock_response_and_strict_env(
+    host_ext_fock_library: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    separate_jkfit: bool,
+) -> None:
+    n, ext, q, oa, ob = 9, 7, 15, 3, 2
+    h, raw, whitener, frames, _ = _make_problem(
+        9001 + int(separate_jkfit), n=n, ext=ext, q=q, oa=oa, ob=ob, same_occ_frame=False
+    )
+    space = (oa, ob, ext - oa, ext - ob, ext)
+    rng = np.random.default_rng(9010)
+    seeds = {
+        "fock_alpha": rng.normal(size=(ext, ext)),
+        "fock_beta": rng.normal(size=(ext, ext)),
+        "exchange_alpha": rng.normal(size=(ext, ext)),
+        "exchange_beta": rng.normal(size=(ext, ext)),
+    }
+
+    ao = {
+        "hcore_ao": h,
+        "coefficients_alpha": frames[0],
+        "coefficients_beta": frames[1],
+    }
+    if separate_jkfit:
+        jkfit = {"ao_coulomb": raw, "metric_whitener": whitener}
+    else:
+        ao["ao_coulomb"] = raw
+        ao["metric_whitener"] = whitener
+        jkfit = None
+
+    def make_bars():
+        d = {
+            "coefficients_alpha": np.zeros_like(frames[0]),
+            "coefficients_beta": np.zeros_like(frames[1]),
+            "hcore_ao": np.zeros_like(h),
+            "metric/coulomb": np.zeros_like(whitener),
+        }
+        return d
+
+    # TensorIR reference
+    monkeypatch.delenv("GENERATIVEQC_F12_REQUIRE_AOT_EXTFOCK", raising=False)
+    monkeypatch.setenv("GENERATIVEQC_F12_DISABLE_AOT_EXTFOCK", "1")
+    fock_ref, pb_ref = extended_fock_response(space, ao, jkfit, CountingRunner())
+    bars_ref = make_bars()
+    pb_ref(seeds, bars_ref)
+
+    # Native AOT discovered via env var + strict enforcement
+    monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_AOT_EXTFOCK", raising=False)
+    monkeypatch.setenv("GENERATIVEQC_F12_REQUIRE_AOT_EXTFOCK", "1")
+    monkeypatch.setenv("GENERATIVEQC_F12_EXT_FOCK_LIBRARY", str(host_ext_fock_library))
+    nat_runner = CountingRunner()
+    fock_nat, pb_nat = extended_fock_response(space, ao, jkfit, nat_runner)
+    bars_nat = make_bars()
+    pb_nat(seeds, bars_nat)
+    assert nat_runner.calls == 0
+
+    for k in fock_ref:
+        np.testing.assert_allclose(fock_nat[k], fock_ref[k], atol=1e-12, rtol=1e-12)
+    assert bars_nat.keys() == bars_ref.keys()
+    for k in bars_ref:
+        np.testing.assert_allclose(bars_nat[k], bars_ref[k], atol=1e-12, rtol=1e-12)
+
+    # physical_fock wrapper with CDLL passed directly via library parameter
+    cdll = ctypes.CDLL(str(host_ext_fock_library))
+    nat_runner2 = CountingRunner()
+    mats_pf, pb_pf = physical_fock(
+        h, raw, whitener, frames, (oa, ob), nat_runner2, False, cdll
+    )
+    pf_bars = pb_pf([seeds["fock_alpha"], seeds["fock_beta"]])
+    assert nat_runner2.calls == 0
+    np.testing.assert_allclose(mats_pf[0], fock_ref["fock_alpha"], atol=1e-12, rtol=0.0)
+    np.testing.assert_allclose(mats_pf[1], fock_ref["fock_beta"], atol=1e-12, rtol=0.0)
+    assert pf_bars[0][0].shape == frames[0].shape
 
 
 def test_require_aot_extfock_raises_when_missing(

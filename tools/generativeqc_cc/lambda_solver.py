@@ -15,6 +15,7 @@ from hashlib import sha256
 from types import MappingProxyType
 
 import numpy as np
+from generativeqc._ucc.native_tensor_cpu import NativeCCTensorExecutor
 from generativeqc.response_problem import ResponseCompatibilityError
 from generativeqc.response_solver import GMRESOptions, _vector_norm
 from generativeqc_compiler.cc.equations import amplitude_layouts
@@ -34,7 +35,6 @@ from tools.generativeqc_response.implicit import (
     transpose_solver_contract,
 )
 
-from .native_tensor_cpu import NativeCCTensorExecutor
 from .solver import CCSDResult, _ccsd_programs
 
 

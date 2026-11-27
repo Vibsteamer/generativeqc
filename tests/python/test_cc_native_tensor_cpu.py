@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from generativeqc._ucc.native_tensor_cpu import NativeCCTensorExecutor
 from generativeqc_compiler.cc.gradient_equations import build_hamiltonian_programs
 from generativeqc_compiler.cc.lambda_equations import build_lambda_programs
 from generativeqc_compiler.cc.triples_response import build_tile_triples_vjp
@@ -13,7 +14,6 @@ from generativeqc_compiler.tensor import PackedLayout, execute
 from generativeqc_compiler.tensor.cpu import NativeTensorProgram, emit_cpu
 from generativeqc_compiler.tensor.optimize import prepare_for_backend
 
-from tools.generativeqc_cc.native_tensor_cpu import NativeCCTensorExecutor
 from tools.generativeqc_cc.oracle import dense_feeds, random_case
 
 

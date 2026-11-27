@@ -30,6 +30,9 @@ PREFIX = r"""
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include "cc/lambda_response.hpp"
+
 struct Stream { int device; };
 using cudaStream_t = Stream*;
 constexpr int cudaSuccess=0, cudaStreamNonBlocking=1;
@@ -104,32 +107,7 @@ struct LambdaOptions {
   std::size_t max_bytes=1U<<20;
   bool serial_scratch_reuse=false;
 };
-struct LambdaDiagnostic {
-  std::size_t owned_device_bytes{},numeric_capacity_bytes{},h2d_bytes{},d2h_bytes{},synchronizations{};
-  std::size_t df_auxiliary_slices{},df_contraction_terms{},df_generated_kernels{};
-  // The extracted owner compiles its DF diagnostic forwarding even though this
-  // conventional-only harness rejects DF construction. Keep that surface typed.
-  bool df_auxiliary_reduction{},df_matrix_gemm{};
-  std::size_t df_preparation_calls{},df_reduced_actions{};
-  std::size_t df_auxiliary_batch_size{1},df_auxiliary_batches{};
-  std::size_t df_gemm_calls{},df_gemm_summands{},df_packing_output_bytes{};
-  std::size_t df_provider_allowance_bytes{};
-  std::size_t df_available_device_bytes{},df_device_limit_bytes{};
-  bool df_core_reuse{};
-  std::size_t df_core_reuse_bytes{},df_core_reuse_preparations{},df_core_reuse_actions{};
-  const char* core_reuse_plan_hash{};
-  bool df_audit_matrix_gemm{};
-  std::size_t df_audit_arena_bytes{};
-  std::size_t df_shared_scratch_bytes{},df_scratch_avoided_bytes{};
-  bool df_primal_matrix_gemm{};
-  bool df_mixed_precision{},df_mixed_precision_refused{};
-  std::size_t df_mixed_storage_bytes{},df_mixed_input_offset_bytes{};
-  std::size_t df_mixed_actions{},df_strict_actions{},df_precision_switches{};
-  std::size_t df_fp32_gemm_calls{},df_fp32_gemm_summands{},df_precision_cast_elements{};
-  const char* mixed_program_hash{};
-  const char* audit_schedule_hash{};
-  const char *shared_program_hash{},*independent_program_hash{};
-};
+using LambdaDiagnostic = generativeqc::cc::LambdaDiagnostic;
 struct CudaFixedOrbitalResponseResult { TrackingVector df_bov,df_bvv; };
 // This harness isolates conventional transfer failures. A DF request must not
 // accidentally enter its synthetic backend; the real DF owner has CUDA tests.
@@ -146,7 +124,7 @@ struct DFLambdaActions {
   bool begin_mixed_precision() { throw std::logic_error("DF action"); }
   void finish_mixed_precision() { throw std::logic_error("DF action"); }
   void transpose(bool,std::span<const double>,std::span<const double>,TrackingVector&,TrackingVector&) { throw std::logic_error("DF action"); }
-  void seeds(std::span<const double>,std::span<const double>) { throw std::logic_error("DF action"); }
+  void seeds(std::span<const double>,std::span<const double>,double) { throw std::logic_error("DF action"); }
   TrackingVector parameter(std::string_view,std::size_t) { throw std::logic_error("DF action"); }
   std::pair<TrackingVector,TrackingVector> virtual_factors() { throw std::logic_error("DF action"); }
 };
@@ -280,6 +258,8 @@ DeviceParameterOutput parameter_stub(CudaState& s) {
             "-Wall",
             "-Wextra",
             "-Werror",
+            "-I",
+            str(ROOT / "src"),
         ],
         compile_timeout=30,
         link_timeout=30,

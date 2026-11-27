@@ -9,6 +9,8 @@ from typing import Any
 
 import numpy as np
 import pytest
+from generativeqc._ucc.native_tensor_cpu import NativeCCTensorExecutor
+from generativeqc._ucc.native_tensor_cuda import CudaCCTensorExecutor
 from generativeqc_compiler.common.cuda_adapter import CudaCompilerAdapter
 from generativeqc_compiler.common.cuda_target import cuda_target_info
 from test_uccsd_equations import (
@@ -20,8 +22,6 @@ from test_uccsd_equations import (
 )
 from test_ump2_energy import DenseSource, _eri, _reference
 
-from tools.generativeqc_cc.native_tensor_cpu import NativeCCTensorExecutor
-from tools.generativeqc_cc.native_tensor_cuda import CudaCCTensorExecutor
 from tools.generativeqc_cc.solver import SolverOptions, solve
 from tools.generativeqc_cc.uccsd_solver import PreparedUCCSD
 from tools.generativeqc_posthf.conventions import SpinMOBlock

@@ -6,6 +6,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+from generativeqc._ucc.native_tensor_cpu import NativeCCTensorExecutor
 from generativeqc_compiler.cc.uccsd_layout import UCCSDLayout
 from generativeqc_compiler.cc.uccsd_response import (
     build_parameter_vjp,
@@ -17,8 +18,6 @@ from test_uccsd_equations import (
     _feeds,
     _random_hamiltonian,
 )
-
-from tools.generativeqc_cc.native_tensor_cpu import NativeCCTensorExecutor
 
 
 def _seeds(layout: UCCSDLayout, packed: np.ndarray) -> dict:

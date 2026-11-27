@@ -5,6 +5,7 @@
 #include "integrals/correlation_backend.hpp"
 #include "scf/cuda/rhf_policy.hpp"
 #include "scf/cuda_density_fitting_integrals.hpp"
+#include "scf/cuda_df_gradient.hpp"
 #include "scf/cuda_one_electron_gradient.hpp"
 
 namespace generativeqc::methods::detail {
@@ -34,6 +35,19 @@ inline integrals::CorrelationIntegralBackend unrestricted_integral_backend() {
             scf::cuda_policy::one_electron_derivative_mapping_requested(), budget, gradient,
             detail);
         if (status == GENERATIVEQC_STATUS_OUT_OF_MEMORY) throw std::length_error(detail);
+        if (status != GENERATIVEQC_STATUS_SUCCESS) throw std::runtime_error(detail);
+        return gradient;
+      },
+      [](int device, const core::System& orbital, const core::System& auxiliary,
+         std::span<const double> bar_three_center, std::span<const double> bar_metric,
+         std::size_t budget) {
+        std::vector<double> gradient;
+        std::string detail;
+        const auto status = scf::execute_cuda_df_gradient(
+            device, orbital, auxiliary, bar_three_center, bar_metric, 0, budget, 0, gradient,
+            detail);
+        if (status == GENERATIVEQC_STATUS_OUT_OF_MEMORY) throw std::length_error(detail);
+        if (status == GENERATIVEQC_STATUS_INVALID_ARGUMENT) throw std::invalid_argument(detail);
         if (status != GENERATIVEQC_STATUS_SUCCESS) throw std::runtime_error(detail);
         return gradient;
       }};

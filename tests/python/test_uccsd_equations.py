@@ -567,7 +567,7 @@ def test_fixed_amplitude_admission_and_budget_fail_closed() -> None:
 def test_native_cpu_matches_determinant_oracle(
     tmp_path: Path, populations: tuple[int, ...]
 ) -> None:
-    from tools.generativeqc_cc.native_tensor_cpu import NativeCCTensorExecutor
+    from generativeqc._ucc.native_tensor_cpu import NativeCCTensorExecutor
 
     layout = UCCSDLayout(*populations)
     amplitudes = _amplitudes(layout)
@@ -588,10 +588,9 @@ def test_native_cpu_matches_determinant_oracle(
 def test_real_cuda_matches_determinant_oracle(
     tmp_path: Path, populations: tuple[int, ...]
 ) -> None:
+    from generativeqc._ucc.native_tensor_cuda import CudaCCTensorExecutor
     from generativeqc_compiler.common.cuda_adapter import CudaCompilerAdapter
     from generativeqc_compiler.common.cuda_target import cuda_target_info
-
-    from tools.generativeqc_cc.native_tensor_cuda import CudaCCTensorExecutor
 
     nvcc = os.environ.get("GENERATIVEQC_NVCC") or shutil.which("nvcc")
     assert nvcc is not None, "allocated CUDA test requires nvcc"

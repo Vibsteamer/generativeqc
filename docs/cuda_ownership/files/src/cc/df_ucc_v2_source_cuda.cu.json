@@ -1,0 +1,26 @@
+{
+  "path": "src/cc/df_ucc_v2_source_cuda.cu",
+  "reason": "Builds spin-blocked DF factors and four-index integrals, differentiates the symmetric inverse square root and maps orbital, metric and integral cotangents back to their sources. Reuses the generated compensated AO-to-MO transform.",
+  "regions": [
+    {
+      "start": "struct SourceDelete",
+      "stop": "__device__ inline double scaled_response_dev",
+      "role": "runtime",
+      "reason": "Owns source handles, status translation, active-space slicing and factor packing, embedding and symmetrization."
+    },
+    {
+      "start": "__global__ void audit_finite_kernel",
+      "stop": "// --- 4-Index Core Build Kernels",
+      "role": "runtime",
+      "reason": "Checks device source values before constructing four-index blocks."
+    },
+    {
+      "start": "std::size_t source_resident_bytes",
+      "stop": "DeviceFourIndexCore<double> build_four_index_core_cuda_impl",
+      "role": "runtime",
+      "reason": "Counts retained source storage against the working budget."
+    }
+  ],
+  "role": "scientific",
+  "subsystem": "focal_cc"
+}

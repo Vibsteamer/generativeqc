@@ -294,6 +294,77 @@ def test_basis_snapshot_and_ecp_mismatch_before_electronic_work(tmp_path: Path) 
         )
 
 
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "cpu_reference",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                os.environ.get("GENERATIVEQC_TENSOR_CUDA_TEST") != "1",
+                reason="requires an explicit CUDA allocation opt-in",
+            ),
+        ),
+    ],
+)
+def test_entry_provider_reuses_native_same_reference_high_order(
+    backend: Backend,
+) -> None:
+    b = basis(2)
+
+    def provider(request: FocalRequest) -> FocalEvaluation:
+        if request.role != "post_mp2":
+            return FocalEvaluation(
+                term(request, 0.0, np.zeros((2, 3))), backend, converged=True
+            )
+        return conventional_df_post_mp2(request)
+
+    def plan(radius: float) -> FocalPlan:
+        return plan_singlepoint(
+            [("H", (0.0, 0.0, 0.0)), ("H", (0.0, 0.0, radius))],
+            FocalSeries(b),
+            FocalSeries(b),
+            b,
+            root_id="uhf",
+            correlation_space_id="all-active",
+            backend=backend,
+        )
+
+    center = plan(1.4)
+    result = center.collect(provider(request) for request, _ in center.steps)
+    assert result.energy != 0.0
+
+    def energy(radius: float) -> float:
+        request = next(r for r, _ in plan(radius).steps if r.role == "post_mp2")
+        return conventional_df_post_mp2_energy(request)
+
+    assert energy(1.4) == pytest.approx(result.energy, abs=2e-12, rel=0)
+    for h in (4e-4, 2e-4):
+        fd = (energy(1.4 - h) - energy(1.4 + h)) / (2 * h)
+        assert result.forces[1, 2] == pytest.approx(fd, abs=3e-8, rel=0)
+
+
+def test_native_grouped_increment_refuses_split_role() -> None:
+    b = basis(2)
+
+    def provider(request: FocalRequest) -> FocalEvaluation:
+        if request.role in ("hf_cabs", "mp2_f12_correlation"):
+            return FocalEvaluation(term(request, 0.0, np.zeros((2, 3))), "cuda", True)
+        return conventional_df_post_mp2(request)
+
+    with pytest.raises(ValueError, match="only returns the post_mp2 role"):
+        singlepoint(
+            [("H", (0.0, 0.0, 0.0)), ("H", (0.0, 0.0, 1.4))],
+            FocalSeries(b),
+            FocalSeries(b),
+            b,
+            triples=b,
+            root_id="uhf",
+            correlation_space_id="all-active",
+            provider=provider,
+        )
+
+
 def test_explicit_mp2_f12_series_dispatch_and_composition() -> None:
     from generativeqc.experimental.f12_focal import combine
 

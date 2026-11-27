@@ -1,0 +1,7 @@
+{
+  "path": "src/cc/f12_energy_gradient.hpp",
+  "reason": "Defines the restricted spatial fixed-cusp energy derivatives with respect to singles and doubles amplitudes, including direct and exchange contributions in simultaneous pair symmetry.",
+  "regions": [],
+  "role": "scientific",
+  "subsystem": "focal_cc"
+}

@@ -82,12 +82,12 @@ def _rss() -> dict[str, int]:
 
 
 def _run_child(mode: str, case: str, cache: Path) -> dict[str, object]:
+    from generativeqc._ucc import native_tensor_cpu
     from generativeqc_compiler.tensor.cpu import emit_cpu
 
     from tools.cc_gradient_fixtures import inputs, source_arguments
     from tools.generativeqc_cc import (
         lambda_solver,
-        native_tensor_cpu,
         rccsd_t_force,
         triples_complete_gradient,
         triples_lambda_response,

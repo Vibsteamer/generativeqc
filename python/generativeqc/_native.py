@@ -1693,6 +1693,16 @@ def load_library(*, device: str | None = None, device_id: int = 0) -> ctypes.CDL
         void_pp,
     ]
     library.generativeqc_calculation_prepare.restype = ctypes.c_int
+    split_ucc = getattr(
+        library, "generativeqc_calculation_prepare_ucc_df_fits_v1", None
+    )
+    if split_ucc is not None:
+        split_ucc.argtypes = [
+            *library.generativeqc_calculation_prepare.argtypes[:-1],
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        split_ucc.restype = ctypes.c_int
     library.generativeqc_calculation_destroy.argtypes = [ctypes.c_void_p]
     library.generativeqc_calculation_execute.argtypes = [
         ctypes.c_void_p,

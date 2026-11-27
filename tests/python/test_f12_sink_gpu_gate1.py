@@ -515,3 +515,114 @@ def test_spherical_slab_admission_is_monotone_in_the_budget(host_sink: Path) -> 
         assert value == pytest.approx(expected, rel=1e-12, abs=1e-14)
         np.testing.assert_allclose(gradient, unslabbed_gradient, atol=1e-13, rtol=1e-13)
     np.testing.assert_allclose(unslabbed_gradient.sum(axis=0), 0.0, atol=1e-12)
+
+
+
+
+
+
+
+
+@pytest.mark.parametrize("oa,ob,frozen", [(3, 3, (1, 1)), (3, 2, (1, 0))])
+def test_native_pair_pullbacks_match_tensorir_exact(
+    host_sink: Path, oa: int, ob: int, frozen: tuple[int, int]
+) -> None:
+    """Native C++/cuBLAS W, C, and Scalar MO pullbacks match TensorIR to < 1e-12."""
+    from functools import partial
+
+    from generativeqc._f12_cc_c_nuclear import _accumulate_c_mo_pullback
+    from generativeqc._f12_cc_pair_pullback_native import bind_pair_pullback
+    from generativeqc._f12_cc_scalar_nuclear import _accumulate_scalar_mo_pullback
+    from generativeqc._f12_cc_w_nuclear import _accumulate_w_mo_pullback
+    from generativeqc_compiler.tensor import execute
+
+    for kind in ("w", "c", "scalar"):
+        assert bind_pair_pullback(host_sink, kind, True) is not None
+
+    rng = np.random.default_rng(100 + oa * 7 + ob)
+    obs, ext, aux = 6, 10, 8
+    space = (oa, ob, obs, ext, aux)
+
+    def sym(a: np.ndarray) -> np.ndarray:
+        return 0.5 * (a + a.swapaxes(-1, -2))
+
+    same = oa == ob and frozen[0] == frozen[1]
+    fa = sym(rng.normal(scale=0.3, size=(ext, ext)))
+    ka = sym(rng.normal(scale=0.2, size=(ext, ext)))
+    fock = {
+        "fock_alpha": fa,
+        "fock_beta": fa.copy() if same else sym(rng.normal(scale=0.3, size=(ext, ext))),
+        "exchange_alpha": ka,
+        "exchange_beta": ka.copy() if same else sym(rng.normal(scale=0.2, size=(ext, ext))),
+    }
+    fit_a = rng.normal(scale=0.2, size=(aux, obs, ext))
+    fit_obs = {
+        "alpha": fit_a,
+        "beta": fit_a.copy() if same else rng.normal(scale=0.2, size=(aux, obs, ext)),
+    }
+    rc_a = rng.normal(scale=0.2, size=(aux, obs, ext))
+    co = sym(rng.normal(scale=0.2, size=(ext, ext))) if same else rng.normal(scale=0.2, size=(ext, ext))
+    data = {
+        "cross_overlap": co,
+        "source/fit_alpha": fit_obs["alpha"][:, :oa, :],
+        "source/fit_beta": fit_obs["beta"][:, :ob, :],
+        "source/raw_coulomb_alpha": rc_a,
+        "source/raw_coulomb_beta": rc_a.copy() if same else rng.normal(scale=0.2, size=(aux, obs, ext)),
+        "metric/geminal": sym(rng.normal(scale=0.2, size=(aux, aux))),
+        "metric/geminal_coulomb": sym(rng.normal(scale=0.2, size=(aux, aux))),
+        "metric/squared_geminal": sym(rng.normal(scale=0.2, size=(aux, aux))),
+        "metric/double_commutator": sym(rng.normal(scale=0.2, size=(aux, aux))),
+    }
+    for op in ("geminal", "geminal_coulomb", "squared_geminal", "double_commutator"):
+        ra = rng.normal(scale=0.2, size=(aux, oa, ext))
+        data[f"raw/{op}/alpha"] = ra
+        data[f"raw/{op}/beta"] = ra.copy() if same else rng.normal(scale=0.2, size=(aux, ob, ext))
+
+    cpu_run = partial(execute, max_bytes=512 << 20)
+    dbar_ref = {k: np.zeros_like(v) for k, v in data.items()}
+    dbar_nat = {k: np.zeros_like(v) for k, v in data.items()}
+    fbar_ref = {k: np.zeros_like(v) for k, v in fock.items()}
+    fbar_nat = {k: np.zeros_like(v) for k, v in fock.items()}
+    fobs_ref = {s: np.zeros_like(v) for s, v in fit_obs.items()}
+    fobs_nat = {s: np.zeros_like(v) for s, v in fit_obs.items()}
+
+    e_ref = _accumulate_scalar_mo_pullback(
+        space, data, fock, 1.25, cpu_run, dbar_ref, fbar_ref, frozen_occupied=frozen, native_library=None
+    )
+    e_nat = _accumulate_scalar_mo_pullback(
+        space, data, fock, 1.25, cpu_run, dbar_nat, fbar_nat, frozen_occupied=frozen, native_library=host_sink, host_reference=True
+    )
+    np.testing.assert_allclose(e_nat, e_ref, atol=1e-13, rtol=1e-13)
+
+    w_aa = rng.normal(scale=0.1, size=(oa - frozen[0], oa - frozen[0], obs - oa, oa - frozen[0]))
+    w_weights = {
+        "w_vo_aaaa": w_aa,
+        "w_vo_bbbb": w_aa.copy() if same else rng.normal(scale=0.1, size=(ob - frozen[1], ob - frozen[1], obs - ob, ob - frozen[1])),
+        "w_vv_abab": rng.normal(scale=0.1, size=(oa - frozen[0], ob - frozen[1], obs - oa, obs - ob)),
+    }
+    _accumulate_w_mo_pullback(
+        space, data, fit_obs, w_weights, cpu_run, dbar_ref, fobs_ref, frozen_occupied=frozen, native_library=None
+    )
+    _accumulate_w_mo_pullback(
+        space, data, fit_obs, w_weights, cpu_run, dbar_nat, fobs_nat, frozen_occupied=frozen, native_library=host_sink, host_reference=True
+    )
+
+    c_aa = rng.normal(scale=0.1, size=(oa - frozen[0], oa - frozen[0], obs - oa, obs - oa))
+    c_weights = {
+        "c_f12_aaaa": c_aa,
+        "c_f12_bbbb": c_aa.copy() if same else rng.normal(scale=0.1, size=(ob - frozen[1], ob - frozen[1], obs - ob, obs - ob)),
+        "c_f12_abab": rng.normal(scale=0.1, size=(oa - frozen[0], ob - frozen[1], obs - oa, obs - ob)),
+    }
+    _accumulate_c_mo_pullback(
+        space, data, fock, c_weights, cpu_run, dbar_ref, fbar_ref, frozen_occupied=frozen, native_library=None
+    )
+    _accumulate_c_mo_pullback(
+        space, data, fock, c_weights, cpu_run, dbar_nat, fbar_nat, frozen_occupied=frozen, native_library=host_sink, host_reference=True
+    )
+
+    for k in dbar_ref:
+        np.testing.assert_allclose(dbar_nat[k], dbar_ref[k], atol=1e-12, rtol=1e-12, err_msg=k)
+    for k in fbar_ref:
+        np.testing.assert_allclose(fbar_nat[k], fbar_ref[k], atol=1e-12, rtol=1e-12, err_msg=k)
+    for k in fobs_ref:
+        np.testing.assert_allclose(fobs_nat[k], fobs_ref[k], atol=1e-12, rtol=1e-12, err_msg=k)

@@ -24,6 +24,7 @@ native compatibility recurrence; CUDA derivatives do not fall back to CPU.
 Neither owner supplies corrected-(T) response or public method registration.
 """
 
+from generativeqc._ucc.native_tensor_cuda import CudaCCTensorExecutor
 from generativeqc_compiler.cc.doubles import build_ccsd_program
 from generativeqc_compiler.cc.equations import amplitude_layouts, build_program
 from generativeqc_compiler.cc.lambda_equations import (
@@ -109,7 +110,6 @@ from .evaluate import evaluate
 from .lambda_cuda import PreparedCUDALambda
 from .lambda_response import BoundCCSDResponse, CCSDParameterWeight
 from .lambda_solver import BoundCCSDLambda, CCSDLambdaResult, LambdaOptions
-from .native_tensor_cuda import CudaCCTensorExecutor
 from .resident_solver import PreparedResidentCCSD, solve_gpu_resident
 from .solver import CCSDResult, PreparedCCSD, SolverOptions, solve
 from .state_transport import (

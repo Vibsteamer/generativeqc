@@ -6,6 +6,8 @@ import ctypes as ct
 import gc
 import os
 import shutil
+import subprocess
+import sys
 import threading
 import types
 import weakref
@@ -19,11 +21,18 @@ from conftest import f12_host_shell
 
 from generativeqc._f12_ao_mo_native import (
     bind_ao_mo_ops,
+    resolve_ao_mo_ops,
     run_ao_mo_bilin_rev,
     run_ao_mo_project_rev,
     run_coulomb_fit_rev,
 )
 from generativeqc._f12_cabs_fock import physical_spin_operators
+from generativeqc._f12_cc_fixed_sources_native import (
+    AUTO_NATIVE_LIBRARY,
+    bind_fixed_pair_sources,
+    discover_ccfixed_library,
+    resolve_ccfixed_library,
+)
 from generativeqc._f12_cphf_relax_native import (
     resolve_cphf_relax,
     run_df_canonical_driver_native,
@@ -46,6 +55,7 @@ from generativeqc._f12_spin_fock_1e_native import (
     SpinFock1eNativeOps,
     _prep_output_buffer,
     bind_spin_fock_1e_ops,
+    resolve_spin_fock_1e_ops,
     run_spin_fock_rev,
 )
 from generativeqc._f12_unrestricted import unrestricted_mp2_f12_ao_response
@@ -65,6 +75,7 @@ def host_sink(tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureR
         "src/posthf/f12/f12_ext_fock_cuda.cu",
         "src/posthf/f12/f12_spin_fock_1e_cuda.cu",
         "src/posthf/f12/f12_cphf_relax_cuda.cu",
+        "src/posthf/f12/f12_cc_fixed_sources_cuda.cu",
         "src/posthf/f12/f12_mp2_pair_response_cuda.cu",
     )
     output = tmp_path_factory.mktemp("audit_host") / "libaudit_host_fixture.so"
@@ -1034,6 +1045,53 @@ def test_m7_spin_fock_1e_rejects_readonly_accumulate_and_c_int_overflow(
         run_spin_fock_rev(ops, (1, 1, 50000, 1), sources, {"fock_alpha": np.eye(n)})
 
 
+# ============================================================================
+# M9: Strict single-backend library binding, precedence & unsafe inplace guard
+# ============================================================================
+
+
+def test_m9_strict_single_backend_no_cross_match(
+    host_sink: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audit M9: requesting CUDA backend never matches host_reference library (and vice versa)."""
+    # Ensure host_sink is mapped into /proc/self/maps!
+    _loaded = ct.CDLL(str(host_sink))
+    assert _loaded is not None
+
+    monkeypatch.setenv("GENERATIVEQC_F12_SHELL_LIBRARY", str(host_sink))
+    monkeypatch.setenv("GENERATIVEQC_F12_HOST_SINK", str(host_sink))
+    monkeypatch.delenv("GENERATIVEQC_F12_REQUIRE_AOT_CCFIXED", raising=False)
+    monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_AOT_CCFIXED", raising=False)
+
+    # CUDA runner stub (has .batch and .profile_snapshot like focal_cuda_runner).
+    def cuda_run(p, i):
+        raise AssertionError("not called")
+
+    cuda_run.batch = lambda g: None  # type: ignore[attr-defined]
+    cuda_run.profile_snapshot = lambda: {}  # type: ignore[attr-defined]
+
+    # 1. cc_fixed_sources must NEVER cross-match host_sink when CUDA is requested.
+    path, is_host = discover_ccfixed_library(host_reference=False)
+    assert path is None and is_host is False
+
+    path2, is_host2 = resolve_ccfixed_library(AUTO_NATIVE_LIBRARY, None, cuda_run)
+    assert path2 is None and is_host2 is False
+
+    path3, is_host3 = resolve_ccfixed_library(host_sink, None, cuda_run)
+    assert is_host3 is False
+    assert bind_fixed_pair_sources(path3, is_host3) is None
+
+    # 2. cphf_relax requires explicit single-backend boolean and never cross-matches.
+    with pytest.raises(ValueError, match="explicit host_reference"):
+        resolve_cphf_relax(host_sink, "whiten_3c", host_reference=None)
+    assert resolve_cphf_relax(host_sink, "whiten_3c", host_reference=False) is None
+
+    # 3. ao_mo and spin_fock_1e never cross-match CUDA against host_sink.
+    assert resolve_ao_mo_ops(cuda_run, None, shell_library=host_sink) is None
+    assert resolve_spin_fock_1e_ops(cuda_run, library=host_sink) is None
+
+
 def test_m9_ext_fock_native_library_owns_the_requested_abi(host_sink, monkeypatch):
     response_only = next(Path(np.__file__).parent.rglob("_multiarray_umath*.so"))
     monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_AOT_EXTFOCK", raising=False)
@@ -1053,6 +1111,137 @@ def test_m9_ext_fock_native_library_owns_the_requested_abi(host_sink, monkeypatc
     monkeypatch.setenv("GENERATIVEQC_F12_HOST_SINK", str(host_sink))
     with pytest.raises(RuntimeError, match="REQUIRE_AOT_EXTFOCK"):
         resolve_ext_fock_native(**args)
+
+
+def test_m9_mp2_pair_and_spinfock_precedence_explicit_gt_env_gt_maps(
+    host_sink: Path,
+    tmp_path: Path,
+) -> None:
+    """Audit M9: explicit library > explicit env > /proc/self/maps precedence (isolated subprocess)."""
+    maps_copy = tmp_path / "libfocal_shell_maps_loaded.so"
+    env_copy = tmp_path / "libfocal_shell_env_override.so"
+    explicit_copy = tmp_path / "libfocal_shell_explicit_override.so"
+    shutil.copy2(host_sink, maps_copy)
+    shutil.copy2(host_sink, env_copy)
+    shutil.copy2(host_sink, explicit_copy)
+
+    script = """
+import ctypes as ct
+import os
+import sys
+from pathlib import Path
+from generativeqc._f12_ao_mo_native import resolve_ao_mo_ops
+from generativeqc._f12_mp2_pair_native import _resolve_symbol as mp2_resolve_symbol
+from generativeqc._f12_spin_fock_1e_native import resolve_spin_fock_1e_ops
+
+maps_copy, env_copy, explicit_copy = map(Path, sys.argv[1:4])
+_loaded_maps = ct.CDLL(str(maps_copy))
+assert _loaded_maps is not None
+
+os.environ["GENERATIVEQC_F12_SHELL_LIBRARY"] = str(env_copy)
+os.environ.pop("GENERATIVEQC_F12_AO_MO_LIBRARY", None)
+
+def addr(fn):
+    return int(ct.cast(fn, ct.c_void_p).value or 0)
+
+# 1. mp2_pair_native: explicit > env > maps.
+fn_env = mp2_resolve_symbol(
+    "gqc_f12_mp2_pair_energies_host_reference", None, host_reference=True
+)
+fn_explicit = mp2_resolve_symbol(
+    "gqc_f12_mp2_pair_energies_host_reference", explicit_copy, host_reference=True
+)
+fn_maps = mp2_resolve_symbol(
+    "gqc_f12_mp2_pair_energies_host_reference", maps_copy, host_reference=True
+)
+assert fn_env is not None and fn_explicit is not None and fn_maps is not None
+assert addr(fn_env) != addr(fn_maps), "env must take precedence over /proc/self/maps"
+assert addr(fn_explicit) != addr(fn_env), "explicit arg must take precedence over env"
+
+# 2. ao_mo_native: explicit > env > maps.
+ops_env = resolve_ao_mo_ops(None, None, host_reference=True)
+assert ops_env is not None and Path(ops_env.library_name).resolve() == env_copy.resolve()
+ops_exp = resolve_ao_mo_ops(None, None, shell_library=explicit_copy, host_reference=True)
+assert ops_exp is not None and Path(ops_exp.library_name).resolve() == explicit_copy.resolve()
+
+# 3. spin_fock_1e_native: explicit > env > registered > maps.
+sf_env = resolve_spin_fock_1e_ops(None, host_reference=True)
+assert sf_env is not None and Path(sf_env.library_name).resolve() == env_copy.resolve()
+sf_exp = resolve_spin_fock_1e_ops(None, library=explicit_copy, host_reference=True)
+assert sf_exp is not None and Path(sf_exp.library_name).resolve() == explicit_copy.resolve()
+"""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2] / "python")
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(maps_copy), str(env_copy), str(explicit_copy)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+
+
+def test_m9_implicit_discovery_requires_one_artifact(host_sink: Path, tmp_path: Path):
+    """An explicit selection is authoritative; implicit matching requires one binary identity."""
+    first = tmp_path / "libfocal_shell_first.so"
+    identical = tmp_path / "libfocal_shell_equal.so"
+    other = tmp_path / "libfocal_shell_other.so"
+    for dest in (first, identical, other):
+        shutil.copyfile(host_sink, dest)
+    # The dynamic loader accepts an ELF trailer. Both binaries export the same
+    # backend ABI while their artifact identities differ.
+    with other.open("ab") as binary:
+        binary.write(b"independent-shell-build")
+    script = """
+import ctypes
+import os
+import sys
+from pathlib import Path
+
+from generativeqc import _native
+from generativeqc._f12_ao_mo_native import resolve_ao_mo_ops, resolve_cabs_singles_ops
+from generativeqc._f12_cc_fixed_sources_native import discover_ccfixed_library
+from generativeqc._f12_mp2_pair_native import bind_ordinary_df_mp2
+from generativeqc._f12_spin_fock_1e_native import register_shell_library, resolve_spin_fock_1e_ops
+
+first, identical, other = map(Path, sys.argv[1:])
+_native.PACKAGE_DIR = first.parent / "empty-package"
+for key in tuple(os.environ):
+    if key.startswith(("GENERATIVEQC_F12_", "GQC_F12_")):
+        os.environ.pop(key)
+bindings = (
+    lambda: resolve_ao_mo_ops(None, host_reference=True),
+    lambda: resolve_cabs_singles_ops(None, host_reference=True),
+    lambda: resolve_spin_fock_1e_ops(None, host_reference=True),
+    lambda: bind_ordinary_df_mp2(host_reference=True),
+    lambda: discover_ccfixed_library(host_reference=True)[0],
+)
+handles = [ctypes.CDLL(str(path)) for path in (first, identical)]
+assert all(bind() is not None for bind in bindings)
+register_shell_library(first)
+register_shell_library(other)
+handles.append(ctypes.CDLL(str(other)))
+for bind in bindings:
+    try:
+        bind()
+    except RuntimeError as error:
+        assert "ambiguous" in str(error).lower(), error
+    else:
+        raise AssertionError(f"selected one of two different implicit artifacts: {bind}")
+os.environ["GENERATIVEQC_F12_SHELL_LIBRARY"] = str(first)
+assert all(bind() is not None for bind in bindings)
+# A stale configured library is a capability miss. A valid lower-level choice
+# and two compatible mapped libraries remain present.
+os.environ["GENERATIVEQC_F12_HOST_SINK"] = str(first)
+import numpy as np
+numpy_dso = next(Path(np.__file__).parent.rglob("_multiarray_umath*.so"))
+for bad in (first.parent / "missing.so", numpy_dso):
+    os.environ["GENERATIVEQC_F12_SHELL_LIBRARY"] = str(bad)
+    assert all(bind() is None for bind in bindings)
+"""
+    subprocess.run([sys.executable, "-c", script, str(first), str(identical), str(other)],
+                   check=True)
 
 
 def test_m9_spin_fock_1e_disables_inplace_on_unsafe_older_library(
@@ -1114,6 +1303,111 @@ def test_m9_spin_fock_1e_disables_inplace_on_unsafe_older_library(
     assert got_bars["raw_coulomb_alpha"] is not raw_in
     np.testing.assert_allclose(got_bars["fit_alpha"], ref_bars["fit_alpha"], atol=1e-13)
     np.testing.assert_allclose(got_bars["raw_coulomb_alpha"], ref_bars["raw_coulomb_alpha"], atol=1e-13)
+
+
+def test_m9_focal_cc_sources_passes_provider_shell_library_and_backend(
+    host_sink: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audit M9: molecular_ucc_sources forwards provider.shell_library and host_reference=(not cuda)."""
+    from generativeqc._f12_focal_cc_sources import (
+        clear_had_cc_source_cache,
+        molecular_ucc_sources,
+    )
+
+    clear_had_cc_source_cache(reset_stats=True)
+    obs, ext, aux = 2, 3, 2
+    eps = np.array([-1.0, 1.0], dtype=np.float64)
+    fock_mat = np.diag([-1.0, 1.0, 2.0])
+
+    captured: dict = {}
+
+    def spy_feeds(*args, **kwargs):
+        captured.update(kwargs)
+        return {"fixed_geminal_energy": np.array(0.0)}
+
+    dummy_panel = types.SimpleNamespace(
+        fit_id="f12-fit",
+        whitener=np.eye(aux, dtype=np.float64),
+        joint=lambda req, explicit=False: {},
+    )
+    provider = types.SimpleNamespace(
+        run=_cpu_runner(),
+        metric_library=None,
+        response_library=None,
+        shell_library=host_sink,
+        budget_mib=128,
+        relative_cutoff=1e-9,
+        slater_normalization="negative_exponential_over_beta",
+        _seed_options=lambda req: {},
+        _cached_pair_sources=lambda req, derivatives=False, budget=128: (
+            types.SimpleNamespace(),
+            (dummy_panel, dummy_panel, dummy_panel),
+        ),
+    )
+    basis = types.SimpleNamespace(
+        basis_id="b-cc",
+        orbital=types.SimpleNamespace(identity="orb"),
+        jk_fit=types.SimpleNamespace(identity="jk"),
+        f12_fit=types.SimpleNamespace(identity="f12-fit"),
+        mp2_fit=types.SimpleNamespace(identity="f12-fit"),
+        cabs=types.SimpleNamespace(identity="cabs"),
+        beta=1.0,
+    )
+    request = types.SimpleNamespace(
+        role="mp2_f12_correlation",
+        root_id="rhf",
+        multiplicity=1,
+        charge=0,
+        backend="cpu_reference",
+        surface_id="surf",
+        correlation_space_id="all-active",
+        atoms=(types.SimpleNamespace(atomic_number=1, position=(0.0, 0.0, 0.0)),),
+        basis=basis,
+    )
+    ref = types.SimpleNamespace(
+        surface_id="surf",
+        basis_id="b-cc",
+        executed_backend="cpu_reference",
+        orbital_id="orb",
+        jk_fit_id="jk",
+        forces=None,
+        occupied=(1,),
+        coefficients=np.eye(obs, dtype=np.float64)[None, :, :],
+        orbital_energies=eps[None, :],
+        energy=-1.0,
+        _pair_spin_indices=lambda req: (0, 0),
+    )
+    proj = types.SimpleNamespace(rank=1)
+
+    with (
+        patch(
+            "generativeqc._f12_focal_cc_sources.canonical_pair_frame",
+            return_value=((1, 1, obs, ext, aux), {}, None, proj),
+        ),
+        patch(
+            "generativeqc._f12_focal_cc_sources._orbital_sources",
+            return_value=({}, None),
+        ),
+        patch(
+            "generativeqc._f12_focal_cc_sources.extended_fock_response",
+            return_value=({"fock_alpha": fock_mat, "fock_beta": fock_mat}, None),
+        ),
+        patch(
+            "generativeqc._f12_focal_cc_sources.unrestricted_cc_f12_fixed_source_feeds",
+            side_effect=spy_feeds,
+        ),
+    ):
+        molecular_ucc_sources(
+            provider,
+            request,
+            include_ordinary=False,
+            reference=ref,
+        )
+
+    assert captured.get("native_library") == host_sink
+    assert captured.get("host_reference") is True
+    clear_had_cc_source_cache(reset_stats=True)
 
 
 # ============================================================================

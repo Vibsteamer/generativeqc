@@ -1,0 +1,7 @@
+{
+  "path": "src/cc/f12_fixed_cusp_cuda.cuh",
+  "reason": "Adds the restricted fixed-cusp energy, singles residual and pair-symmetric doubles residual. Applies the transpose of the doubles coupling to Lambda doubles to form the singles response.",
+  "regions": [],
+  "role": "scientific",
+  "subsystem": "focal_cc"
+}

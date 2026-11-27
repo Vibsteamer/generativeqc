@@ -286,6 +286,29 @@ std::unique_ptr<PreparedCalculation> prepare_calculation(
                                         auxiliary_basis);
 }
 
+std::unique_ptr<PreparedCalculation> prepare_split_uccsd_calculation(
+    core::ContextState& context, const core::System& system,
+    const generativeqc_method_descriptor& descriptor, const core::System* correlation_auxiliary,
+    const core::System& reference_auxiliary) {
+  if (descriptor.method != GENERATIVEQC_METHOD_UCCSD && descriptor.method != GENERATIVEQC_METHOD_UCCSD_T)
+    throw std::invalid_argument("split unrestricted fitting requires UCCSD or UCCSD(T)");
+  const MethodDefinition& definition = require_available(descriptor.method);
+  validate_option_family(definition, descriptor, context.requested_backend);
+  validate_system(definition, system);
+  validate_preliminary_system(descriptor, system);
+  if (!correlation_auxiliary) throw std::invalid_argument("missing UCC correlation fitting basis");
+  for (const auto* fit : {correlation_auxiliary, &reference_auxiliary}) {
+    if (fit->atoms.size() != system.atoms.size() || !fit->ecp_terms.empty())
+      throw std::invalid_argument("UCC fitting basis must use every physical center without an ECP");
+    for (std::size_t i = 0; i < system.atoms.size(); ++i)
+      if (fit->atoms[i].ecp_core || fit->atoms[i].atomic_number != system.atoms[i].atomic_number ||
+          fit->atoms[i].position != system.atoms[i].position)
+        throw std::invalid_argument("UCC fitting centers must match orbital nuclei and carry no ECP");
+  }
+  return detail::prepare_uccsd_with_reference_fit(definition.provider.domain, context, system,
+                                                  descriptor, correlation_auxiliary, &reference_auxiliary);
+}
+
 void prepare_calculation_with_provider_initialization_intent_into(
     core::ContextState& context, const core::System& system,
     const generativeqc_method_descriptor& descriptor, const core::System* auxiliary_basis,

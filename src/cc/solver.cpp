@@ -10,6 +10,7 @@
 #include <stdexcept>
 
 #include "cc/df_plan.hpp"
+#include "cc/f12_fixed_cusp.hpp"
 #include "cc/iteration_driver.hpp"
 #include "generated_df_ccsd_core_cpu.hpp"
 #include "generated_rccsd_cpu.hpp"
@@ -224,6 +225,7 @@ void validate_problem(const Problem& p, bool allow_df_virtual) {
   expect(p.initial_t2, oovv, "initial_t2");
   if (!std::isfinite(p.reference_energy))
     throw std::invalid_argument("nonfinite RCCSD reference energy");
+  if (p.f12.active()) f12::validate(o, v, p.f12);
 }
 
 void validate_options(const SolverOptions& o) {
@@ -257,6 +259,7 @@ std::size_t problem_host_bytes(const Problem& p) {
   for (const auto* value : values) result = checked_add(result, bytes(value->capacity()));
   result = checked_add(result, bytes(p.df_boo.capacity()));
   result = checked_add(result, bytes(p.canonical_eps.capacity()));
+  result = checked_add(result, f12::host_bytes(p.f12));
   return result;
 }
 
@@ -292,6 +295,10 @@ SolverResult solve_cpu(const Problem& p, const SolverOptions& options) {
       const auto scratch = checked_add(
           checked_mul(h, h), checked_add(checked_mul(2, checked_mul(n, n)), checked_mul(2, n)));
       capacity = checked_add(capacity, bytes(scratch));
+    }
+    if (p.f12.active()) {
+      capacity = checked_add(capacity, bytes(n1));
+      if (!p.naux) capacity = checked_add(capacity, bytes(checked_mul(5, elements)));
     }
     return capacity;
   };
@@ -338,6 +345,20 @@ SolverResult solve_cpu(const Problem& p, const SolverOptions& options) {
   std::vector<double> replay_arena(replay_elements);
   std::vector<double> virtual_arena(plan.auxiliary), virtual_sum(plan.accumulation),
       prepare_arena(plan.preparation);
+  const bool f12_active = p.f12.active();
+  std::vector<double> f12_r1_const;
+  std::vector<double> f12_r1, f12_r2, f12_next_t1, f12_next_t2, f12_replay_r1, f12_replay_r2;
+  if (f12_active) {
+    f12_r1_const = f12::singles_constant(p.nocc, p.nvir, p.f12.w_vo);
+    if (!p.naux) {
+      f12_r1.resize(n1);
+      f12_r2.resize(n2);
+      f12_next_t1.resize(n1);
+      f12_next_t2.resize(n2);
+      f12_replay_r1.resize(n1);
+      f12_replay_r2.resize(n2);
+    }
+  }
   std::vector<double> current;
   current.reserve(elements);
   current.insert(current.end(), p.initial_t1.begin(), p.initial_t1.end());
@@ -373,6 +394,9 @@ SolverResult solve_cpu(const Problem& p, const SolverOptions& options) {
           checked_add(result.diagnostic.df_contraction_terms,
                       generated::dfhoist::fallback_virtual_cpu_contraction_terms(p.nocc, p.nvir));
     }
+    if (f12_active)
+      f12::add_residuals_cpu(p.nocc, p.nvir, p.f12, f12_r1_const, in.t1, virtual_sum.data(),
+                             virtual_sum.data() + n1);
     return generated::dfcore::Inputs{in.foo,
                                      in.fov,
                                      in.fvv,
@@ -394,6 +418,20 @@ SolverResult solve_cpu(const Problem& p, const SolverOptions& options) {
   // reference vectors cannot change during the call; current/trial amplitudes
   // are separate dynamic inputs. No state or retained value survives return,
   // so a new reference/geometry/basis/method or solve always prepares anew.
+  auto apply_f12_dense_iteration = [&](const generated::Inputs& in,
+                                       generated::IterationOutputs out) -> generated::IterationOutputs {
+    if (!f12_active) return out;
+    std::copy_n(out.r1, n1, f12_r1.data());
+    std::copy_n(out.r2, n2, f12_r2.data());
+    f12::add_residuals_cpu(p.nocc, p.nvir, p.f12, f12_r1_const, in.t1, f12_r1.data(),
+                           f12_r2.data());
+    for (std::size_t k = 0; k < n1; ++k) f12_next_t1[k] = in.t1[k] + f12_r1[k] / p.d1[k];
+    for (std::size_t k = 0; k < n2; ++k)
+      f12_next_t2[k] = in.t2[k] + f12_r2[k] / doubles_denominator_at(p, k);
+    const double energy =
+        out.energy + f12::energy_cpu(p.nocc, p.nvir, p.f12, f12_r1_const, in.t1, in.t2);
+    return {energy, f12_r1.data(), f12_r2.data(), f12_next_t1.data(), f12_next_t2.data()};
+  };
   bool invariants_prepared = false;
   auto run_iteration = [&](const generated::Inputs& in) -> generated::IterationOutputs {
     if (!p.naux && reuse_invariants) {
@@ -415,7 +453,7 @@ SolverResult solve_cpu(const Problem& p, const SolverOptions& options) {
       if (had_prepared)
         result.diagnostic.iteration_invariant_operations_saved +=
             generated::iteration_invariant_operation_count;
-      return out;
+      return apply_f12_dense_iteration(in, out);
     }
     if (!p.naux) {
       const auto out = generated::run_iteration_cpu(p.nocc, p.nvir, in, iteration_arena.data(),
@@ -424,7 +462,7 @@ SolverResult solve_cpu(const Problem& p, const SolverOptions& options) {
           generated::iteration_invariant_operation_count;
       result.diagnostic.iteration_dynamic_operations +=
           generated::iteration_dynamic_operation_count;
-      return out;
+      return apply_f12_dense_iteration(in, out);
     }
     if (plan.hoisted) {
       generated::dfhoist::Inputs fast{};
@@ -475,6 +513,9 @@ SolverResult solve_cpu(const Problem& p, const SolverOptions& options) {
         result.diagnostic.df_virtual_operations += generated::dfhoist::auxiliary_operation_count;
         result.diagnostic.df_accumulation_calls += counts.size();
       }
+      if (f12_active)
+        f12::add_residuals_cpu(p.nocc, p.nvir, p.f12, f12_r1_const, in.t1, virtual_sum.data(),
+                               virtual_sum.data() + n1);
       ++result.diagnostic.df_hoisted_evaluations;
       result.diagnostic.df_contraction_terms = checked_add(
           result.diagnostic.df_contraction_terms,
@@ -482,7 +523,10 @@ SolverResult solve_cpu(const Problem& p, const SolverOptions& options) {
                       checked_add(checked_mul(p.naux, plan.auxiliary_terms), plan.core_terms)));
       const auto out = generated::dfhoist::run_iteration_cpu(
           p.nocc, p.nvir, fast, iteration_arena.data(), iteration_arena.size());
-      return {out.energy, out.r1, out.r2, out.next_t1, out.next_t2};
+      const double energy =
+          out.energy +
+          (f12_active ? f12::energy_cpu(p.nocc, p.nvir, p.f12, f12_r1_const, in.t1, in.t2) : 0.0);
+      return {energy, out.r1, out.r2, out.next_t1, out.next_t2};
     }
     const auto core = df_inputs(in);
     const auto out = generated::dfcore::run_iteration_cpu(
@@ -490,19 +534,34 @@ SolverResult solve_cpu(const Problem& p, const SolverOptions& options) {
     result.diagnostic.df_contraction_terms =
         checked_add(result.diagnostic.df_contraction_terms,
                     generated::dfhoist::fallback_core_contraction_terms(p.nocc, p.nvir));
-    return {out.energy, out.r1, out.r2, out.next_t1, out.next_t2};
+    const double energy =
+        out.energy +
+        (f12_active ? f12::energy_cpu(p.nocc, p.nvir, p.f12, f12_r1_const, in.t1, in.t2) : 0.0);
+    return {energy, out.r1, out.r2, out.next_t1, out.next_t2};
   };
   auto run_replay = [&](const generated::Inputs& in) -> generated::ReplayOutputs {
-    if (!p.naux)
-      return generated::run_replay_cpu(p.nocc, p.nvir, in, replay_arena.data(),
-                                       replay_arena.size());
+    if (!p.naux) {
+      const auto out =
+          generated::run_replay_cpu(p.nocc, p.nvir, in, replay_arena.data(), replay_arena.size());
+      if (!f12_active) return out;
+      std::copy_n(out.r1, n1, f12_replay_r1.data());
+      std::copy_n(out.r2, n2, f12_replay_r2.data());
+      f12::add_residuals_cpu(p.nocc, p.nvir, p.f12, f12_r1_const, in.t1, f12_replay_r1.data(),
+                             f12_replay_r2.data());
+      const double energy =
+          out.energy + f12::energy_cpu(p.nocc, p.nvir, p.f12, f12_r1_const, in.t1, in.t2);
+      return {energy, f12_replay_r1.data(), f12_replay_r2.data()};
+    }
     const auto core = df_inputs(in);
     const auto out = generated::dfcore::run_replay_cpu(p.nocc, p.nvir, core, replay_arena.data(),
                                                        replay_arena.size());
     result.diagnostic.df_contraction_terms =
         checked_add(result.diagnostic.df_contraction_terms,
                     generated::dfhoist::fallback_replay_contraction_terms(p.nocc, p.nvir));
-    return {out.energy, out.r1, out.r2};
+    const double energy =
+        out.energy +
+        (f12_active ? f12::energy_cpu(p.nocc, p.nvir, p.f12, f12_r1_const, in.t1, in.t2) : 0.0);
+    return {energy, out.r1, out.r2};
   };
 
   run_cc_iterations<generated::IterationOutputs>(

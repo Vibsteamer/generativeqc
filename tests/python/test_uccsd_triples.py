@@ -229,7 +229,7 @@ def test_restricted_limit_matches_existing_rccsd_triples() -> None:
 def test_native_cpu_tile_matches_independent_channel(
     channel: str, tmp_path: Path
 ) -> None:
-    from tools.generativeqc_cc.native_tensor_cpu import NativeCCTensorExecutor
+    from generativeqc._ucc.native_tensor_cpu import NativeCCTensorExecutor
 
     coupled_cluster, eris, layout, amplitudes, sources = _case()
     tile = build_tile_program(layout, channel, channel_shape(layout, channel))
@@ -324,10 +324,9 @@ def test_invalid_tile_admission(shape: tuple) -> None:
 def test_real_cuda_tile_matches_independent_channel(
     channel: str, tmp_path: Path
 ) -> None:
+    from generativeqc._ucc.native_tensor_cuda import CudaCCTensorExecutor
     from generativeqc_compiler.common.cuda_adapter import CudaCompilerAdapter
     from generativeqc_compiler.common.cuda_target import cuda_target_info
-
-    from tools.generativeqc_cc.native_tensor_cuda import CudaCCTensorExecutor
 
     assert os.environ.get("SLURM_JOB_ID"), (
         "CUDA tests require a finite Slurm allocation"

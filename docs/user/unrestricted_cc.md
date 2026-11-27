@@ -71,6 +71,15 @@ Selecting CUDA never retries an operation on the CPU backend.
 Supply `auxiliary_basis` and `density_fitting="correlation_cuda"` for fitted
 correlation with a conventional UHF reference, or `"full_cuda"` for fitted
 UHF J/K and fitted correlation using the same auxiliary/metric policy.
+For full-DF UCCSD or UCCSD(T) single points, pass a canonical
+`reference_auxiliary_basis` record to `singlepoint()` to select a separate
+JKFit. The SCF and its orbital response use JKFit. Correlation energies and
+relaxed forces use the correlation fit from `Calculator(auxiliary_basis=...)`.
+The force includes both auxiliary-center and both metric derivatives. The
+native prepare call is `generativeqc_calculation_prepare_ucc_df_fits_v1` in
+`generativeqc/ucc_fitting.h`. The split-fit path supports energy and forces
+through the ordinary singlepoint executor.
+
 These two unrestricted policies also work with `device="cpu"` for native
 reference qualification. `"cpu"`/`"cuda"`/`"auto"` fitting modes select
 correlation-only fitting. Host FP64 spectral conditioning is explicit in

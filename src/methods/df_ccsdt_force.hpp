@@ -42,6 +42,10 @@ struct DFCCSDTResult {
   double reference_energy_change{}, reference_density_rms{};
   int reference_iterations{};
   std::vector<double> forces;
+  // Pure (T)/(T+) or spatial CCSD-F12b force sources for focal split-fit/ECP CPHF.
+  std::vector<double> correlation_gradient, bar_f, bar_c;
+  // Spatial amplitudes and Lambda multipliers exported for CCSD-F12b fixed-source pullback.
+  std::vector<double> ccsd_t1, ccsd_t2, lambda1, lambda2;
   Result method_result;
   generativeqc_correlation_diagnostic correlation{};
   std::size_t numeric_capacity_bytes{}, source_weight_values{}, metric_weight_values{};
@@ -63,6 +67,25 @@ struct DFCorrelationDemand {
   unsigned companions{};
   /** Explicit scientific model change, never inferred from resource refusal. */
   bool df_reference{};
+  /** Supplement the physical triples result with its occupied partition. */
+  bool triples_occupied_partition{};
+  /** Already selected canonical RHF root for the focal spatial route. */
+  std::shared_ptr<const hf::PhysicalReference> retained_reference;
+  /** Extra live focal-owner bytes, excluding the RHF frame charged by the solver. */
+  std::size_t retained_reference_bytes{};
+  /** Optional lowest spatial occupied orbitals excluded from correlation. */
+  std::size_t frozen_occupied{};
+  /** Optional per-active-occupied weights for (T+) weighted triples pullback. */
+  std::vector<double> triples_occupied_weights;
+  /** Return pure triples increment (corr_gradient, bar_f, bar_c) without RHF frame solve. */
+  bool focal_triples_sources{};
+  /** Opt-in experimental FP32 forward-W lowering for spatial triples. */
+  bool triples_fp32_w{};
+  bool triples_compensated_w{};
+  /** Solve spatial fixed-cusp RHF CCSD-F12b (with optional Lambda + ordinary force sources). */
+  bool focal_ccsdf12b_sources{};
+  /** Compact active-orbital spatial fixed-cusp F12b coupling tensors. */
+  cc::FixedCuspF12 f12;
 };
 
 /** Cold normalized geometry -> selected native CUDA RHF -> DF source -> CCSD(T)

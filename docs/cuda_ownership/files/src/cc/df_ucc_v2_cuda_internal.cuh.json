@@ -1,0 +1,14 @@
+{
+  "path": "src/cc/df_ucc_v2_cuda_internal.cuh",
+  "reason": "Owns CUDA buffers, stream-bound resources, row-major cuBLAS operations, finite norms, spin-blocked device layouts, precision conversion and packed DIIS history.",
+  "regions": [
+    {
+      "start": "__global__ void antisymmetrize_t2_kernel",
+      "stop": "// Generic 4D permutation:",
+      "role": "scientific",
+      "reason": "Defines the like-spin T2 antisymmetrizer and the like- and unlike-spin tau combinations."
+    }
+  ],
+  "role": "runtime",
+  "subsystem": "focal_cc"
+}

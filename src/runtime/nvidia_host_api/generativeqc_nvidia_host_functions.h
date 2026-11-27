@@ -27,6 +27,8 @@ cublasStatus_t cublasGetPointerMode_v2(cublasHandle_t arg0, cublasPointerMode_t*
 cublasStatus_t cublasGetProperty(libraryPropertyType arg0, int* arg1);
 cublasStatus_t cublasGetStream_v2(cublasHandle_t arg0, cudaStream_t* arg1);
 cublasStatus_t cublasGetVersion_v2(cublasHandle_t arg0, int* arg1);
+cublasStatus_t cublasSaxpy_v2(cublasHandle_t arg0, int arg1, const float* arg2, const float* arg3, int arg4, float* arg5, int arg6);
+cublasStatus_t cublasSdot_v2(cublasHandle_t arg0, int arg1, const float* arg2, int arg3, const float* arg4, int arg5, float* arg6);
 cublasStatus_t cublasSetMathMode(cublasHandle_t arg0, cublasMath_t arg1);
 cublasStatus_t cublasSetPointerMode_v2(cublasHandle_t arg0, cublasPointerMode_t arg1);
 cublasStatus_t cublasSetStream_v2(cublasHandle_t arg0, cudaStream_t arg1);
@@ -75,6 +77,8 @@ cusolverStatus_t cusolverGetProperty(libraryPropertyType arg0, int* arg1);
 #define cublasGetPointerMode cublasGetPointerMode_v2
 #define cublasGetStream cublasGetStream_v2
 #define cublasGetVersion cublasGetVersion_v2
+#define cublasSaxpy cublasSaxpy_v2
+#define cublasSdot cublasSdot_v2
 #define cublasSetPointerMode cublasSetPointerMode_v2
 #define cublasSetStream cublasSetStream_v2
 #define cublasSetWorkspace cublasSetWorkspace_v2

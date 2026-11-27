@@ -317,6 +317,42 @@ resolved model requires a new prepared owner; equal array dimensions do not make
 changed grid/functional/precision identities interchangeable. Inspection and
 serialization expose data without running a solve or acquiring device storage.
 
+(python-stationary-cc-options-values)=
+## Fixed-cusp CC amplitude and Lambda options
+
+`generativeqc.experimental.uccsd_f12.SolverOptions` controls the compiled
+amplitude solve. `energy_tolerance` bounds the energy comparisons in Hartree
+and may be at most `1e-8`. `residual_tolerance` bounds the maximum absolute
+physical amplitude residual and may be at most `1e-9`. Both tolerances
+must be positive and finite. `max_iterations` and the logical numeric
+storage limit `max_bytes` are positive integers.
+
+`denominator_threshold`, `level_shift` and `damping` are finite. The
+denominator threshold is positive and the level shift is nonnegative,
+both in Hartree. Damping is in `[0, 1)`. These controls shape the amplitude
+proposals. `diis_size` is either zero to disable DIIS or an integer from 2
+through 20.
+
+`generativeqc.experimental.uccsd_f12.UCCSDLambdaOptions` uses
+`cc_tolerance` for the fresh parent amplitude residual and
+`lambda_tolerance` for both the packed stationarity norm and the largest
+weighted stationarity component. Each tolerance is finite, positive and
+at most `1e-9`. `max_bytes` bounds logical numeric storage,
+`max_operator_actions` caps the number of transpose actions and
+`max_total_work` bounds the scalar work charged by the solver. Each limit is a
+positive integer up to `2**63 - 1`. `gmres` accepts a `GMRESOptions` record and
+defaults to `rtol=0.0`, `atol=1e-11` and `max_iterations=400` with the
+remaining GMRES defaults.
+
+(python-stationary-cc-options-errors)=
+## Fixed-cusp CC option validation
+
+Construction raises `ValueError` for invalid counts or out-of-range
+numeric controls. `UCCSDLambdaOptions` raises `TypeError` when `gmres`
+has the wrong type. During execution, the solver checks the applicable
+resource limits and re-evaluates the physical equations before publishing
+a converged result.
+
 (python-method-values)=
 ## Method and XC construction
 

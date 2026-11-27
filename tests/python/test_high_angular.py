@@ -97,7 +97,15 @@ def test_scf_auxiliary_h_admission_keeps_orbital_and_response_boundaries(
         shells = [Shell(0, angular, (Primitive(0.7, 1),))]
         assert basis_capability(shells, atoms, **request)["eligible"] is eligible
     shells = [Shell(0, 5, (Primitive(0.7, 1),))]
-    for consumer in (None, "correlation_df", "wb97mv_df_values"):
+    assert basis_capability(
+        shells, atoms, **(request | {"consumer": "correlation_df"})
+    )["eligible"]
+    assert not basis_capability(
+        [Shell(0, 6, (Primitive(0.7, 1),))],
+        atoms,
+        **(request | {"consumer": "correlation_df"}),
+    )["eligible"]
+    for consumer in (None, "wb97mv_df_values"):
         if consumer == "wb97mv_df_values" and order != 0:
             continue
         assert not basis_capability(

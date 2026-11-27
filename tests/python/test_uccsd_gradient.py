@@ -373,10 +373,10 @@ def test_native_one_electron_binding_is_verified_before_eri_reads(
 def test_complete_cuda_gradient_matches_independent_oracle(
     atoms: list, spin: int, broken: bool, tmp_path: Path
 ) -> None:
+    from generativeqc._ucc.native_tensor_cuda import CudaCCTensorExecutor
     from generativeqc_compiler.common.cuda_adapter import CudaCompilerAdapter
     from generativeqc_compiler.common.cuda_target import cuda_target_info
 
-    from tools.generativeqc_cc.native_tensor_cuda import CudaCCTensorExecutor
     from tools.generativeqc_posthf.cuda import compile_cuda
     from tools.generativeqc_response.backends import NativeJKBackend
     from tools.generativeqc_response.spin_cuda import CudaSpinJKBackend
