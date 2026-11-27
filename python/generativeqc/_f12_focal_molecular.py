@@ -125,6 +125,21 @@ class FocalTriplesEvaluation:
 _UHF_CC_BACKEND_ENV = "GENERATIVEQC_F12_UHF_CC_BACKEND"
 
 
+def _occupied_scaling_executor(backend: str):
+    """Disclose occupied-vector algebra only when the triples model executes it."""
+    from generativeqc_compiler.tensor import execute
+
+    def run(program, feeds):
+        disclose_host_assisted_stage(
+            "tplus_occupied_scaling",
+            requested_backend=backend,
+            detail="Occupied-orbital (T+) energy and cotangents use the host FP64 tensor executor.",
+        )
+        return execute(program, feeds)
+
+    return run
+
+
 def _uhf_cc_backend_override() -> Literal["native", "legacy"] | None:
     """Parse the unified UHF CCSD-F12b backend selector (native | legacy)."""
     raw = os.environ.get(_UHF_CC_BACKEND_ENV)
@@ -295,6 +310,8 @@ class MolecularFocalProvider:
     # The owner may reuse matching CC and DF state and must return role-keyed
     # increments with exactly the requested derivative scope.
     triples_models: Callable[..., dict[str, FocalTriplesEvaluation]] | None = None
+    # Availability of both energy and full analytic force for this exact request.
+    qualified_tplus: Callable[[FocalRequest], bool] | None = None
     relative_cutoff: float = 1e-9
     budget_mib: int = 1536
     preconvergence: str = "auto"
@@ -328,6 +345,31 @@ class MolecularFocalProvider:
             object.__setattr__(self, "triples_models", self.default_triples_models)
 
 
+    def supports_tplus(self, request: FocalRequest) -> bool:
+        """Check the implemented occupied model and backend, independently of qualification."""
+        if request.role != "triples_plus":
+            return False
+        basis = request.basis
+        if (
+            basis.cabs is None
+            or basis.mp2_fit is None
+            or basis.f12_fit is None
+            or basis.beta is None
+        ):
+            return False
+        if request.root_id == "rhf":
+            return (
+                request.multiplicity == 1
+                and request.backend == "cuda"
+                and self.run is not None
+            )
+        if request.root_id == "uhf":
+            return (
+                request.backend == "cuda" and self.run is not None
+            ) or request.backend == "cpu_reference"
+        return False
+
+
     def default_triples_models(
         self,
         requests: tuple[FocalRequest, ...],
@@ -340,6 +382,54 @@ class MolecularFocalProvider:
         """Evaluate the selected increments on the supplied molecular determinant."""
         by_role = {r.role: r for r in requests}
         results: dict[str, FocalTriplesEvaluation] = {}
+        conv_from_tplus: float | None = None
+        if "triples_plus" in by_role:
+            tplus_req = by_role["triples_plus"]
+            if not self.supports_tplus(tplus_req):
+                raise NotImplementedError(
+                    f"Built-in (T+) is unavailable for root={tplus_req.root_id!r}, "
+                    f"backend={tplus_req.backend!r}, multiplicity={tplus_req.multiplicity}"
+                )
+            if isinstance(low_order, FocalLowOrderEnergy) and low_order.occupied_mp2_f12 is not None:
+                low_occ = low_order
+            else:
+                rank_hint = expected_cabs_rank
+                if rank_hint is None and isinstance(low_order, FocalLowOrderForces):
+                    rank_hint = low_order.energies.cabs_rank
+                elif rank_hint is None and isinstance(low_order, FocalLowOrderEnergy):
+                    rank_hint = low_order.cabs_rank
+                pair_req = replace(tplus_req, role="mp2_f12_correlation")
+                low_occ = self.low_order_energy(
+                    pair_req,
+                    expected_cabs_rank=rank_hint,
+                    include_hf_cabs=False,
+                    include_occupied_partitions=True,
+                    reference=reference,
+                )
+            rank = expected_cabs_rank if expected_cabs_rank is not None else low_occ.cabs_rank
+            if tplus_req.root_id == "rhf":
+                if forces:
+                    conv_from_tplus, tplus_ev, _ = (
+                        self.restricted_tplus_energy_and_forces_on_reference(
+                            tplus_req, low_order=low_occ, expected_cabs_rank=rank
+                        )
+                    )
+                else:
+                    conv_from_tplus, tplus_ev = self.restricted_tplus_energy_on_reference(
+                        tplus_req, low_order=low_occ, expected_cabs_rank=rank
+                    )
+            else:
+                if forces:
+                    conv_from_tplus, tplus_ev, _ = (
+                        self.unrestricted_tplus_energy_and_forces_on_reference(
+                            tplus_req, low_order=low_occ, expected_cabs_rank=rank
+                        )
+                    )
+                else:
+                    conv_from_tplus, tplus_ev = self.unrestricted_tplus_energy_on_reference(
+                        tplus_req, low_order=low_occ, expected_cabs_rank=rank
+                    )
+            results["triples_plus"] = tplus_ev
         if "triples" in by_role:
             conv_req = by_role["triples"]
             telemetry = {}
@@ -357,7 +447,11 @@ class MolecularFocalProvider:
                     telemetry=telemetry,
                 )
             else:
-                conv_e = self.triples_energy(conv_req, reference=reference, telemetry=telemetry)
+                if conv_from_tplus is None:
+                    conv_e = self.triples_energy(conv_req, reference=reference, telemetry=telemetry)
+                else:
+                    conv_e = conv_from_tplus
+                    telemetry = dict(results["triples_plus"].telemetry)
                 results["triples"] = FocalTriplesEvaluation(
                     conv_e,
                     None,
@@ -398,6 +492,7 @@ class MolecularFocalProvider:
         use_native_uhf_f12b: bool = True,
         high_order: Callable[[FocalRequest], FocalEvaluation] | None = None,
         triples_models: Callable[..., dict[str, FocalTriplesEvaluation]] | None = None,
+        qualified_tplus: Callable[[FocalRequest], bool] | None = None,
         record_graph: Callable[[dict], None] | None = None,
         lambda_options: UCCSDLambdaOptions | None = None,
         rhf_df_ladder: RHFDFLadderOptions | None = None,
@@ -450,6 +545,7 @@ class MolecularFocalProvider:
             use_native_uhf_f12b=use_native_uhf_f12b,
             high_order=high_order,
             triples_models=triples_models,
+            qualified_tplus=qualified_tplus,
             lambda_options=lambda_options,
             rhf_df_ladder=rhf_df_ladder,
             uhf_df_ladder=uhf_df_ladder,
@@ -564,6 +660,443 @@ class MolecularFocalProvider:
         if dropped:
             release_host_memory()
 
+    def tplus_scaling_forces(
+        self,
+        request: FocalRequest,
+        reference: FocalReference,
+        mp2_weights: SpinOccupied,
+        f12_weights: SpinOccupied,
+        *,
+        expected_cabs_rank: int,
+    ) -> np.ndarray:
+        """Relax the MP2 and F12 orbital energy seeds supplied by a (T+) owner."""
+        budget = _check_request(self, request)
+        one, panels = self._cached_pair_sources(request, derivatives=True, budget=budget)
+        record_ram_phase("after_cached_pair_sources")
+        forces = self._pair_components(
+            request,
+            reference,
+            one,
+            panels,
+            expected_cabs_rank=expected_cabs_rank,
+            mp2_weights=mp2_weights,
+            f12_weights=f12_weights,
+        )[3]
+        if any(p.streaming for p in panels):
+            del one, panels
+            self._evict_pair_source_cache()
+        return forces
+
+    def tplus_from_occupied(
+        self,
+        request: FocalRequest,
+        low_order: FocalLowOrderEnergy,
+        triples: FocalOccupiedTriples,
+        *,
+        inactive: tuple[bool, ...] | None = None,
+    ) -> FocalTPlusWeights:
+        """Combine source partitions on one exact frame and return the three seeds.
+
+        This step does not solve the conventional CC parent or the weighted
+        triples response. Feed the MP2 and F12 seeds to tplus_scaling_forces
+        and the triples seed to the same conventional triples response owner.
+        """
+        from generativeqc_compiler.cc.tplus import evaluate_tplus
+
+        from ._f12_focal_tplus_sources import FocalTPlusWeights, checked_occupied_weights
+        from ._f12_frozen_core import active_occupied_counts, resolve_frozen_occupied
+
+        _check_request(self, request)
+        ref, source = low_order.reference, low_order.occupied_mp2_f12
+        basis = request.basis
+        if (
+            source is None
+            or triples.reference is not ref
+            or ref.surface_id != request.surface_id
+            or ref.basis_id != basis.basis_id
+            or ref.orbital_id != basis.orbital.identity
+            or ref.jk_fit_id != basis.jk_fit.identity
+            or ref.executed_backend != request.backend
+            or triples.correlation_space_id != request.correlation_space_id
+            or basis.mp2_fit is None
+            or triples.correlation_fit_id != basis.mp2_fit.identity
+        ):
+            raise ValueError("(T+) sources require the same determinant, basis and correlation fit")
+        spins = ref._pair_spin_indices(request)
+        full_counts = tuple(ref.occupied[index] for index in spins)
+        frozen = resolve_frozen_occupied(request, full_counts)
+        counts = active_occupied_counts(full_counts, frozen)
+        mp2 = checked_occupied_weights(source.mp2, counts)
+        f12 = checked_occupied_weights(source.f12_increment, counts)
+        if not np.allclose(
+            [sum(np.sum(block) for block in parts) for parts in (mp2, f12)],
+            [sum(low_order.ordinary_mp2_spin_energies), low_order.f12_increment],
+            atol=1e-10, rtol=1e-10,
+        ):
+            raise ValueError("(T+) occupied partitions disagree with their unscaled energies")
+        values = triples.values
+        if request.backend == "cuda":
+            from generativeqc_compiler.tensor import execute as _cpu_tensor_execute
+
+            if self.run is None or self.run is _cpu_tensor_execute:
+                raise RuntimeError("(T+) scalar requires the FP64 CUDA executor")
+
+        if request.root_id == "rhf":
+            if (
+                not isinstance(values, np.ndarray)
+                or values.dtype != np.float64
+                or values.shape != (counts[0],)
+            ):
+                raise ValueError("RHF (T+) requires one spatial occupied triples vector")
+            scaled = evaluate_tplus(
+                mp2[0] + mp2[1],
+                f12[0] + f12[1],
+                values,
+                inactive=inactive,
+                run=_occupied_scaling_executor(request.backend),
+            )
+            mp2_seed = np.array(scaled.mp2_cotangent)
+            f12_seed = np.array(scaled.f12_cotangent)
+            return FocalTPlusWeights(
+                scaled.energy, (mp2_seed, mp2_seed.copy()),
+                (f12_seed, f12_seed.copy()), np.array(scaled.triples_cotangent),
+            )
+        if not isinstance(values, tuple):
+            raise ValueError("UHF (T+) requires separate alpha and beta triples vectors")
+        values = checked_occupied_weights(values, counts)
+        scaled = evaluate_tplus(
+            np.concatenate(mp2),
+            np.concatenate(f12),
+            np.concatenate(values),
+            inactive=inactive,
+            run=_occupied_scaling_executor(request.backend),
+        )
+
+        def split(source):
+            weights = np.array(source)
+            return weights[:counts[0]], weights[counts[0]:]
+
+        return FocalTPlusWeights(
+            scaled.energy, split(scaled.mp2_cotangent), split(scaled.f12_cotangent),
+            split(scaled.triples_cotangent),
+        )
+
+    def restricted_tplus_energy_on_reference(
+        self,
+        request: FocalRequest,
+        *,
+        low_order: FocalLowOrderEnergy,
+        expected_cabs_rank: int | None = None,
+    ) -> tuple[float, FocalTriplesEvaluation]:
+        """Evaluate both conventional and scaled (T) energies on one CUDA RHF frame.
+
+        The caller supplies the retained low-order energies and occupied MP2-F12
+        partitions. The two scalars share the native spatial CC solve and the
+        conventional occupied triples contraction. Supports common or split
+        JK/correlation fits, scalar ECP, frozen-core and mixed preconvergence.
+        """
+        from ._f12_focal_ucc_triples import molecular_occupied_triples_on_reference
+
+        if request.role != "triples_plus" or request.root_id != "rhf":
+            raise ValueError("Restricted (T+) requires the RHF scaled triples role")
+        if request.backend != "cuda" or self.run is None:
+            raise NotImplementedError("Restricted (T+) energy requires the CUDA executor")
+        pair_request = replace(request, role="mp2_f12_correlation")
+        _check_request(self, pair_request)
+        if expected_cabs_rank is not None and expected_cabs_rank != low_order.cabs_rank:
+            raise ValueError("The displaced (T+) CABS rank differs from the center")
+        if low_order.occupied_mp2_f12 is None:
+            raise ValueError("Restricted (T+) requires the low-order occupied partitions")
+        extra: dict[str, object] = {}
+        if self.preconvergence != "auto":
+            extra["preconvergence"] = self.preconvergence
+        conventional, occupied = molecular_occupied_triples_on_reference(
+            request,
+            low_order.reference,
+            budget_mib=self.budget_mib,
+            **extra,
+        )
+        scaled = self.tplus_from_occupied(pair_request, low_order, occupied)
+        return conventional, FocalTriplesEvaluation(
+            scaled.energy,
+            None,
+            low_order.cabs_rank,
+            executed_backend=occupied.reference.executed_backend,
+            converged=True,
+            telemetry=dict(occupied.telemetry),
+            triples_model_id="tplus_rhf_occupied_v2",
+        )
+
+    def unrestricted_tplus_energy_on_reference(
+        self,
+        request: FocalRequest,
+        *,
+        low_order: FocalLowOrderEnergy,
+        expected_cabs_rank: int | None = None,
+    ) -> tuple[float, FocalTriplesEvaluation]:
+        """Evaluate both conventional and scaled (T+) energies on one UHF frame.
+
+        The caller supplies the retained low-order energies and occupied MP2-F12
+        partitions. The two scalars share the native spin-blocked DF-UCCSD(T) v2
+        solve and occupied triples partitions across alpha and beta channels.
+        """
+        from ._f12_focal_ucc_triples import molecular_occupied_triples_on_reference
+
+        if request.role != "triples_plus" or request.root_id != "uhf":
+            raise ValueError("Unrestricted (T+) requires the UHF scaled triples role")
+        if request.backend == "cuda" and self.run is None:
+            raise NotImplementedError("CUDA unrestricted (T+) energy requires the CUDA executor")
+        pair_request = replace(request, role="mp2_f12_correlation")
+        _check_request(self, pair_request)
+        if expected_cabs_rank is not None and expected_cabs_rank != low_order.cabs_rank:
+            raise ValueError("The displaced (T+) CABS rank differs from the center")
+        if low_order.occupied_mp2_f12 is None:
+            raise ValueError("Unrestricted (T+) requires the low-order occupied partitions")
+        extra: dict[str, object] = {}
+        if self.preconvergence != "auto":
+            extra["preconvergence"] = self.preconvergence
+        conventional, occupied = molecular_occupied_triples_on_reference(
+            request,
+            low_order.reference,
+            budget_mib=self.budget_mib,
+            **extra,
+        )
+        scaled = self.tplus_from_occupied(pair_request, low_order, occupied)
+        return conventional, FocalTriplesEvaluation(
+            scaled.energy,
+            None,
+            low_order.cabs_rank,
+            executed_backend=occupied.reference.executed_backend,
+            converged=True,
+            telemetry=dict(occupied.telemetry),
+            triples_model_id="tplus_uhf_occupied_v2",
+        )
+
+    def restricted_tplus_energy_and_forces_on_reference(
+        self,
+        request: FocalRequest,
+        *,
+        low_order: FocalLowOrderEnergy,
+        expected_cabs_rank: int | None = None,
+        inactive: tuple[bool, ...] | None = None,
+    ) -> tuple[float, FocalTriplesEvaluation, TriplesTelemetry]:
+        """Evaluate conventional (T) energy plus full analytic (T+) energy & 3N forces.
+
+        Uses one spatial CUDA DF-RCCSD + weighted DF-(T) pullback + Delta-Lambda solve
+        for sum_i w_i * d(e_i^(T))/dR, combined with tplus_scaling_forces for
+        sum_i e_i^(T) * dw_i/dR. Supports split-fit, scalar ECP, frozen-core and
+        mixed preconvergence.
+        """
+        from generativeqc_compiler.cc.tplus import evaluate_tplus
+
+        from ._f12_focal_tplus_sources import FocalOccupiedTriples
+        from ._f12_focal_ucc_triples import _record_frozen_core, spatial_rhf_triples_v2
+        from ._f12_frozen_core import active_occupied_counts, resolve_frozen_occupied
+
+        if request.role != "triples_plus" or request.root_id != "rhf":
+            raise ValueError("Restricted (T+) forces require the RHF scaled triples role")
+        if request.backend != "cuda" or self.run is None:
+            raise NotImplementedError("Restricted (T+) forces require the CUDA executor")
+        pair_request = replace(request, role="mp2_f12_correlation")
+        _check_request(self, pair_request)
+        if expected_cabs_rank is not None and expected_cabs_rank != low_order.cabs_rank:
+            raise ValueError("The (T+) CABS rank differs from the center")
+        source = low_order.occupied_mp2_f12
+        if source is None:
+            raise ValueError("Restricted (T+) forces require low-order occupied partitions")
+        ref = low_order.reference
+        o_full = ref.occupied[0]
+        frozen = resolve_frozen_occupied(request, (o_full, o_full))
+        o_act = active_occupied_counts((o_full, o_full), frozen)[0]
+        mp2_spatial = source.mp2[0] + source.mp2[1]
+        f12_spatial = source.f12_increment[0] + source.f12_increment[1]
+        if mp2_spatial.shape != (o_act,) or f12_spatial.shape != (o_act,):
+            raise ValueError("Occupied MP2/F12 partition shape disagrees with active occupied count")
+        # Fixed (T+) weights depend only on occupied MP2 and F12 energies, independent of e_i^(T).
+        weight_probe = evaluate_tplus(
+            mp2_spatial, f12_spatial, np.ones(o_act, dtype=np.float64), inactive=inactive,
+            run=_occupied_scaling_executor(request.backend),
+        )
+        occ_weights = np.asarray(weight_probe.triples_cotangent, dtype=np.float64)
+
+        # Evict any low-order pair caches before the C++ triples spike so host arenas never stack.
+        self._evict_pair_source_cache()
+        release_host_memory()
+        record_ram_phase("before_triples")
+
+        spatial_res = spatial_rhf_triples_v2(
+            replace(request, role="triples"),
+            ref,
+            budget_mib=self.budget_mib,
+            forces=True,
+            occupied_partition=True,
+            occupied_weights=occ_weights,
+            preconvergence=self.preconvergence,
+            provider=self,
+        )
+        record_ram_phase("after_triples")
+        release_host_memory()
+        record_ram_phase("after_trim")
+        telemetry = dict(spatial_res.telemetry)
+        assert spatial_res.occupied is not None and spatial_res.forces is not None
+        assert request.basis.mp2_fit is not None
+        occupied_obj = FocalOccupiedTriples(
+            ref, request.correlation_space_id, request.basis.mp2_fit.identity, spatial_res.occupied
+        )
+        scaled = self.tplus_from_occupied(
+            pair_request, low_order, occupied_obj, inactive=inactive
+        )
+        if abs(scaled.energy - spatial_res.energy) > 1e-10 * (1.0 + abs(scaled.energy)):
+            raise RuntimeError(
+                f"Weighted spatial (T+) energy {spatial_res.energy} disagrees with "
+                f"occupied partition sum {scaled.energy}"
+            )
+        scaling_forces = self.tplus_scaling_forces(
+            pair_request,
+            ref,
+            scaled.mp2,
+            scaled.f12_increment,
+            expected_cabs_rank=low_order.cabs_rank,
+        )
+        total_forces = spatial_res.forces + scaling_forces
+        conventional_energy = float(np.sum(spatial_res.occupied))
+        _record_frozen_core(telemetry, request, ref)
+        return (
+            conventional_energy,
+            FocalTriplesEvaluation(
+                scaled.energy,
+                total_forces,
+                low_order.cabs_rank,
+                executed_backend=ref.executed_backend,
+                converged=True,
+                telemetry=dict(telemetry),
+                triples_model_id="tplus_rhf_occupied_v2",
+            ),
+            telemetry,
+        )
+
+    def unrestricted_tplus_energy_and_forces_on_reference(
+        self,
+        request: FocalRequest,
+        *,
+        low_order: FocalLowOrderEnergy,
+        expected_cabs_rank: int | None = None,
+        inactive: tuple[bool, ...] | None = None,
+    ) -> tuple[float, FocalTriplesEvaluation, TriplesTelemetry]:
+        """Evaluate conventional (T) energy plus full analytic (T+) energy & 3N forces on UHF.
+
+        Uses one spin-blocked DF-UCCSD + 4-channel weighted DF-(T) pullback + Delta-Lambda
+        solve for sum_i w_i * d(e_i^(T))/dR across alpha and beta channels, combined with
+        tplus_scaling_forces for sum_i e_i^(T) * dw_i/dR. Supports split-fit, scalar ECP,
+        frozen-core and mixed preconvergence.
+        """
+        from generativeqc_compiler.cc.tplus import evaluate_tplus
+
+        from ._f12_focal_tplus_sources import FocalOccupiedTriples
+        from ._f12_focal_ucc_triples import _record_frozen_core, spin_blocked_uhf_triples_v2
+        from ._f12_frozen_core import active_occupied_counts, resolve_frozen_occupied
+
+        if request.role != "triples_plus" or request.root_id != "uhf":
+            raise ValueError("Unrestricted (T+) forces require the UHF scaled triples role")
+        if request.backend == "cuda" and self.run is None:
+            raise NotImplementedError("CUDA unrestricted (T+) forces require the CUDA executor")
+        pair_request = replace(request, role="mp2_f12_correlation")
+        _check_request(self, pair_request)
+        if expected_cabs_rank is not None and expected_cabs_rank != low_order.cabs_rank:
+            raise ValueError("The (T+) CABS rank differs from the center")
+        source = low_order.occupied_mp2_f12
+        if source is None:
+            raise ValueError("Unrestricted (T+) forces require low-order occupied partitions")
+        ref = low_order.reference
+        full_counts = (ref.occupied[0], ref.occupied[1])
+        frozen = resolve_frozen_occupied(request, full_counts)
+        oa_act, ob_act = active_occupied_counts(full_counts, frozen)
+        mp2_a, mp2_b = source.mp2
+        f12_a, f12_b = source.f12_increment
+        if (
+            mp2_a.shape != (oa_act,)
+            or mp2_b.shape != (ob_act,)
+            or f12_a.shape != (oa_act,)
+            or f12_b.shape != (ob_act,)
+        ):
+            raise ValueError(
+                "Occupied MP2/F12 partition shape disagrees with active occupied counts"
+            )
+        # Fixed (T+) weights depend only on occupied MP2 and F12 energies, independent of e_i^(T).
+        weight_probe = evaluate_tplus(
+            np.concatenate((mp2_a, mp2_b)),
+            np.concatenate((f12_a, f12_b)),
+            np.ones(oa_act + ob_act, dtype=np.float64),
+            inactive=inactive,
+            run=_occupied_scaling_executor(request.backend),
+        )
+        all_weights = np.asarray(weight_probe.triples_cotangent, dtype=np.float64)
+        occ_weights = (all_weights[:oa_act], all_weights[oa_act:])
+
+        # Evict any low-order pair caches before the C++ triples spike so host arenas never stack.
+        self._evict_pair_source_cache()
+        release_host_memory()
+        record_ram_phase("before_triples")
+
+        uhf_res = spin_blocked_uhf_triples_v2(
+            replace(request, role="triples"),
+            ref,
+            budget_mib=self.budget_mib,
+            forces=True,
+            occupied_partition=True,
+            occupied_weights=occ_weights,
+            preconvergence=self.preconvergence,
+            provider=self,
+        )
+        record_ram_phase("after_triples")
+        release_host_memory()
+        record_ram_phase("after_trim")
+        telemetry = dict(uhf_res.telemetry)
+        assert (
+            uhf_res.occupied_alpha is not None
+            and uhf_res.occupied_beta is not None
+            and uhf_res.forces is not None
+        )
+        assert request.basis.mp2_fit is not None
+        occupied_obj = FocalOccupiedTriples(
+            ref,
+            request.correlation_space_id,
+            request.basis.mp2_fit.identity,
+            (uhf_res.occupied_alpha, uhf_res.occupied_beta),
+        )
+        scaled = self.tplus_from_occupied(
+            pair_request, low_order, occupied_obj, inactive=inactive
+        )
+        if abs(scaled.energy - uhf_res.energy) > 1e-10 * (1.0 + abs(scaled.energy)):
+            raise RuntimeError(
+                f"Weighted UHF (T+) energy {uhf_res.energy} disagrees with "
+                f"occupied partition sum {scaled.energy}"
+            )
+        scaling_forces = self.tplus_scaling_forces(
+            pair_request,
+            ref,
+            scaled.mp2,
+            scaled.f12_increment,
+            expected_cabs_rank=low_order.cabs_rank,
+        )
+        total_forces = uhf_res.forces + scaling_forces
+        conventional_energy = float(
+            np.sum(uhf_res.occupied_alpha) + np.sum(uhf_res.occupied_beta)
+        )
+        _record_frozen_core(telemetry, request, ref)
+        return (
+            conventional_energy,
+            FocalTriplesEvaluation(
+                scaled.energy,
+                total_forces,
+                low_order.cabs_rank,
+                executed_backend=ref.executed_backend,
+                converged=True,
+                telemetry=dict(telemetry),
+                triples_model_id="tplus_uhf_occupied_v2",
+            ),
+            telemetry,
+        )
 
     def low_order_energy_and_forces(
         self, request: FocalRequest, *, include_hf_cabs: bool = True

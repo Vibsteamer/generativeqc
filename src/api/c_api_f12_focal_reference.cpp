@@ -654,6 +654,115 @@ extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_o
   return focal_rcc_triples_values(calculation, owner, output, count, true);
 }
 
+extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_v2(
+    generativeqc_calculation* calculation, const generativeqc_focal_reference* owner, int forces,
+    int occupied_partition, std::size_t frozen_occupied, const double* occupied_weights,
+    std::size_t weights_count, std::uint32_t preconvergence, int triples_fp32_w, double* energy_out,
+    double* occupied_out, std::size_t occupied_count, double* corr_gradient_out,
+    std::size_t corr_gradient_count, double* bar_f_out, std::size_t bar_f_count, double* bar_c_out,
+    std::size_t bar_c_count, double* telemetry_out, std::size_t telemetry_count) {
+  if (!calculation || !calculation->context || !owner || !energy_out ||
+      (forces != 0 && forces != 1) || (occupied_partition != 0 && occupied_partition != 1) ||
+      triples_fp32_w != 0 || preconvergence > 3)
+    return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
+  auto* context = calculation->context;
+  std::lock_guard lock(context->mutex);
+  context->lambda_telemetry.reset();
+  try {
+    using namespace generativeqc;
+    runtime::df_progress::Scope trace(
+        forces ? "focal_rcc_triples_force_sources_v2"
+               : (occupied_partition ? "focal_rcc_triples_occupied_v2"
+                                     : "focal_rcc_triples_energy_v2"),
+        "cuda");
+    if (!owner->uhf || !owner->uhf->source_identity || !owner->rhf ||
+        owner->backend != core::kCudaBackend || owner->backend != context->state.executed_backend ||
+        owner->device != context->state.device_id)
+      throw std::invalid_argument("focal spatial triples v2 requires a retained CUDA RHF owner");
+    const auto& expanded = *owner->uhf;
+    const std::size_t o_full = expanded.nocc[0];
+    if (frozen_occupied >= o_full)
+      throw std::invalid_argument("focal spatial triples v2 frozen_occupied exceeds occupied count");
+    const std::size_t o_active = o_full - frozen_occupied;
+    const std::size_t n = expanded.nbf;
+    const std::size_t nn = runtime::size_mul(n, n);
+    const std::size_t coords = runtime::size_mul(3, calculation->plan->atom_count());
+    if (occupied_partition && (!occupied_out || occupied_count != o_active))
+      throw std::invalid_argument("focal spatial triples v2 occupied buffer shape mismatch");
+    if (weights_count && (!occupied_weights || weights_count != o_active))
+      throw std::invalid_argument("focal spatial triples v2 weights buffer shape mismatch");
+    if (forces && (!corr_gradient_out || corr_gradient_count != coords || !bar_f_out ||
+                   bar_f_count != nn || !bar_c_out || bar_c_count != nn))
+      throw std::invalid_argument("focal spatial triples v2 force source buffer shape mismatch");
+    if (telemetry_out && telemetry_count < 8)
+      throw std::invalid_argument("focal spatial triples v2 telemetry buffer requires >= 8 slots");
+
+    auto retained = runtime::size_add(owner->jk.storage_bytes(),
+                                     expanded.source_identity->storage_bytes());
+    auto charge = [&](const std::vector<double>& values) {
+      retained = runtime::size_add(retained, runtime::size_mul(values.capacity(), sizeof(double)));
+    };
+    charge(expanded.overlap);
+    charge(expanded.hcore);
+    for (std::size_t spin = 0; spin < 2; ++spin) {
+      charge(expanded.coefficients[spin]);
+      charge(expanded.density[spin]);
+      charge(expanded.fock[spin]);
+      charge(expanded.orbital_energies[spin]);
+    }
+
+    methods::detail::FocalRccTriplesOptions options;
+    options.forces = forces != 0;
+    options.occupied_partition = occupied_partition != 0;
+    options.frozen_occupied = frozen_occupied;
+    if (weights_count)
+      options.occupied_weights.assign(occupied_weights, occupied_weights + weights_count);
+    options.preconvergence = static_cast<core::DfPreconvergence>(preconvergence);
+
+    cc::detail::reset_last_lambda_diagnostic();
+    const auto result = methods::detail::focal_rcc_triples_values(
+        *calculation->plan, owner->rhf, *expanded.source_identity, owner->jk, retained, options);
+    if (!std::isfinite(result.energy))
+      throw std::runtime_error("nonfinite focal spatial triples v2 energy");
+    *energy_out = result.energy;
+    if (occupied_partition) {
+      if (result.occupied.size() != o_active)
+        throw std::runtime_error("focal spatial triples v2 occupied partition size mismatch");
+      std::copy(result.occupied.begin(), result.occupied.end(), occupied_out);
+    }
+    if (forces) {
+      if (result.correlation_gradient.size() != coords || result.bar_f.size() != nn ||
+          result.bar_c.size() != nn)
+        throw std::runtime_error("focal spatial triples v2 force source size mismatch");
+      std::copy(result.correlation_gradient.begin(), result.correlation_gradient.end(),
+                corr_gradient_out);
+      std::copy(result.bar_f.begin(), result.bar_f.end(), bar_f_out);
+      std::copy(result.bar_c.begin(), result.bar_c.end(), bar_c_out);
+    }
+    if (telemetry_out) {
+      telemetry_out[0] = result.ccsd_fp32_executed ? 1.0 : 0.0;
+      telemetry_out[1] = result.lambda_fp32_executed ? 1.0 : 0.0;
+      telemetry_out[2] = static_cast<double>(result.triples_fp32_gemms);
+      telemetry_out[3] = static_cast<double>(result.triples_fp64_gemms);
+      telemetry_out[4] = result.ccsd_seconds;
+      telemetry_out[5] = result.triples_seconds;
+      telemetry_out[6] = result.lambda_seconds;
+      telemetry_out[7] = result.source_response_seconds;
+    }
+    if (forces) cc::detail::capture_last_lambda_telemetry(context->lambda_telemetry);
+    trace.finish();
+    return GENERATIVEQC_STATUS_SUCCESS;
+  } catch (const std::length_error& error) {
+    record_oom_detail_noalloc(context->last_detail, error.what());
+    return GENERATIVEQC_STATUS_OUT_OF_MEMORY;
+  } catch (const std::bad_alloc& error) {
+    record_oom_detail_noalloc(context->last_detail, error.what());
+    return GENERATIVEQC_STATUS_OUT_OF_MEMORY;
+  } catch (...) {
+    return generativeqc::api::map_exception(&context->last_detail);
+  }
+}
+
 extern "C" GENERATIVEQC_API int generativeqc_focal_rcc_f12b_cuda_stage_counters_v1(void) {
 #if GENERATIVEQC_HAS_CUDA
   return 1;
