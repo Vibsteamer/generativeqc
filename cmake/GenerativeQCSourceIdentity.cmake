@@ -54,6 +54,7 @@ function(generativeqc_collect_source_identity_inputs output_variable)
         file(GLOB_RECURSE _matches CONFIGURE_DEPENDS
              RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
              "${CMAKE_CURRENT_SOURCE_DIR}/${_root}/${_pattern}")
+        list(FILTER _matches EXCLUDE REGEX "(^|/)__pycache__/")
         list(APPEND _inputs ${_matches})
       endforeach()
     endforeach()
