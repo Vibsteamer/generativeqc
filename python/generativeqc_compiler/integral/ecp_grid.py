@@ -73,7 +73,7 @@ def _scalar(
     ]
 
 
-def emit_ecp_grid_cpp() -> typing.Any:
+def emit_ecp_grid_cpp(max_orbital_angular: int = ECP_MAX_ORBITAL_ANGULAR) -> typing.Any:
     """Host-only helpers with bounded raw diagnostics and unchanged root policy."""
     lines = [
         "inline std::array<double, 2> ecp_legendre_step(double k, double z,",
@@ -172,7 +172,7 @@ def emit_ecp_grid_cpp() -> typing.Any:
         "}",
         "inline double ecp_component_coefficient(unsigned x, unsigned y, unsigned z, double coefficient) {",
     ]
-    for angular in range(ECP_MAX_ORBITAL_ANGULAR + 1):
+    for angular in range(max_orbital_angular + 1):
         for component in cartesian_components(angular):
             powers = tuple(component.count(a) for a in "xyz")
             denominator = math.prod(math.prod(range(1, 2 * p, 2)) for p in powers)
@@ -189,7 +189,7 @@ def emit_ecp_grid_cpp() -> typing.Any:
                 "  }",
             ]
     lines += [
-        '  throw std::invalid_argument("ECP component exceeds validated s/p/d/f domain");',
+        f'  throw std::invalid_argument("ECP component exceeds validated {"/".join("spdfghi"[: max_orbital_angular + 1])} domain");',
         "}",
     ]
     return lines

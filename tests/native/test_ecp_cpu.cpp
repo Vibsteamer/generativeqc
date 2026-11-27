@@ -155,7 +155,7 @@ void check_checked_and_failures() {
                           [](double x) { return x == 0; }),
           "ECP dynamic AO capacity");
   auto unsupported = system;
-  unsupported.shells[0].angular_momentum = 4;
+  unsupported.shells[0].angular_momentum = 5;
   for (auto representation : {GENERATIVEQC_BASIS_CARTESIAN, GENERATIVEQC_BASIS_SPHERICAL}) {
     unsupported.basis_representation = representation;
     rejects([&] { generativeqc::integrals::ecp_integrals(unsupported); });
