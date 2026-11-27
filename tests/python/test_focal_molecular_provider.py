@@ -89,6 +89,60 @@ def test_molecular_provider_requires_declared_backend_and_high_order(
 
 @pytest.mark.parametrize(
     ("root", "fits"),
+    [
+        ("uhf", (0, 0, 0)),
+        ("uhf", (0, 0, 1)),
+        ("uhf", (0, 1, 0)),
+        ("uhf", (0, 1, 1)),
+        ("uhf", (0, 1, 2)),
+        ("rhf", (0, 1, 2)),
+    ],
+)
+def test_molecular_pair_all_fit_assignments(
+    root: str, fits: tuple[int, int, int]
+) -> None:
+    shell = os.environ.get("GENERATIVEQC_F12_HOST_SINK")
+    if not shell:
+        pytest.skip("requires the built native F12 host shell library")
+    from benchmarks.f12_focal_increment import molecular_f12_increment
+    from benchmarks.f12_focal_ump2 import molecular_df_ump2
+
+    lib = Path(shell)
+    p = MolecularFocalProvider(shell_library=lib)
+    xyz = XYZ[:2] if root == "rhf" else XYZ
+    q = request(xyz, fits, root)
+    val = p(q)
+    ordinary = molecular_df_ump2(q, shell_library=lib, one_electron_library=lib)
+    explicit = molecular_f12_increment(q, shell_library=lib, one_electron_library=lib)
+    assert (val.term.surface_id, val.term.basis_id, val.term.role) == (
+        q.surface_id,
+        q.basis.basis_id,
+        q.role,
+    )
+    assert val.term.energy == pytest.approx(
+        sum(ordinary.spin_energies) + explicit.energy, abs=2e-10, rel=0
+    )
+    np.testing.assert_allclose(
+        val.term.forces,
+        ordinary.correlation_forces + explicit.forces,
+        atol=3e-9,
+        rtol=0,
+    )
+    direction = np.array([[0.1, 0.4, -0.2], [-0.2, 0.3, 0.5], [0.2, -0.1, 0.3]])
+    direction = direction[: len(xyz)]
+    direction /= np.linalg.norm(direction)
+    for h in (4e-4, 2e-4):
+        plus, minus = [
+            p(request(xyz + sign * h * direction, fits, root)).term.energy
+            for sign in (1, -1)
+        ]
+        assert np.vdot(val.term.forces, direction) == pytest.approx(
+            (minus - plus) / (2 * h), abs=2e-7, rel=0
+        )
+
+
+@pytest.mark.parametrize(
+    ("root", "fits"),
     [("rhf", (0, 2, 2)), ("uhf", (0, 1, 2)), ("uhf", (0, 0, 0)), ("uhf", (0, 0, 2))],
 )
 def test_one_root_low_order_energies_and_forces(

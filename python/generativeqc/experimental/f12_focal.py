@@ -16,6 +16,7 @@ import numpy as np
 
 from .. import (
     _f12_focal_cv,
+    _f12_focal_increment,
     _f12_focal_integral_kernel,
     _f12_focal_molecular,
     _f12_focal_one_electron,
@@ -86,6 +87,9 @@ one_electron_sources = _f12_focal_one_electron.one_electron_sources
 FocalReference = _f12_focal_reference.FocalReference
 FocalReferenceSeed = _f12_focal_reference.FocalReferenceSeed
 df_reference = _f12_focal_reference.df_reference
+FocalF12Increment = _f12_focal_increment.FocalF12Increment
+FocalF12Sources = _f12_focal_increment.FocalF12Sources
+reference_f12_increment = _f12_focal_increment.reference_f12_increment
 focal_cabs_projector = _f12_focal_projector.focal_cabs_projector
 CompensatedProductWorkLimit = _f12_focal_projector.CompensatedProductWorkLimit
 FocalCabsSingles = _f12_focal_singles.FocalCabsSingles
