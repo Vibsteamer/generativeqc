@@ -68,6 +68,9 @@ def basis_capability(
     orbital values and first derivatives through g, and fitting auxiliaries
     through h. It does not register conventional ERIs, AO jets or higher orders.
     These scoped consumers never widen a different reference model's admission.
+    The standalone CUDA ``one_electron_gradient`` operator contracts fixed AO
+    weights with first derivatives of S, T and V. Its all-electron orbital
+    descriptors support g shells, and its ECP system descriptors support f.
 
     The report retains the selected ``consumer``, the largest supplied angular
     momentum and the route's supported maximum, even when admission fails.
@@ -84,6 +87,14 @@ def basis_capability(
     backend = "cpu" if backend == "cpu_reference" else backend
     reasons, rows = [], []
     maximum = LIMITS.get(backend, {}).get(operator, {}).get(derivative_order)
+    contracted_gradient = (
+        backend == "cuda"
+        and operator == "one_electron_gradient"
+        and derivative_order == 1
+        and role == "orbital"
+    )
+    if contracted_gradient:
+        maximum = 4
     if consumer is not None:
         full_df = (
             consumer == "full_df"
@@ -133,6 +144,10 @@ def basis_capability(
             if element.ecp_core_electrons or element.ecp_data:
                 from .ecp import resolve_ecp
 
+                if contracted_gradient:
+                    # The native ECP system constructor bounds every orbital
+                    # shell in the system, including shells on other atoms.
+                    maximum = 3
                 try:
                     resolve_ecp(basis, atoms)
                     cpu_spatial_ao = (

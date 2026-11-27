@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -16,6 +17,7 @@ from generativeqc import (
     basis_capability,
     import_bse,
 )
+from generativeqc.basis import load_basis
 from generativeqc.elements import SYMBOLS
 
 ATOMS = (("C", (0.0, 0.0, 0.0)), ("N", (0.1, 0.2, 2.0)))
@@ -102,6 +104,40 @@ def test_absent_route_and_absent_shells_have_distinct_bounds() -> None:
     assert not empty["eligible"]
     assert empty["max_angular_momentum"] is None
     assert empty["max_supported_angular_momentum"] == 3
+
+
+def test_contracted_first_derivative_is_orbital_only_and_respects_ecp_system_capacity() -> (
+    None
+):
+    options = {
+        "backend": "cuda",
+        "operator": "one_electron_gradient",
+        "derivative_order": 1,
+    }
+    assert basis_capability(shells(4), ATOMS, **options)["eligible"]
+    assert not basis_capability(shells(5), ATOMS, **options)["eligible"]
+    assert not basis_capability(shells(4), ATOMS, role="auxiliary", **options)[
+        "eligible"
+    ]
+    assert not basis_capability(
+        shells(4),
+        ATOMS,
+        backend="cuda",
+        operator="one_electron_gradient",
+        derivative_order=2,
+    )["eligible"]
+    basis = load_basis(
+        Path(__file__).resolve().parents[1]
+        / "data/conventional_ecp_cbs/native_basis_dz.json"
+    )
+    iodine, hydrogen = basis.by_element[53], basis.by_element[1]
+    hydrogen = replace(
+        hydrogen, shells=(replace(hydrogen.shells[0], angular_momentum=4),)
+    )
+    combined = replace(basis, elements=(hydrogen, iodine))
+    assert basis_capability(combined, [("H", (0, 0, 0))], **options)["eligible"]
+    report = basis_capability(combined, [("H", (0, 0, 0)), ("I", (0, 0, 3))], **options)
+    assert not report["eligible"] and report["max_supported_angular_momentum"] == 3
 
 
 @pytest.mark.parametrize("representation", ("cartesian", "spherical"))

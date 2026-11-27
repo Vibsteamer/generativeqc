@@ -2452,6 +2452,9 @@ class Calculator:
         charge: int,
         multiplicity: int,
         basis: str | Sequence[Shell] | None = None,
+        *,
+        operator: str | None = None,
+        derivative_order: int = 0,
     ) -> ctypes.c_void_p:
         if self._method == _native.METHOD_GFN2_XTB:
             if basis is not None:
@@ -2487,7 +2490,9 @@ class Calculator:
                 context=context,
             )
             return system
-        selected_basis = self._basis_for_atoms(atoms, basis)
+        selected_basis = self._basis_for_atoms(
+            atoms, basis, operator=operator, derivative_order=derivative_order
+        )
         checked_integer(charge, "ionic charge", low=-(2**31), high=2**31 - 1)
         checked_integer(multiplicity, "multiplicity", low=1, high=2**31 - 1)
         checked_integer(len(atoms), "atom count", low=1, high=2**32 - 1)
@@ -2598,7 +2603,9 @@ class Calculator:
                 )
             _native.check(self._library, status, context=context)
             return system
-        shells = self._shells_for_atoms(atoms, basis)
+        shells = self._shells_for_atoms(
+            atoms, basis, operator=operator, derivative_order=derivative_order
+        )
         checked_integer(len(shells), "shell count", low=1, high=2**32 - 1)
         checked_integer(
             sum(len(s.primitives) for s in shells),
