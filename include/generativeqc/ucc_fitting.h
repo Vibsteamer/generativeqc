@@ -64,6 +64,32 @@ GENERATIVEQC_API generativeqc_status generativeqc_rcc_f12b_cpu_solve_v1(
     double* t1_out, double* t2_out, double* lambda1_out, double* lambda2_out, double* bar_foo_out,
     double* bar_fov_out, double* bar_fvv_out);
 
+/** Native spin-blocked DF-UCCSD(T) / (T+) v2 focal entry on a retained canonical RHF or UHF root.
+ * Runs on CPU (OpenBLAS) or CUDA without materializing 4-index ovvv/vvvv tensors.
+ * Supports split JK/correlation fits, scalar ECP, independent frozen_alpha/frozen_beta,
+ * optional per-spin occupied weights for exact (T+) analytic force sources,
+ * preconvergence (0=Legacy/FP64, 1=FP64, 2=Mixed, 3=Automatic), and optional FP32 forward-W.
+ * Optional ccsd_energy_out receives the DF-UCCSD correlation energy; energy_out receives (T)/(T+).
+ * When forces != 0, writes pure triples-increment (corr_gradient, bar_f_alpha/beta,
+ * bar_c_alpha/beta) for focal CPHF relaxation.
+ * Optional telemetry_out (count >= 10) receives [ccsd_fp32, lambda_fp32, t_fp32_gemms,
+ * t_fp64_gemms, ccsd_s, triples_s, lambda_s, source_response_s, ccsd_iterations,
+ * lambda_iterations]. Slots 10 and 11, when present, report physical reverse FP32 GEMM
+ * count and observed split3 execution. Mode 2 requests the compensated host spin-blocked
+ * W schedule. The spin-blocked CUDA endpoint supports modes 0 and 1. */
+GENERATIVEQC_API generativeqc_status generativeqc_focal_ucc_triples_v2(
+    generativeqc_context* context, const generativeqc_system* orbital,
+    const generativeqc_system* correlation_fit, const generativeqc_focal_reference* owner,
+    size_t budget_bytes, int forces, int occupied_partition, size_t frozen_alpha,
+    size_t frozen_beta, const double* occupied_weights_alpha, size_t weights_alpha_count,
+    const double* occupied_weights_beta, size_t weights_beta_count, uint32_t preconvergence,
+    int triples_fp32_w, double* ccsd_energy_out, double* energy_out, double* occupied_out_alpha,
+    size_t occupied_alpha_count, double* occupied_out_beta, size_t occupied_beta_count,
+    double* corr_gradient_out, size_t corr_gradient_count, double* bar_f_alpha_out,
+    size_t bar_f_alpha_count, double* bar_f_beta_out, size_t bar_f_beta_count,
+    double* bar_c_alpha_out, size_t bar_c_alpha_count, double* bar_c_beta_out,
+    size_t bar_c_beta_count, double* telemetry_out, size_t telemetry_count);
+
 /** Reset the calling thread's last RCCSD Lambda diagnostic slot. */
 GENERATIVEQC_API void generativeqc_cc_reset_last_lambda_telemetry_v1(void);
 

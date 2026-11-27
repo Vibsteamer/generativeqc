@@ -612,3 +612,236 @@ def relax_spin_blocked_uhf_force_sources(
     grad += provider._gradient(pair_request, jk, jk_bars, coulomb_only=True)
     grad += corr_gradient.reshape(-1, 3)
     return -grad
+
+
+def spin_blocked_uhf_triples_v2(
+    request: FocalRequest,
+    reference: FocalReference,
+    *,
+    budget_mib: int,
+    forces: bool = False,
+    occupied_partition: bool = False,
+    occupied_weights: tuple[np.ndarray, np.ndarray] | None = None,
+    preconvergence: str = "auto",
+    triples_fp32_w: bool = False,
+    triples_w_schedule: str | None = None,
+    provider: MolecularFocalProvider | None = None,
+) -> SpinBlockedTriplesResult:
+    """Invoke generativeqc_focal_ucc_triples_v2 for native spin-blocked DF-UCCSD(T) / (T+)."""
+    import ctypes as ct
+    from contextlib import ExitStack
+
+    from . import _native
+    from ._f12_frozen_core import resolve_frozen_occupied
+    from .calculator import Calculator
+
+    w_mode = _w_precision_code(triples_fp32_w, triples_w_schedule)
+    if w_mode == 2 and request.backend == "cuda":
+        raise NotImplementedError("CUDA fp32_split3 requires the spatial RHF triples engine")
+    if preconvergence not in PRECONVERGENCE_CODES:
+        raise ValueError(
+            f"Unsupported preconvergence {preconvergence!r}; expected one of {tuple(PRECONVERGENCE_CODES)}"
+        )
+    basis = request.basis
+    if (
+        request.root_id not in ("uhf", "rhf")
+        or request.backend not in ("cpu_reference", "cuda")
+        or basis.mp2_fit is None
+        or reference.surface_id != request.surface_id
+        or reference.executed_backend != request.backend
+        or reference.orbital_id != basis.orbital.identity
+        or reference.jk_fit_id != basis.jk_fit.identity
+    ):
+        raise ValueError(
+            "Spin-blocked UHF triples v2 requires matching focal reference and correlation fit"
+        )
+    if forces and provider is None:
+        raise ValueError(
+            "Spin-blocked UHF triples forces require the owning MolecularFocalProvider"
+        )
+    spins = reference._pair_spin_indices(request)
+    oa_full, ob_full = (reference.occupied[k] for k in spins)
+    n = len(reference.overlap)
+    frozen_a, frozen_b = resolve_frozen_occupied(request, (oa_full, ob_full))
+    oa_act = oa_full - frozen_a
+    ob_act = ob_full - frozen_b
+    va = n - oa_full
+    vb = n - ob_full
+
+    if (oa_act == 0 and ob_act == 0) or (va == 0 and vb == 0):
+        occ_a = np.zeros(oa_act, dtype=np.float64) if occupied_partition else None
+        occ_b = np.zeros(ob_act, dtype=np.float64) if occupied_partition else None
+        frc_out = np.zeros((len(request.atoms), 3), dtype=np.float64) if forces else None
+        return SpinBlockedTriplesResult(
+            0.0, 0.0, occ_a, occ_b, frc_out, _empty_triples_telemetry(triples_fp32_w, triples_w_schedule)
+        )
+
+    owner = reference._native_owner
+    if owner is None:
+        raise RuntimeError(
+            "Spin-blocked UHF triples v2 requires the native retained DF reference ABI"
+        )
+    fn = getattr(owner.library, "generativeqc_focal_ucc_triples_v2", None)
+    if fn is None:
+        raise NotImplementedError(
+            "Native generativeqc_focal_ucc_triples_v2 ABI is unavailable"
+        )
+
+    wa_arr: np.ndarray | None = None
+    wb_arr: np.ndarray | None = None
+    if occupied_weights is not None:
+        if len(occupied_weights) != 2:
+            raise ValueError("occupied_weights must be a 2-tuple (alpha, beta)")
+        wa_arr = np.ascontiguousarray(occupied_weights[0], dtype=np.float64)
+        wb_arr = np.ascontiguousarray(occupied_weights[1], dtype=np.float64)
+        if (
+            wa_arr.shape != (oa_act,)
+            or wb_arr.shape != (ob_act,)
+            or not np.isfinite(wa_arr).all()
+            or not np.isfinite(wb_arr).all()
+        ):
+            raise ValueError(
+                f"occupied_weights must be finite float64 arrays of lengths ({oa_act}, {ob_act})"
+            )
+
+    cuda = request.backend == "cuda"
+    budget_bytes = budget_mib << 20
+    calc = Calculator(
+        method="uccsd(t)",
+        device="cuda" if cuda else "cpu",
+        basis=basis.orbital,
+        auxiliary_basis=basis.mp2_fit,
+        density_fitting="full_cuda",
+        initial_guess=None,
+        correlation_memory_budget_bytes=budget_bytes,
+    )
+    with ExitStack() as stack:
+        stack.callback(calc.clear_cache)
+        lib = calc._library
+        if lib._handle != owner.library._handle:
+            raise RuntimeError("The triples library must own the supplied reference")
+        ctx = ct.c_void_p()
+        _native.check(
+            lib,
+            lib.generativeqc_context_create(
+                ct.byref(calc._context_descriptor()), ct.byref(ctx)
+            ),
+        )
+        stack.callback(lib.generativeqc_context_destroy, ctx)
+        geometry = (ctx, request.atoms, request.charge, request.multiplicity)
+        system = calc._create_native_system(*geometry)
+        stack.callback(lib.generativeqc_system_destroy, system)
+        correlation_fit = calc._create_native_system(*geometry, basis.mp2_fit)
+        stack.callback(lib.generativeqc_system_destroy, correlation_fit)
+
+        fn.restype = ct.c_int
+        fn.argtypes = [
+            ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_void_p,
+            ct.c_size_t, ct.c_int, ct.c_int, ct.c_size_t, ct.c_size_t,
+            ct.POINTER(ct.c_double), ct.c_size_t,
+            ct.POINTER(ct.c_double), ct.c_size_t,
+            ct.c_uint32, ct.c_int,
+            ct.POINTER(ct.c_double), ct.POINTER(ct.c_double),
+            ct.POINTER(ct.c_double), ct.c_size_t,
+            ct.POINTER(ct.c_double), ct.c_size_t,
+            ct.POINTER(ct.c_double), ct.c_size_t,
+            ct.POINTER(ct.c_double), ct.c_size_t,
+            ct.POINTER(ct.c_double), ct.c_size_t,
+            ct.POINTER(ct.c_double), ct.c_size_t,
+            ct.POINTER(ct.c_double), ct.c_size_t,
+            ct.POINTER(ct.c_double), ct.c_size_t,
+        ]
+        ccsd_energy_out = ct.c_double()
+        energy_out = ct.c_double()
+        occ_a_buf = np.empty(oa_act, dtype=np.float64) if occupied_partition else None
+        occ_b_buf = np.empty(ob_act, dtype=np.float64) if occupied_partition else None
+        grad_buf = np.empty(3 * len(request.atoms), dtype=np.float64) if forces else None
+        bar_fa_buf = np.empty(n * n, dtype=np.float64) if forces else None
+        bar_fb_buf = np.empty(n * n, dtype=np.float64) if forces else None
+        bar_ca_buf = np.empty(n * n, dtype=np.float64) if forces else None
+        bar_cb_buf = np.empty(n * n, dtype=np.float64) if forces else None
+        tel_buf = np.full(12, np.nan, dtype=np.float64)
+
+        def ptr(arr: np.ndarray | None):
+            return (
+                arr.ctypes.data_as(ct.POINTER(ct.c_double))
+                if arr is not None and arr.size > 0
+                else None
+            )
+
+        status = fn(
+            ctx,
+            system,
+            correlation_fit,
+            owner.handle,
+            budget_bytes,
+            1 if forces else 0,
+            1 if occupied_partition else 0,
+            frozen_a,
+            frozen_b,
+            ptr(wa_arr),
+            0 if wa_arr is None else wa_arr.size,
+            ptr(wb_arr),
+            0 if wb_arr is None else wb_arr.size,
+            PRECONVERGENCE_CODES[preconvergence],
+            w_mode,
+            ct.byref(ccsd_energy_out),
+            ct.byref(energy_out),
+            ptr(occ_a_buf),
+            0 if occ_a_buf is None else occ_a_buf.size,
+            ptr(occ_b_buf),
+            0 if occ_b_buf is None else occ_b_buf.size,
+            ptr(grad_buf),
+            0 if grad_buf is None else grad_buf.size,
+            ptr(bar_fa_buf),
+            0 if bar_fa_buf is None else bar_fa_buf.size,
+            ptr(bar_fb_buf),
+            0 if bar_fb_buf is None else bar_fb_buf.size,
+            ptr(bar_ca_buf),
+            0 if bar_ca_buf is None else bar_ca_buf.size,
+            ptr(bar_cb_buf),
+            0 if bar_cb_buf is None else bar_cb_buf.size,
+            ptr(tel_buf),
+            tel_buf.size,
+        )
+        _native.check(lib, status, context=ctx)
+
+    telemetry = _triples_execution_telemetry(
+        tel_buf, forces=forces, fp32_requested=triples_fp32_w, spatial_cuda=False, cpu=not cuda,
+        schedule=triples_w_schedule,
+    )
+    telemetry.update(
+        ccsd_iterations=int(tel_buf[8]),
+        lambda_iterations=int(tel_buf[9]),
+        frozen_alpha=frozen_a,
+        frozen_beta=frozen_b,
+        preconvergence=preconvergence,
+    )
+    forces_out = None
+    if forces:
+        assert (
+            provider is not None
+            and grad_buf is not None
+            and bar_fa_buf is not None
+            and bar_fb_buf is not None
+            and bar_ca_buf is not None
+            and bar_cb_buf is not None
+        )
+        forces_out = relax_spin_blocked_uhf_force_sources(
+            provider,
+            request,
+            reference,
+            bar_fa_buf.reshape(n, n),
+            bar_fb_buf.reshape(n, n),
+            bar_ca_buf.reshape(n, n),
+            bar_cb_buf.reshape(n, n),
+            grad_buf,
+        )
+    return SpinBlockedTriplesResult(
+        float(ccsd_energy_out.value),
+        float(energy_out.value),
+        occ_a_buf,
+        occ_b_buf,
+        forces_out,
+        telemetry,
+    )

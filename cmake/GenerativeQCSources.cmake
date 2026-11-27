@@ -427,6 +427,11 @@ function(generativeqc_add_cpu_component_object_targets target)
       src/cc/rccsdt_force.cpp
       src/cc/uccsd_solver.cpp
       src/cc/uccsd_force.cpp
+      src/cc/df_ucc_v2_source.cpp
+      src/cc/df_ucc_v2_ccsd.cpp
+      src/cc/df_ucc_v2_triples.cpp
+      src/cc/df_ucc_v2_lambda.cpp
+      src/cc/df_ucc_v2.cpp
       src/posthf/mp2_derivative_common.cpp
       src/posthf/mp2_derivative_cpu.cpp
       src/posthf/mp2_energy.cpp

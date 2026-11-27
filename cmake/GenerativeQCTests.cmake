@@ -707,6 +707,8 @@ macro(generativeqc_add_native_tests)
   generativeqc_native_test(generativeqc_precision_policy_tests tests/native/test_precision_policy.cpp)
   generativeqc_native_test(generativeqc_focal_hf_stability_tests
                        tests/native/test_focal_hf_stability.cpp)
+  generativeqc_native_test(generativeqc_small_core_halide_and_ucc_budget_tests
+                       tests/native/test_small_core_halide_and_ucc_budget.cpp)
 
   if(GENERATIVEQC_ENABLE_CUDA)
     generativeqc_native_test(generativeqc_cuda_runtime_tests tests/native/test_cuda_runtime.cu

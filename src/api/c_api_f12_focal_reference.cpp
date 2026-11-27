@@ -11,6 +11,7 @@
 
 #include "api/error.hpp"
 #include "api/handles.hpp"
+#include "cc/df_ucc_v2.hpp"
 #include "cc/f12_fixed_cusp.hpp"
 #include "cc/lambda_response.hpp"
 #include "cc/solver.hpp"
@@ -823,6 +824,166 @@ extern "C" GENERATIVEQC_API generativeqc_status generativeqc_rcc_f12b_cpu_solve_
     return GENERATIVEQC_STATUS_OUT_OF_MEMORY;
   } catch (...) {
     return generativeqc::api::map_exception(nullptr);
+  }
+}
+
+extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_ucc_triples_v2(
+    generativeqc_context* context, const generativeqc_system* orbital,
+    const generativeqc_system* correlation_fit, const generativeqc_focal_reference* owner,
+    std::size_t budget_bytes, int forces, int occupied_partition, std::size_t frozen_alpha,
+    std::size_t frozen_beta, const double* occupied_weights_alpha,
+    std::size_t weights_alpha_count, const double* occupied_weights_beta,
+    std::size_t weights_beta_count, std::uint32_t preconvergence, int triples_fp32_w,
+    double* ccsd_energy_out, double* energy_out, double* occupied_out_alpha,
+    std::size_t occupied_alpha_count, double* occupied_out_beta, std::size_t occupied_beta_count,
+    double* corr_gradient_out, std::size_t corr_gradient_count, double* bar_f_alpha_out,
+    std::size_t bar_f_alpha_count, double* bar_f_beta_out, std::size_t bar_f_beta_count,
+    double* bar_c_alpha_out, std::size_t bar_c_alpha_count, double* bar_c_beta_out,
+    std::size_t bar_c_beta_count, double* telemetry_out, std::size_t telemetry_count) {
+  if (!context || !orbital || !correlation_fit || !owner || !energy_out ||
+      (forces != 0 && forces != 1) || (occupied_partition != 0 && occupied_partition != 1) ||
+      (triples_fp32_w < 0 || triples_fp32_w > 2) || preconvergence > 3)
+    return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
+  std::lock_guard lock(context->mutex);
+  try {
+    using namespace generativeqc;
+    const auto backend = context->state.executed_backend;
+    if (backend != context->state.requested_backend ||
+        (backend != core::kCudaBackend && backend != core::kCpuReferenceBackend))
+      throw std::invalid_argument("focal UCC triples v2 requires an explicit CPU or CUDA context");
+    const bool cuda = backend == core::kCudaBackend;
+    runtime::df_progress::Scope trace(
+        forces ? "focal_ucc_triples_force_sources_v2"
+               : (occupied_partition ? "focal_ucc_triples_occupied_v2"
+                                     : "focal_ucc_triples_energy_v2"),
+        cuda ? "cuda" : "host");
+    if (!owner->uhf || !owner->uhf->source_identity ||
+        owner->backend != static_cast<generativeqc_backend>(backend) ||
+        owner->device != context->state.device_id)
+      throw std::invalid_argument(
+          "focal UCC triples v2 requires a matching retained DF reference owner");
+    if (orbital->ks_auxiliary || orbital->correlation_auxiliary || orbital->scf_auxiliary ||
+        correlation_fit->ks_auxiliary || correlation_fit->scf_auxiliary)
+      throw std::invalid_argument(
+          "focal UCC triples v2 requires normalized orbital and correlation-fit system handles");
+    const auto& sys = orbital->data;
+    const auto& aux = correlation_fit->data;
+    if (sys.basis_representation != core::kSphericalBasis ||
+        aux.basis_representation != core::kSphericalBasis)
+      throw std::invalid_argument(
+          "focal UCC triples v2 requires real-spherical orbital and correlation-fit bases");
+    if (!aux.ecp_terms.empty())
+      throw std::invalid_argument(
+          "focal UCC triples v2 correlation fit describes Coulomb fitting functions only");
+    if (!owner->uhf->source_identity->matches(sys))
+      throw std::invalid_argument(
+          "focal UCC triples v2 orbital system differs from the retained DF determinant");
+    if (sys.atoms.size() != aux.atoms.size())
+      throw std::invalid_argument(
+          "focal UCC triples v2 orbital and correlation-fit geometries differ");
+    for (std::size_t i = 0; i < sys.atoms.size(); ++i)
+      if (sys.atoms[i].atomic_number != aux.atoms[i].atomic_number ||
+          sys.atoms[i].position != aux.atoms[i].position || aux.atoms[i].ecp_core)
+        throw std::invalid_argument(
+            "focal UCC triples v2 orbital and correlation-fit nuclei differ");
+
+    const auto& ref = *owner->uhf;
+    const std::size_t oa_full = ref.nocc[0];
+    const std::size_t ob_full = ref.nocc[1];
+    if (frozen_alpha > oa_full || frozen_beta > ob_full)
+      throw std::invalid_argument("focal UCC triples v2 frozen count exceeds occupied count");
+    const std::size_t oa_active = oa_full - frozen_alpha;
+    const std::size_t ob_active = ob_full - frozen_beta;
+    const std::size_t n = ref.nbf;
+    const std::size_t nn = runtime::size_mul(n, n);
+    const std::size_t coords = runtime::size_mul(3, sys.atoms.size());
+
+    if (occupied_partition &&
+        ((oa_active && !occupied_out_alpha) || occupied_alpha_count != oa_active ||
+         (ob_active && !occupied_out_beta) || occupied_beta_count != ob_active))
+      throw std::invalid_argument("focal UCC triples v2 occupied buffer shape mismatch");
+    const bool has_wa = weights_alpha_count != 0;
+    const bool has_wb = weights_beta_count != 0;
+    if ((has_wa && (!occupied_weights_alpha || weights_alpha_count != oa_active)) ||
+        (has_wb && (!occupied_weights_beta || weights_beta_count != ob_active)) ||
+        (has_wa != has_wb && !(oa_active == 0 || ob_active == 0)))
+      throw std::invalid_argument("focal UCC triples v2 occupied weights shape mismatch");
+    if (forces && (!corr_gradient_out || corr_gradient_count != coords || !bar_f_alpha_out ||
+                   bar_f_alpha_count != nn || !bar_f_beta_out || bar_f_beta_count != nn ||
+                   !bar_c_alpha_out || bar_c_alpha_count != nn || !bar_c_beta_out ||
+                   bar_c_beta_count != nn))
+      throw std::invalid_argument("focal UCC triples v2 force source buffer shape mismatch");
+    if (telemetry_out && telemetry_count < 10)
+      throw std::invalid_argument("focal UCC triples v2 telemetry buffer requires >= 10 slots");
+
+    cc::DFUccV2Options options;
+    options.compute_forces = forces != 0;
+    options.compute_triples = true;
+    options.occupied_partition = occupied_partition != 0;
+    options.energy_source_only = true;
+    options.frozen_alpha = frozen_alpha;
+    options.frozen_beta = frozen_beta;
+    if (has_wa)
+      options.occupied_weights_alpha.assign(occupied_weights_alpha,
+                                            occupied_weights_alpha + weights_alpha_count);
+    if (has_wb)
+      options.occupied_weights_beta.assign(occupied_weights_beta,
+                                           occupied_weights_beta + weights_beta_count);
+    options.preconvergence = static_cast<core::DfPreconvergence>(preconvergence);
+    options.triples_fp32_w = triples_fp32_w == 1;
+    options.triples_compensated_w = triples_fp32_w == 2;
+    if (budget_bytes) options.max_bytes = budget_bytes;
+
+    const auto result =
+        cc::run_df_ucc_v2(sys, aux, ref, cuda, context->state.device_id, options);
+    if (!std::isfinite(result.ccsd_correlation_energy) || !std::isfinite(result.triples_energy))
+      throw std::runtime_error("nonfinite focal UCC triples v2 energy");
+    if (ccsd_energy_out) *ccsd_energy_out = result.ccsd_correlation_energy;
+    *energy_out = result.triples_energy;
+    if (occupied_partition) {
+      if (result.occupied_alpha.size() != oa_active || result.occupied_beta.size() != ob_active)
+        throw std::runtime_error("focal UCC triples v2 occupied partition size mismatch");
+      if (oa_active) std::copy(result.occupied_alpha.begin(), result.occupied_alpha.end(), occupied_out_alpha);
+      if (ob_active) std::copy(result.occupied_beta.begin(), result.occupied_beta.end(), occupied_out_beta);
+    }
+    if (forces) {
+      if (result.correlation_gradient.size() != coords || result.bar_f_alpha.size() != nn ||
+          result.bar_f_beta.size() != nn || result.bar_c_alpha.size() != nn ||
+          result.bar_c_beta.size() != nn)
+        throw std::runtime_error("focal UCC triples v2 force source size mismatch");
+      std::copy(result.correlation_gradient.begin(), result.correlation_gradient.end(),
+                corr_gradient_out);
+      std::copy(result.bar_f_alpha.begin(), result.bar_f_alpha.end(), bar_f_alpha_out);
+      std::copy(result.bar_f_beta.begin(), result.bar_f_beta.end(), bar_f_beta_out);
+      std::copy(result.bar_c_alpha.begin(), result.bar_c_alpha.end(), bar_c_alpha_out);
+      std::copy(result.bar_c_beta.begin(), result.bar_c_beta.end(), bar_c_beta_out);
+    }
+    if (telemetry_out) {
+      telemetry_out[0] = result.ccsd_fp32_executed ? 1.0 : 0.0;
+      telemetry_out[1] = result.lambda_fp32_executed ? 1.0 : 0.0;
+      telemetry_out[2] = static_cast<double>(result.triples_fp32_gemms);
+      telemetry_out[3] = static_cast<double>(result.triples_fp64_gemms);
+      telemetry_out[4] = result.ccsd_seconds;
+      telemetry_out[5] = result.triples_seconds;
+      telemetry_out[6] = result.lambda_seconds;
+      telemetry_out[7] = result.source_response_seconds;
+      telemetry_out[8] = static_cast<double>(result.ccsd_iterations);
+      telemetry_out[9] = static_cast<double>(result.lambda_iterations);
+      if (telemetry_count >= 11)
+        telemetry_out[10] = static_cast<double>(result.triples_fp32_reverse_gemms);
+      if (telemetry_count >= 12)
+        telemetry_out[11] = result.triples_compensated_w_executed ? 1.0 : 0.0;
+    }
+    trace.finish();
+    return GENERATIVEQC_STATUS_SUCCESS;
+  } catch (const std::length_error& error) {
+    record_oom_detail_noalloc(context->last_detail, error.what());
+    return GENERATIVEQC_STATUS_OUT_OF_MEMORY;
+  } catch (const std::bad_alloc& error) {
+    record_oom_detail_noalloc(context->last_detail, error.what());
+    return GENERATIVEQC_STATUS_OUT_OF_MEMORY;
+  } catch (...) {
+    return generativeqc::api::map_exception(&context->last_detail);
   }
 }
 
