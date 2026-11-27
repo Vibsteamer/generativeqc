@@ -11,6 +11,7 @@
 #include "runtime/host_component_trace.hpp"
 #include "runtime/resource_usage.hpp"
 #include "scf/fock_prepared.hpp"
+#include "scf/fock_symmetry.hpp"
 #include "scf/gradient/hf_gradient.hpp"
 #include "scf/initial_guess/density.hpp"
 #include "scf/reference/mean_field.hpp"
@@ -143,14 +144,29 @@ class ExactIncrementalDirectJk {
   DirectJkMatrices anchor_jk_;
 };
 
+FockMatrices assemble_host_fock(const PreparedFockPlan& plan, const Matrix& hcore,
+                                const DirectJkMatrices& jk) {
+  const auto& strategy = plan.strategy();
+  auto fock = assemble_fock(strategy, hcore, jk);
+  if (strategy.backend == FockBackend::Cuda &&
+      strategy.spec.coulomb.approximation == FockApproximation::DensityFitted &&
+      strategy.spec.exchange.approximation == FockApproximation::DensityFitted) {
+    // Keep independently accumulated CUDA J/K roundoff out of Pulay history
+    // and use the same physical matrix convention for finalization.
+    preserve_fock_symmetry(fock.alpha, jk.nbf);
+    if (!fock.beta.empty()) preserve_fock_symmetry(fock.beta, jk.nbf);
+  }
+  return fock;
+}
+
 std::pair<Matrix, Matrix> build_uhf_focks(const PreparedFockPlan& plan, const Matrix& hcore,
                                           const Matrix& alpha_density, const Matrix& beta_density) {
-  auto fock = assemble_fock(plan.strategy(), hcore, plan.build(alpha_density, beta_density));
+  auto fock = assemble_host_fock(plan, hcore, plan.build(alpha_density, beta_density));
   return {std::move(fock.alpha), std::move(fock.beta)};
 }
 
 Matrix build_fock(const PreparedFockPlan& plan, const Matrix& hcore, const Matrix& density) {
-  return assemble_fock(plan.strategy(), hcore, plan.build(density)).alpha;
+  return assemble_host_fock(plan, hcore, plan.build(density)).alpha;
 }
 
 /** Substitute only the provider of this actual matrix. Iterative matrices may
@@ -172,32 +188,105 @@ EigenResult diagonalize(const PreparedFockPlan& plan, const Matrix& matrix,
                    : generalized_eigen(matrix, orthogonalizer, ints.nbf);
 }
 
-void finalize_scf(const PreparedFockPlan& plan, const integrals::IntegralData& ints,
-                  const Matrix& orthogonalizer, std::size_t occupied, Matrix& density,
-                  bool compute_forces, ScfResult& result,
-                  const initial_guess::EigenOperation& target_eigen) {
-  const std::size_t n = ints.nbf;
-  runtime::host_trace::Region final_trace("host_finalization", n);
-  Matrix final_fock = build_fock(plan, ints.hcore, density);
-  EigenResult orbitals = diagonalize(plan, final_fock, ints, orthogonalizer,
-                                     PreparedFockPlan::EigenUse::Finalization, target_eigen);
-  density = density_from_orbitals(orbitals.vectors, n, occupied);
-  final_fock = build_fock(plan, ints.hcore, density);
-  result.energy = electronic_energy(density, ints.hcore, final_fock) + ints.nuclear_repulsion;
-  if (compute_forces) {
-    const Matrix weighted = reference::physical_weighted_density(density, final_fock, n, 2.0);
-    result.forces =
-        gradient::analytic_forces(ints, density, weighted, plan.energy_derivative(density));
-  }
-  result.density = density;
-}
-
 std::uint64_t next_host_final_state_epoch() {
   static std::atomic<std::uint64_t> next{1};
   const auto epoch = next.fetch_add(1, std::memory_order_relaxed);
   if (epoch == 0 || epoch == std::numeric_limits<std::uint64_t>::max())
     throw std::runtime_error("host final-state epoch exhausted");
   return epoch;
+}
+
+unsigned finalize_scf(const PreparedFockPlan& plan, const integrals::IntegralData& ints,
+                      const Matrix& orthogonalizer, std::size_t occupied, Matrix& density,
+                      const ScfOptions& options, ScfResult& result,
+                      const initial_guess::EigenOperation& target_eigen) {
+  const std::size_t n = ints.nbf;
+  runtime::host_trace::Region final_trace("host_finalization", n);
+  Matrix final_fock = build_fock(plan, ints.hcore, density);
+  EigenResult orbitals = diagonalize(plan, final_fock, ints, orthogonalizer,
+                                     PreparedFockPlan::EigenUse::Finalization, target_eigen);
+  unsigned physical_fock_builds = 1;
+  const auto evaluate_energy = options.stabilize_focal_rhf_convergence
+                                   ? reference::compensated_electronic_energy : electronic_energy;
+
+  if (options.export_physical_reference) {
+    const auto epoch = next_host_final_state_epoch();
+    FinalStateIdentity identity{
+        {epoch, epoch, 2, 1}, epoch, plan.strategy(), {occupied}};
+    FinalFrameCandidate candidate{identity, 1, true, {orbitals}};
+    const PhysicalFockOperation physical = [&](const auto& current, const auto& densities) {
+      if (densities.size() != 1)
+        throw std::runtime_error("RHF final-state provider lost its density");
+      return PhysicalFockFrame{current, true, {build_fock(plan, ints.hcore, densities[0])}};
+    };
+    const initial_guess::EigenOperation eigen = [&](const auto& fock, const auto*, const auto*,
+                                                    auto) {
+      return diagonalize(plan, fock, ints, orthogonalizer, PreparedFockPlan::EigenUse::Finalization,
+                         target_eigen);
+    };
+    const double final_tol = options.stabilize_focal_rhf_convergence
+                                 ? std::max(options.density_tolerance, 1e-8)
+                                 : options.density_tolerance;
+    const double final_e_tol = options.stabilize_focal_rhf_convergence
+                                   ? std::max(options.energy_tolerance, 1e-10)
+                                   : options.energy_tolerance;
+    auto selected = select_final_state(identity, ints.overlap, ints.hcore, orthogonalizer,
+                                       ints.nuclear_repulsion, {density}, &candidate, physical,
+                                       eigen, {final_tol, final_e_tol, 32, true, false},
+                                       options.compute_forces);
+    physical_fock_builds += selected.fock_evaluations;
+    if (!selected.state) {
+      if (options.stabilize_focal_rhf_convergence) {
+        result.converged = false;
+        result.density = density;
+        return physical_fock_builds;
+      }
+      throw std::runtime_error("RHF final-state canonicalization failed: " + selected.detail);
+    }
+    density = std::move(selected.state->density[0]);
+    final_fock = std::move(selected.state->fock[0]);
+    result.energy = evaluate_energy(density, ints.hcore, final_fock) + ints.nuclear_repulsion;
+    auto reference = std::make_shared<PhysicalReference>();
+    reference->nbf = n;
+    reference->nocc = occupied;
+    reference->density_fitted =
+        plan.strategy().spec.coulomb.approximation == FockApproximation::DensityFitted;
+    reference->overlap = ints.overlap;
+    reference->hcore = ints.hcore;
+    reference->fock = final_fock;
+    reference->coefficients = std::move(selected.state->orbitals[0].vectors);
+    reference->orbital_energies = std::move(selected.state->orbitals[0].values);
+    reference->density = density;
+    if (options.compute_forces) {
+      reference->weighted_density = selected.state->weighted_density[0];
+      result.forces = gradient::analytic_forces(
+          ints, density, selected.state->weighted_density[0], plan.energy_derivative(density));
+    }
+    reference->energy = result.energy;
+    reference->commutator_residual = selected.state->diagnostic.maximum_commutator;
+    reference->canonical_density_drift = selected.state->diagnostic.maximum_density_error;
+    if (!selected.state->diagnostic.eigenframes.empty())
+      reference->eigen_residual = selected.state->diagnostic.eigenframes[0].maximum_eigen_residual;
+    result.reference = std::move(reference);
+    result.density = density;
+    return physical_fock_builds;
+  }
+
+  density = density_from_orbitals(orbitals.vectors, n, occupied);
+  final_fock = build_fock(plan, ints.hcore, density);
+  ++physical_fock_builds;
+  result.energy = evaluate_energy(density, ints.hcore, final_fock) + ints.nuclear_repulsion;
+  if (options.compute_forces) {
+    const Matrix weighted = reference::physical_weighted_density(density, final_fock, n, 2.0);
+    result.forces =
+        gradient::analytic_forces(ints, density, weighted, plan.energy_derivative(density));
+  }
+  result.density = density;
+  return physical_fock_builds;
+}
+
+double congruence_rms(const Matrix& matrix, const Matrix& basis, std::size_t n) {
+  return residual_rms(multiply(reference::transpose(basis, n), multiply(matrix, basis, n), n));
 }
 
 unsigned finalize_uhf(const PreparedFockPlan& plan, const integrals::IntegralData& ints,
@@ -235,10 +324,16 @@ unsigned finalize_uhf(const PreparedFockPlan& plan, const integrals::IntegralDat
     // mode even when the retained determinant already passes the physical
     // proof. Rejected candidates still receive the same bounded correction:
     // at most 33 selector evaluations plus the initial physical Fock above.
+    const double final_tol = options.stabilize_focal_rhf_convergence
+                                 ? std::max(options.density_tolerance, 1e-8)
+                                 : options.density_tolerance;
+    const double final_e_tol = options.stabilize_focal_rhf_convergence
+                                   ? std::max(options.energy_tolerance, 1e-10)
+                                   : options.energy_tolerance;
     auto selected = select_final_state(identity, ints.overlap, ints.hcore, orthogonalizer,
                                        ints.nuclear_repulsion, {alpha_density, beta_density},
                                        &candidate, physical, eigen,
-                                       {options.density_tolerance, options.energy_tolerance, 32,
+                                       {final_tol, final_e_tol, 32,
                                         options.export_physical_reference, false},
                                        options.compute_forces);
     physical_fock_builds += selected.fock_evaluations;
@@ -291,6 +386,25 @@ unsigned finalize_uhf(const PreparedFockPlan& plan, const integrals::IntegralDat
   return physical_fock_builds;
 }
 
+Matrix apply_level_shift(Matrix fock, const Matrix& overlap, const Matrix& spin_density,
+                         std::size_t n, double level_shift) {
+  if (level_shift <= 0.0) return fock;
+  // Virtual-space projector in AO basis: S - S * D_spin * S (zero on occupied space).
+  const Matrix sds = multiply(overlap, multiply(spin_density, overlap, n), n);
+  for (std::size_t i = 0; i < fock.size(); ++i)
+    fock[i] += level_shift * (overlap[i] - sds[i]);
+  return fock;
+}
+
+Matrix blend_density(const Matrix& current, const Matrix& proposed, double damping) {
+  if (damping >= 1.0) return proposed;
+  Matrix blended(current.size());
+  const double keep = 1.0 - damping;
+  for (std::size_t i = 0; i < current.size(); ++i)
+    blended[i] = keep * current[i] + damping * proposed[i];
+  return blended;
+}
+
 }  // namespace
 
 ScfResult run_rhf_host_plan(const core::System& system, const ScfOptions& options,
@@ -325,6 +439,21 @@ ScfResult run_rhf_host_plan(const core::System& system, const ScfOptions& option
   result.initial_density_used = initial_density != nullptr;
   ExactIncrementalDirectJk incremental_jk(plan, options, result.incremental_direct_jk);
   const bool require_residual = options.hooks && options.hooks->propose;
+  const bool stabilize = options.stabilize_focal_rhf_convergence;
+  const auto evaluate_energy = stabilize ? reference::compensated_electronic_energy : electronic_energy;
+  Matrix density_metric_basis;
+  const auto overlap_orthogonalizer = [&]() -> const Matrix& {
+    if (density_metric_basis.empty())
+      density_metric_basis = multiply(ints.overlap, orthogonalizer, n);
+    return density_metric_basis;
+  };
+  const auto metric_commutator_rms = [&](const Matrix& fock, const Matrix& density,
+                                          const Matrix& residual) {
+    if (options.use_antisymmetric_rhf_commutator)
+      return residual_rms(reference::orthonormal_commutator_residual(
+          fock, density, orthogonalizer, overlap_orthogonalizer(), n));
+    return congruence_rms(residual, orthogonalizer, n);
+  };
 
   struct RhfEvaluation {
     Matrix fock;
@@ -333,6 +462,9 @@ ScfResult run_rhf_host_plan(const core::System& system, const ScfOptions& option
     double energy{};
     double state_rms{};
     double residual_rms{};
+    double ao_density_rms{};
+    // Observed only by eligibility, before the driver advances the density.
+    const Matrix* current_density{};
   };
 
   const ::generativeqc::solver::SelfConsistentPolicy policy{
@@ -343,23 +475,49 @@ ScfResult run_rhf_host_plan(const core::System& system, const ScfOptions& option
       [&](const Matrix& current_density, unsigned) {
         ++result.fock_builds;
         Matrix fock =
-            assemble_fock(plan.strategy(), ints.hcore, incremental_jk.build(current_density)).alpha;
+            assemble_host_fock(plan, ints.hcore, incremental_jk.build(current_density)).alpha;
         const runtime::CpuRetainedCapacity anchor_capacity(incremental_jk.numeric_capacity());
         const double energy =
-            electronic_energy(current_density, ints.hcore, fock) + ints.nuclear_repulsion;
+            evaluate_energy(current_density, ints.hcore, fock) + ints.nuclear_repulsion;
         Matrix residual = commutator_residual(fock, current_density, ints.overlap, n);
-        const Matrix effective_fock = diis.update(fock, residual);
+        Matrix effective_fock = options.enable_diis ? diis.update(fock, residual) : fock;
+        if (options.level_shift > 0.0 && (result.iterations > 0 || initial_density != nullptr)) {
+          Matrix spin_density(current_density.size());
+          for (std::size_t i = 0; i < spin_density.size(); ++i)
+            spin_density[i] = 0.5 * current_density[i];
+          effective_fock =
+              apply_level_shift(std::move(effective_fock), ints.overlap, spin_density, n,
+                                options.level_shift);
+        }
         orbitals = diagonalize(plan, effective_fock, ints, orthogonalizer,
                                PreparedFockPlan::EigenUse::Iteration, target_eigen);
-        Matrix next_density = density_from_orbitals(orbitals.vectors, n, occupied);
+        Matrix diag_density = density_from_orbitals(orbitals.vectors, n, occupied);
 
+        const double ao_rms = density_rms(diag_density, current_density);
+        double state_rms = ao_rms;
+        // With diffuse OBS, a well-conditioned physical step can look large
+        // in raw AO coefficients. Only consider the metric step when the
+        // energy and the unextrapolated physical Fock are also stationary.
+        if (stabilize && ao_rms >= options.density_tolerance && result.iterations != 0 &&
+            std::abs(energy - result.energy) < options.energy_tolerance &&
+            metric_commutator_rms(fock, current_density, residual) < options.density_tolerance) {
+          Matrix delta(diag_density.size());
+          for (std::size_t i = 0; i < delta.size(); ++i)
+            delta[i] = diag_density[i] - current_density[i];
+          const double metric_rms = congruence_rms(delta, overlap_orthogonalizer(), n);
+          if (metric_rms < options.density_tolerance) state_rms = metric_rms;
+        }
+        Matrix next_density =
+            (options.density_damping > 0.0 && options.density_damping < 1.0 &&
+             state_rms >= options.density_tolerance)
+                ? blend_density(current_density, diag_density, options.density_damping)
+                : std::move(diag_density);
         sample_scf_buffers(plan, diis, orthogonalizer, current_density, fock, residual,
-                           effective_fock, orbitals.values, orbitals.vectors, next_density);
-
-        const double state_rms = density_rms(next_density, current_density);
+                           effective_fock, orbitals.values, orbitals.vectors, next_density,
+                           density_metric_basis);
         const double physical_residual_rms = require_residual ? residual_rms(residual) : 0.0;
         return RhfEvaluation{std::move(fock), std::move(residual), std::move(next_density),
-                             energy,          state_rms,           physical_residual_rms};
+                             energy, state_rms, physical_residual_rms, ao_rms, &current_density};
       },
       [&](const Matrix& current_density, RhfEvaluation evaluation,
           const ::generativeqc::solver::SelfConsistentProgress& progress) {
@@ -381,11 +539,19 @@ ScfResult run_rhf_host_plan(const core::System& system, const ScfOptions& option
         }
         return next_density;
       },
-      [&](const ::generativeqc::solver::SelfConsistentProgress& progress, const RhfEvaluation&) {
+      [&](const ::generativeqc::solver::SelfConsistentProgress& progress, const RhfEvaluation& evaluation) {
         result.iterations = progress.iteration;
         result.energy = progress.energy;
         result.energy_change = progress.energy_change;
-        result.density_rms = progress.state_rms;
+        result.density_rms = evaluation.ao_density_rms;
+      },
+      [&](const ::generativeqc::solver::SelfConsistentProgress&, const RhfEvaluation& evaluation) {
+        if (!options.export_physical_reference) return true;
+        const double raw_max = reference::residual_max_abs(evaluation.residual);
+        if (raw_max <= std::min(1e-8, options.density_tolerance)) return true;
+        if (!stabilize || raw_max > 1e-8) return false;
+        return metric_commutator_rms(evaluation.fock, *evaluation.current_density,
+                                      evaluation.residual) <= options.density_tolerance;
       });
   density = std::move(outcome.state);
   result.converged = outcome.converged;
@@ -395,14 +561,14 @@ ScfResult run_rhf_host_plan(const core::System& system, const ScfOptions& option
     result.density = density;
     return result;
   }
-  result.fock_builds += 2;  // Physical rebuilds performed by finalization.
-  incremental_jk.note_post_scf_full_builds(2);
   const runtime::CpuRetainedCapacity anchor_capacity(incremental_jk.numeric_capacity());
 
   // Rebuild and diagonalize the un-extrapolated converged Fock matrix. The
   // resulting orbitals define the energy-weighted density in the Pulay term.
-  finalize_scf(plan, ints, orthogonalizer, occupied, density, options.compute_forces, result,
-               target_eigen);
+  const unsigned post_scf_builds =
+      finalize_scf(plan, ints, orthogonalizer, occupied, density, options, result, target_eigen);
+  result.fock_builds += post_scf_builds;
+  incremental_jk.note_post_scf_full_builds(post_scf_builds);
   return result;
 }
 
@@ -438,7 +604,13 @@ ScfResult run_uhf_host_plan(const core::System& system, const ScfOptions& option
   result.initial_density_used = initial_density != nullptr;
   ExactIncrementalDirectJk incremental_jk(plan, options, result.incremental_direct_jk);
   const bool require_residual = options.hooks && options.hooks->propose;
-
+  const bool stabilize = options.stabilize_focal_rhf_convergence;
+  Matrix density_metric_basis;
+  const auto overlap_orthogonalizer = [&]() -> const Matrix& {
+    if (density_metric_basis.empty())
+      density_metric_basis = multiply(ints.overlap, orthogonalizer, n);
+    return density_metric_basis;
+  };
   struct UhfState {
     Matrix alpha;
     Matrix beta;
@@ -459,8 +631,7 @@ ScfResult run_uhf_host_plan(const core::System& system, const ScfOptions& option
   auto outcome = ::generativeqc::solver::run_self_consistent(
       UhfState{std::move(alpha_density), std::move(beta_density)}, policy,
       [&](const UhfState& state, unsigned) {
-        auto fock = assemble_fock(plan.strategy(), ints.hcore,
-                                  incremental_jk.build(state.alpha, state.beta));
+        auto fock = assemble_host_fock(plan, ints.hcore, incremental_jk.build(state.alpha, state.beta));
         const runtime::CpuRetainedCapacity anchor_capacity(incremental_jk.numeric_capacity());
         auto alpha_fock = std::move(fock.alpha);
         auto beta_fock = std::move(fock.beta);
@@ -472,14 +643,47 @@ ScfResult run_uhf_host_plan(const core::System& system, const ScfOptions& option
         const Matrix beta_residual = commutator_residual(beta_fock, state.beta, ints.overlap, n);
         Matrix physical_fock = concatenate(alpha_fock, beta_fock);
         Matrix physical_residual = concatenate(alpha_residual, beta_residual);
-        const Matrix effective_joined = diis.update(physical_fock, physical_residual);
+        const Matrix effective_joined =
+            options.enable_diis ? diis.update(physical_fock, physical_residual) : physical_fock;
         std::tie(alpha_fock, beta_fock) = split_spin_matrices(effective_joined, n * n);
+        if (options.level_shift > 0.0 && (result.iterations > 0 || initial_density != nullptr)) {
+          alpha_fock = apply_level_shift(std::move(alpha_fock), ints.overlap, state.alpha, n,
+                                         options.level_shift);
+          beta_fock = apply_level_shift(std::move(beta_fock), ints.overlap, state.beta, n,
+                                        options.level_shift);
+        }
         alpha_orbitals = diagonalize(plan, alpha_fock, ints, orthogonalizer,
                                      PreparedFockPlan::EigenUse::Iteration, target_eigen);
         beta_orbitals = diagonalize(plan, beta_fock, ints, orthogonalizer,
                                     PreparedFockPlan::EigenUse::Iteration, target_eigen);
-        Matrix next_alpha = density_from_orbitals(alpha_orbitals.vectors, n, alpha_occupied, 1.0);
-        Matrix next_beta = density_from_orbitals(beta_orbitals.vectors, n, beta_occupied, 1.0);
+        Matrix diag_alpha = density_from_orbitals(alpha_orbitals.vectors, n, alpha_occupied, 1.0);
+        Matrix diag_beta = density_from_orbitals(beta_orbitals.vectors, n, beta_occupied, 1.0);
+
+        const double ao_rms =
+            density_rms(concatenate(diag_alpha, diag_beta), concatenate(state.alpha, state.beta));
+        double state_rms = ao_rms;
+        if (stabilize && ao_rms >= options.density_tolerance && result.iterations != 0 &&
+            std::abs(energy - result.energy) < options.energy_tolerance &&
+            std::max(congruence_rms(alpha_residual, orthogonalizer, n),
+                     congruence_rms(beta_residual, orthogonalizer, n)) <
+                options.density_tolerance) {
+          Matrix da(diag_alpha.size()), db(diag_beta.size());
+          for (std::size_t i = 0; i < da.size(); ++i) {
+            da[i] = diag_alpha[i] - state.alpha[i];
+            db[i] = diag_beta[i] - state.beta[i];
+          }
+          const double metric_rms = std::max(congruence_rms(da, overlap_orthogonalizer(), n),
+                                             congruence_rms(db, overlap_orthogonalizer(), n));
+          if (metric_rms < options.density_tolerance) state_rms = metric_rms;
+        }
+        const bool damp = options.density_damping > 0.0 && options.density_damping < 1.0 &&
+                          state_rms >= options.density_tolerance;
+        Matrix next_alpha =
+            damp ? blend_density(state.alpha, diag_alpha, options.density_damping)
+                 : std::move(diag_alpha);
+        Matrix next_beta =
+            damp ? blend_density(state.beta, diag_beta, options.density_damping)
+                 : std::move(diag_beta);
 
         sample_scf_buffers(plan, diis, orthogonalizer, state.alpha, state.beta, alpha_fock,
                            beta_fock, alpha_residual, beta_residual, physical_fock,
@@ -487,8 +691,6 @@ ScfResult run_uhf_host_plan(const core::System& system, const ScfOptions& option
                            alpha_orbitals.vectors, beta_orbitals.values, beta_orbitals.vectors,
                            next_alpha, next_beta);
 
-        const double state_rms =
-            density_rms(concatenate(next_alpha, next_beta), concatenate(state.alpha, state.beta));
         const double physical_residual_rms =
             require_residual ? residual_rms(physical_residual) : 0.0;
         return UhfEvaluation{std::move(physical_fock),
@@ -534,8 +736,17 @@ ScfResult run_uhf_host_plan(const core::System& system, const ScfOptions& option
         // to the bounded final selector. Refine under the same SCF budget
         // until its existing physical commutator ceiling can pass; the full
         // canonical/fixed-point proof remains owned by finalization.
-        return reference::residual_max_abs(evaluation.physical_residual) <=
-               std::min(1e-8, options.density_tolerance);
+        const double raw_max = reference::residual_max_abs(evaluation.physical_residual);
+        const bool raw_ok = raw_max <= std::min(1e-8, options.density_tolerance);
+        if (!raw_ok && (!stabilize || raw_max > 1e-8)) return false;
+        if (raw_ok) return true;
+        const auto [a_res, b_res] = split_spin_matrices(evaluation.physical_residual, n * n);
+        if (!raw_ok && std::max(congruence_rms(a_res, orthogonalizer, n),
+                                congruence_rms(b_res, orthogonalizer, n)) >
+                           options.density_tolerance) {
+          return false;
+        }
+        return true;
       });
   alpha_density = std::move(outcome.state.alpha);
   beta_density = std::move(outcome.state.beta);

@@ -6,8 +6,12 @@ bilinear envelope does not choose HF factors, spin conventions or ECP policy.
 """
 
 from functools import cache
+from typing import TYPE_CHECKING
 
 from generativeqc_compiler.integral.expr import Graph
+
+if TYPE_CHECKING:
+    from generativeqc_compiler.tensor.program import Program
 
 
 @cache
@@ -40,3 +44,32 @@ def projected_integral_program() -> tuple:
         gradient, right, {"first": mixed, "weight": delta_weight}
     )
     return graph, (projected, first_value * direction, gradient, response)
+
+
+def overlap_hcore_gradient(atoms: int, ao_count: int) -> "Program":
+    """Contract two full AO Jacobians with fixed overlap and core weights."""
+    from generativeqc_compiler.tensor.ir import add, einsum, input_tensor
+    from generativeqc_compiler.tensor.program import Program
+    from generativeqc_compiler.tensor.types import Index, IndexSpace, TensorSpec
+
+    centers = IndexSpace("nuclei", "atom", atoms)
+    axes = IndexSpace("spatial", "cartesian", 3)
+    atomic = IndexSpace("molecular_ao", "ao", ao_count)
+    a, x = Index("a", centers), Index("x", axes)
+    i, j = Index("i", atomic), Index("j", atomic)
+    matrix = TensorSpec((i, j), role="input")
+    jacobian = TensorSpec((a, x, i, j), role="input")
+    terms = [
+        einsum(
+            "axij,ij->ax",
+            input_tensor("d_" + name, jacobian),
+            input_tensor(name, matrix),
+        )
+        for name in ("overlap", "hcore")
+    ]
+    return Program(
+        {"gradient": add(*terms)},
+        provenance={
+            "operation": "one-electron positive nuclear gradient from full AO weights"
+        },
+    )

@@ -1,0 +1,15 @@
+{
+  "current_default": "The installed NVIDIA shell and response libraries serve the molecular CUDA provider. An explicit host shell target serves the reference backend.",
+  "evidence": [
+    "src/posthf/f12/CMakeLists.txt",
+    "python/generativeqc_compiler/integral/df_derivatives_cuda.py",
+    "docs/user/ccsdt_cbs.md",
+    "tests/python/test_audit_fix1_shell_cuda_gate1.py",
+    "tests/python/test_f12_cabs_i_one_electron.py"
+  ],
+  "generated_capability": "The integral compiler emits domain-specific Coulomb and fitted-geminal derivative headers. CABS projector response also uses the shared generated symmetric matrix-function derivative.",
+  "missing_capability": "Physical pair and fixed-source contractions, multiple orbital and Fock adjoints, semilocal ECP projectors, high-angular-momentum one-electron terms and other shell assembly remain maintained native mathematical code.",
+  "owner": "src/posthf/f12 with shared src/integrals and src/posthf providers",
+  "retirement_condition": "Transfer an equation or shell family only when its generated replacement covers the supported roots, angular momenta, capacity and derivative domains, passes independent endpoint force tests, and is qualified for the target GPU.",
+  "status": "experimental"
+}

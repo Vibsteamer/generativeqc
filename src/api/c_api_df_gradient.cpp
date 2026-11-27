@@ -45,7 +45,8 @@ extern "C" generativeqc_status generativeqc_system_df_gradient_cuda(
         span(bar_m, count_m), schedule, maximum_bytes, maximum_tile_elements, result, detail,
         &measured);
     if (status != GENERATIVEQC_STATUS_SUCCESS) {
-      context->last_detail = std::move(detail);
+      // Copy into the context's reserved capacity; allocation-free refusals need it.
+      context->last_detail = detail;
       return status;
     }
     std::copy(result.begin(), result.end(), gradient);

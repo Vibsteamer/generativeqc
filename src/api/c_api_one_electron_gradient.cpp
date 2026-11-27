@@ -42,7 +42,8 @@ extern "C" generativeqc_status generativeqc_system_one_electron_gradient_cuda(
         context->state.device_id, system->data, weights(overlap_weights), weights(kinetic_weights),
         weights(attraction_weights), schedule, maximum_bytes, result, detail, &measured);
     if (status != GENERATIVEQC_STATUS_SUCCESS) {
-      context->last_detail = std::move(detail);
+      // Copy into the context's reserved capacity; allocation-free refusals need it.
+      context->last_detail = detail;
       return status;
     }
     std::copy(result.begin(), result.end(), gradient);

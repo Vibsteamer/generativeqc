@@ -1,0 +1,10 @@
+{
+  global:
+    generativeqc_f12_cabs_congruence_cuda_v1;
+    generativeqc_f12_cabs_projector_cuda_v2;
+    generativeqc_f12_cabs_singles_cuda_v1;
+    gqc_f12_extended_fock;
+    gqc_f12_molecular_metric_inverse_cholesky_v1;
+    gqc_f12_molecular_metric_whitener;
+  local: *;
+};

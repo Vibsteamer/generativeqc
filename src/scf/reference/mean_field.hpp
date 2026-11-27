@@ -23,6 +23,9 @@ Matrix physical_weighted_density(const Matrix& density, const Matrix& fock, std:
                                  double occupation_weight = 2.0);
 /** Restricted electronic energy, excluding nuclear repulsion. */
 double electronic_energy(const Matrix& density, const Matrix& hcore, const Matrix& fock);
+/** Restricted electronic energy with compensated accumulation of the existing FP64 terms. */
+double compensated_electronic_energy(const Matrix& density, const Matrix& hcore,
+                                    const Matrix& fock);
 /** Unrestricted electronic energy with separate unit-occupation spin densities. */
 double uhf_electronic_energy(const Matrix& alpha_density, const Matrix& beta_density,
                              const Matrix& hcore, const Matrix& alpha_fock,
@@ -34,6 +37,17 @@ std::pair<Matrix, Matrix> split_spin_matrices(const Matrix& joined, std::size_t 
 /** Physical nonorthogonal-AO stationarity residual F D S - S D F. */
 Matrix commutator_residual(const Matrix& fock, const Matrix& density, const Matrix& overlap,
                            std::size_t n);
+/** X^T (F D S - S D F) X for symmetric F, D, S, evaluated as M - M^T with
+ * M = (X^T F)(D (S X)); overlap_orthogonalizer is S X. Transforming the AO commutator
+ * instead amplifies the rounding of its cancelling |F||D||S|-sized terms by
+ * |X|^2 = 1/s_min. */
+Matrix orthonormal_commutator_residual(const Matrix& fock, const Matrix& density,
+                                       const Matrix& orthogonalizer,
+                                       const Matrix& overlap_orthogonalizer, std::size_t n);
+/** Max norm of the orthonormal commutator. Nonfinite values return infinity. */
+double orthonormal_commutator_max_abs(const Matrix& fock, const Matrix& density,
+                                      const Matrix& orthogonalizer,
+                                      const Matrix& overlap_orthogonalizer, std::size_t n);
 /** RMS difference over equally sized nonempty density arrays. */
 double density_rms(const Matrix& a, const Matrix& b);
 /** RMS physical residual, distinct from an update or DIIS extrapolation error. */

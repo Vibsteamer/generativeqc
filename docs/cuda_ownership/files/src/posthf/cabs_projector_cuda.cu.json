@@ -1,0 +1,32 @@
+{
+  "path": "src/posthf/cabs_projector_cuda.cu",
+  "reason": "Manages stream and provider handles, solver workspace, input transfer, result staging and C ABI errors for the CABS projector and congruence.",
+  "regions": [
+    {
+      "reason": "Symmetrizes the overlap and forms the spectral inverse, normalized metric frame, compensated products and overlap response. Includes the intervening frame packing.",
+      "role": "scientific",
+      "start": "__global__ void symmetrize",
+      "stop": "void evaluate(int device"
+    },
+    {
+      "reason": "Constructs the OBS lift, projected overlap and retained-space kernel; selects and checks the spectral branch, then combines the shared generated matrix-function adjoint with the lift response.",
+      "role": "scientific",
+      "start": "auto invert =",
+      "stop": "std::vector<double> staged(nn)"
+    },
+    {
+      "reason": "Constructs the normalized frame from retained eigenvectors in the rank-reduced branch.",
+      "role": "scientific",
+      "start": "const double* retained = j",
+      "stop": "pack_frame<<<"
+    },
+    {
+      "reason": "Contracts both legs of the physical AO operator congruence in the extended frame with compensated accumulation.",
+      "role": "scientific",
+      "start": "__global__ void operator_times_frame",
+      "stop": "extern \"C\" int generativeqc_f12_cabs_congruence_cuda_v1"
+    }
+  ],
+  "role": "runtime",
+  "subsystem": "molecular_f12"
+}

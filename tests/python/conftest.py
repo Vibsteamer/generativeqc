@@ -17,6 +17,36 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
 
+def configured_test_library(variable: str) -> Path | None:
+    """An explicit qualification artifact must exist, even when a bundled one is available."""
+    value = os.environ.get(variable)
+    if value is None:
+        return None
+    path = Path(value).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"{variable}={value!r} does not identify a library file")
+    return path.resolve()
+
+
+def f12_host_shell() -> Path:
+    """Select the explicit or installed through-i host-reference shell."""
+    from generativeqc import _native
+
+    path = configured_test_library("GENERATIVEQC_F12_HOST_SINK")
+    if path is None:
+        path = _native.installed_f12_shell_library(host_reference=True)
+    if path is None:
+        pytest.skip("install the through-i host-reference shell or set GENERATIVEQC_F12_HOST_SINK")
+    return path
+
+
+def f12_host_libraries() -> tuple[Path, Path]:
+    """The through-i shell also exports the host one-electron and projection ABI."""
+    one_electron = configured_test_library("GENERATIVEQC_F12_ONE_ECP")
+    shell = f12_host_shell()
+    return shell, one_electron or shell
+
+
 @dataclass(frozen=True)
 class NativeCxx:
     """Compile standalone native test probes through a compiler cache, then link normally."""

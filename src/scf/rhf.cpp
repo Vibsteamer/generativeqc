@@ -1304,29 +1304,44 @@ ScfResult run_prepared_fock_strategy(const PreparedFockPlan& plan, const ScfOpti
     if (options.reference_memory_budget_bytes != 0 &&
         capacity > options.reference_memory_budget_bytes)
       throw std::length_error("bounded RHF reference exceeds numeric memory budget");
-    const auto jk = plan.build(result.density);
-    const auto matrices = assemble_fock(strategy, plan.one_electron().hcore, jk);
-    auto ref = std::make_shared<PhysicalReference>();
-    ref->nbf = n;
-    ref->nocc = occupied;
-    ref->overlap = plan.one_electron().overlap;
-    ref->hcore = plan.one_electron().hcore;
-    ref->fock = matrices.alpha;
-    ref->density = result.density;
-    host_trace::Reason export_reason(host_trace::EigenReason::reference_export);
-    host_trace::Region export_trace("reference_export", n);
-    const auto orthogonalizer = plan.overlap_orthogonalizer(overlap_cache);
-    const auto eigen = plan.eigen_operation(PreparedFockPlan::EigenUse::Finalization);
-    auto canonical = eigen ? eigen(ref->fock, &ref->overlap, &orthogonalizer, n)
-                           : generalized_eigen(ref->fock, orthogonalizer, n);
-    ref->coefficients = std::move(canonical.vectors);
-    ref->orbital_energies = std::move(canonical.values);
-    ref->energy = electronic_energy(ref->density, ref->hcore, ref->fock) +
-                  plan.one_electron().nuclear_repulsion;
-    ref->numeric_capacity_bytes = capacity;
-    validate_physical_reference(*ref);
-    result.energy = ref->energy;
-    result.reference = std::move(ref);
+    if (result.reference) {
+      auto ref = std::make_shared<PhysicalReference>(*result.reference);
+      ref->numeric_capacity_bytes = capacity;
+      validate_physical_reference(*ref);
+      result.energy = ref->energy;
+      result.reference = std::move(ref);
+    } else {
+      const auto jk = plan.build(result.density);
+      auto matrices = assemble_fock(strategy, plan.one_electron().hcore, jk);
+      if (strategy.backend == FockBackend::Cuda &&
+          strategy.spec.coulomb.approximation == FockApproximation::DensityFitted &&
+          strategy.spec.exchange.approximation == FockApproximation::DensityFitted) {
+        preserve_fock_symmetry(matrices.alpha, n);
+      }
+      auto ref = std::make_shared<PhysicalReference>();
+      ref->nbf = n;
+      ref->nocc = occupied;
+      ref->overlap = plan.one_electron().overlap;
+      ref->hcore = plan.one_electron().hcore;
+      ref->fock = matrices.alpha;
+      ref->density = result.density;
+      host_trace::Reason export_reason(host_trace::EigenReason::reference_export);
+      host_trace::Region export_trace("reference_export", n);
+      const auto orthogonalizer = plan.overlap_orthogonalizer(overlap_cache);
+      const auto eigen = plan.eigen_operation(PreparedFockPlan::EigenUse::Finalization);
+      auto canonical = eigen ? eigen(ref->fock, &ref->overlap, &orthogonalizer, n)
+                             : generalized_eigen(ref->fock, orthogonalizer, n);
+      ref->coefficients = std::move(canonical.vectors);
+      ref->orbital_energies = std::move(canonical.values);
+      const auto evaluate_energy = options.stabilize_focal_rhf_convergence
+                                       ? reference::compensated_electronic_energy : electronic_energy;
+      ref->energy = evaluate_energy(ref->density, ref->hcore, ref->fock) +
+                    plan.one_electron().nuclear_repulsion;
+      ref->numeric_capacity_bytes = capacity;
+      validate_physical_reference(*ref);
+      result.energy = ref->energy;
+      result.reference = std::move(ref);
+    }
   }
   return result;
 }

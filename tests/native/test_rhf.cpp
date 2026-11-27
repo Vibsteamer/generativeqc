@@ -11,6 +11,11 @@
 #include "generativeqc/fock.h"
 #include "generativeqc/generativeqc.h"
 
+extern "C" generativeqc_status generativeqc_focal_df_reference_v1(
+    generativeqc_context* context, const generativeqc_system* orbital,
+    const generativeqc_system* auxiliary, int spins, int forces, std::size_t budget,
+    double* output, std::size_t count);
+
 namespace {
 
 struct Evaluation {
@@ -102,6 +107,63 @@ void verify_context_detail_storage() {
 
   generativeqc_context_destroy(first);
   generativeqc_context_destroy(second);
+}
+
+// Budget refusals are reported without allocating, so the detail text must
+// already fit when the context is fresh and after ordinary failures replace it.
+void verify_budget_refusal_detail() {
+  const generativeqc_context_descriptor context_descriptor{sizeof(generativeqc_context_descriptor),
+                                                           GENERATIVEQC_ABI_VERSION, 0,
+                                                           GENERATIVEQC_BACKEND_CPU_REFERENCE};
+  generativeqc_context* context = nullptr;
+  require(generativeqc_context_create(&context_descriptor, &context) == GENERATIVEQC_STATUS_SUCCESS,
+          "refusal detail context creation failed");
+  const generativeqc_atom atom{2, 0.0, 0.0, 0.0};
+  generativeqc_primitive primitive{1.0, 1.0};
+  const generativeqc_shell shell{0, 0, 0, 1};
+  const generativeqc_system_descriptor descriptor{sizeof(generativeqc_system_descriptor),
+                                                  GENERATIVEQC_ABI_VERSION,
+                                                  &atom,
+                                                  1,
+                                                  &shell,
+                                                  1,
+                                                  &primitive,
+                                                  1,
+                                                  0,
+                                                  1,
+                                                  GENERATIVEQC_BASIS_SPHERICAL};
+  generativeqc_system* orbital = nullptr;
+  generativeqc_system* auxiliary = nullptr;
+  require(generativeqc_system_create(context, &descriptor, &orbital) ==
+                  GENERATIVEQC_STATUS_SUCCESS &&
+              generativeqc_system_create(context, &descriptor, &auxiliary) ==
+                  GENERATIVEQC_STATUS_SUCCESS,
+          "refusal detail systems were not created");
+  // One spherical s function exports five matrices, two orbital values and
+  // three scalars; one double of budget cannot hold them.
+  std::array<double, 10> output{};
+  const std::string refusal = "focal reference export exceeds the numeric budget";
+  for (int round = 0; round < 2; ++round) {
+    require(generativeqc_focal_df_reference_v1(context, orbital, auxiliary, 1, 0, sizeof(double),
+                                               output.data(), output.size()) ==
+                GENERATIVEQC_STATUS_OUT_OF_MEMORY,
+            "focal reference export budget was not refused");
+    require(generativeqc_context_get_last_detail(context) == refusal,
+            "budget refusal detail was truncated");
+    primitive.exponent = -1.0;
+    generativeqc_system* rejected = nullptr;
+    require(generativeqc_system_create(context, &descriptor, &rejected) ==
+                    GENERATIVEQC_STATUS_INVALID_ARGUMENT &&
+                rejected == nullptr,
+            "invalid primitive did not fail");
+    require(std::string(generativeqc_context_get_last_detail(context)).find("positive finite") !=
+                std::string::npos,
+            "ordinary failure did not replace the refusal detail");
+    primitive.exponent = 1.0;
+  }
+  generativeqc_system_destroy(auxiliary);
+  generativeqc_system_destroy(orbital);
+  generativeqc_context_destroy(context);
 }
 
 // Exercise output selection on one retained C ABI calculation, including
@@ -410,6 +472,7 @@ int main() {
 
     verify_precision_provenance_gate();
     verify_context_detail_storage();
+    verify_budget_refusal_detail();
 
     generativeqc_method_capabilities_descriptor capabilities{
         sizeof(generativeqc_method_capabilities_descriptor),

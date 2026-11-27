@@ -466,6 +466,10 @@ endif()
 # solver and basis objects behind their own incremental compile boundaries.
 generativeqc_add_cpu_component_object_targets(generativeqc)
 
+if(NOT GENERATIVEQC_ENABLE_CUDA OR GENERATIVEQC_CUDA_PROVIDER STREQUAL "nvidia")
+  add_subdirectory(src/posthf/f12)
+endif()
+
 set_target_properties(generativeqc PROPERTIES OUTPUT_NAME generativeqc)
 if(NOT GENERATIVEQC_PYTHON_WHEEL)
   # Native SDK installs retain the normal SONAME chain. Wheel archives often

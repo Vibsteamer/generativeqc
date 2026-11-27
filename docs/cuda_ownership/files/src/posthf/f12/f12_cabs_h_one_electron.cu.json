@@ -1,0 +1,7 @@
+{
+  "path": "src/posthf/f12/f12_cabs_h_one_electron.cu",
+  "reason": "Combined-basis one-electron overlap, kinetic and attraction integrals and nuclear derivatives use the shared Cartesian Hermite recurrences. The shell contracts primitives into the physical matrices.",
+  "regions": [],
+  "role": "scientific",
+  "subsystem": "molecular_f12"
+}

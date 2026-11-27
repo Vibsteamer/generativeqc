@@ -1,0 +1,26 @@
+{
+  "path": "src/posthf/cabs_singles_cuda.cu",
+  "reason": "Validates dimensions, allocates the occupied/virtual eigensolver workspace, transfers Fock matrices and publishes the CABS energy and optional cotangent.",
+  "regions": [
+    {
+      "reason": "Forms symmetric occupied/virtual Fock blocks, divides amplitudes by spectrally guarded gaps and assembles spin-weighted pullback blocks.",
+      "role": "scientific",
+      "start": "__global__ void unpack",
+      "stop": "void cabs_singles(int device"
+    },
+    {
+      "reason": "Defines the zero singles energy and zero Fock response in an empty occupied or virtual space after Fock validation.",
+      "role": "scientific",
+      "start": "if (!o || !v)",
+      "stop": "const std::size_t oo ="
+    },
+    {
+      "reason": "Diagonalizes both Fock blocks and composes the Sylvester solution, spin-weighted singles energy and Fock derivatives with cuBLAS.",
+      "role": "scientific",
+      "start": "solver_check(eig::launch_symmetric_eigen(resources, family, occ",
+      "stop": "std::vector<double> staged(square)"
+    }
+  ],
+  "role": "runtime",
+  "subsystem": "molecular_f12"
+}
