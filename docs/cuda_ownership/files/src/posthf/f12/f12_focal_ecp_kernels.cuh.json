@@ -1,0 +1,7 @@
+{
+  "path": "src/posthf/f12/f12_focal_ecp_kernels.cuh",
+  "reason": "Off-center Gaussian AO jets, radial and angular quadrature weights, real harmonics and semilocal ECP channel evaluation used by the CUDA ECP projector.",
+  "regions": [],
+  "role": "scientific",
+  "subsystem": "molecular_f12"
+}

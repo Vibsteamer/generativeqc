@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from generativeqc._f12_focal_ecp_cuda import add_cuda_projector_residual
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -21,6 +22,146 @@ def test_b1_pyproject_declares_basis_set_exchange_optional_extra() -> None:
     opt = data["project"]["optional-dependencies"]
     assert any(dep.startswith("basis-set-exchange") for dep in opt["reference-test"])
     assert any(dep.startswith("basis-set-exchange") for dep in opt["bse"])
+
+
+# ============================================================================
+# H1: Br/I ECP CUDA 3rd-level grid escalation (ArithmeticError vs ValueError)
+# ============================================================================
+
+
+def test_h1_ecp_cuda_escalates_to_640x112_on_arithmetic_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When (384,80) vs (512,96) raises ArithmeticError, escalate to (640,112) and return refined."""
+    from generativeqc import _f12_focal_ecp_cuda as ecp_cuda
+    from generativeqc_compiler.integral.ecp_policy import (
+        EXTENDED_POLAR_POINTS,
+        EXTENDED_RADIAL_POINTS,
+        MAX_CUDA_POLAR_POINTS,
+        MAX_CUDA_RADIAL_POINTS,
+        ORBITAL_G_POLAR_POINTS,
+        ORBITAL_G_RADIAL_POINTS,
+    )
+
+    assert (ORBITAL_G_RADIAL_POINTS, ORBITAL_G_POLAR_POINTS) == (640, 112)
+
+    coarse = np.full((1, 2, 2), 1.0, dtype=np.float64)
+    # Differ by 1e-6 >> MATRIX_ABS_TOLERANCE (2e-9) so check_projector_grids raises ArithmeticError.
+    fine = np.full((1, 2, 2), 1.0 + 1e-6, dtype=np.float64)
+    # Converged within 1e-12 << 2e-9 against fine.
+    refined = np.full((1, 2, 2), 1.0 + 1e-6 + 1e-12, dtype=np.float64)
+    responses = {
+        (EXTENDED_RADIAL_POINTS, EXTENDED_POLAR_POINTS): (coarse, 1024),
+        (MAX_CUDA_RADIAL_POINTS, MAX_CUDA_POLAR_POINTS): (fine, 2048),
+        (ORBITAL_G_RADIAL_POINTS, ORBITAL_G_POLAR_POINTS): (refined, 4096),
+    }
+    called_grids: list[tuple[int, int]] = []
+
+    def fake_cuda_projectors(
+        library, shells, transforms, xyz, terms, grid, derivatives, budget
+    ) -> tuple[np.ndarray, int]:
+        called_grids.append(grid)
+        return responses[grid]
+
+    monkeypatch.setattr(ecp_cuda, "cuda_projectors", fake_cuda_projectors)
+    hcore = np.zeros((1, 2, 2), dtype=np.float64)
+    max_w = add_cuda_projector_residual(
+        hcore, Path("fake.so"), None, {}, np.zeros((1, 3)), {}, False, 1 << 20  # type: ignore[arg-type]
+    )
+
+    assert called_grids == [
+        (EXTENDED_RADIAL_POINTS, EXTENDED_POLAR_POINTS),
+        (MAX_CUDA_RADIAL_POINTS, MAX_CUDA_POLAR_POINTS),
+        (ORBITAL_G_RADIAL_POINTS, ORBITAL_G_POLAR_POINTS),
+    ]
+    assert max_w == 4096
+    np.testing.assert_array_equal(hcore, refined)
+
+
+def test_h1_ecp_cuda_fails_closed_when_640x112_remains_unconverged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When (512,96) vs (640,112) still fails convergence, fail closed with ArithmeticError."""
+    from generativeqc import _f12_focal_ecp_cuda as ecp_cuda
+    from generativeqc_compiler.integral.ecp_policy import (
+        EXTENDED_POLAR_POINTS,
+        EXTENDED_RADIAL_POINTS,
+        MAX_CUDA_POLAR_POINTS,
+        MAX_CUDA_RADIAL_POINTS,
+        ORBITAL_G_POLAR_POINTS,
+        ORBITAL_G_RADIAL_POINTS,
+    )
+
+    coarse = np.full((4, 2, 2), 1.0, dtype=np.float64)
+    fine = np.full((4, 2, 2), 1.0 + 1e-6, dtype=np.float64)
+    # Still diverges in derivative channel (> 2e-8).
+    refined = fine.copy()
+    refined[1] += 1e-5
+    responses = {
+        (EXTENDED_RADIAL_POINTS, EXTENDED_POLAR_POINTS): (coarse, 1024),
+        (MAX_CUDA_RADIAL_POINTS, MAX_CUDA_POLAR_POINTS): (fine, 2048),
+        (ORBITAL_G_RADIAL_POINTS, ORBITAL_G_POLAR_POINTS): (refined, 4096),
+    }
+    called_grids: list[tuple[int, int]] = []
+
+    def fake_cuda_projectors(
+        library, shells, transforms, xyz, terms, grid, derivatives, budget
+    ) -> tuple[np.ndarray, int]:
+        called_grids.append(grid)
+        return responses[grid]
+
+    monkeypatch.setattr(ecp_cuda, "cuda_projectors", fake_cuda_projectors)
+    hcore = np.full((4, 2, 2), 7.5, dtype=np.float64)
+    with pytest.raises(ArithmeticError, match="did not converge"):
+        add_cuda_projector_residual(
+            hcore, Path("fake.so"), None, {}, np.zeros((1, 3)), {}, True, 1 << 20  # type: ignore[arg-type]
+        )
+
+    assert called_grids == [
+        (EXTENDED_RADIAL_POINTS, EXTENDED_POLAR_POINTS),
+        (MAX_CUDA_RADIAL_POINTS, MAX_CUDA_POLAR_POINTS),
+        (ORBITAL_G_RADIAL_POINTS, ORBITAL_G_POLAR_POINTS),
+    ]
+    np.testing.assert_array_equal(hcore, np.full((4, 2, 2), 7.5, dtype=np.float64))
+
+
+def test_h1_ecp_cuda_skips_third_grid_when_initial_pair_converges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When (384,80) vs (512,96) already converges, do not invoke (640,112)."""
+    from generativeqc import _f12_focal_ecp_cuda as ecp_cuda
+    from generativeqc_compiler.integral.ecp_policy import (
+        EXTENDED_POLAR_POINTS,
+        EXTENDED_RADIAL_POINTS,
+        MAX_CUDA_POLAR_POINTS,
+        MAX_CUDA_RADIAL_POINTS,
+    )
+
+    coarse = np.full((1, 2, 2), 2.0, dtype=np.float64)
+    fine = np.full((1, 2, 2), 2.0 + 1e-12, dtype=np.float64)
+    called_grids: list[tuple[int, int]] = []
+
+    def fake_cuda_projectors(
+        library, shells, transforms, xyz, terms, grid, derivatives, budget
+    ) -> tuple[np.ndarray, int]:
+        called_grids.append(grid)
+        if grid == (EXTENDED_RADIAL_POINTS, EXTENDED_POLAR_POINTS):
+            return coarse, 1024
+        if grid == (MAX_CUDA_RADIAL_POINTS, MAX_CUDA_POLAR_POINTS):
+            return fine, 2048
+        raise AssertionError(f"Unexpected escalation to grid {grid}")
+
+    monkeypatch.setattr(ecp_cuda, "cuda_projectors", fake_cuda_projectors)
+    hcore = np.zeros((1, 2, 2), dtype=np.float64)
+    max_w = add_cuda_projector_residual(
+        hcore, Path("fake.so"), None, {}, np.zeros((1, 3)), {}, False, 1 << 20  # type: ignore[arg-type]
+    )
+    assert called_grids == [
+        (EXTENDED_RADIAL_POINTS, EXTENDED_POLAR_POINTS),
+        (MAX_CUDA_RADIAL_POINTS, MAX_CUDA_POLAR_POINTS),
+    ]
+    assert max_w == 2048
+    np.testing.assert_array_equal(hcore, fine)
 
 
 # ============================================================================

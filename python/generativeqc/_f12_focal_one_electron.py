@@ -120,7 +120,9 @@ def one_electron_sources(
     orbital_only=True the matrices contain just the ordinary orbital basis. With
     derivatives=True, each Jacobian has shape (atoms, 3, AOs, AOs) and includes
     the motion of both Gaussian centers and the nuclear attraction centers.
-    The numeric budget bounds workspace.
+    For scalar ECPs the requested backend also evaluates through-f semilocal
+    projectors with a zero residual local channel. The point attraction then
+    uses the effective ionic charges. The numeric budget bounds workspace.
     """
     if request.role not in ("hf_cabs", "mp2_f12_correlation"):
         raise ValueError("one-electron F12 sources require an HF+CABS or MP2-F12 role")
@@ -146,9 +148,14 @@ def one_electron_sources(
         groups.append(("CABS", basis.cabs))
     shells = pack_shells(request.atoms, tuple(groups), maximum)
     nuclei = [basis.orbital.by_element[a.atomic_number] for a in request.atoms]
+    terms = {}
     if any(n.ecp_core_electrons for n in nuclei):
-        raise NotImplementedError("Combined one-electron sources require an all-electron orbital basis")
-    charges = np.asarray([n.nuclear_charge for n in nuclei], dtype=np.int32)
+        from ._f12_focal_ecp import projector_terms
+
+        terms = projector_terms(nuclei)
+    charges = np.asarray(
+        [n.nuclear_charge - n.ecp_core_electrons for n in nuclei], dtype=np.int32
+    )
     xyz = np.asarray([a.position for a in request.atoms], dtype=np.float64)
     ns = len(shells.angular)
     widths = (2 * shells.angular + 1).tolist()
@@ -249,6 +256,35 @@ def one_electron_sources(
             if first != second:
                 matrices[:, :, right, left] = block.swapaxes(-1, -2)
             pos += a * b
+    if terms:
+        from ._f12_focal_ecp import add_projector_residual
+
+        del block, compact
+        residual_budget = min(maximum - dense_bytes - retained, 12 << 30)
+        if request.backend == "cpu_reference":
+            add_projector_residual(
+                matrices[:, 1],
+                shells,
+                transforms,
+                xyz,
+                terms,
+                derivatives,
+                residual_budget,
+            )
+        else:
+            from ._f12_focal_ecp_cuda import add_cuda_projector_residual
+
+            ecp_bytes = add_cuda_projector_residual(
+                matrices[:, 1],
+                path,
+                shells,
+                transforms,
+                xyz,
+                terms,
+                derivatives,
+                residual_budget,
+            )
+            used.value = max(used.value, ecp_bytes)
     jac_shape = (len(nuclei), 3, n, n)
     return FocalOneElectron(
         matrices[0, 0],

@@ -19,6 +19,7 @@ set(shell_sources
     f12_cc_fixed_sources_cuda.cu)
 if(GENERATIVEQC_ENABLE_CUDA)
   set(backend cuda)
+  list(APPEND shell_sources f12_focal_ecp.cu)
 else()
   set(backend host)
   # CMP0119 makes the compiler explicitly treat these shared .cu units as C++.
