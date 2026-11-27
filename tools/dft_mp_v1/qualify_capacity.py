@@ -2385,6 +2385,9 @@ def _calculator_basis_contract(repository: Path) -> tuple[str, str]:
                         native.DENSITY_FITTING_CPU_REFERENCE
                     )
                     calculator._method = native.METHOD_PBE_RKS
+                    calculator._method_name = "pbe"
+                    calculator._precision_mode = native.PRECISION_FP64
+                    calculator._auxiliary_basis = auxiliary
                     calculator._dispersion_method_ir = None
                     calculator._composite_rks_second_order = False
                     calculator._ks_options = None
@@ -2478,6 +2481,7 @@ def _calculator_basis_contract(repository: Path) -> tuple[str, str]:
         calculator._device_name = "cuda"
         calculator._density_fitting_mode = native.DENSITY_FITTING_CORRELATION_CUDA
         calculator._method = native.METHOD_MP2
+        calculator._method_name = "mp2"
         for explicit_basis in (None, auxiliary):
             expected_basis = orbital if explicit_basis is None else auxiliary
             expected_shells = expected_basis.shells_for(atoms)
@@ -2527,6 +2531,7 @@ def _calculator_basis_contract(repository: Path) -> tuple[str, str]:
         calculator._density_fitting_mode = native.DENSITY_FITTING_CUDA
         calculator._create_native_system(context, atoms, -1, 2)
         calculator._method = native.METHOD_RHF
+        calculator._method_name = "rhf"
         native_seen = False
         try:
             calculator._create_native_system(context, atoms, -1, 2)
@@ -2539,6 +2544,7 @@ def _calculator_basis_contract(repository: Path) -> tuple[str, str]:
             raise RuntimeError("ECP density fitting did not fail closed")
 
         calculator._basis = expected_basis = orbital
+        calculator._density_fitting_mode = native.DENSITY_FITTING_NONE
         expected_shells = orbital.shells_for(atoms)
         expected_route = "ordinary"
         for charge, multiplicity in ((2**31, 2), (-1, 0)):
@@ -2794,12 +2800,8 @@ def _spd_expansion_contract(repository: Path) -> dict[str, Any]:
     """
 
     source = (repository / "src/molecule/basis.cpp").read_text(encoding="utf-8")
-    try:
-        begin = source.index("std::vector<CartesianComponent> cartesian_components")
-        end = source.index("  if (l == 3)", begin)
-    except ValueError as error:
-        raise RuntimeError("native s/p/d expansion owner is missing") from error
-    digest = _lf_sha256(source[begin:end].encode())
+    # Record the translation unit so the expansion may delegate to local helpers.
+    digest = _lf_sha256(source.encode())
 
     packer_source = (repository / "src/dft/ao_grid.cpp").read_text(encoding="utf-8")
     try:

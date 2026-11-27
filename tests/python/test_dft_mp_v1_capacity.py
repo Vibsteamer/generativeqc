@@ -4,6 +4,7 @@ import os
 import py_compile
 import subprocess
 import sys
+from collections.abc import Callable
 from importlib.machinery import SourceFileLoader
 from importlib.util import cache_from_source
 from pathlib import Path
@@ -146,6 +147,30 @@ def copy_contract_files(tmp_path: Path, files: tuple[str, ...]) -> None:
         target.write_text(
             (ROOT / relative).read_text(encoding="utf-8"), encoding="utf-8"
         )
+
+
+def wrap_calculator_call(
+    source: str, method: str, receiver: str, callee: str, wrapper: str
+) -> str:
+    owner = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef) and node.name == method
+    )
+    (call,) = (
+        node
+        for node in ast.walk(owner)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == receiver
+        and node.func.attr == callee
+    )
+    method_source = ast.get_source_segment(source, owner)
+    call_source = ast.get_source_segment(source, call)
+    assert method_source is not None and call_source is not None
+    changed = method_source.replace(call_source, wrapper.format(call=call_source), 1)
+    return source.replace(method_source, changed, 1)
 
 
 def stationary_contract_tree(tmp_path: Path, source: str) -> None:
@@ -397,14 +422,8 @@ def test_frozen_capacity_report_uses_actual_basis_and_grid_identities() -> None:
         "2 * self.packed.nbytes + 32 * self.natom + "
         "32 * len(self.shells) + 16 * self.nprimitive"
     )
-    basis_source = (ROOT / "src/molecule/basis.cpp").read_text()
     assert result["basis"]["spd_expansion_contract_sha256"] == (
-        qualify_capacity._source_span_sha256(
-            basis_source,
-            begin="std::vector<CartesianComponent> cartesian_components",
-            end="  if (l == 3)",
-            label="native s/p/d expansion",
-        )
+        qualify_capacity._lf_sha256((ROOT / "src/molecule/basis.cpp").read_bytes())
     )
     assert result["basis"]["sparse_spherical_component_terms"] == {
         "s": 1,
@@ -2012,12 +2031,6 @@ def test_memory_bounds_fail_closed_when_production_definition_moves(
             "            )[:1]\n            if isinstance(selected_basis, BasisSet)",
             "_shells_for_atoms basis lowering contract changed",
         ),
-        (
-            "python/generativeqc/calculator.py",
-            "shells = self._shells_for_atoms(atoms, basis)",
-            "shells = self._shells_for_atoms(atoms, basis)[:1]",
-            "_create_native_system basis lowering contract changed",
-        ),
     ],
 )
 def test_basis_counts_fail_closed_when_production_lowering_moves(
@@ -2092,11 +2105,6 @@ def test_basis_counts_fail_closed_when_production_lowering_moves(
             "consumer=None",
         ),
         ("_basis_for_atoms", "require_basis(", "(lambda *args, **kwargs: None)("),
-        (
-            "_create_native_system",
-            "shells = self._shells_for_atoms(atoms, basis)",
-            "shells = self._shells_for_atoms(atoms, basis)[:1]",
-        ),
         ("_create_native_system", "shell.atom_index,", "0,"),
         ("_create_native_system", "shell.angular_momentum,", "0,"),
         (
@@ -2159,6 +2167,40 @@ def test_calculator_basis_semantics_reject_changed_admission_and_descriptors(
         qualify_capacity._calculator_basis_contract(tmp_path)
 
 
+@pytest.mark.parametrize(
+    "validate",
+    (
+        qualify_capacity._basis_layout_contract,
+        qualify_capacity._calculator_basis_contract,
+    ),
+)
+def test_calculator_native_descriptor_rejects_truncated_shells(
+    tmp_path: Path, validate: Callable[[Path], object]
+) -> None:
+    relative = "python/generativeqc/calculator.py"
+    copy_contract_files(
+        tmp_path,
+        (
+            "python/generativeqc_compiler/dft/ao.py",
+            "python/generativeqc/_model_resolution.py",
+            "python/generativeqc/basis.py",
+            relative,
+        ),
+    )
+    target = tmp_path / relative
+    source = target.read_text()
+    validate(tmp_path)
+    target.write_text(
+        wrap_calculator_call(
+            source, "_create_native_system", "self", "_shells_for_atoms", "{call}[:1]"
+        )
+    )
+    with pytest.raises(
+        RuntimeError, match="native basis descriptor dimensions changed"
+    ):
+        validate(tmp_path)
+
+
 def test_calculator_basis_semantics_accept_refactors_without_native_loading(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2175,24 +2217,22 @@ def test_calculator_basis_semantics_accept_refactors_without_native_loading(
     copy_contract_files(tmp_path, (relative,))
     original = qualify_capacity._calculator_basis_contract(tmp_path)
     target = tmp_path / relative
-    source = target.read_text()
-    forwarding = next(
-        node
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "selected_basis"
-        and node.func.attr == "shells_for"
+    source = wrap_calculator_call(
+        target.read_text(),
+        "_shells_for_atoms",
+        "selected_basis",
+        "shells_for",
+        "tuple({call})",
     )
-    call = ast.get_source_segment(source, forwarding)
-    assert call is not None
-    source = source.replace(call, f"tuple({call})", 1).replace(
-        "shells = self._shells_for_atoms(atoms, basis)",
-        "shells = tuple(self._shells_for_atoms(atoms, basis))",
-        1,
+    target.write_text(
+        wrap_calculator_call(
+            source,
+            "_create_native_system",
+            "self",
+            "_shells_for_atoms",
+            "tuple({call})",
+        )
     )
-    target.write_text(source)
     observed = qualify_capacity._calculator_basis_contract(tmp_path)
     assert observed[0] != original[0]
     assert observed[1] != original[1]
