@@ -24,6 +24,21 @@ if TYPE_CHECKING:
     from .experimental.f12_focal import FocalRequest
 
 
+@dataclass(frozen=True)
+class FocalF12Sources:
+    """Joint OBS/OptRI spherical sources for a physical fit and F12 exponent."""
+
+    surface_id: str
+    basis_id: str
+    fit_id: str
+    executed_backend: str
+    beta: float | None
+    integrals: Mapping[str, np.ndarray]
+    whitener: np.ndarray
+    ao_loader: Callable[[str], np.ndarray] | None = None
+    obs_coulomb: np.ndarray | None = None
+
+
 def _canonical_occupied_virtual_blocks(
     m: np.ndarray, eps: np.ndarray, occ: int
 ) -> np.ndarray:

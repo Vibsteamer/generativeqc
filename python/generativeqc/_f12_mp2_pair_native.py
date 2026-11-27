@@ -1,4 +1,4 @@
-"""Native AOT cuBLAS (and FP64 host-reference) bindings for ordinary DF-MP2."""
+"""Native AOT cuBLAS (and FP64 host-reference) bindings for ordinary DF-MP2 and MP2-F12 pairs."""
 
 from __future__ import annotations
 
@@ -208,4 +208,237 @@ def run_ordinary_df_mp2_native(
         bar_coeff_b,
         bar_ao_coul,
         bar_metric,
+    )
+
+
+def bind_mp2_f12_pair_energies(
+    *,
+    host_reference: bool,
+    shell_library: Path | str | ct.CDLL | None = None,
+) -> Any | None:
+    """Bind gqc_f12_mp2_pair_energies_{host_reference,cuda} if exported by shell_library."""
+    req, dis = _check_mp2f12_env_flags()
+    if dis:
+        return None
+    suffix = "_host_reference" if host_reference else "_cuda"
+    symbol = f"gqc_f12_mp2_pair_energies{suffix}"
+    func = _resolve_symbol(symbol, shell_library, host_reference=host_reference)
+    if func is None:
+        if req:
+            raise RuntimeError(
+                f"{_REQUIRE_ENV}=1 requires native symbol {symbol!r}, but no matching library was found"
+            )
+        return None
+    func.argtypes = (
+        [ct.c_int] * 12
+        + [ct.c_uint64]
+        + [_D_PTR] * 26
+    )
+    func.restype = ct.c_int
+    return func
+
+
+def _prep_raw_coul(
+    arr: np.ndarray | None,
+    *,
+    aux: int,
+    occ: int,
+    ext: int,
+    label: str,
+) -> tuple[np.ndarray | None, int]:
+    if arr is None or occ == 0:
+        return None, 0
+    if arr.ndim != 3 or arr.shape[0] != aux or arr.shape[1] < occ or arr.shape[2] != ext:
+        raise ValueError(
+            f"{label} must have shape ({aux}, >={occ}, {ext}), got {arr.shape}"
+        )
+    if arr.flags.c_contiguous and arr.dtype == np.float64:
+        return arr, int(arr.shape[1])
+    sliced = np.ascontiguousarray(arr[:, :occ, :], dtype=np.float64)
+    return sliced, occ
+
+
+def _prep_occ_3c(
+    arr: np.ndarray | None,
+    *,
+    aux: int,
+    occ: int,
+    ext: int,
+    label: str,
+) -> np.ndarray | None:
+    if arr is None or occ == 0:
+        return None
+    out = np.ascontiguousarray(arr, dtype=np.float64)
+    if out.shape != (aux, occ, ext):
+        raise ValueError(f"{label} must have shape ({aux}, {occ}, {ext}), got {out.shape}")
+    return out
+
+
+def run_mp2_f12_pair_energies_native(
+    func: Any,
+    *,
+    space: tuple[int, int, int, int, int],
+    frozen_occupied: tuple[int, int],
+    rhf_spatial: bool,
+    include_ordinary: bool,
+    budget_bytes: int,
+    data: dict[str, np.ndarray],
+    sources: dict[str, np.ndarray],
+    fock: dict[str, np.ndarray],
+    occ_w_a: np.ndarray | None = None,
+    occ_w_b: np.ndarray | None = None,
+) -> tuple[
+    tuple[float, float, float],
+    tuple[float, float, float],
+    np.ndarray,
+    np.ndarray | None,
+]:
+    """Execute AOT forward MP2-F12 3C(FIX) SP pair energies (RHF spatial fast path + UHF)."""
+    budget_bytes = workspace_bytes(budget_bytes, signed=False)
+    oa, ob, obs, ext, aux = space
+    fa, fb = frozen_occupied
+    if not (0 <= fa <= oa < obs and 0 <= fb <= ob < obs < ext and aux > 0):
+        raise ValueError(
+            "Invalid occupied/frozen spin spaces or orbital/fitting dimensions"
+        )
+    if rhf_spatial and (oa != ob or fa != fb):
+        raise ValueError("rhf_spatial requires equal alpha/beta occupied and frozen counts")
+
+    oa_act = oa - fa
+    ob_act = ob - fb
+    has_occ_weights = occ_w_a is not None or occ_w_b is not None
+    wa = (
+        np.ascontiguousarray(occ_w_a, dtype=np.float64)
+        if has_occ_weights and occ_w_a is not None
+        else None
+    )
+    wb = (
+        wa
+        if (has_occ_weights and rhf_spatial)
+        else (
+            np.ascontiguousarray(occ_w_b, dtype=np.float64)
+            if has_occ_weights and occ_w_b is not None
+            else None
+        )
+    )
+    if has_occ_weights:
+        if (oa_act > 0 and (wa is None or wa.shape != (oa_act,))) or (
+            not rhf_spatial and ob_act > 0 and (wb is None or wb.shape != (ob_act,))
+        ):
+            raise ValueError("MP2-F12 pair energies occupied weights have invalid shapes")
+
+    mg = np.ascontiguousarray(data["metric/geminal"], dtype=np.float64)
+    msq = np.ascontiguousarray(data["metric/squared_geminal"], dtype=np.float64)
+    mgc = np.ascontiguousarray(data["metric/geminal_coulomb"], dtype=np.float64)
+    mdc = np.ascontiguousarray(data["metric/double_commutator"], dtype=np.float64)
+    for name, mat in (
+        ("metric/geminal", mg),
+        ("metric/squared_geminal", msq),
+        ("metric/geminal_coulomb", mgc),
+        ("metric/double_commutator", mdc),
+    ):
+        if mat.shape != (aux, aux):
+            raise ValueError(f"{name} must have shape ({aux}, {aux}), got {mat.shape}")
+
+    fa_mat = np.ascontiguousarray(fock["fock_alpha"], dtype=np.float64)
+    ka_mat = np.ascontiguousarray(fock["exchange_alpha"], dtype=np.float64)
+    if fa_mat.shape != (ext, ext) or ka_mat.shape != (ext, ext):
+        raise ValueError("alpha Fock/exchange matrices must have shape (ext, ext)")
+
+    if rhf_spatial:
+        fb_mat = fa_mat
+        kb_mat = ka_mat
+        cross = None
+    else:
+        fb_mat = np.ascontiguousarray(fock["fock_beta"], dtype=np.float64)
+        kb_mat = np.ascontiguousarray(fock["exchange_beta"], dtype=np.float64)
+        if fb_mat.shape != (ext, ext) or kb_mat.shape != (ext, ext):
+            raise ValueError("beta Fock/exchange matrices must have shape (ext, ext)")
+        if oa_act > 0 and ob_act > 0:
+            cross = np.ascontiguousarray(data["cross_overlap"], dtype=np.float64)
+            if cross.shape != (ext, ext):
+                raise ValueError(
+                    f"cross_overlap must have shape ({ext}, {ext}), got {cross.shape}"
+                )
+        else:
+            cross = None
+
+    fit_a = _prep_occ_3c(sources.get("fit_alpha") if oa_act > 0 else None, aux=aux, occ=oa, ext=ext, label="fit_alpha")
+    rca, rca_n1 = _prep_raw_coul(sources.get("raw_coulomb_alpha") if oa_act > 0 else None, aux=aux, occ=oa, ext=ext, label="raw_coulomb_alpha")
+    rga = _prep_occ_3c(data.get("raw/geminal/alpha") if oa_act > 0 else None, aux=aux, occ=oa, ext=ext, label="raw/geminal/alpha")
+    rsqa = _prep_occ_3c(data.get("raw/squared_geminal/alpha") if oa_act > 0 else None, aux=aux, occ=oa, ext=ext, label="raw/squared_geminal/alpha")
+    rgca = _prep_occ_3c(data.get("raw/geminal_coulomb/alpha") if oa_act > 0 else None, aux=aux, occ=oa, ext=ext, label="raw/geminal_coulomb/alpha")
+    rdca = _prep_occ_3c(data.get("raw/double_commutator/alpha") if oa_act > 0 else None, aux=aux, occ=oa, ext=ext, label="raw/double_commutator/alpha")
+
+    if rhf_spatial or ob_act == 0:
+        fit_b = rgb = rsqb = rgcb = rdcb = None
+        rcb, rcb_n1 = None, 0
+    else:
+        fit_b = _prep_occ_3c(sources.get("fit_beta"), aux=aux, occ=ob, ext=ext, label="fit_beta")
+        rcb, rcb_n1 = _prep_raw_coul(sources.get("raw_coulomb_beta"), aux=aux, occ=ob, ext=ext, label="raw_coulomb_beta")
+        rgb = _prep_occ_3c(data.get("raw/geminal/beta"), aux=aux, occ=ob, ext=ext, label="raw/geminal/beta")
+        rsqb = _prep_occ_3c(data.get("raw/squared_geminal/beta"), aux=aux, occ=ob, ext=ext, label="raw/squared_geminal/beta")
+        rgcb = _prep_occ_3c(data.get("raw/geminal_coulomb/beta"), aux=aux, occ=ob, ext=ext, label="raw/geminal_coulomb/beta")
+        rdcb = _prep_occ_3c(data.get("raw/double_commutator/beta"), aux=aux, occ=ob, ext=ext, label="raw/double_commutator/beta")
+
+    n_aa = (oa_act * (oa_act - 1)) // 2 if oa_act >= 2 else 0
+    n_ab = oa_act * ob_act
+    n_bb = (ob_act * (ob_act - 1)) // 2 if ob_act >= 2 else 0
+    n_total = n_aa + n_ab + n_bb
+
+    out_scalars = np.zeros(6, dtype=np.float64)
+    pair_f12 = np.zeros(n_total, dtype=np.float64)
+    pair_ord = np.zeros(n_total, dtype=np.float64) if include_ordinary else None
+
+    rc = int(
+        func(
+            int(rhf_spatial),
+            int(include_ordinary),
+            int(has_occ_weights),
+            int(oa),
+            int(ob),
+            int(fa),
+            int(fb),
+            int(obs),
+            int(ext),
+            int(aux),
+            int(rca_n1),
+            int(rcb_n1),
+            budget_bytes,
+            _dptr(wa),
+            _dptr(wb),
+            _dptr(fit_a),
+            _dptr(fit_b),
+            _dptr(rca),
+            _dptr(rcb),
+            _dptr(rga),
+            _dptr(rgb),
+            _dptr(rsqa),
+            _dptr(rsqb),
+            _dptr(rgca),
+            _dptr(rgcb),
+            _dptr(rdca),
+            _dptr(rdcb),
+            _dptr(mg),
+            _dptr(msq),
+            _dptr(mgc),
+            _dptr(mdc),
+            _dptr(fa_mat),
+            _dptr(fb_mat),
+            _dptr(ka_mat),
+            _dptr(kb_mat),
+            _dptr(cross),
+            _dptr(out_scalars),
+            _dptr(pair_f12),
+            _dptr(pair_ord),
+        )
+    )
+    if rc != 0:
+        raise RuntimeError(f"native MP2-F12 pair energies kernel failed with status {rc}")
+
+    return (
+        (float(out_scalars[0]), float(out_scalars[1]), float(out_scalars[2])),
+        (float(out_scalars[3]), float(out_scalars[4]), float(out_scalars[5])),
+        pair_f12,
+        pair_ord,
     )

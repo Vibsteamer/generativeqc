@@ -72,6 +72,7 @@ DEFAULT_SLATER_FIT_NORMALIZATION = (
     _f12_focal_integral_kernel.DEFAULT_SLATER_FIT_NORMALIZATION
 )
 MolecularFocalProvider = _f12_focal_molecular.MolecularFocalProvider
+FocalLowOrderEnergy = _f12_focal_molecular.FocalLowOrderEnergy
 conventional_mp2_request = _f12_focal_cv.conventional_mp2_request
 DEFAULT_PRODUCTION_CORRELATION_SPACE = _f12_frozen_core.DEFAULT_PRODUCTION_CORRELATION_SPACE
 FROZEN_CORE_DEFINITION_VERSION = _f12_frozen_core.FROZEN_CORE_DEFINITION_VERSION
