@@ -245,3 +245,14 @@ installed with every native SDK/CLI build under `share/generativeqc/licenses/`
 numbers are used unchanged; at run time the exponents are multiplied by the
 square of the Slater exponent and, for the second normalization, the
 coefficients are divided by it.
+
+## Test-embedded Basis Set Exchange excerpts
+
+Some tests embed small excerpts of Gaussian basis sets from MolSSI Basis Set
+Exchange as test inputs. The data are BSD-3-Clause; the license is retained in
+`LICENSES/bse-data-BSD-3-Clause.txt`.
+
+| Basis Set Exchange basis | Elements | Used in |
+| --- | --- | --- |
+| STO-3G | H, He, B, C, O | Many native and Python tests; the same records as the bundled catalog |
+| cc-pVDZ-F12 and aug-cc-pVTZ-RI | H, O | `tests/reference_data/f12/libint_contracted.json`, `tests/reference_data/f12/libint_contracted_full_shells.json` |
