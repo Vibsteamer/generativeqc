@@ -209,6 +209,337 @@ def _paired_cv_fc_requests(
     return req_cv, req_fc
 
 
+def molecular_delta_cv_energy(
+    provider: MolecularFocalProvider,
+    request_cv: FocalRequest,
+    request_fc: FocalRequest | None = None,
+    *,
+    expected_cabs_rank: int | None = None,
+) -> FocalDeltaCVResult:
+    """Evaluate forward-only Delta-CV = E_MP2-F12(cv-active) - E_MP2-F12(frozen-core).
+
+    Shares a single DF-HF solve, 1e/ECP + 3c/2c integral build, CABS projector,
+    MO-transformed pair source, Fock matrix, and single-pass pair summation.
+    """
+    from generativeqc_compiler.tensor import execute
+
+    from ._f12_focal_energy import (
+        _check_request,
+        _fock_uses_canonical_spectrum,
+        _ordinary_energies,
+    )
+    from ._f12_focal_frame import canonical_pair_frame
+    from ._f12_focal_reference import df_reference
+    from ._f12_focal_reference import partition_focal_reference
+    from ._f12_spin_ao import _orbital_sources
+    from ._f12_spin_fock import spin_fock
+    from ._f12_spin_pairs import molecular_pair_energies
+
+    req_cv, req_fc = _paired_cv_fc_requests(request_cv, request_fc)
+    budget = _check_request(provider, req_cv)
+    cuda = req_cv.backend == "cuda"
+    runner = provider.run or partial(execute, max_bytes=budget << 20)
+
+    def run(graph: Program, inputs: Mapping[str, np.ndarray]) -> Execution:
+        result = runner(graph, inputs)
+        if result.backend != (
+            "cuda-fp64-ordinary-stream" if cuda else "numpy-cpu-interpreter"
+        ):
+            raise RuntimeError("Delta-CV energy graph executed on another backend")
+        return result
+
+    if hasattr(runner, "batch"):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def run_batch(graph: Program):
+            with runner.batch(graph) as exec_one:
+                def wrapped(inputs: Mapping[str, np.ndarray]) -> Execution:
+                    result = exec_one(inputs)
+                    if result.backend != (
+                        "cuda-fp64-ordinary-stream" if cuda else "numpy-cpu-interpreter"
+                    ):
+                        raise RuntimeError(
+                            "Delta-CV energy graph executed on another backend"
+                        )
+                    return result
+
+                yield wrapped
+
+        run.batch = run_batch  # type: ignore[attr-defined]
+
+    ref = df_reference(
+        req_cv, forces=False, budget_mib=budget, **provider._seed_options(req_cv)
+    )
+    ref = partition_focal_reference(
+        req_cv, ref, budget, additional_space=req_fc.correlation_space_id,
+    )
+    assert ref.frozen_frame is not None
+    cv_frozen = ref.frozen_frame.counts(req_cv.correlation_space_id)
+    fc_frozen = ref.frozen_frame.counts(req_fc.correlation_space_id)
+    indices = ref._pair_spin_indices(req_cv)
+    occs = tuple(ref.occupied[k] for k in indices)
+
+    if cv_frozen == fc_frozen:
+        from ._f12_focal_projector import checked_reference_cabs_rank
+
+        return FocalDeltaCVResult(
+            reference=ref,
+            cabs_rank=checked_reference_cabs_rank(provider, req_cv, ref, expected_cabs_rank),
+            cv_frozen=cv_frozen,
+            fc_frozen=fc_frozen,
+            fc_mode=req_fc.correlation_space_id,
+            frozen_core_definition_version=FROZEN_CORE_DEFINITION_VERSION,
+            cv_ordinary_mp2_Eh=None,
+            fc_ordinary_mp2_Eh=None,
+            cv_f12_increment_Eh=None,
+            fc_f12_increment_Eh=None,
+            cv_mp2_f12_Eh=None,
+            fc_mp2_f12_Eh=None,
+            delta_ordinary_mp2_Eh=0.0,
+            delta_f12_increment_Eh=0.0,
+            delta_mp2_f12_Eh=0.0,
+        )
+
+    one, (jk, mp2, f12) = provider._cached_pair_sources(
+        req_cv, derivatives=False, budget=budget
+    )
+    space, ao, jkfit, projector = canonical_pair_frame(
+        req_cv,
+        ref,
+        one,
+        jk.joint(req_cv, explicit=False),
+        f12.joint(req_cv, explicit=True),
+        expected_cabs_rank=expected_cabs_rank,
+        relative_cutoff=provider.relative_cutoff,
+        library=provider.response_library,
+    )
+    oa, ob, obs, ext, _ = space
+    distinct_jk = jk is not f12
+    data, _ = _orbital_sources(
+        space,
+        ao,
+        run,
+        None,
+        projected=None,
+        role="pairs" if distinct_jk else "shared",
+        occupied_coulomb=distinct_jk,
+    )
+    fock_data = data
+    if distinct_jk:
+        shared = ("overlap_ao", "hcore_ao", "coefficients_alpha", "coefficients_beta")
+        fock_ao = {**{k: ao[k] for k in shared}, **jkfit}
+        fock_data, _ = _orbital_sources(
+            (oa, ob, obs, ext, len(jk.whitener)),
+            fock_ao,
+            run,
+            None,
+            projected=None,
+            role="fock",
+        )
+
+    def sources(raw: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        return {
+            k.removeprefix("source/"): v
+            for k, v in raw.items()
+            if k.startswith("source/")
+        }
+
+    fock = spin_fock((oa, ob, ext, len(jk.whitener)), sources(fock_data), run)
+    fc_by_spin = {"alpha": fc_frozen[0], "beta": fc_frozen[1]}
+    shared_pairs = mp2 is f12 and _fock_uses_canonical_spectrum(fock, ref, indices, obs)
+
+    cv_mp2_terms: list[float] = []
+    fc_mp2_terms: list[float] = []
+    cv_f12_terms: list[float] = []
+    fc_f12_terms: list[float] = []
+
+    for item in molecular_pair_energies(
+        space,
+        data,
+        sources(data),
+        fock,
+        run,
+        frozen_occupied=cv_frozen,
+        include_ordinary=shared_pairs,
+        shell_library=provider.shell_library,
+        budget_mib=budget,
+        backend=req_cv.backend,
+    ):
+        sl, sr = item.spins
+        ii, jj = item.occupied_indices
+        in_fc = ii >= fc_by_spin[sl] and jj >= fc_by_spin[sr]
+        cv_f12_terms.append(item.f12)
+        if in_fc:
+            fc_f12_terms.append(item.f12)
+        if item.mp2 is not None:
+            cv_mp2_terms.append(item.mp2)
+            if in_fc:
+                fc_mp2_terms.append(item.mp2)
+
+    if shared_pairs:
+        cv_ord = fsum(cv_mp2_terms)
+        fc_ord = fsum(fc_mp2_terms)
+    else:
+        obs_src = mp2.obs(req_cv, obs)
+        cv_ord = fsum(
+            _ordinary_energies(
+                ref,
+                indices,
+                obs_src,
+                run,
+                None,
+                frozen_occupied=cv_frozen,
+                shell_library=provider.shell_library,
+                response_library=provider.response_library,
+                budget_mib=budget,
+                cuda=cuda,
+            )
+        )
+        fc_ord = fsum(
+            _ordinary_energies(
+                ref,
+                indices,
+                obs_src,
+                run,
+                None,
+                frozen_occupied=fc_frozen,
+                shell_library=provider.shell_library,
+                response_library=provider.response_library,
+                budget_mib=budget,
+                cuda=cuda,
+            )
+        )
+
+    cv_f12 = fsum(cv_f12_terms)
+    fc_f12 = fsum(fc_f12_terms)
+    cv_tot = cv_ord + cv_f12
+    fc_tot = fc_ord + fc_f12
+    d_ord = cv_ord - fc_ord
+    d_f12 = cv_f12 - fc_f12
+    d_tot = cv_tot - fc_tot
+
+    if not all(isfinite(v) for v in (cv_tot, fc_tot, d_tot)):
+        raise ArithmeticError("nonfinite molecular Delta-CV energy")
+
+    return FocalDeltaCVResult(
+        reference=ref,
+        cabs_rank=projector.rank,
+        cv_frozen=cv_frozen,
+        fc_frozen=fc_frozen,
+        fc_mode=req_fc.correlation_space_id,
+        frozen_core_definition_version=FROZEN_CORE_DEFINITION_VERSION,
+        cv_ordinary_mp2_Eh=float(cv_ord),
+        fc_ordinary_mp2_Eh=float(fc_ord),
+        cv_f12_increment_Eh=float(cv_f12),
+        fc_f12_increment_Eh=float(fc_f12),
+        cv_mp2_f12_Eh=float(cv_tot),
+        fc_mp2_f12_Eh=float(fc_tot),
+        delta_ordinary_mp2_Eh=float(d_ord),
+        delta_f12_increment_Eh=float(d_f12),
+        delta_mp2_f12_Eh=float(d_tot),
+    )
+
+
+def molecular_delta_cv_energy_and_forces(
+    provider: MolecularFocalProvider,
+    request_cv: FocalRequest,
+    request_fc: FocalRequest | None = None,
+    *,
+    expected_cabs_rank: int | None = None,
+) -> FocalDeltaCVResult:
+    """Evaluate Delta-CV energy and analytic 3N forces sharing one DF-HF + 1e + 3c panel."""
+    from ._f12_focal_energy import _check_request
+    from ._f12_focal_reference import df_reference
+    from ._f12_focal_reference import partition_focal_reference
+
+    req_cv, req_fc = _paired_cv_fc_requests(request_cv, request_fc)
+    budget = _check_request(provider, req_cv)
+
+    ref_cv = df_reference(
+        req_cv, forces=False, budget_mib=budget, **provider._seed_options(req_cv)
+    )
+    ref_cv = partition_focal_reference(
+        req_cv, ref_cv, budget, additional_space=req_fc.correlation_space_id,
+    )
+    assert ref_cv.frozen_frame is not None
+    cv_frozen = ref_cv.frozen_frame.counts(req_cv.correlation_space_id)
+    fc_frozen = ref_cv.frozen_frame.counts(req_fc.correlation_space_id)
+
+    if cv_frozen == fc_frozen:
+        from ._f12_focal_projector import checked_reference_cabs_rank
+
+        zeros = np.zeros((len(req_cv.atoms), 3), dtype=np.float64)
+        return FocalDeltaCVResult(
+            reference=ref_cv,
+            cabs_rank=checked_reference_cabs_rank(provider, req_cv, ref_cv, expected_cabs_rank),
+            cv_frozen=cv_frozen,
+            fc_frozen=fc_frozen,
+            fc_mode=req_fc.correlation_space_id,
+            frozen_core_definition_version=FROZEN_CORE_DEFINITION_VERSION,
+            cv_ordinary_mp2_Eh=None,
+            fc_ordinary_mp2_Eh=None,
+            cv_f12_increment_Eh=None,
+            fc_f12_increment_Eh=None,
+            cv_mp2_f12_Eh=None,
+            fc_mp2_f12_Eh=None,
+            delta_ordinary_mp2_Eh=0.0,
+            delta_f12_increment_Eh=0.0,
+            delta_mp2_f12_Eh=0.0,
+            cv_forces=None,
+            fc_forces=None,
+            delta_forces=zeros,
+        )
+
+    one, panels = provider._cached_pair_sources(req_cv, derivatives=True, budget=budget)
+    spin_cv, inc_cv, rank, forces_cv = provider._pair_components(
+        req_cv, ref_cv, one, panels, expected_cabs_rank=expected_cabs_rank
+    )
+    import gc
+
+    gc.collect()
+
+    ref_fc = replace(ref_cv, surface_id=req_fc.surface_id)
+    one_fc = replace(one, surface_id=req_fc.surface_id)
+    spin_fc, inc_fc, rank_fc, forces_fc = provider._pair_components(
+        req_fc, ref_fc, one_fc, panels, expected_cabs_rank=rank
+    )
+    if rank_fc != rank:
+        raise RuntimeError(
+            f"Delta-CV CABS rank mismatch between cv-active ({rank}) and frozen-core ({rank_fc})"
+        )
+
+    cv_ord = fsum(spin_cv)
+    fc_ord = fsum(spin_fc)
+    cv_tot = cv_ord + inc_cv
+    fc_tot = fc_ord + inc_fc
+    delta_forces = forces_cv - forces_fc
+
+    if not all(isfinite(v) for v in (cv_tot, fc_tot, cv_tot - fc_tot)) or not np.isfinite(delta_forces).all():
+        raise ArithmeticError("nonfinite molecular Delta-CV energy or forces")
+
+    return FocalDeltaCVResult(
+        reference=ref_cv,
+        cabs_rank=rank,
+        cv_frozen=cv_frozen,
+        fc_frozen=fc_frozen,
+        fc_mode=req_fc.correlation_space_id,
+        frozen_core_definition_version=FROZEN_CORE_DEFINITION_VERSION,
+        cv_ordinary_mp2_Eh=float(cv_ord),
+        fc_ordinary_mp2_Eh=float(fc_ord),
+        cv_f12_increment_Eh=float(inc_cv),
+        fc_f12_increment_Eh=float(inc_fc),
+        cv_mp2_f12_Eh=float(cv_tot),
+        fc_mp2_f12_Eh=float(fc_tot),
+        delta_ordinary_mp2_Eh=float(cv_ord - fc_ord),
+        delta_f12_increment_Eh=float(inc_cv - inc_fc),
+        delta_mp2_f12_Eh=float(cv_tot - fc_tot),
+        cv_forces=forces_cv,
+        fc_forces=forces_fc,
+        delta_forces=delta_forces,
+    )
+
+
 def conventional_mp2_request(
     atoms,
     basis,

@@ -20,7 +20,13 @@ from ._f12_focal_cc_sources import (
     FocalUCCFixedSources,
     molecular_ucc_sources,
 )
-from ._f12_focal_cv import FocalDeltaCVResult, molecular_delta_cv_mp2_energy, molecular_delta_cv_mp2_energy_and_forces
+from ._f12_focal_cv import (
+    FocalDeltaCVResult,
+    molecular_delta_cv_energy,
+    molecular_delta_cv_energy_and_forces,
+    molecular_delta_cv_mp2_energy,
+    molecular_delta_cv_mp2_energy_and_forces,
+)
 from ._f12_focal_energy import (
     FocalLowOrderEnergy,
     FocalLowOrderForces,
@@ -660,6 +666,35 @@ class MolecularFocalProvider:
             reference=reference,
         )
 
+    def delta_cv_energy(
+        self,
+        request_cv: FocalRequest,
+        request_fc: FocalRequest | None = None,
+        *,
+        expected_cabs_rank: int | None = None,
+    ) -> FocalDeltaCVResult:
+        """Return shared-reference MP2-F12 additive core-valence energy (cv-active - frozen-core)."""
+        return molecular_delta_cv_energy(
+            self,
+            request_cv,
+            request_fc,
+            expected_cabs_rank=expected_cabs_rank,
+        )
+
+    def delta_cv_energy_and_forces(
+        self,
+        request_cv: FocalRequest,
+        request_fc: FocalRequest | None = None,
+        *,
+        expected_cabs_rank: int | None = None,
+    ) -> FocalDeltaCVResult:
+        """Return shared-reference MP2-F12 additive core-valence energy and analytic 3N forces."""
+        return molecular_delta_cv_energy_and_forces(
+            self,
+            request_cv,
+            request_fc,
+            expected_cabs_rank=expected_cabs_rank,
+        )
 
     def delta_cv_mp2_energy(
         self,

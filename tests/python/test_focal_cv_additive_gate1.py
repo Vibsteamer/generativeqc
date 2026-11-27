@@ -73,6 +73,43 @@ def _shell(ell: int, exps: tuple[float, ...], coeffs: tuple[float, ...]) -> Basi
     return BasisShell(ell, tuple(str(x) for x in exps), (tuple(str(c) for c in coeffs),))
 
 
+def test_delta_cv_forward_and_analytic_use_same_ordinary_denominators():
+    from generativeqc.experimental.f12_focal import MolecularFocalProvider
+
+    def lih_basis(name, exponents):
+        shells = tuple(_shell(0, (exponent,), (1.0,)) for exponent in exponents)
+        return _make_basis(name, (ElementBasis(1, shells), ElementBasis(3, shells)))
+
+    # Two close JK exponents amplify the difference between the reconstructed
+    # extended Fock diagonal and the canonical reference orbital energies.
+    jk = lih_basis("JK", (5.0, 1.1, 0.28, 0.28 * 1.00097, 0.07))
+    ri = lih_basis("RI", (6.0, 1.2, 0.30, 0.08))
+    basis = FocalBasis(
+        2, "LiH", lih_basis("OBS", (1.5, 0.32)), jk_fit=jk,
+        mp2_fit=ri, f12_fit=ri, cabs=lih_basis("CABS", (0.09,)), beta=0.9,
+    )
+    series = FocalSeries(basis)
+    plan = plan_singlepoint(
+        [("Li", (0.0, 0.0, 0.0)), ("H", (0.0, 0.0, 4.0))],
+        series, series, None, root_id="rhf", correlation_space_id="cv-active",
+        backend="cpu_reference",
+    )
+    request = next(r for r, _ in plan.steps if r.role == "mp2_f12_correlation")
+    shell_library, one_electron_library = f12_host_libraries()
+    provider = MolecularFocalProvider(
+        shell_library=shell_library, one_electron_library=one_electron_library,
+    )
+    center = provider.delta_cv_energy_and_forces(request)
+    forward = provider.delta_cv_energy(request, expected_cabs_rank=center.cabs_rank)
+    assert center.cv_frozen == forward.cv_frozen == (0, 0)
+    assert center.fc_frozen == forward.fc_frozen == (1, 1)
+    for field in (
+        "cv_ordinary_mp2_Eh", "fc_ordinary_mp2_Eh", "delta_ordinary_mp2_Eh",
+        "delta_f12_increment_Eh", "delta_mp2_f12_Eh",
+    ):
+        assert getattr(forward, field) == pytest.approx(
+            getattr(center, field), abs=2e-13, rel=0,
+        )
 
 
 def _build_split_gate1_bases() -> FocalBasis:
@@ -531,6 +568,75 @@ def test_cv_active_and_delta_cv_df_mp2_forces_two_step_fd(label, root, atoms_spe
             assert err_dcv < 2e-8, f"{label} Delta-CV force err={err_dcv:.3e} at ({atom_idx},{axis}) h={h}"
 
 
+@pytest.mark.parametrize(
+    "oa,ob,cv_frozen,fc_frozen",
+    [(5, 5, (0, 0), (1, 1)), (5, 4, (0, 0), (1, 1)), (6, 6, (1, 1), (3, 3))],
+)
+def test_single_pass_cv_fc_f12_pair_accumulation_parity(oa, ob, cv_frozen, fc_frozen):
+    """Single-pass cv-active/frozen-core pair accumulation matches separate F12 evaluations to <1e-14."""
+    from generativeqc._f12_spin_pairs import molecular_pair_energies
+    from generativeqc._f12_unrestricted import unrestricted_mp2_f12_ao_response
+    from generativeqc_compiler.tensor import execute
+
+    rng = np.random.default_rng(777 + 13 * oa + ob + cv_frozen[0] + fc_frozen[0])
+    obs, ext, q = oa + 3, oa + 6, 12
+    space = (oa, ob, obs, ext, q)
+
+    def spd(n):
+        a = rng.standard_normal((n, n)) * 0.08
+        return a @ a.T + 2.0 * np.eye(n)
+
+    def sym_panel(nq, n):
+        p = rng.standard_normal((nq, n, n)) * 0.02
+        return 0.5 * (p + p.swapaxes(1, 2))
+
+    ca, _ = np.linalg.qr(rng.standard_normal((ext, ext)))
+    cb = ca.copy() if oa == ob else np.linalg.qr(ca + 0.05 * rng.standard_normal((ext, ext)))[0]
+    eigs = np.linspace(-3.0, 2.5, ext)
+    hcore = ca @ np.diag(eigs) @ ca.T
+    hcore = 0.5 * (hcore + hcore.T)
+    m_c = spd(q)
+    w_c = np.linalg.inv(np.linalg.cholesky(m_c))
+    ao_dense = {
+        "overlap_ao": np.eye(ext),
+        "hcore_ao": hcore,
+        "coefficients_alpha": ca,
+        "coefficients_beta": cb,
+        "metric_whitener": w_c,
+        "metric/coulomb": m_c,
+        "metric/geminal": spd(q),
+        "metric/squared_geminal": spd(q),
+        "metric/geminal_coulomb": spd(q),
+        "metric/double_commutator": spd(q),
+        "ao_coulomb": sym_panel(q, ext),
+        "ao_f12": sym_panel(q, ext),
+        "ao_f12_squared": sym_panel(q, ext),
+        "ao_f12_over_coulomb": sym_panel(q, ext),
+        "ao_double_commutator": sym_panel(q, ext),
+    }
+    run = lambda g, inp: execute(g, inp, max_bytes=1 << 29)
+    t_cv, _ = unrestricted_mp2_f12_ao_response(space, ao_dense, run, frozen_occupied=cv_frozen, component="f12")
+    t_fc, _ = unrestricted_mp2_f12_ao_response(space, ao_dense, run, frozen_occupied=fc_frozen, component="f12")
+
+    # Compare against single-pass molecular_pair_energies subset accumulation
+    from generativeqc._f12_spin_ao import _orbital_sources
+    from generativeqc._f12_spin_fock import spin_fock
+
+    data, _ = _orbital_sources(space, ao_dense, run, None, projected=None, role="shared")
+    src = {k.removeprefix("source/"): v for k, v in data.items() if k.startswith("source/")}
+    fock = spin_fock((oa, ob, ext, q), src, run)
+    fc_by_spin = {"alpha": fc_frozen[0], "beta": fc_frozen[1]}
+    cv_sum = 0.0
+    fc_sum = 0.0
+    for item in molecular_pair_energies(space, data, src, fock, run, frozen_occupied=cv_frozen, include_ordinary=True):
+        sl, sr = item.spins
+        ii, jj = item.occupied_indices
+        cv_sum += item.f12
+        if ii >= fc_by_spin[sl] and jj >= fc_by_spin[sr]:
+            fc_sum += item.f12
+    assert abs(cv_sum - t_cv.f12_increment) < 1e-13
+    assert abs(fc_sum - t_fc.f12_increment) < 1e-13
+    assert abs((cv_sum - fc_sum) - (t_cv.f12_increment - t_fc.f12_increment)) < 1e-13
 
 
 def test_chunked_shell_projection_exact_parity():
@@ -701,6 +807,156 @@ def _basis_to_gbs_text(basis: BasisSet, syms: list[str]) -> str:
     return "\n".join(lines) + "\n"
 
 
+@pytest.mark.parametrize(
+    "label,atoms_spec,expected_cv_frozen,expected_fc_frozen",
+    [
+        (
+            # GSCDB W4-17_h2o (CC BY 4.0, see THIRD_PARTY_NOTICES.md), in Bohr.
+            "H2O",
+            (
+                ("O", (0.0, 0.0, 0.0)),
+                ("H", (0.0, 0.0, 1.8101686547790252)),
+                ("H", (1.7554778816245764, 0.0, -0.4415970623550433)),
+            ),
+            0,
+            1,
+        ),
+        (
+            "HCl",
+            (
+                ("Cl", (0.0, 0.0, 0.0)),
+                ("H", (0.0, 0.0, 2.41)),
+            ),
+            1,
+            5,
+        ),
+    ],
+)
+def test_df_mp2_f12_3c_fix_delta_cv_matches_psi4_blackbox_oracle(
+    label, atoms_spec, expected_cv_frozen, expected_fc_frozen, tmp_path, monkeypatch
+):
+    """Independent black-box Psi4 1.11 DF-MP2-F12 3C(FIX) oracle check on H2O (0 vs 1) and HCl (1 vs 5) in cc-pCVDZ-F12 (beta=1.4)."""
+    import os
+
+    monkeypatch.chdir(tmp_path)
+    psi4 = pytest.importorskip("psi4")
+    pytest.importorskip("basis_set_exchange")
+
+    from generativeqc.experimental.f12_focal import MolecularFocalProvider
+
+    shell_lib, one_lib = f12_host_libraries()
+
+    syms = [s for s, _ in atoms_spec]
+    uniq = sorted(set(syms))
+    orb_elems, cabs_elems, ri_elems = [], [], []
+    for sym in uniq:
+        if sym == "H":
+            orb_elems.append(_bse_element_basis("cc-pVDZ-F12", "H"))
+            cabs_elems.append(_bse_element_basis("cc-pVDZ-F12-OPTRI", "H"))
+            ri_elems.append(_bse_element_basis("aug-cc-pVTZ-RIFIT", "H"))
+        else:
+            orb_elems.append(_bse_element_basis("cc-pCVDZ-F12", sym))
+            cabs_elems.append(_bse_element_basis("cc-pCVDZ-F12-OPTRI", sym))
+            ri_elems.append(_bse_element_basis("cc-pCVDZ-F12-RIFIT", sym))
+
+    orb_bs = _make_basis(f"cv-orb-{label}", tuple(orb_elems))
+    cabs_bs = _make_basis(f"cv-cabs-{label}", tuple(cabs_elems))
+    ri_bs = _make_basis(f"cv-ri-{label}", tuple(ri_elems))
+
+    # Psi4 1.11 DF-MP2-F12 uses one common DF_BASIS_F12 fitting basis across SCF, MP2, and F12
+    beta = 1.4
+    fb = FocalBasis(
+        2,
+        f"psi4-oracle/{label}/cc-pCVDZ-F12",
+        orb_bs,
+        jk_fit=ri_bs,
+        mp2_fit=ri_bs,
+        f12_fit=ri_bs,
+        cabs=cabs_bs,
+        beta=beta,
+    )
+    series = FocalSeries(fb)
+    plan_cv = plan_singlepoint(
+        atoms_spec,
+        series,
+        series,
+        None,
+        charge=0,
+        multiplicity=1,
+        root_id="rhf",
+        correlation_space_id="cv-active",
+        backend="cpu_reference",
+        slater_normalization="negative_exponential",
+    )
+    req_cv = next(r for r, _ in plan_cv.steps if r.role == "mp2_f12_correlation")
+    # Psi4 1.11 evaluates unnormalized f12 = -exp(-beta*r) ("negative_exponential");
+    # select that mode explicitly to verify exact parity against Psi4 1.11 at beta=1.4.
+    provider = MolecularFocalProvider(
+        shell_library=shell_lib,
+        one_electron_library=one_lib,
+        budget_mib=4096,
+        slater_normalization="negative_exponential",
+    )
+    gqc = provider.delta_cv_energy(req_cv)
+    assert gqc.cv_frozen == (expected_cv_frozen, expected_cv_frozen)
+    assert gqc.fc_frozen == (expected_fc_frozen, expected_fc_frozen)
+
+    # Independent black-box Psi4 1.11 DF-MP2-F12 3C(FIX) on the identical sealed .gbs files
+    orb_name = f"gqc_oracle_orb_{label.lower()}"
+    ri_name = f"gqc_oracle_ri_{label.lower()}"
+    cabs_name = f"gqc_oracle_cabs_{label.lower()}"
+    (tmp_path / f"{orb_name}.gbs").write_text(_basis_to_gbs_text(orb_bs, syms))
+    (tmp_path / f"{ri_name}.gbs").write_text(_basis_to_gbs_text(ri_bs, syms))
+    (tmp_path / f"{cabs_name}.gbs").write_text(_basis_to_gbs_text(cabs_bs, syms))
+    monkeypatch.setenv("PSIPATH", str(tmp_path) + ":" + os.environ.get("PSIPATH", ""))
+
+    psi4.core.be_quiet()
+    psi4.set_memory("4 GB")
+    geom_str = (
+        "0 1\n"
+        + "\n".join(f"{s} {x:.16f} {y:.16f} {z:.16f}" for s, (x, y, z) in atoms_spec)
+        + "\nunits bohr\nsymmetry c1\nno_reorient\nno_com\n"
+    )
+    p4_res = {}
+    for tag, nf in (("cv", expected_cv_frozen), ("fc", expected_fc_frozen)):
+        psi4.core.clean()
+        psi4.core.clean_options()
+        psi4.geometry(geom_str)
+        psi4.set_options(
+            {
+                "basis": orb_name,
+                "df_basis_f12": ri_name,
+                "cabs_basis": cabs_name,
+                "f12_beta": beta,
+                "num_frozen_docc": nf,
+                "scf_type": "df",
+                "mp2_type": "df",
+                "cabs_singles": True,
+                "e_convergence": 1e-12,
+                "d_convergence": 1e-12,
+                "ints_tolerance": 1e-14,
+            }
+        )
+        psi4.energy("mp2-f12")
+        hf = float(psi4.variable("SCF TOTAL ENERGY"))
+        mp2_c = float(psi4.variable("MP2 CORRELATION ENERGY"))
+        f12_c = float(psi4.variable("MP2-F12 CORRELATION ENERGY"))
+        p4_res[tag] = (hf, mp2_c, f12_c - mp2_c, f12_c)
+
+    p4_d_ord = p4_res["cv"][1] - p4_res["fc"][1]
+    p4_d_f12 = p4_res["cv"][2] - p4_res["fc"][2]
+    p4_d_tot = p4_res["cv"][3] - p4_res["fc"][3]
+
+    assert abs(gqc.reference.energy - p4_res["cv"][0]) < 1e-8
+    assert abs(gqc.cv_ordinary_mp2_Eh - p4_res["cv"][1]) < 1e-10
+    assert abs(gqc.fc_ordinary_mp2_Eh - p4_res["fc"][1]) < 1e-10
+    assert abs(gqc.cv_f12_increment_Eh - p4_res["cv"][2]) < 5e-9
+    assert abs(gqc.fc_f12_increment_Eh - p4_res["fc"][2]) < 5e-9
+    assert abs(gqc.cv_mp2_f12_Eh - p4_res["cv"][3]) < 5e-9
+    assert abs(gqc.fc_mp2_f12_Eh - p4_res["fc"][3]) < 5e-9
+    assert abs(gqc.delta_ordinary_mp2_Eh - p4_d_ord) < 1e-10
+    assert abs(gqc.delta_f12_increment_Eh - p4_d_f12) < 5e-9
+    assert abs(gqc.delta_mp2_f12_Eh - p4_d_tot) < 5e-9
 
 
 @pytest.mark.parametrize(

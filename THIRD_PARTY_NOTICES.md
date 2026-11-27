@@ -261,7 +261,7 @@ original references.
 
 | GSCDB record (`xyz_files/`) | Used in | Changes |
 | --- | --- | --- |
-| `W4-17_h2o` | `tests/python/test_f12_aot_mp2f12_gate1.py`, `tests/python/test_f12_aot_deltacv_gate1.py` | Converted from Å to Bohr (divided by 0.529177210903) |
+| `W4-17_h2o` | `tests/python/test_f12_aot_mp2f12_gate1.py`, `tests/python/test_f12_aot_deltacv_gate1.py`, `tests/python/test_focal_cv_additive_gate1.py` | Converted from Å to Bohr (divided by 0.529177210903) |
 | `W4-17_oh` | `tests/python/test_f12_aot_mp2f12_gate1.py`, `tests/python/test_f12_aot_deltacv_gate1.py`, `tests/python/test_haq_all_electron_ef_gate1.py`, `tests/native/test_df_spin_admission.cpp` | Bond length only, converted from Å to Bohr (divided by 0.529177210903) |
 | `P34_P06_HBr` | `tests/python/test_f12_aot_mp2f12_gate1.py`, `tests/python/test_f12_aot_deltacv_gate1.py` | Converted from Å to Bohr (divided by 0.529177210903) |
 | `IHB100x10_05.012_OH-Oa__water--hydroxide_080` | `tests/python/test_f12_aot_mp2f12_gate1.py`, `tests/python/test_f12_aot_deltacv_gate1.py` | Converted from Å to Bohr (divided by 0.529177210903) |
