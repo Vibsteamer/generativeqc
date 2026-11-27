@@ -119,6 +119,7 @@ def _build_tile_program(
     shape: tuple[int, ...],
     *,
     resolvents: bool = False,
+    lanes: int | None = None,
 ) -> TriplesTileProgram:
     """Lower one scalar (T) tile with independent alpha/beta populations.
 
@@ -138,6 +139,9 @@ def _build_tile_program(
         raise ValueError(
             "triples tile shape must contain six positive bounded integers"
         )
+    if lanes is not None and (type(lanes) is not int or lanes < 1 or shape != (1,) * 6):
+        raise ValueError("independent triples panels require positive singleton lanes")
+    lane = Index("q", IndexSpace("triples_tile_lane", "batch", lanes)) if lanes else None
     indices = {
         label: Index(
             label,
@@ -153,7 +157,13 @@ def _build_tile_program(
         )
     }
     output_spins = dict(zip("ijkabc", channel * 2, strict=True))
+    output_labels = "ijkabc" if lane is None else "q"
     nodes: dict[TriplesOperand, Node] = {}
+
+    def tensor_labels(labels: str) -> str:
+        if lane is None:
+            return labels
+        return "q" + "".join(label for label in labels if label not in indices)
 
     def operand(
         name: str, labels: str, assignment: dict[str, str]
@@ -165,7 +175,10 @@ def _build_tile_program(
         binding = TriplesOperand("", source, axes, labels)
         if binding not in nodes:
             bound_indices = []
-            for label in labels:
+            for label in tensor_labels(labels):
+                if label == "q" and lane is not None:
+                    bound_indices.append(lane)
+                    continue
                 if label in indices:
                     bound_indices.append(indices[label])
                 else:
@@ -222,12 +235,12 @@ def _build_tile_program(
                     continue
                 values = [value for value in resolved if value is not None]
                 term = einsum(
-                    ",".join(labels) + "->ijkabc",
+                    ",".join(map(tensor_labels, labels)) + "->" + output_labels,
                     *(value[0] for value in values),
                     coefficient=coefficient * values[0][1] * values[1][1],
                 )
                 (connected_terms if connected else disconnected_terms).append(term)
-    output_indices = tuple(indices.values())
+    output_indices = tuple(indices.values()) if lane is None else (lane,)
     zero = broadcast(constant(0), output_indices, ())
     connected = add(*connected_terms) if connected_terms else zero
     disconnected = add(*disconnected_terms) if disconnected_terms else zero
@@ -238,20 +251,22 @@ def _build_tile_program(
         node = input_tensor(
             f"tile_operand_{len(nodes)}",
             TensorSpec(
-                (indices[label],),
+                (indices[label],) if lane is None else (lane,),
                 representation="spin_orbital",
                 role="parameter",
                 differentiable=True,
             ),
         )
         nodes[binding] = node
-        denominators.append(broadcast(node, output_indices, (position,)))
+        denominators.append(
+            broadcast(node, output_indices, (position,)) if lane is None else node
+        )
     denominator = add(*denominators, coefficients=(1, 1, 1, -1, -1, -1))
     factor = Fraction(comb(3, channel.count("a")) ** 2, 36)
     resolved_left = divide(connected, denominator)
     complete = add(connected, disconnected)
     energy = einsum(
-        "ijkabc,ijkabc->",
+        "ijkabc,ijkabc->" if lane is None else "q,q->q",
         resolved_left,
         complete,
         coefficient=factor,

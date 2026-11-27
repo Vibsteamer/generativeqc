@@ -73,7 +73,7 @@ def shells(angular: int) -> tuple[Shell, ...]:
 @pytest.mark.parametrize("operator", ("df_metric", "df_three_center"))
 @pytest.mark.parametrize(
     "consumer,maximum",
-    ((None, 3), ("correlation_df", 4), ("scf_df", 5), ("full_df", 5)),
+    ((None, 3), ("correlation_df", 5), ("scf_df", 5), ("full_df", 5)),
 )
 def test_selected_auxiliary_boundary_is_explicit(
     order: int, operator: str, consumer: str | None, maximum: int
@@ -243,13 +243,17 @@ def test_scf_auxiliary_closure_does_not_promote_orbitals_or_correlation(
         else:
             assert check["max_supported_angular_momentum"] == maximum
             assert check["eligible"] == linked
-    correlation = configured_calculator(
+    correlation_h = configured_calculator(
         shells(3), shells(5), fitting=_native.DENSITY_FITTING_CORRELATION_CUDA
     ).basis_capability_report(ATOMS)
-    assert not correlation["eligible"]
+    assert correlation_h["eligible"]
+    correlation_i = configured_calculator(
+        shells(3), shells(6), fitting=_native.DENSITY_FITTING_CORRELATION_CUDA
+    ).basis_capability_report(ATOMS)
+    assert not correlation_i["eligible"]
     assert all(
         check["eligible"]
-        for check in correlation["checks"]
+        for check in correlation_i["checks"]
         if check["role"] == "orbital"
     )
 

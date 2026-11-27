@@ -6,25 +6,28 @@ from typing import Any
 
 import numpy as np
 import pytest
+from generativeqc._ucc.native_tensor_cpu import NativeCCTensorExecutor
 from generativeqc_compiler.cc.gradient_equations import (
     build_ao_eri_weight_block_program,
 )
+from generativeqc_compiler.cc.uccsd_equations import build_program
 from generativeqc_compiler.cc.uccsd_hamiltonian import (
     RAW_INPUTS,
+    build_hamiltonian_cotangent_program,
     build_lagrangian_programs,
     build_raw_hamiltonian,
+    canonical_cc_cotangents,
+    canonical_rotation_transport,
+    canonical_source_programs,
 )
 from generativeqc_compiler.cc.uccsd_layout import UCCSDLayout
+from generativeqc_compiler.tensor import execute
 from test_uccsd_equations import _amplitudes, _determinant_oracle, _feeds
 from test_uccsd_response import _physical_residual
-
-from generativeqc._ucc.native_tensor_cpu import NativeCCTensorExecutor
 
 
 def test_separate_fitted_interaction_does_not_replace_reference_fock() -> None:
     """Exact-reference DF binds independent tensors in the identical spin frame."""
-    from generativeqc_compiler.tensor import execute
-
     layout = UCCSDLayout(1, 1, 1, 1)
     inputs = _inputs(layout)
     exact = execute(build_raw_hamiltonian(layout).primal, inputs).outputs
@@ -44,6 +47,85 @@ def test_separate_fitted_interaction_does_not_replace_reference_fock() -> None:
             else 0.7 * value
         )
         np.testing.assert_allclose(separate[name], expected, atol=1e-13, rtol=0)
+
+
+@pytest.mark.parametrize(
+    ("populations", "separate_fock"),
+    [((2, 2, 2, 2), False), ((2, 1, 2, 3), True), ((2, 0, 1, 3), True)],
+)
+def test_native_canonical_response_matches_general_identity_frame(
+    populations: tuple[int, int, int, int], separate_fock: bool
+) -> None:
+    """Keep the symmetric rotation and both independent DF weight families."""
+    layout = UCCSDLayout(*populations)
+    general = build_raw_hamiltonian(layout, separate_fock=separate_fock)
+    lagrangian = build_lagrangian_programs(layout, general)
+    general_correction = build_hamiltonian_cotangent_program(layout, general)
+    raw, source_actions = canonical_source_programs(layout, separate_fock=separate_fock)
+    source_bars = canonical_cc_cotangents(build_program(*populations))
+    values = _inputs(layout)
+    if separate_fock:
+        values.update(
+            reference_g_aa=values["g_aa"] * 0.65,
+            reference_g_ab=values["g_ab"] * 1.11,
+            reference_g_bb=values["g_bb"] * 1.21,
+        )
+    amplitudes = _amplitudes(layout)
+    rng = np.random.default_rng(381721)
+    canonical_inputs = {
+        name: value
+        for name, value in values.items()
+        if not name.startswith("rotation_")
+    }
+    fields = execute(raw, canonical_inputs).outputs
+    expected_fields = execute(general.primal, values).outputs
+    assert set(fields) == set(expected_fields)
+    for name, value in fields.items():
+        np.testing.assert_allclose(value, expected_fields[name], rtol=0, atol=5e-13)
+    triple_sources = {
+        f"bar_{name}": rng.normal(scale=0.3, size=node.spec.shape)
+        for name, node in raw.outputs.items()
+    }
+    triple_sources["bar_reference_electronic_energy"] = np.array(0.0)
+    correction = execute(general_correction, {**values, **triple_sources}).outputs
+    for constrained in (False, True):
+        lagrangian_seeds = {
+            f"bar_{name}": rng.normal(scale=0.3, size=node.spec.shape)
+            for name, node in lagrangian.primal.outputs.items()
+        }
+        if not constrained:
+            for name in ("fov_aa", "fov_bb", "reference_electronic_energy"):
+                lagrangian_seeds[f"bar_{name}"].fill(0.0)
+        expected = execute(
+            lagrangian.weights, {**values, **amplitudes, **lagrangian_seeds}
+        ).outputs
+        cc_bars = execute(
+            source_bars, {**fields, **amplitudes, **lagrangian_seeds}
+        ).outputs
+        seeds = {
+            name: value + cc_bars.get(name, 0.0)
+            for name, value in triple_sources.items()
+        }
+        for name in ("fov_aa", "fov_bb", "reference_electronic_energy"):
+            seeds[f"bar_{name}"] += lagrangian_seeds[f"bar_{name}"]
+        actual = {
+            f"rotation_{spin}": np.zeros_like(values[f"rotation_{spin}"])
+            for spin in "ab"
+        }
+        for action in source_actions.values():
+            partial = execute(action, {**canonical_inputs, **seeds}).outputs
+            for name, value in partial.items():
+                if name.startswith("rotation_"):
+                    actual[name] += value
+                else:
+                    assert name not in actual
+                    actual[name] = value
+        actual.update(execute(canonical_rotation_transport(layout), actual).outputs)
+        assert set(actual) == set(expected)
+        for name, value in actual.items():
+            np.testing.assert_allclose(
+                value, expected[name] + correction[name], rtol=0, atol=5e-13
+            )
 
 
 def test_shared_shell_transform_uses_explicit_admission_beyond_oracle_frontier() -> (

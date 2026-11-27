@@ -68,32 +68,63 @@ class UccsdPrepared final : public PreparedCalculation {
   }
 
   Result execute_components_impl(bool compute_forces, unsigned components) override {
+    return evaluate(system_, compute_forces, components, {});
+  }
+
+  Result triples_on_reference(const std::shared_ptr<const hf::UnrestrictedPhysicalReference>& ref,
+                              const molecule::ScalarHamiltonianIdentity& jk,
+                              bool refine_ecp_quadrature, bool forces) {
+    if (!ref || !ref->source_identity || !ref->source_identity->matches(system_) ||
+        !fitting_.full_reference || !jk.matches(*fitting_.reference_auxiliary()) ||
+        capabilities_.method != GENERATIVEQC_METHOD_UCCSD_T)
+      throw std::invalid_argument(
+          "focal triples requires the same molecular determinant and JKFit");
+    (void)refine_ecp_quadrature;
+    return evaluate(system_, forces, 0, ref);
+  }
+
+ private:
+  Result evaluate(const core::System& physical, bool compute_forces, unsigned components,
+                  const std::shared_ptr<const hf::UnrestrictedPhysicalReference>& focal) {
     std::lock_guard<std::mutex> lock(mutex_);
     last_.reset();
     performance_.reset();
-    if ((components & ~(kHfComponent | kMp2Component)) ||
+    if ((fitting_.separate_reference_auxiliary && components) ||
+        (components & ~(kHfComponent | kMp2Component)) ||
         (components && capabilities_.method != GENERATIVEQC_METHOD_UCCSD_T))
       throw MethodError(GENERATIVEQC_STATUS_NOT_IMPLEMENTED,
                         "unrestricted companions require UCCSD(T)");
     try {
       const bool triples = capabilities_.method == GENERATIVEQC_METHOD_UCCSD_T;
+      // CUDA preparation admits a value plan. Reapply the derivative allowance
+      // before constructing any provider for an explicitly requested force.
+      const auto reference_capacity =
+          cuda_ && compute_forces
+              ? fitting_.reference_capacity(physical, reference_options_.diis_history)
+              : reference_capacity_;
       const auto derivative_capacity = cuda_ && compute_forces
-                                           ? posthf::one_electron_response_capacity(system_)
+                                           ? posthf::one_electron_response_capacity(physical)
                                            : posthf::source_scratch_bytes;
       if (compute_forces) {
-        const auto nbf = molecule::ao_count(system_);
+        const auto nbf = molecule::ao_count(physical);
         const auto alpha =
-            static_cast<std::size_t>((system_.electron_count + system_.multiplicity - 1) / 2);
+            static_cast<std::size_t>((physical.electron_count + physical.multiplicity - 1) / 2);
         cc::unrestricted_force_capacity(
-            nbf, alpha, system_.electron_count - alpha, options_, triples, reference_capacity_,
-            fitting_.auxiliary && !fitting_.full_reference, derivative_capacity);
+            nbf, alpha, physical.electron_count - alpha, options_, triples, reference_capacity,
+            fitting_.auxiliary && (!fitting_.full_reference || fitting_.separate_reference_auxiliary),
+            derivative_capacity, cuda_);
       }
       const auto started = std::chrono::steady_clock::now();
+      // The retained CUDA focal determinant needs the reference J/K action
+      // for orbital response. Its nuclear derivatives use the fitted
+      // correlation and reference sources owned by unrestricted_force.
+      const bool reference_plan_forces =
+          compute_forces && !(cuda_ && focal && fitting_.full_reference);
       const auto strategy = scf::resolve_fock_build(
-          fitting_.reference_spec(compute_forces),
+          fitting_.reference_spec(reference_plan_forces),
           cuda_ ? scf::FockBackend::Cuda : scf::FockBackend::Cpu, 0, fitting_.threshold);
       scf::PreparedFockPlan reference_plan(
-          system_, fitting_.full_reference ? &*fitting_.auxiliary : nullptr, strategy,
+          physical, fitting_.reference_auxiliary(), strategy,
           cuda_ ? device_ : -1, cuda_ ? options_.max_bytes : 0,
           cuda_ && !fitting_.full_reference && compute_forces && (components & kHfComponent) ? 1
                                                                                              : 0,
@@ -103,17 +134,22 @@ class UccsdPrepared final : public PreparedCalculation {
           (cuda_ || fitting_.full_reference) && compute_forces && (components & kHfComponent);
       reference_options.density_fitting_relative_threshold = fitting_.threshold;
       reference_options.resolved_fock_build = reference_plan.strategy();
-      auto reference_result = warm_reference::solve_reference(
-          nullptr, scf::FockSpin::Unrestricted, nullptr,
-          [&](const std::vector<double>* seed) {
-            return scf::run_prepared_fock_strategy(reference_plan, reference_options, seed);
-          },
-          "UHF did not produce a converged physical unrestricted CC reference");
+      scf::ScfResult reference_result;
+      if (focal) {
+        reference_result.unrestricted_reference = focal;
+      } else {
+        reference_result = warm_reference::solve_reference(
+            nullptr, scf::FockSpin::Unrestricted, nullptr,
+            [&](const std::vector<double>* seed) {
+              return scf::run_prepared_fock_strategy(reference_plan, reference_options, seed);
+            },
+            "UHF did not produce a converged physical unrestricted CC reference");
+      }
       const auto reference_seconds =
           std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
       const auto& reference = *reference_result.unrestricted_reference;
       auto retained_reference_capacity = posthf::checked_add(
-          reference_capacity_, cuda_ ? reference_plan.diagnostic().peak_device_bytes : 0);
+          reference_capacity, cuda_ ? reference_plan.diagnostic().peak_device_bytes : 0);
       reference_result.density.clear();
       reference_result.density.shrink_to_fit();
       scf::PreparedFockInteractionSourceView reference_source(reference_plan);
@@ -126,6 +162,17 @@ class UccsdPrepared final : public PreparedCalculation {
                        cuda_, device_, compute_forces, unrestricted_integral_backend());
         retained_reference_capacity =
             posthf::checked_add(retained_reference_capacity, fitted->numeric_capacity_bytes());
+      }
+      std::optional<posthf::DensityFittedInteractionSource> reference_fit;
+      if (compute_forces && fitting_.separate_reference_auxiliary) {
+        if (retained_reference_capacity >= options_.max_bytes)
+          throw std::length_error("independent JKFit exceeds unrestricted CC endpoint budget");
+        reference_fit.emplace(reference_source, reference, *fitting_.separate_reference_auxiliary,
+                              fitting_.threshold,
+                              std::min(fitting_.budget, options_.max_bytes - retained_reference_capacity),
+                              cuda_, device_, true, unrestricted_integral_backend());
+        retained_reference_capacity = posthf::checked_add(retained_reference_capacity,
+                                                           reference_fit->numeric_capacity_bytes());
       }
       // MP2 providers own the retained fitted source on both backends. CC's
       // provider includes it only on CUDA; preserve the CPU CC reservation.
@@ -141,17 +188,18 @@ class UccsdPrepared final : public PreparedCalculation {
       const integrals::ElectronInteractionSource& source =
           fitted ? static_cast<const integrals::ElectronInteractionSource&>(*fitted)
                  : reference_source;
-      const auto* independent_reference =
-          fitted && !fitting_.full_reference ? &reference_source : nullptr;
+      const integrals::ElectronInteractionSource* independent_reference = nullptr;
+      if (reference_fit) independent_reference = &*reference_fit;
+      else if (fitted && !fitting_.full_reference) independent_reference = &reference_source;
       if (compute_forces)
         cc::unrestricted_force_capacity(reference.nbf, reference.nocc[0], reference.nocc[1],
                                         options_, triples, retained_reference_capacity,
-                                        independent_reference != nullptr, derivative_capacity);
+                                        independent_reference != nullptr, derivative_capacity, cuda_);
       std::optional<response::SpinResponseProblem> orbital_problem;
       if (compute_forces && (reference.nocc[0] * (reference.nbf - reference.nocc[0]) +
                              reference.nocc[1] * (reference.nbf - reference.nocc[1])))
-        orbital_problem.emplace(unrestricted_response_problem(reference, reference_plan,
-                                                              fitting_.reference_spec(true)));
+        orbital_problem.emplace(unrestricted_response_problem(
+            reference, reference_plan, fitting_.reference_spec(reference_plan_forces)));
       Result result;
       if (components & kHfComponent) {
         result.hf_component.emplace();
@@ -224,8 +272,9 @@ class UccsdPrepared final : public PreparedCalculation {
       if (!solved.converged)
         throw MethodError(GENERATIVEQC_STATUS_NOT_CONVERGED,
                           "UCCSD physical residual/replay convergence gates did not pass");
-      // UHF owns the nuclear repulsion; do not add it a second time here.
-      result.energy = reference.energy + solved.correlation_energy + solved.triples_energy;
+      // UHF owns the nuclear repulsion in the total energy.
+      result.energy = focal ? solved.triples_energy
+                            : reference.energy + solved.correlation_energy + solved.triples_energy;
       if (!std::isfinite(result.energy))
         throw MethodError(GENERATIVEQC_STATUS_NUMERICAL_FAILURE,
                           "nonfinite unrestricted CC total energy");
@@ -248,7 +297,9 @@ class UccsdPrepared final : public PreparedCalculation {
         auto force = cc::unrestricted_force(
             reference, source, solved, options_, triples, charged_reference_capacity,
             orbital_problem ? &*orbital_problem : nullptr, cuda_, device_,
-            fitted ? &*fitted : nullptr, independent_reference, unrestricted_integral_backend());
+            fitted ? &*fitted : nullptr, independent_reference, unrestricted_integral_backend(),
+            focal ? cc::UnrestrictedForceTarget::TriplesIncrement
+                  : cc::UnrestrictedForceTarget::Total);
         result.forces = std::move(force.forces);
         diagnostic.numeric_capacity_bytes = force.numeric_capacity_bytes;
         diagnostic.planned_endpoint_peak_bytes = force.numeric_capacity_bytes;
@@ -332,6 +383,15 @@ class UccsdPrepared final : public PreparedCalculation {
 
 }  // namespace
 
+Result focal_ucc_triples(PreparedCalculation& plan,
+                         const std::shared_ptr<const hf::UnrestrictedPhysicalReference>& reference,
+                         const molecule::ScalarHamiltonianIdentity& jk,
+                         bool refine_ecp_quadrature, bool forces) {
+  auto* cc = dynamic_cast<UccsdPrepared*>(&plan);
+  if (!cc) throw std::invalid_argument("focal triples requires a native UCCSD(T) plan");
+  return cc->triples_on_reference(reference, jk, refine_ecp_quadrature, forces);
+}
+
 generativeqc_status validate_uccsd_system(generativeqc_method method, const core::System& system,
                                           std::string& detail) {
   const auto status = validate_ump2_system(method, system, detail);
@@ -340,17 +400,19 @@ generativeqc_status validate_uccsd_system(generativeqc_method method, const core
       detail.replace(position, 4, "unrestricted CC");
     return status;
   }
-  if (std::any_of(system.shells.begin(), system.shells.end(),
-                  [](const auto& shell) { return shell.angular_momentum > 2; })) {
-    detail = "native unrestricted CC is qualified for s/p/d references";
-    return GENERATIVEQC_STATUS_NOT_IMPLEMENTED;
-  }
   return GENERATIVEQC_STATUS_SUCCESS;
 }
 
 std::unique_ptr<PreparedCalculation> prepare_uccsd_calculation(
     const Capabilities& capabilities, core::ContextState& context, const core::System& system,
     const generativeqc_method_descriptor& descriptor, const core::System* auxiliary) {
+  return prepare_uccsd_with_reference_fit(capabilities, context, system, descriptor, auxiliary, nullptr);
+}
+
+std::unique_ptr<PreparedCalculation> prepare_uccsd_with_reference_fit(
+    const Capabilities& capabilities, core::ContextState& context, const core::System& system,
+    const generativeqc_method_descriptor& descriptor, const core::System* auxiliary,
+    const core::System* reference_auxiliary) {
   if (context.requested_backend != GENERATIVEQC_BACKEND_CPU_REFERENCE &&
       context.requested_backend != GENERATIVEQC_BACKEND_CUDA)
     throw MethodError(GENERATIVEQC_STATUS_NOT_IMPLEMENTED,
@@ -396,8 +458,21 @@ std::unique_ptr<PreparedCalculation> prepare_uccsd_calculation(
   reference_options.export_physical_reference = true;
   reference_options.reference_memory_budget_bytes = options.max_bytes;
   auto fitting = unrestricted_fitting(descriptor, auxiliary, options.max_bytes);
+  if (std::any_of(system.shells.begin(), system.shells.end(),
+                  [](const auto& shell) { return shell.angular_momentum == 3; }) &&
+      (!fitting.full_reference || system.basis_representation != core::kSphericalBasis)) {
+    throw MethodError(GENERATIVEQC_STATUS_NOT_IMPLEMENTED,
+                      "native unrestricted CC f orbitals require a "
+                      "real-spherical full density-fitted reference");
+  }
+  if (reference_auxiliary) {
+    if (!fitting.full_reference || !fitting.auxiliary)
+      throw std::invalid_argument("independent UCC JKFit requires full density fitting");
+    fitting.separate_reference_auxiliary = *reference_auxiliary;
+  }
+  const auto cuda = context.requested_backend == GENERATIVEQC_BACKEND_CUDA;
   const auto reference_capacity =
-      fitting.reference_capacity(system, reference_options.diis_history);
+      fitting.reference_capacity(system, reference_options.diis_history, !cuda);
   const auto nbf = molecule::ao_count(system);
   const auto alpha =
       static_cast<std::size_t>((system.electron_count + system.multiplicity - 1) / 2);
@@ -405,14 +480,13 @@ std::unique_ptr<PreparedCalculation> prepare_uccsd_calculation(
   try {
     cc::unrestricted_capacity(nbf, alpha, beta, options,
                               capabilities.method == GENERATIVEQC_METHOD_UCCSD_T,
-                              reference_capacity);
+                              reference_capacity, cuda);
   } catch (const std::length_error& error) {
     throw MethodError(GENERATIVEQC_STATUS_OUT_OF_MEMORY, error.what());
   }
   return std::make_unique<UccsdPrepared>(capabilities, system, reference_options, options,
                                          reference_capacity, mp2_threshold,
-                                         context.requested_backend == GENERATIVEQC_BACKEND_CUDA,
-                                         context.device_id, std::move(fitting));
+                                         cuda, context.device_id, std::move(fitting));
 }
 
 }  // namespace generativeqc::methods::detail

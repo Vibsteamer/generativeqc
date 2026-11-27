@@ -64,7 +64,7 @@ class DensityFittedInteractionSource final : public integrals::ElectronInteracti
   core::System auxiliary_;
   double threshold_{};
   std::size_t budget_{}, capacity_{};
-  bool cuda_{}, forces_{};
+  bool cuda_{}, forces_{}, bounded_fit_gradient_{};
   int device_{};
   integrals::CorrelationIntegralBackend backend_;
   integrals::DensityFittingIntegralData raw_;

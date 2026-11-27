@@ -37,6 +37,9 @@ DensityFittedInteractionSource::DensityFittedInteractionSource(
       budget_(budget),
       cuda_(cuda),
       forces_(forces),
+      bounded_fit_gradient_(
+          cuda && forces && std::any_of(auxiliary_.shells.begin(), auxiliary_.shells.end(),
+                                       [](const auto& shell) { return shell.angular_momentum == 5; })),
       device_(device),
       backend_(backend) {
   runtime::df_progress::Scope trace("unrestricted_df_factors", cuda ? "cuda" : "host");
@@ -46,6 +49,8 @@ DensityFittedInteractionSource::DensityFittedInteractionSource(
     throw std::invalid_argument("unrestricted DF factors require their physical reference");
   if (cuda_ && !backend_.density_fitting)
     throw std::invalid_argument("CUDA fitted interaction requires an explicit integral backend");
+  if (bounded_fit_gradient_ && !backend_.density_fitting_gradient)
+    throw std::invalid_argument("CUDA auxiliary h response requires the bounded DF gradient backend");
   const auto orbital_count = reference.nbf(), auxiliary_count = molecule::ao_count(auxiliary_);
   const auto cartesian_orbitals = molecule::cartesian_ao_count(reference.orbital());
   const auto cartesian_auxiliary = molecule::cartesian_ao_count(auxiliary_);
@@ -64,7 +69,7 @@ DensityFittedInteractionSource::DensityFittedInteractionSource(
   auto count = checked_add(checked_mul(24, checked_add(raw_count, metric_count)),
                            checked_mul(cuda ? 4 : 2, arena));
   auto raw_generation = checked_mul(4, checked_add(raw_cartesian, metric_cartesian));
-  if (forces && cuda)
+  if (forces_ && cuda_ && !bounded_fit_gradient_)
     raw_generation = checked_mul(raw_generation,
                                  checked_add(1, checked_mul(3, reference.orbital().atoms.size())));
   count = checked_add(count, raw_generation);
@@ -343,6 +348,16 @@ std::vector<double> DensityFittedInteractionSource::nuclear_derivative(
     return integrals::contract_weighted_density_fitting_derivative(
         orbital(), auxiliary_, raw_cotangent, metric_bar, budget_);
 #if GENERATIVEQC_HAS_CUDA
+  if (bounded_fit_gradient_) {
+    // The fixed A and M cotangents already follow the public real-spherical
+    // ordering. Contract directly in the generated raised-moment sink.
+    const auto stage_budget = checked_add(budget_ - capacity_, source_scratch_bytes);
+    auto gradient = backend_.density_fitting_gradient(device_, orbital(), auxiliary_,
+                                                       raw_cotangent, metric_bar, stage_budget);
+    if (gradient.size() != checked_mul(3, orbital().atoms.size()) || !finite(gradient))
+      throw std::runtime_error("invalid unrestricted auxiliary h DF nuclear response");
+    return gradient;
+  }
   // Detached coordinate tensors are an explicit bounded hybrid DF consumer;
   // unlike the conventional shell path this must not claim streaming flags.
   const auto derivative = backend_.density_fitting(device_, orbital(), auxiliary_, true);

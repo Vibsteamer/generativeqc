@@ -15,8 +15,10 @@
 #include "generativeqc/electronic_properties.h"
 #include "generativeqc/generativeqc.h"
 #include "generativeqc/provider_initialization.h"
+#include "generativeqc/ucc_fitting.h"
 #include "methods/dft_method.hpp"
 #include "methods/method.hpp"
+#include "methods/uccsd_method.hpp"
 #include "methods/provider_initialization_intent.hpp"
 #include "molecule/basis_template.hpp"
 #include "runtime/host_component_trace.hpp"
@@ -29,7 +31,8 @@ generativeqc_status prepare_candidate(
     const generativeqc_method_descriptor* descriptor, generativeqc_calculation** calculation,
     const std::optional<scf::ProviderInitializationIntent>& pending,
     const std::shared_ptr<runtime::DeviceResourceLedger>& resource_owner,
-    const generativeqc_named_ks_descriptor* named = nullptr) {
+    const generativeqc_named_ks_descriptor* named = nullptr,
+    const generativeqc_system* reference_fit = nullptr) {
   generativeqc::runtime::host_trace::Region trace("calculation_prepare");
   if (context == nullptr || system == nullptr || descriptor == nullptr || calculation == nullptr) {
     return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
@@ -82,6 +85,14 @@ generativeqc_status prepare_candidate(
           context->provider_initialization_calculation = nullptr;
         throw;
       }
+    } else if (reference_fit) {
+      if (reference_fit->ks_auxiliary ||
+          ((reference_fit->scf_auxiliary || reference_fit->correlation_auxiliary) &&
+           context->state.executed_backend != generativeqc::core::kCudaBackend))
+        throw std::invalid_argument("invalid UCC JK fitting handle for the selected backend");
+      candidate->plan = generativeqc::methods::prepare_split_uccsd_calculation(
+          context->state, system->data, *descriptor, generativeqc::api::native_auxiliary_basis(*descriptor),
+          reference_fit->data);
     } else {
       candidate->plan = generativeqc::methods::prepare_calculation(
           context->state, system->data, *descriptor,
@@ -223,6 +234,15 @@ generativeqc_status generativeqc_calculation_prepare(
     generativeqc_context* context, const generativeqc_system* system,
     const generativeqc_method_descriptor* descriptor, generativeqc_calculation** calculation) {
   return generativeqc::api::prepare_candidate(context, system, descriptor, calculation, {}, {});
+}
+
+generativeqc_status generativeqc_calculation_prepare_ucc_df_fits_v1(
+    generativeqc_context* context, const generativeqc_system* orbital,
+    const generativeqc_method_descriptor* descriptor, const generativeqc_system* jk_fit,
+    generativeqc_calculation** calculation) {
+  if (!jk_fit) return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
+  return generativeqc::api::prepare_candidate(context, orbital, descriptor, calculation, {}, {},
+                                               nullptr, jk_fit);
 }
 
 generativeqc_status generativeqc_calculation_prepare_named_ks_v1(

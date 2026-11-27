@@ -18,6 +18,10 @@ struct CorrelationIntegralBackend {
   std::vector<double> (*one_electron_gradient)(int device, const core::System& system,
                                                std::span<const double> overlap,
                                                std::span<const double> hcore, std::size_t budget){};
+  std::vector<double> (*density_fitting_gradient)(
+      int device, const core::System& orbital, const core::System& auxiliary,
+      std::span<const double> bar_three_center, std::span<const double> bar_metric,
+      std::size_t budget){};
 };
 
 }  // namespace generativeqc::integrals
