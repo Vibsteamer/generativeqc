@@ -53,7 +53,14 @@ from ._f12_focal_reference import (
 )
 from ._f12_focal_singles import FocalCabsSingles, reference_cabs_singles
 from ._f12_focal_ump2 import FocalCoulombSource, ordinary_df_ump2_unrelaxed, reference_df_ump2
-from ._f12_frozen_core import DEFAULT_PRODUCTION_CORRELATION_SPACE
+from ._f12_frozen_core import (
+    DEFAULT_PRODUCTION_CORRELATION_SPACE,
+    DEFAULT_PRODUCTION_F12_BETA_BY_CARDINAL,
+    ProductionFocalAssembly,
+    ProductionFocalRecipe,
+    assemble_production_focal_energy_and_forces,
+    validate_production_focal_recipe,
+)
 from ._f12_triples_w_policy import TriplesWForceAdmission, admit_triples_w_forces
 from ._f12_ram_hygiene import (
     disclose_host_assisted_stage,
@@ -713,6 +720,15 @@ class MolecularFocalProvider:
         """Return pure conventional DF-MP2 additive core-valence energy and analytic 3N forces."""
         return molecular_delta_cv_mp2_energy_and_forces(self, request_cv, request_fc)
 
+    @staticmethod
+    def validate_production_recipe(**kwargs) -> ProductionFocalRecipe:
+        """Validate locked Plan-A correlation space and size-consistent F12 beta schedule."""
+        return validate_production_focal_recipe(**kwargs)
+
+    @staticmethod
+    def assemble_production_energy_and_forces(**kwargs) -> ProductionFocalAssembly:
+        """Validate locked Plan-A recipe and assemble additive valence + Delta-CV + Delta-SR E/F."""
+        return assemble_production_focal_energy_and_forces(**kwargs)
 
     def _cached_pair_sources(
         self, request: FocalRequest, *, derivatives: bool, budget: int

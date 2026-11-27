@@ -64,7 +64,12 @@ class FocalDeltaCVResult:
 
 from ._f12_frozen_core import (
     DEFAULT_PRODUCTION_CORRELATION_SPACE,
+    DEFAULT_PRODUCTION_F12_BETA_BY_CARDINAL,
     FROZEN_CORE_DEFINITION_VERSION,
+    ProductionFocalAssembly,
+    ProductionFocalRecipe,
+    assemble_production_focal_energy_and_forces,
+    validate_production_focal_recipe,
 )
 
 

@@ -18,11 +18,21 @@ from generativeqc._cuda_device import CudaDeviceIdentity
 from generativeqc._f12_focal_molecular import MolecularFocalProvider
 from generativeqc._f12_focal_reference import FocalReference
 from generativeqc._f12_focal_tplus_sources import OccupiedMP2F12
+from generativeqc._f12_frozen_core import (
+    assemble_production_focal_energy_and_forces,
+    validate_production_focal_recipe,
+)
 from generativeqc.experimental.f12_focal import (
     FocalBasis,
+    FocalEnergyComponent,
+    FocalEnergyResult,
+    FocalEvaluation,
     FocalLowOrderEnergy,
     FocalLowOrderForces,
+    FocalMolecularResult,
+    FocalRunResult,
     FocalSeries,
+    FocalTerm,
     TriplesWPrecisionError,
     plan_singlepoint,
     singlepoint,
@@ -281,11 +291,65 @@ def _force_entry(
     return evaluation.energy, evaluation.forces, dict(evaluation.telemetry)
 
 
+def _composed(
+    components: tuple[FocalEvaluation, ...], weights: tuple[float, ...]
+) -> FocalRunResult:
+    """Compose weighted components the way focal composition does."""
+    return FocalRunResult(
+        math.fsum(c.term.energy * w for c, w in zip(components, weights, strict=True)),
+        np.sum(
+            [c.term.forces * w for c, w in zip(components, weights, strict=True)],
+            axis=0,
+        ),
+        tuple(
+            (c.term.role, c.term.basis_id, c.term.cardinal, w)
+            for c, w in zip(components, weights, strict=True)
+        ),
+        components,
+        valence_correlation_space="all-active",
+        frozen_core_definition_version=2,
+    )
+
+
+def _evaluation(
+    role: str, energy: float, forces: np.ndarray, telemetry: dict[str, object]
+) -> FocalEvaluation:
+    term = FocalTerm(
+        "surface",
+        "series",
+        f"basis-{role}",
+        2,
+        role,
+        energy,
+        np.asarray(forces, dtype=np.float64),
+    )
+    return FocalEvaluation(term, "cuda", True, telemetry=dict(telemetry))
+
+
+def _valence_with_triples(
+    entry: str, energy: float, forces: np.ndarray, telemetry: dict[str, object]
+) -> FocalRunResult:
+    """A composed valence result whose triples component is the given evaluation."""
+    role = "triples" if entry == "conventional" else "triples_plus"
+    low_order = _evaluation("hf_cabs", -76.0, np.full(forces.shape, 0.125), {})
+    return _composed(
+        (low_order, _evaluation(role, energy, forces, telemetry)), (1.0, 1.0)
+    )
+
+
+def _assemble(valence: FocalRunResult | FocalMolecularResult) -> Any:
+    return assemble_production_focal_energy_and_forces(
+        valence=valence,
+        valence_correlation_space="all-active",
+        require_production_defaults=False,
+    )
+
+
 @pytest.mark.parametrize("entry", _ENTRIES)
 def test_l20_runs_requested_single_pass_forces_for_production(
     entry: str, native_triples: list[dict[str, Any]]
 ) -> None:
-    _, _, telemetry = _force_entry(entry, "fp32_single")
+    energy, forces, telemetry = _force_entry(entry, "fp32_single")
     assert len(native_triples) == 1
     assert native_triples[0]["triples_fp32_w"] is True
     assert native_triples[0]["forces"] is True
@@ -297,6 +361,15 @@ def test_l20_runs_requested_single_pass_forces_for_production(
     )
     assert telemetry["preconvergence"] == "auto"
     assert "production_eligible" not in telemetry
+    valence = _valence_with_triples(entry, energy, forces, telemetry)
+    validate_production_focal_recipe(
+        valence_correlation_space="all-active",
+        require_production_defaults=False,
+        components=valence.components,
+    )
+    assembled = _assemble(valence)
+    np.testing.assert_array_equal(assembled.total_forces_Eh_per_bohr, forces + 0.125)
+    assert assembled.total_energy_Eh == math.fsum((-76.0, energy))
 
 
 @_UNQUALIFIED
@@ -373,7 +446,7 @@ def test_default_and_split_schedules_run_on_any_device_with_provenance(
     device: CudaDeviceIdentity,
     native_triples: list[dict[str, Any]],
 ) -> None:
-    _, _, telemetry = _force_entry(entry, precision, device=device)
+    energy, forces, telemetry = _force_entry(entry, precision, device=device)
     assert not native_triples[0].get("triples_fp32_w", False)
     assert telemetry["w_precision_schedule"] == precision
     assert (telemetry["device_name"], telemetry["device_architecture"]) == (
@@ -382,6 +455,8 @@ def test_default_and_split_schedules_run_on_any_device_with_provenance(
     )
     assert telemetry["preconvergence"] == "auto"
     assert "production_eligible" not in telemetry
+    assembled = _assemble(_valence_with_triples(entry, energy, forces, telemetry))
+    np.testing.assert_array_equal(assembled.total_forces_Eh_per_bohr, forces + 0.125)
 
 
 @pytest.mark.parametrize("preconvergence", ["fp64", "mixed"])
@@ -550,12 +625,89 @@ def test_singlepoint_single_pass_forces_follow_the_device(
     assert telemetry["device_name"] == "NVIDIA L20"
     assert "production_eligible" not in telemetry
     assert len(native_triples) == 1
+    _assemble(result)
     with pytest.raises(TriplesWPrecisionError, match="only on an NVIDIA L20"):
         water_singlepoint("fp32_single", triples, _A100)
     assert len(native_triples) == 1
     result = water_singlepoint("fp32_split3", triples, _A100)
     assert result.components[-1].telemetry["device_name"] == _A100.name
     assert len(native_triples) == 2
+
+
+@pytest.mark.parametrize("precision", ["fp32_split3", "fp32_single"])
+@_SINGLEPOINT_TRIPLES
+def test_production_assembly_takes_the_composed_singlepoint_result(
+    triples: object, entry: str, precision: str, water_singlepoint: Any
+) -> None:
+    result = water_singlepoint(precision, triples)
+    assert isinstance(result, FocalMolecularResult)
+    delta_sr = np.full(result.forces.shape, 0.001)
+    assembled = assemble_production_focal_energy_and_forces(
+        valence=result,
+        valence_correlation_space="all-active",
+        delta_sr_energy=-0.25,
+        delta_sr_forces=delta_sr,
+        delta_sr_correlation_space="all-active",
+        delta_sr_frozen_core_definition_version=2,
+        require_production_defaults=False,
+    )
+    assert assembled.valence_energy_Eh == result.energy
+    np.testing.assert_array_equal(assembled.valence_forces_Eh_per_bohr, result.forces)
+    assert assembled.total_energy_Eh == math.fsum((result.energy, -0.25))
+    np.testing.assert_array_equal(
+        assembled.total_forces_Eh_per_bohr, result.forces + delta_sr
+    )
+
+
+@_SINGLEPOINT_TRIPLES
+def test_production_assembly_refuses_a_real_diagnostic_result_and_its_bare_values(
+    triples: object, entry: str, water_singlepoint: Any
+) -> None:
+    result = water_singlepoint("fp32_split3", triples)
+    energy, forces, telemetry = _force_entry(
+        entry, "fp32_single", device=_A100, diagnostic_fp32_single_w_forces=True
+    )
+    assert telemetry["production_eligible"] is False
+    production = result.components[-1]
+    assert production.term.energy != energy
+    diagnostic = replace(
+        production,
+        term=replace(
+            production.term, energy=energy, forces=np.asarray(forces, dtype=np.float64)
+        ),
+        telemetry=telemetry,
+    )
+    weights = tuple(w for *_, w in result.weights)
+    composed = _composed((*result.components[:-1], diagnostic), weights)
+    with pytest.raises(
+        ValueError, match="diagnostic focal result 'fp32_single_w_forces'"
+    ):
+        _assemble(
+            replace(
+                result,
+                energy=composed.energy,
+                forces=composed.forces,
+                components=composed.components,
+            )
+        )
+    with pytest.raises(TypeError, match="valence_energy"):
+        assemble_production_focal_energy_and_forces(  # type: ignore[call-arg]
+            valence_energy=composed.energy,
+            valence_forces=composed.forces,
+            valence_components=(),
+        )
+    with pytest.raises(ValueError, match="requires the valence result components"):
+        assemble_production_focal_energy_and_forces(
+            valence=replace(
+                result,
+                energy=composed.energy,
+                forces=composed.forces,
+                weights=(),
+                components=(),
+            ),
+        )
+    with pytest.raises(ValueError, match="do not equal the weighted sum"):
+        _assemble(replace(result, energy=composed.energy, forces=composed.forces))
 
 
 @pytest.mark.parametrize("device", [_L20, _A100], ids=["l20", "a100"])
@@ -620,6 +772,148 @@ def test_single_pass_conventional_forces_must_record_their_provenance(
     assert native_triples == []
 
 
+@pytest.mark.parametrize("device", [_L20, _A100], ids=["l20", "a100"])
+@pytest.mark.parametrize("entry", _ENTRIES)
+def test_production_assembly_refuses_the_diagnostic_result(
+    entry: str, device: CudaDeviceIdentity, native_triples: list[dict[str, Any]]
+) -> None:
+    energy, forces, telemetry = _force_entry(
+        entry, "fp32_single", device=device, diagnostic_fp32_single_w_forces=True
+    )
+    valence = _valence_with_triples(entry, energy, forces, telemetry)
+    with pytest.raises(
+        ValueError, match="diagnostic focal result 'fp32_single_w_forces'"
+    ):
+        validate_production_focal_recipe(components=valence.components)
+    with pytest.raises(
+        ValueError, match="diagnostic focal result 'fp32_single_w_forces'"
+    ):
+        assemble_production_focal_energy_and_forces(valence=valence)
+    production = _valence_with_triples(entry, -0.01, np.zeros_like(forces), {})
+    with pytest.raises(ValueError, match="do not equal the weighted sum"):
+        assemble_production_focal_energy_and_forces(
+            valence=replace(production, energy=valence.energy, forces=valence.forces)
+        )
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        {},
+        {"device_name": _A100.name, "device_architecture": _A100.architecture},
+        {"device_name": _L40S.name, "device_architecture": _L40S.architecture},
+        {"device_name": _L20.name, "device_architecture": "sm_80"},
+        {"device_name": "cpu", "device_architecture": "n/a"},
+        {"device_name": None, "device_architecture": None},
+    ],
+    ids=["unrecorded", "a100", "l40s", "mismatched-architecture", "host", "null"],
+)
+@pytest.mark.parametrize(
+    "reverse", ["fp32", "fp64", "n/a", pytest.param(None, id="missing")]
+)
+def test_production_assembly_refuses_single_pass_forces_without_an_l20_record(
+    device: dict[str, object], reverse: str | None
+) -> None:
+    forces = np.zeros((3, 3))
+    telemetry = {
+        "w_precision_schedule": "fp32_single",
+        **device,
+    }
+    if reverse is not None:
+        telemetry["reverse_w_precision"] = reverse
+    valence = _valence_with_triples("conventional", -1.0, forces, telemetry)
+    with pytest.raises(ValueError, match="only from an NVIDIA L20"):
+        validate_production_focal_recipe(components=valence.components)
+    with pytest.raises(ValueError, match="only from an NVIDIA L20"):
+        _assemble(valence)
+    recorded = {
+        **telemetry,
+        "device_name": "NVIDIA L20",
+        "device_architecture": "sm_89",
+    }
+    assert _assemble(
+        _valence_with_triples("conventional", -1.0, forces, recorded)
+    ).total_energy_Eh == math.fsum((-76.0, -1.0))
+
+
+@pytest.mark.parametrize("executed", ["fp32_single", "fp64"])
+def test_production_assembly_refuses_an_l20_force_result_with_a_resource_fallback(
+    executed: str,
+) -> None:
+    telemetry = {
+        "requested_w_precision_schedule": "fp32_single",
+        "w_precision_schedule": executed,
+        "triples_fp32_w_resource_fallback": True,
+        "device_name": _L20.name,
+        "device_architecture": _L20.architecture,
+    }
+    valence = _valence_with_triples("conventional", -1.0, np.zeros((3, 3)), telemetry)
+    with pytest.raises(
+        TriplesWPrecisionError, match="resource fallback|matching W telemetry"
+    ):
+        validate_production_focal_recipe(components=valence.components)
+    with pytest.raises(
+        TriplesWPrecisionError, match="resource fallback|matching W telemetry"
+    ):
+        _assemble(valence)
+
+
+def test_production_assembly_refuses_a_cpu_force_result_with_an_l20_record() -> None:
+    telemetry = {
+        "w_precision_schedule": "fp32_single",
+        "device_name": _L20.name,
+        "device_architecture": _L20.architecture,
+    }
+    valence = _valence_with_triples("conventional", -1.0, np.zeros((3, 3)), telemetry)
+    hf, triples = valence.components
+    valence = replace(
+        valence, components=(hf, replace(triples, executed_backend="cpu_reference"))
+    )
+    with pytest.raises(ValueError, match="backend='cpu_reference'"):
+        _assemble(valence)
+
+
+def test_production_assembly_refuses_unreported_legacy_single_pass_forces() -> None:
+    telemetry = {"triples_fp32_w": True, "w_precision_schedule": "unreported"}
+    valence = _valence_with_triples("conventional", -1.0, np.zeros((3, 3)), telemetry)
+    with pytest.raises(
+        TriplesWPrecisionError, match="w_precision_schedule='unreported'"
+    ):
+        _assemble(valence)
+
+
+@pytest.mark.parametrize("device", [None, _A100], ids=["unrecorded", "a100"])
+def test_production_assembly_admits_single_pass_energy(
+    device: CudaDeviceIdentity | None,
+) -> None:
+    request = _request("rhf", "triples", "cuda")
+    telemetry = {"w_precision_schedule": "fp32_single", "reverse_w_precision": "n/a"}
+    if device is not None:
+        telemetry.update(
+            device_name=device.name, device_architecture=device.architecture
+        )
+    energy_only = FocalEnergyComponent(
+        request,
+        -1.0,
+        1.0,
+        "cuda",
+        True,
+        telemetry=telemetry,
+    )
+    assembled = assemble_production_focal_energy_and_forces(
+        valence=FocalEnergyResult(
+            -1.0, (energy_only,), {}, {}, valence_correlation_space="all-active",
+            frozen_core_definition_version=2,
+        ),
+        valence_correlation_space="all-active",
+        require_production_defaults=False,
+    )
+    assert assembled.total_energy_Eh == -1.0
+    assert assembled.total_forces_Eh_per_bohr is None
+    with pytest.raises(TypeError, match="telemetry mapping"):
+        validate_production_focal_recipe(components=(object(),))
+
+
 @pytest.mark.parametrize("entry", _ENTRIES)
 def test_a100_energy_entry_keeps_the_callers_single_pass_choice(
     entry: str,
@@ -668,3 +962,63 @@ def test_a100_energy_entry_keeps_the_callers_single_pass_choice(
     )
     assert telemetry["w_precision_schedule"] == "fp32_single"
     assert telemetry["reverse_w_precision"] == "n/a"
+
+
+def test_production_assembly_requires_a_consistent_typed_valence_result() -> None:
+    with pytest.raises(TypeError, match="valence"):
+        assemble_production_focal_energy_and_forces()  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="FocalRunResult"):
+        assemble_production_focal_energy_and_forces(valence=-1.0)  # type: ignore[arg-type]
+    component = _evaluation("hf_cabs", -1.0, np.zeros((3, 3)), {})
+    with pytest.raises(TypeError, match="FocalRunResult"):
+        assemble_production_focal_energy_and_forces(
+            valence=SimpleNamespace(energy=-1.0, components=(component,))  # type: ignore[arg-type]
+        )
+    with pytest.raises(TypeError, match="FocalEvaluation"):
+        assemble_production_focal_energy_and_forces(
+            valence=FocalRunResult(
+                -1.0,
+                np.zeros((3, 3)),
+                (("hf_cabs", "b", 2, 1.0),),
+                (SimpleNamespace(telemetry={}),),  # type: ignore[arg-type]
+            )
+        )
+    valence = _composed((component,), (1.0,))
+    with pytest.raises(ValueError, match="frozen-core definition version 2"):
+        assemble_production_focal_energy_and_forces(
+            valence=replace(valence, frozen_core_definition_version=1),
+            require_production_defaults=False,
+        )
+    with pytest.raises(ValueError, match="describe different terms"):
+        assemble_production_focal_energy_and_forces(
+            valence=replace(
+                valence, weights=(("mp2_f12_correlation", "basis-hf_cabs", 2, 1.0),)
+            )
+        )
+    with pytest.raises(ValueError, match="must be converged"):
+        assemble_production_focal_energy_and_forces(
+            valence=replace(valence, components=(replace(component, converged=False),))
+        )
+    request = _request("rhf", "triples", "cuda")
+    part = FocalEnergyComponent(request, -1.0, 0.5, "cuda", True)
+    with pytest.raises(ValueError, match="does not equal the weighted sum"):
+        assemble_production_focal_energy_and_forces(
+            valence=FocalEnergyResult(-1.0, (part,), {}, {}),
+            valence_correlation_space="all-active",
+            require_production_defaults=False,
+        )
+    with pytest.raises(
+        ValueError, match="require a valence FocalRunResult with forces"
+    ):
+        assemble_production_focal_energy_and_forces(
+            valence=FocalEnergyResult(
+                -0.5, (part,), {}, {}, valence_correlation_space="all-active",
+                frozen_core_definition_version=2,
+            ),
+            valence_correlation_space="all-active",
+            delta_cv_energy=-0.1,
+            delta_cv_forces=np.zeros((3, 3)),
+            delta_cv_valence_space="all-active",
+            delta_cv_frozen_core_definition_version=2,
+            require_production_defaults=False,
+        )
