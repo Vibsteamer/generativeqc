@@ -29,6 +29,7 @@ from generativeqc._f12_focal_rcc_f12b import spatial_rhf_ccsdf12b_v1
 from generativeqc._f12_focal_reference import (
     FocalReference,
     FocalReferenceSeed,
+    _NativeFocalReference,
 )
 from generativeqc._f12_focal_tplus_sources import FocalOccupiedTriples, OccupiedMP2F12
 from generativeqc._f12_ram_hygiene import (
@@ -47,6 +48,7 @@ from generativeqc.experimental.f12_focal import (
     FocalLowOrderForces,
     FocalRequest,
     FocalSeries,
+    FocalTriplesAlternatives,
     plan_singlepoint,
     singlepoint,
     singlepoint_energy,
@@ -1463,3 +1465,37 @@ def test_m10_ordinary_ucc_source_forces_uses_aot_rotation_zero_tensorir(
     grad = ordinary_ucc_source_forces(prov, req, sources, weights)
     assert rotation_tir_calls == []
     assert grad.shape == (2, 3) and np.isfinite(grad).all()
+
+
+def test_d1_24_verified_dead_benchmark_scripts_removed() -> None:
+    """Verify the exact 24 verified zero-reference early-Codex benchmark files are deleted."""
+    root = Path(__file__).resolve().parents[2] / "benchmarks"
+    deleted = (
+        "df_unrestricted_snapshot.cpp",
+        "f12_canonical_frame.py",
+        "f12_cc_residual.py",
+        "f12_focal_hf_cabs.py",
+        "f12_full_frame_probe.py",
+        "f12_full_rank_center.py",
+        "f12_molecular_displacements.py",
+        "f12_molecular_i_sink_test.py",
+        "f12_nuclear_overlap.py",
+        "f12_occupied_fock.py",
+        "f12_polarized_force.py",
+        "f12_polarized_ladder.py",
+        "f12_polarized_ladder_force.py",
+        "f12_projector_component.py",
+        "f12_psi4_double_commutator.cpp",
+        "f12_psi4_geminal_nuclear.cpp",
+        "f12_unrestricted_ao.py",
+        "f12_unrestricted_cartesian.py",
+        "f12_unrestricted_energy.py",
+        "f12_unrestricted_live_reference.py",
+        "f12_unrestricted_molecule.py",
+        "f12_unrestricted_molecule_force.py",
+        "f12_unrestricted_reference_response.py",
+        "focal_oh_f_orbital.py",
+    )
+    assert len(deleted) == 24
+    for name in deleted:
+        assert not (root / name).exists(), f"Dead benchmark file still present: {name}"
