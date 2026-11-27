@@ -420,8 +420,9 @@ generativeqc_status focal_df_reference(generativeqc_context* context,
     };
     auto run_ladder = [&](const scf::PreparedFockPlan& plan) {
       auto st = scf::run_prepared_fock_strategy(plan, options, start);
-      // Recover failed closed-shell primaries in the restricted space.
-      if (spins != 1 || st.converged) return st;
+      // Converged closed-shell primaries return directly. Failed closed-shell
+      // primaries and open-shell references go through the stability search.
+      if (spins == 1 && st.converged) return st;
       return settle(plan, std::move(st));
     };
     const auto strategy = scf::fock_strategy_for_execution(options);
