@@ -170,7 +170,8 @@ def energy(
     if backend in ("cpu", "cpu-native"):
         executor = None
         if backend == "cpu-native":
-            from .native_tensor_cpu import NativeCCTensorExecutor
+            from generativeqc._ucc.native_tensor_cpu import NativeCCTensorExecutor
+
             from .solver import SolverOptions
 
             if compiler is not None and not isinstance(compiler, Path):

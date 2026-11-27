@@ -500,10 +500,10 @@ def test_empty_excitation_lambda_and_correlation_cotangents_are_exact_zero(
 def test_complete_cuda_lambda_and_parameter_vjp_match_independent_oracle(
     atom: str, spin: int, broken: bool, tmp_path: Path
 ) -> None:
+    from generativeqc._ucc.native_tensor_cuda import CudaCCTensorExecutor
     from generativeqc_compiler.common.cuda_adapter import CudaCompilerAdapter
     from generativeqc_compiler.common.cuda_target import cuda_target_info
 
-    from tools.generativeqc_cc.native_tensor_cuda import CudaCCTensorExecutor
     from tools.generativeqc_posthf.cuda import compile_cuda
 
     assert os.environ.get("SLURM_JOB_ID"), (

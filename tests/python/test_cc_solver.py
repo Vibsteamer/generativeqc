@@ -414,7 +414,7 @@ def test_native_cpu_ccsd_full_endpoint_matches_pinned_and_oracle(
 
     if shutil.which("c++") is None:
         pytest.skip("a native C++ compiler is required for the explicit CPU route")
-    from tools.generativeqc_cc.native_tensor_cpu import NativeCCTensorExecutor
+    from generativeqc._ucc.native_tensor_cpu import NativeCCTensorExecutor
 
     module = importlib.import_module("tools.generativeqc_cc.solver")
     s, p, meta, a = fixture_problem(name)
@@ -471,7 +471,7 @@ def test_native_cpu_ccsd_full_endpoint_matches_pinned_and_oracle(
 def test_native_cpu_ccsd_resource_rejections_precede_integral_reads(
     tmp_path: typing.Any,
 ) -> None:
-    from tools.generativeqc_cc.native_tensor_cpu import NativeCCTensorExecutor
+    from generativeqc._ucc.native_tensor_cpu import NativeCCTensorExecutor
 
     s, p, _meta, _a = fixture_problem()
     with pytest.raises(TypeError, match="native CPU TensorIR executor"):
@@ -491,7 +491,7 @@ def test_native_cpu_ccsd_facade_and_numeric_failure(
     if shutil.which("c++") is None:
         pytest.skip("a native C++ compiler is required for the explicit CPU route")
     from tools.generativeqc_cc import energy
-    from tools.generativeqc_cc.native_tensor_cpu import NativeCCTensorExecutor
+    from generativeqc._ucc.native_tensor_cpu import NativeCCTensorExecutor
 
     s, p, meta, a = fixture_problem()
     actual = energy(s, p, backend="cpu-native", cache=tmp_path)
@@ -528,7 +528,7 @@ def test_native_cpu_ccsd_configuration_changes_never_fall_back(
 
     if shutil.which("c++") is None:
         pytest.skip("a native C++ compiler is required for the explicit CPU route")
-    from tools.generativeqc_cc.native_tensor_cpu import NativeCCTensorExecutor
+    from generativeqc._ucc.native_tensor_cpu import NativeCCTensorExecutor
 
     module = importlib.import_module("tools.generativeqc_cc.solver")
     s, p, _meta, _a = fixture_problem()

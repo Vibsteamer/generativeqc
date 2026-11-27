@@ -13,7 +13,11 @@ import typing
 from pathlib import Path
 
 from generativeqc_compiler.common.cuda_adapter import CudaCompilerAdapter
-from generativeqc_compiler.tensor.cuda_execute import PreparedCuda, compile_cuda
+from generativeqc_compiler.tensor.cuda_execute import (
+    CudaExecution,
+    PreparedCuda,
+    compile_cuda,
+)
 from generativeqc_compiler.tensor.cuda_plan import plan_cuda
 
 
@@ -29,6 +33,7 @@ class CudaCCTensorExecutor:
         compiler: CudaCompilerAdapter,
         cache: Path,
         device: int = 0,
+        record_graph: typing.Callable[[dict], None] | None = None,
     ) -> None:
         if type(max_bytes) is not int or max_bytes <= 0:
             raise ValueError("CUDA CC tensor max_bytes must be a positive integer")
@@ -42,6 +47,7 @@ class CudaCCTensorExecutor:
         self.compiler = compiler
         self.cache = cache
         self.device = device
+        self._record_graph = record_graph
         self._configuration = (max_bytes, compiler, cache, device, self.backend)
         self._compiled: dict[str, tuple[object, object]] = {}
         self._metrics: dict[str, dict[str, typing.Any]] = {}
@@ -91,8 +97,8 @@ class CudaCCTensorExecutor:
             for program in candidates:
                 self._compile(program)
 
-    def execute(self, program: object, feeds: object) -> dict[str, object]:
-        """Execute one program, closing its native CUDA arena before returning."""
+    def run(self, program: object, feeds: object) -> CudaExecution:
+        """Run a molecular TensorIR graph and return detached outputs and device metrics."""
         with self._lock:
             plan, artifact = self._compile(program)
             with self._PreparedCuda(plan, artifact, device=self.device) as prepared:
@@ -103,7 +109,20 @@ class CudaCCTensorExecutor:
                 )
             identity = program.logical_hash
             self._metrics[identity] = dict(result.metrics)
-            return dict(result.outputs)
+            if self._record_graph is not None:
+                self._record_graph(
+                    {
+                        "program": identity,
+                        "backend": result.backend,
+                        "stage": "cc",
+                        "metrics": dict(result.metrics),
+                    }
+                )
+            return result
+
+    def execute(self, program: object, feeds: object) -> dict[str, object]:
+        """Return named tensors for CC solvers using the same bounded CUDA owner."""
+        return dict(self.run(program, feeds).outputs)
 
     @property
     def compiled_program_count(self) -> int:

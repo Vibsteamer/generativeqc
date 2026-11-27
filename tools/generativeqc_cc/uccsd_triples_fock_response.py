@@ -17,6 +17,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+from generativeqc._ucc.native_tensor_cuda import CudaCCTensorExecutor
 from generativeqc_compiler.cc.uccsd_layout import BLOCK_NAMES
 from generativeqc_compiler.cc.uccsd_triples import channel_shape
 from generativeqc_compiler.cc.uccsd_triples_fock import (
@@ -29,7 +30,6 @@ from generativeqc_compiler.common.resources import MAX_BYTES, checked_bytes
 from generativeqc_compiler.tensor.cpu import emit_cpu
 from generativeqc_compiler.tensor.cuda_plan import plan_cuda
 
-from .native_tensor_cuda import CudaCCTensorExecutor
 from .uccsd_lambda import _freeze
 from .uccsd_t import PreparedUCCSDT, _axis_variants
 from .uccsd_triples_response import (

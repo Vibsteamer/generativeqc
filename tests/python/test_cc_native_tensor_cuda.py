@@ -109,9 +109,11 @@ def test_cuda_cc_tensor_executor_caches_program_and_releases_each_arena(
     executor, budgets, compiled = _fake_executor(tmp_path)
 
     first = executor.execute(reverse, feeds)
-    second = executor.execute(reverse, feeds)
+    second = executor.run(reverse, feeds)
 
-    np.testing.assert_array_equal(first["bar_fov"], second["bar_fov"])
+    assert second.backend == executor.backend
+    assert second.metrics == executor.metrics[reverse.logical_hash]
+    np.testing.assert_array_equal(first["bar_fov"], second.outputs["bar_fov"])
     assert budgets == [64 << 20]
     assert compiled == [reverse.logical_hash]
     assert executor.compiled_program_count == 1

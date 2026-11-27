@@ -10,13 +10,13 @@ from typing import Any
 
 import numpy as np
 import pytest
+from generativeqc._ucc.native_tensor_cpu import NativeCCTensorExecutor
 from test_uccsd_equations import _spin_amplitudes
 from test_uccsd_lambda import _problem
 from test_uccsd_t_owner import _ASYMMETRIC_H6, _BROKEN_H4, _noninteracting
 from test_uccsd_triples_response import _snapshot_hamiltonian
 
 from tools.generativeqc_cc.lambda_solver import BoundCCSDLambda
-from tools.generativeqc_cc.native_tensor_cpu import NativeCCTensorExecutor
 from tools.generativeqc_cc.solver import SolverOptions, solve
 from tools.generativeqc_cc.triples_lambda_response import solve_corrected_lambda
 from tools.generativeqc_cc.uccsd_lambda import PreparedUCCSDLambda, UCCSDLambdaResult
@@ -499,10 +499,10 @@ def test_empty_corrected_domain_has_distinct_zero_stationarity(
 def test_complete_cuda_corrected_lambda_against_independent_equations(
     atom: str, spin: int, broken: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from generativeqc._ucc.native_tensor_cuda import CudaCCTensorExecutor
     from generativeqc_compiler.common.cuda_adapter import CudaCompilerAdapter
     from generativeqc_compiler.common.cuda_target import cuda_target_info
 
-    from tools.generativeqc_cc.native_tensor_cuda import CudaCCTensorExecutor
     from tools.generativeqc_posthf.cuda import compile_cuda
 
     assert os.environ.get("SLURM_JOB_ID")

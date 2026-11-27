@@ -18,7 +18,7 @@ from generativeqc_compiler.cc.uccsd_layout import UCCSDLayout
 from test_uccsd_equations import _amplitudes, _determinant_oracle, _feeds
 from test_uccsd_response import _physical_residual
 
-from tools.generativeqc_cc.native_tensor_cpu import NativeCCTensorExecutor
+from generativeqc._ucc.native_tensor_cpu import NativeCCTensorExecutor
 
 
 def test_separate_fitted_interaction_does_not_replace_reference_fock() -> None:

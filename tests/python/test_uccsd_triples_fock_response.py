@@ -29,7 +29,7 @@ from test_uccsd_t_owner import small_parent as _small_parent
 from test_uccsd_triples import _tile_feeds
 from test_uccsd_triples_response import _snapshot_hamiltonian, _source_feeds
 
-from tools.generativeqc_cc.native_tensor_cpu import NativeCCTensorExecutor
+from generativeqc._ucc.native_tensor_cpu import NativeCCTensorExecutor
 from tools.generativeqc_cc.solver import SolverOptions
 from tools.generativeqc_cc.uccsd_solver import PreparedUCCSD
 from tools.generativeqc_cc.uccsd_t import UCCSDTOptions
@@ -489,7 +489,7 @@ def test_native_cuda_all_sectors_and_degenerate_resolvent_closure(
     from generativeqc_compiler.common.cuda_adapter import CudaCompilerAdapter
     from generativeqc_compiler.common.cuda_target import cuda_target_info
 
-    from tools.generativeqc_cc.native_tensor_cuda import CudaCCTensorExecutor
+    from generativeqc._ucc.native_tensor_cuda import CudaCCTensorExecutor
 
     assert os.environ.get("SLURM_JOB_ID")
     compiler = CudaCompilerAdapter(
@@ -524,7 +524,7 @@ def test_complete_cuda_molecular_fock_response_has_independent_full_spin_oracle(
     from generativeqc_compiler.common.cuda_adapter import CudaCompilerAdapter
     from generativeqc_compiler.common.cuda_target import cuda_target_info
 
-    from tools.generativeqc_cc.native_tensor_cuda import CudaCCTensorExecutor
+    from generativeqc._ucc.native_tensor_cuda import CudaCCTensorExecutor
     from tools.generativeqc_posthf.cuda import compile_cuda
 
     assert os.environ.get("SLURM_JOB_ID")

@@ -505,11 +505,11 @@ def test_complete_corrected_cuda_forces_forbid_cpu_fallback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from generativeqc._ucc.native_tensor_cpu import NativeCCTensorExecutor
+    from generativeqc._ucc.native_tensor_cuda import CudaCCTensorExecutor
     from generativeqc_compiler.common.cuda_adapter import CudaCompilerAdapter
     from generativeqc_compiler.common.cuda_target import cuda_target_info
 
-    from tools.generativeqc_cc.native_tensor_cpu import NativeCCTensorExecutor
-    from tools.generativeqc_cc.native_tensor_cuda import CudaCCTensorExecutor
     from tools.generativeqc_posthf.cuda import compile_cuda
     from tools.generativeqc_response.spin_cuda import CudaSpinJKBackend
 

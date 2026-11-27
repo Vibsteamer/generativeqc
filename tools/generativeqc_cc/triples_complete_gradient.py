@@ -22,6 +22,7 @@ from generativeqc_compiler.cc.gradient_equations import (
     build_ao_one_electron_weight_program,
     build_ao_weight_program,
 )
+from generativeqc._ucc.native_tensor_cuda import CudaCCTensorExecutor
 from generativeqc_compiler.cc.triples import (
     _check_denominators,
     _validate,
@@ -56,7 +57,6 @@ from .complete_gradient import (
 )
 from .lambda_cuda import PreparedCUDALambda
 from .lambda_solver import BoundCCSDLambda, _graph_bytes
-from .native_tensor_cuda import CudaCCTensorExecutor
 from .solver import solve
 from .triples_cuda import TriplesTileConfig
 from .triples_lambda_response import (
