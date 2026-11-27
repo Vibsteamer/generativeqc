@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from conftest import f12_host_shell
 
 from generativeqc import Atom, Primitive, Shell
 from generativeqc._f12_focal_cv import (
@@ -636,6 +637,26 @@ def test_m5_m16_m20_spatial_rhf_ccsdf12b_contracts(
         spatial_rhf_ccsdf12b_v1(prov_tiny, req_active, ref_big, forces=True, expected_cabs_rank=2)
 
 
+# ---------------------------------------------------------------------------
+# M10: Zero residual TensorIR compiles in rotation_gradient, low_order_energy,
+#      tplus_from_occupied, and streamed_f12_increment
+# ---------------------------------------------------------------------------
+
+def test_spatial_force_rotation_with_installed_aot(monkeypatch):
+    from generativeqc._f12_focal_ucc_triples import _frame_rotation_action
+
+    provider = MolecularFocalProvider(shell_library=f12_host_shell(), budget_mib=2)
+    monkeypatch.setenv("GENERATIVEQC_F12_REQUIRE_AOT_CPHF", "1")
+    def no_jit(*args):
+        pytest.fail("AOT canonical-frame contraction dispatched a TensorIR graph")
+
+    coeff = np.array([[1.0, -0.6], [0.3, 0.4], [0.12, -0.75]])
+    bar = np.array([[2.0, 0.1], [1.9, 0.5], [-3.0, 0.2]])
+    action = _frame_rotation_action(provider, no_jit, cuda=False)
+    np.testing.assert_allclose(action(coeff, bar), coeff.T @ bar, rtol=0, atol=2e-15)
+    np.testing.assert_allclose(action(coeff, -bar), -(coeff.T @ bar), rtol=0, atol=2e-15)
+
+
 def test_m10_tplus_from_occupied_zero_cuda_runner_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify tplus_from_occupied runs directly in exact FP64 NumPy (0 calls to provider.run on CUDA)."""
     from generativeqc_compiler.tensor import execute
@@ -701,6 +722,71 @@ def test_m10_tplus_from_occupied_zero_cuda_runner_calls(monkeypatch: pytest.Monk
     monkeypatch.setenv("GENERATIVEQC_F12_STRICT_GPU_ONLY", "1")
     with pytest.raises(NotImplementedError, match="tplus_occupied_scaling"):
         prov.tplus_from_occupied(req, low, triples)
+
+
+def test_m10_zero_tensorir_in_low_order_tplus_and_streamed_increment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify 0 TensorIR calls in split-fit low_order_energy(occupied) and streamed_f12_increment with AOT sink."""
+    import generativeqc_compiler.tensor as tensor_mod
+
+    shell = f12_host_shell()
+    basis = _compact_h2o_split_basis(split_mp2=True)
+    atoms = [("O", (0.0, 0.0, 0.0)), ("H", (0.0, 1.43, 1.10)), ("H", (0.15, -1.43, 1.10))]
+    req = next(
+        r
+        for r, _ in plan_singlepoint(
+            atoms,
+            FocalSeries(basis),
+            FocalSeries(basis),
+            None,
+            root_id="rhf",
+            correlation_space_id="frozen-core",
+            backend="cpu_reference",
+        ).steps
+        if r.role == "mp2_f12_correlation"
+    )
+
+    # Reference TensorIR oracle (with AOT MP2-F12 disabled)
+    monkeypatch.setenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", "1")
+    monkeypatch.setenv("GENERATIVEQC_F12_STREAM_PANELS", "0")
+    prov_oracle = MolecularFocalProvider(shell_library=shell, budget_mib=512)
+    low_oracle = prov_oracle.low_order_energy(
+        req, include_hf_cabs=False, include_occupied_partitions=True
+    )
+
+    # AOT path: count EVERY TensorIR execute() call
+    monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", raising=False)
+    monkeypatch.setenv("GENERATIVEQC_F12_STREAM_PANELS", "1")
+    real_execute = tensor_mod.execute
+    tir_calls: list[tuple[str, ...]] = []
+
+    def spy_execute(program, inputs, *args, **kwargs):
+        tir_calls.append(tuple(sorted(program.outputs.keys())))
+        return real_execute(program, inputs, *args, **kwargs)
+
+    monkeypatch.setattr(tensor_mod, "execute", spy_execute)
+
+    prov_aot = MolecularFocalProvider(shell_library=shell, budget_mib=512)
+    low_aot = prov_aot.low_order_energy(
+        req, include_hf_cabs=False, include_occupied_partitions=True
+    )
+    assert tir_calls == [], f"low_order_energy(occupied) invoked TensorIR: {tir_calls}"
+    assert low_aot.occupied_mp2_f12 is not None and low_oracle.occupied_mp2_f12 is not None
+    assert abs(low_aot.mp2_f12_correlation_energy - low_oracle.mp2_f12_correlation_energy) < 1e-12
+    for a, b in zip(low_aot.occupied_mp2_f12.mp2, low_oracle.occupied_mp2_f12.mp2, strict=True):
+        np.testing.assert_allclose(a, b, atol=1e-12, rtol=0)
+
+    # Now run streamed_f12_increment via tplus_scaling_forces -> 0 TensorIR calls!
+    o_act = len(low_aot.occupied_mp2_f12.mp2[0])
+    w_mp2 = np.linspace(1.1, 1.4, o_act)
+    w_f12 = np.linspace(0.8, 1.1, o_act)
+    tir_calls.clear()
+    f_stream = prov_aot.tplus_scaling_forces(
+        req, low_aot.reference, (w_mp2, w_mp2), (w_f12, w_f12), expected_cabs_rank=low_aot.cabs_rank
+    )
+    assert tir_calls == [], f"streamed_f12_increment invoked TensorIR: {tir_calls}"
+    assert np.isfinite(f_stream).all()
 
 
 # ---------------------------------------------------------------------------
@@ -951,6 +1037,61 @@ def test_m14_displaced_seed_uses_overlap_normalized_spin_density(monkeypatch) ->
             SimpleNamespace(data={"ao_coulomb": np.zeros((1, 4, 4))}, whitener=np.eye(1)),
             run=None, seed=invalid_center,
         )
+
+
+def test_m21_delta_cv_identical_freeze_counts_returns_none_not_fake_zero() -> None:
+    """Verify H2 (cv_frozen == fc_frozen == (0, 0)) returns delta=0 and None for uncomputed absolutes."""
+    shell = f12_host_shell()
+    basis = _compact_h2o_split_basis(split_mp2=False)
+    h2 = [("H", (0.0, 0.0, 0.0)), ("H", (0.0, 0.0, 1.4))]
+    req_f12 = next(
+        r
+        for r, _ in plan_singlepoint(
+            h2,
+            FocalSeries(basis),
+            FocalSeries(basis),
+            None,
+            root_id="rhf",
+            correlation_space_id="cv-active",
+            backend="cpu_reference",
+        ).steps
+        if r.role == "mp2_f12_correlation"
+    )
+    req_mp2 = conventional_mp2_request(
+        h2, basis, root_id="rhf", correlation_space_id="cv-active", backend="cpu_reference"
+    )
+    prov = MolecularFocalProvider(shell_library=shell, budget_mib=512)
+
+    for evaluate in (prov.delta_cv_energy, prov.delta_cv_energy_and_forces):
+        measured = evaluate(req_f12).cabs_rank
+        assert measured == 2
+        with pytest.raises(ValueError, match="rank"):
+            evaluate(req_f12, expected_cabs_rank=1)
+
+    for res, has_forces in (
+        (prov.delta_cv_energy(req_f12), False),
+        (prov.delta_cv_energy_and_forces(req_f12), True),
+        (prov.delta_cv_mp2_energy(req_mp2), False),
+        (prov.delta_cv_mp2_energy_and_forces(req_mp2), True),
+    ):
+        assert res.cv_frozen_occupied == (0, 0)
+        assert res.fc_frozen_occupied == (0, 0)
+        assert res.delta_ordinary_mp2_Eh == 0.0
+        assert res.delta_f12_increment_Eh == 0.0
+        assert res.delta_mp2_f12_Eh == 0.0
+        assert res.cv_ordinary_mp2_Eh is None
+        assert res.fc_ordinary_mp2_Eh is None
+        assert res.cv_f12_increment_Eh is None
+        assert res.fc_f12_increment_Eh is None
+        assert res.cv_mp2_f12_Eh is None
+        assert res.fc_mp2_f12_Eh is None
+        assert res.cv_forces is None
+        assert res.fc_forces is None
+        if has_forces:
+            assert res.delta_forces is not None
+            np.testing.assert_array_equal(res.delta_forces, np.zeros((2, 3)))
+        else:
+            assert res.delta_forces is None
 
 
 # ---------------------------------------------------------------------------
@@ -1279,3 +1420,46 @@ def test_d4_host_libraries_reject_invalid_explicit_env(
         f12_host_libraries()
     monkeypatch.delenv("GENERATIVEQC_F12_ONE_ECP")
     assert f12_host_libraries() == (shell, shell)
+
+
+def test_m10_ordinary_ucc_source_forces_uses_aot_rotation_zero_tensorir(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify ordinary_ucc_source_forces uses AOT orbital_rot_metric (0 orbital_rotation_cotangent TensorIR)."""
+    import generativeqc_compiler.tensor as tensor_mod
+    from generativeqc._f12_focal_cc_ordinary import ordinary_ucc_source_forces
+
+    shell = f12_host_shell()
+    basis = _compact_h2o_split_basis(split_mp2=True)
+    h2 = [("H", (0.0, 0.0, 0.0)), ("H", (0.0, 0.0, 1.4))]
+    req = next(
+        r
+        for r, _ in plan_singlepoint(
+            h2,
+            FocalSeries(basis),
+            FocalSeries(basis),
+            None,
+            root_id="rhf",
+            correlation_space_id="all-active",
+            backend="cpu_reference",
+        ).steps
+        if r.role == "mp2_f12_correlation"
+    )
+    prov = MolecularFocalProvider(shell_library=shell, budget_mib=512)
+    sources = prov.ucc_equation_sources(req)
+    rng = np.random.default_rng(42)
+    weights = {k: rng.normal(0.0, 0.01, size=v.shape) for k, v in sources.ordinary.items()}
+
+    real_execute = tensor_mod.execute
+    rotation_tir_calls: list[tuple[str, ...]] = []
+
+    def spy_execute(program, inputs, *args, **kwargs):
+        outs = tuple(sorted(program.outputs.keys()))
+        if "rotation_gradient" in outs:
+            rotation_tir_calls.append(outs)
+        return real_execute(program, inputs, *args, **kwargs)
+
+    monkeypatch.setattr(tensor_mod, "execute", spy_execute)
+    grad = ordinary_ucc_source_forces(prov, req, sources, weights)
+    assert rotation_tir_calls == []
+    assert grad.shape == (2, 3) and np.isfinite(grad).all()
