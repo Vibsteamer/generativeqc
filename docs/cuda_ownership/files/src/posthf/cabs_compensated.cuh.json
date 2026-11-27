@@ -1,0 +1,7 @@
+{
+  "path": "src/posthf/cabs_compensated.cuh",
+  "reason": "Provides the two-word FP64 accumulator used by CABS contractions. Rounded sums and fused multiply-add recover low-order residuals independently of the operator being contracted.",
+  "regions": [],
+  "role": "runtime",
+  "subsystem": "molecular_f12"
+}

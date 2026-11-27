@@ -1,0 +1,7 @@
+{
+  "path": "src/posthf/f12/f12_molecular_fock.cuh",
+  "reason": "Compensated construction of the extended Fock matrix combines the DF occupied density, one-electron terms, exchange and orbital transformation.",
+  "regions": [],
+  "role": "scientific",
+  "subsystem": "molecular_f12"
+}

@@ -79,9 +79,24 @@ endif()
 gqc_f12_install(${shell_target} focal_shell_i_${backend})
 
 if(GENERATIVEQC_ENABLE_CUDA)
+  add_library(focal_hf_cabs_response SHARED
+      f12_molecular_metric.cu
+      ../cabs_projector_cuda.cu
+      ../../solver/cuda/symmetric_eigen_handles.cpp
+      ../../solver/cuda/symmetric_eigen_provider.cpp
+      ../../solver/cuda/cholesky_provider.cpp)
+  add_dependencies(focal_hf_cabs_response generativeqc_matrix_function_codegen)
+  target_include_directories(focal_hf_cabs_response PRIVATE
+      "${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/include" "${PROJECT_BINARY_DIR}/generated")
+  if(_generativeqc_cuda_compile_pool)
+    set_property(TARGET focal_hf_cabs_response PROPERTY JOB_POOL_COMPILE "${_generativeqc_cuda_compile_pool}")
+  endif()
   if(GENERATIVEQC_PYTHON_WHEEL)
     generativeqc_attach_cuda_implib(${shell_target})
+    generativeqc_attach_cuda_implib(focal_hf_cabs_response)
   else()
     target_link_libraries(${shell_target} PRIVATE CUDA::cudart CUDA::cublas)
+    target_link_libraries(focal_hf_cabs_response PRIVATE CUDA::cudart CUDA::cublas CUDA::cusolver)
   endif()
+  gqc_f12_install(focal_hf_cabs_response focal_hf_cabs_response)
 endif()

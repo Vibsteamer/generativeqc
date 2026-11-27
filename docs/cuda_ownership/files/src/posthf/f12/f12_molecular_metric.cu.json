@@ -1,0 +1,7 @@
+{
+  "path": "src/posthf/f12/f12_molecular_metric.cu",
+  "reason": "Checks the Coulomb metric spectrum and its full-rank margin. Constructs symmetric inverse square roots from the eigensystem and lower inverse Cholesky factors for F12 fitting from a factorization and triangular solve.",
+  "regions": [],
+  "role": "scientific",
+  "subsystem": "molecular_f12"
+}

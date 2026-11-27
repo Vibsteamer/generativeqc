@@ -1014,6 +1014,7 @@ macro(generativeqc_register_cuda_generated_sources target)
   set(GENERATIVEQC_MATRIX_FUNCTION_HEADER
       "${CMAKE_CURRENT_BINARY_DIR}/generated/generated_symmetric_matrix_function.cuh")
   generativeqc_register_generated_sources(
+    NAME generativeqc_matrix_function_codegen
     TARGET ${target}
     ADD_TO_TARGET
     GENERATOR "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_matrix_function_cuda.py"

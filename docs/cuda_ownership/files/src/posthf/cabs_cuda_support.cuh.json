@@ -1,0 +1,7 @@
+{
+  "path": "src/posthf/cabs_cuda_support.cuh",
+  "reason": "Owns cuBLAS handle lifetime, cuSOLVER status translation, bounded launch geometry and synchronized device flag readback.",
+  "regions": [],
+  "role": "runtime",
+  "subsystem": "molecular_f12"
+}
