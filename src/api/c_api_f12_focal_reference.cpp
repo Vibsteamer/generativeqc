@@ -150,6 +150,7 @@ generativeqc_status focal_df_reference(generativeqc_context* context,
     options.precision_mode = GENERATIVEQC_PRECISION_FP64;
     options.compute_forces = forces;
     options.export_physical_reference = true;
+    options.enforce_orthonormal_uhf_commutator = true;
     auto spec =
         scf::make_hf_fock_spec(spins == 1 ? scf::FockSpin::Restricted : scf::FockSpin::Unrestricted,
                                scf::FockApproximation::DensityFitted);
@@ -205,6 +206,7 @@ generativeqc_status focal_df_reference(generativeqc_context* context,
       auto stage2 = options;
       stage2.compute_forces = false;
       stage2.export_physical_reference = false;
+      stage2.enforce_orthonormal_uhf_commutator = false;
       stage2.strict_initial_density = false;
       stage2.resolved_fock_build = value_build;
       stage2.energy_tolerance = 1e-7;
@@ -418,8 +420,9 @@ generativeqc_status focal_df_reference(generativeqc_context* context,
     };
     auto run_ladder = [&](const scf::PreparedFockPlan& plan) {
       auto st = scf::run_prepared_fock_strategy(plan, options, start);
-      // Recover failed closed-shell primaries in the restricted space.
-      if (spins != 1 || st.converged) return st;
+      // Converged closed-shell primaries return directly. Failed closed-shell
+      // primaries and open-shell references go through the stability search.
+      if (spins == 1 && st.converged) return st;
       return settle(plan, std::move(st));
     };
     const auto strategy = scf::fock_strategy_for_execution(options);

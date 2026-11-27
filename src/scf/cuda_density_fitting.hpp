@@ -567,7 +567,9 @@ generativeqc_status run_cuda_density_fitting_uhf_device_scf(
 
 /** DIIS-enabled overload with a physical overlap and explicitly planned history.
  * Preserves the compatibility overload/ABI, requested iteration limits, and
- * final-state validation. UHF uses one joined-spin history. */
+ * final-state validation. UHF uses one joined-spin history. Opt-in
+ * enforce_orthonormal_uhf_commutator checks max|X^T(FDS-SDF)X| <=
+ * min(density_tolerance, 1e-8) and requires diis_history >= 2. */
 generativeqc_status run_cuda_density_fitting_uhf_device_scf(
     CudaDensityFittingJkPlan* plan, const std::vector<double>& hcore,
     const std::vector<double>& orthogonalizer, const std::vector<double>& initial_alpha_density,
@@ -576,7 +578,8 @@ generativeqc_status run_cuda_density_fitting_uhf_device_scf(
     const std::vector<double>& nuclear_repulsion, unsigned max_iterations, double energy_tolerance,
     double density_tolerance, std::vector<double>& final_alpha_density,
     std::vector<double>& final_beta_density, std::vector<CudaDensityFittingDeviceScfItem>& results,
-    std::string& detail, const std::vector<double>& overlap, unsigned diis_history);
+    std::string& detail, const std::vector<double>& overlap, unsigned diis_history,
+    bool enforce_orthonormal_uhf_commutator = false);
 
 void destroy_cuda_density_fitting_jk_plan(CudaDensityFittingJkPlan* plan) noexcept;
 

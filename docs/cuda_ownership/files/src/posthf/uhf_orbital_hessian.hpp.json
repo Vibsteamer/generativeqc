@@ -1,0 +1,14 @@
+{
+  "path": "src/posthf/uhf_orbital_hessian.hpp",
+  "reason": "Defines host/device views of the two spin factor packs and their occupied-virtual rotation ordering.",
+  "regions": [
+    {
+      "reason": "Evaluates the orbital energy gap, cross-spin Coulomb coupling and same-spin exchange contributions to a real canonical DF-UHF orbital-Hessian matrix element.",
+      "role": "scientific",
+      "start": "GENERATIVEQC_UHF_HD inline double element",
+      "stop": "}  // namespace generativeqc::posthf::uhf_response"
+    }
+  ],
+  "role": "runtime",
+  "subsystem": "molecular_f12"
+}

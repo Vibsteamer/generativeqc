@@ -241,8 +241,15 @@ struct PreparedFockPlan::Impl {
         projection_reservation(projection_reservation_input) {
     validate_resolved_fock_build(strategy);
     if (strategy.backend == FockBackend::Cuda &&
-        needs(strategy.spec, FockApproximation::DensityFitted))
-      cuda_execution::require_cuda_df_spin_domain(system, strategy.spec.spin);
+        needs(strategy.spec, FockApproximation::DensityFitted)) {
+      auto fitted_hf = make_hf_fock_spec(strategy.spec.spin, FockApproximation::DensityFitted);
+      fitted_hf.derivative_order = strategy.spec.derivative_order;
+      const bool full_range_fully_fitted =
+          strategy.spec == fitted_hf && strategy.spec.derivative_order <= 1 &&
+          retained_direct_derivative_order == 0;
+      cuda_execution::require_cuda_df_spin_domain(system, strategy.spec.spin,
+                                                  full_range_fully_fitted);
+    }
     const auto reserved_rank = projection_reservation.restricted_rank;
     if (reserved_rank &&
         (strategy.backend != FockBackend::Cuda || strategy.spec.spin != FockSpin::Restricted ||

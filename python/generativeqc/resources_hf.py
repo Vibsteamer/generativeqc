@@ -178,6 +178,7 @@ def _basis_record(
     *,
     derivative_order: typing.Any = 1,
     library: typing.Any = None,
+    fitted_consumer: str | None = None,
 ) -> typing.Any:
     selected = _snapshot_basis(basis, representation)
     mode = (
@@ -185,16 +186,30 @@ def _basis_record(
         if isinstance(selected, BasisSet)
         else representation or "cartesian"
     )
+    operator = "df_three_center" if fitted_consumer else "eri"
     require_basis(
         selected,
         atoms,
         backend=backend,
-        operator="eri",
+        operator=operator,
+        consumer=fitted_consumer,
         derivative_order=derivative_order,
         representation=mode,
         role=role,
     )
-    shells = selected.shells_for(atoms) if isinstance(selected, BasisSet) else selected
+    if isinstance(selected, BasisSet) and fitted_consumer:
+        shells = selected.shells_for(
+            atoms,
+            backend=backend,
+            operator=operator,
+            derivative_order=derivative_order,
+            role=role,
+            consumer=fitted_consumer,
+        )
+    else:
+        shells = (
+            selected.shells_for(atoms) if isinstance(selected, BasisSet) else selected
+        )
     metadata = resolved_basis_metadata(
         selected,
         shells,
@@ -749,11 +764,28 @@ def hf_resource_request(
     executed_backend = "cpu" if density_fitting in ("cpu", "cpu_reference") else backend
     if density_fitting == "cuda" and backend != "cuda":
         raise ValueError("CUDA DF requires a CUDA backend")
+    # Freeze orbital and auxiliary basis inputs once so single-use shell iterators
+    # or replaceable file paths cannot be exhausted or diverge between preflight and sizing.
+    selected_basis = _snapshot_basis(basis, basis_representation)
+    aux_representation = (
+        None
+        if isinstance(auxiliary_basis, (BasisSet, os.PathLike))
+        or (isinstance(auxiliary_basis, str) and auxiliary_basis.endswith(".json"))
+        else basis_representation
+    )
+    selected_auxiliary = None
+    if fitted and auxiliary_basis is not None:
+        if auxiliary_basis is basis:
+            selected_auxiliary = selected_basis
+        else:
+            selected_auxiliary = _snapshot_basis(auxiliary_basis, aux_representation)
+    selected_aux_representation = (
+        None if isinstance(selected_auxiliary, BasisSet) else basis_representation
+    )
     items = []
     for atoms, charge, multiplicity in zip(
         systems, charges, multiplicities, strict=True
     ):
-        selected_basis = _snapshot_basis(basis, basis_representation)
         electrons = electron_state(
             atoms,
             charge=charge,
@@ -764,15 +796,39 @@ def hf_resource_request(
         )
         if method == "rhf" and multiplicity != 1:
             raise ValueError("RHF requires a closed-shell singlet")
+        fitted_ecp = False
+        fitted_all_electron = (
+            fitted
+            and backend == "cuda"
+            and density_fitting == "cuda"
+            and precision == "fp64"
+            and isinstance(selected_basis, BasisSet)
+            and selected_basis.representation == "spherical"
+            and isinstance(selected_auxiliary, BasisSet)
+            and selected_auxiliary.representation == "spherical"
+            and all(
+                atom.atomic_number in selected_basis.by_element
+                and not selected_basis.by_element[atom.atomic_number].ecp_core_electrons
+                and not selected_basis.by_element[atom.atomic_number].ecp_data
+                and atom.atomic_number in selected_auxiliary.by_element
+                and not selected_auxiliary.by_element[
+                    atom.atomic_number
+                ].ecp_core_electrons
+                and not selected_auxiliary.by_element[atom.atomic_number].ecp_data
+                for atom in atoms
+            )
+        )
+        fitted_g_domain = fitted_ecp or fitted_all_electron
         orbital = _basis_record(
             atoms,
-            basis,
+            selected_basis,
             basis_representation,
             executed_backend,
             charge,
             multiplicity,
             "orbital",
             library=library,
+            fitted_consumer="full_df" if fitted_g_domain else None,
         )
         if max(electrons.nalpha, electrons.nbeta) > orbital["nbf"]:
             raise ValueError(
@@ -780,28 +836,23 @@ def hf_resource_request(
             )
         auxiliary = None
         if fitted:
-            if orbital.get("ecp_terms"):
+            if orbital.get("ecp_terms") and not fitted_ecp:
                 raise NotImplementedError(
                     "ECP density-fitting execution is not yet validated"
                 )
             auxiliary = (
                 orbital
-                if auxiliary_basis is None
+                if selected_auxiliary is None
                 else _basis_record(
                     atoms,
-                    auxiliary_basis,
-                    None
-                    if isinstance(auxiliary_basis, (BasisSet, os.PathLike))
-                    or (
-                        isinstance(auxiliary_basis, str)
-                        and auxiliary_basis.endswith(".json")
-                    )
-                    else basis_representation,
+                    selected_auxiliary,
+                    selected_aux_representation,
                     executed_backend,
                     charge,
                     multiplicity,
                     "auxiliary",
                     library=library,
+                    fitted_consumer="scf_df" if fitted_g_domain else None,
                 )
             )
         items.append(

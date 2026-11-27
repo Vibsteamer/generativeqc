@@ -2316,7 +2316,7 @@ ScfResult run_uhf_density_fitting_cuda_impl(const core::System& system,
                                             const std::vector<double>* initial_density,
                                             initial_guess::OverlapOrthogonalizer* overlap_cache) {
   host_trace::Region endpoint_trace("run_uhf_density_fitting_cuda_impl");
-  cuda_execution::require_cuda_df_spin_domain(system, FockSpin::Unrestricted);
+  cuda_execution::require_cuda_df_spin_domain(system, FockSpin::Unrestricted, true);
   reject_cuda_df_preliminary_guess(options);
   if (options.hooks || options.strict_initial_density)
     throw std::invalid_argument("SCF proposal callbacks require the CPU reference backend");
@@ -2358,7 +2358,8 @@ ScfResult run_uhf_density_fitting_cuda_impl(const core::System& system,
           {static_cast<std::int32_t>(alpha_occupied)}, {static_cast<std::int32_t>(beta_occupied)},
           {data.one_electron.nuclear_repulsion}, options.max_iterations, options.energy_tolerance,
           options.density_tolerance, device_final_alpha, device_final_beta, device_records, detail,
-          data.one_electron.overlap, cuda_df_iteration_diis_history(options));
+          data.one_electron.overlap, cuda_df_iteration_diis_history(options),
+          options.enforce_orthonormal_uhf_commutator);
     });
     runtime::df_progress::number("compact_dispatch_status", device_status);
     // A resource rejection must not trigger an undisclosed host SCF retry.
@@ -2426,8 +2427,24 @@ ScfResult run_uhf_density_fitting_cuda_impl(const core::System& system,
                                                           : std::numeric_limits<double>::infinity();
     result.density_rms =
         density_rms(concatenate(next_alpha, next_beta), concatenate(alpha_density, beta_density));
+    bool commutator_ok = true;
+    if (options.enforce_orthonormal_uhf_commutator) {
+      const auto ortho_max = [&](const Matrix& residual) {
+        const Matrix transformed = reference::multiply(
+            reference::transpose(orthogonalizer, n),
+            reference::multiply(residual, orthogonalizer, n), n);
+        double maximum = 0.0;
+        for (double value : transformed) {
+          if (!std::isfinite(value)) return std::numeric_limits<double>::infinity();
+          maximum = std::max(maximum, std::abs(value));
+        }
+        return maximum;
+      };
+      commutator_ok = std::max(ortho_max(alpha_residual), ortho_max(beta_residual)) <=
+                      options.density_tolerance;
+    }
     if (iteration > 1 && result.energy_change < options.energy_tolerance &&
-        result.density_rms < options.density_tolerance) {
+        result.density_rms < options.density_tolerance && commutator_ok) {
       alpha_density = std::move(next_alpha);
       beta_density = std::move(next_beta);
       result.converged = true;
@@ -3038,7 +3055,7 @@ std::vector<RhfBucketItem> run_uhf_density_fitting_cuda_bucket_impl(
     const std::vector<initial_guess::OverlapOrthogonalizer*>* overlap_caches) {
   host_trace::Region endpoint_trace("run_uhf_density_fitting_cuda_bucket_impl");
   for (const auto& system : systems)
-    cuda_execution::require_cuda_df_spin_domain(system, FockSpin::Unrestricted);
+    cuda_execution::require_cuda_df_spin_domain(system, FockSpin::Unrestricted, true);
   reject_cuda_df_preliminary_guess(options);
   if (overlap_caches && (overlap_caches->size() != systems.size() ||
                          std::any_of(overlap_caches->begin(), overlap_caches->end(),
@@ -3364,7 +3381,7 @@ std::vector<RhfBucketItem> run_uhf_density_fitting_cuda_bucket_impl(
           plan, hcore, orthogonalizer, initial_alpha, initial_beta, alpha_occupied, beta_occupied,
           nuclear, options.max_iterations, options.energy_tolerance, options.density_tolerance,
           device_final_alpha, device_final_beta, device_records, device_detail, overlap,
-          cuda_df_iteration_diis_history(options));
+          cuda_df_iteration_diis_history(options), options.enforce_orthonormal_uhf_commutator);
     });
     if (device_status == GENERATIVEQC_STATUS_OUT_OF_MEMORY) {
       for (const auto source : source_indices) {
@@ -3491,8 +3508,24 @@ std::vector<RhfBucketItem> run_uhf_density_fitting_cuda_bucket_impl(
                                    : std::numeric_limits<double>::infinity();
         result.density_rms = density_rms(concatenate(next_alpha, next_beta),
                                          concatenate(alpha_densities[slot], beta_densities[slot]));
+        bool commutator_ok = true;
+        if (options.enforce_orthonormal_uhf_commutator) {
+          const auto ortho_max = [&](const Matrix& residual) {
+            const Matrix transformed = reference::multiply(
+                reference::transpose(orthogonalizers[slot], nbf),
+                reference::multiply(residual, orthogonalizers[slot], nbf), nbf);
+            double maximum = 0.0;
+            for (double value : transformed) {
+              if (!std::isfinite(value)) return std::numeric_limits<double>::infinity();
+              maximum = std::max(maximum, std::abs(value));
+            }
+            return maximum;
+          };
+          commutator_ok = std::max(ortho_max(alpha_residual), ortho_max(beta_residual)) <=
+                          options.density_tolerance;
+        }
         if (iteration > 1 && result.energy_change < options.energy_tolerance &&
-            result.density_rms < options.density_tolerance) {
+            result.density_rms < options.density_tolerance && commutator_ok) {
           alpha_densities[slot] = std::move(next_alpha);
           beta_densities[slot] = std::move(next_beta);
           result.converged = true;

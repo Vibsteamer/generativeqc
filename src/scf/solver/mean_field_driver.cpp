@@ -605,12 +605,22 @@ ScfResult run_uhf_host_plan(const core::System& system, const ScfOptions& option
   ExactIncrementalDirectJk incremental_jk(plan, options, result.incremental_direct_jk);
   const bool require_residual = options.hooks && options.hooks->propose;
   const bool stabilize = options.stabilize_focal_rhf_convergence;
+  const bool enforce_orthonormal_commutator = options.enforce_orthonormal_uhf_commutator;
   Matrix density_metric_basis;
   const auto overlap_orthogonalizer = [&]() -> const Matrix& {
     if (density_metric_basis.empty())
       density_metric_basis = multiply(ints.overlap, orthogonalizer, n);
     return density_metric_basis;
   };
+  const auto orthonormal_commutator = [&](const Matrix& joined_fock, const Matrix& alpha,
+                                          const Matrix& beta) {
+    const auto [fa, fb] = split_spin_matrices(joined_fock, n * n);
+    return std::max(reference::orthonormal_commutator_max_abs(fa, alpha, orthogonalizer,
+                                                              overlap_orthogonalizer(), n),
+                    reference::orthonormal_commutator_max_abs(fb, beta, orthogonalizer,
+                                                              overlap_orthogonalizer(), n));
+  };
+
   struct UhfState {
     Matrix alpha;
     Matrix beta;
@@ -623,6 +633,8 @@ ScfResult run_uhf_host_plan(const core::System& system, const ScfOptions& option
     double energy{};
     double state_rms{};
     double residual_rms{};
+    /** Joined spin densities of the evaluated state, kept only for H2. */
+    Matrix density;
   };
 
   const ::generativeqc::solver::SelfConsistentPolicy policy{
@@ -666,7 +678,10 @@ ScfResult run_uhf_host_plan(const core::System& system, const ScfOptions& option
             std::abs(energy - result.energy) < options.energy_tolerance &&
             std::max(congruence_rms(alpha_residual, orthogonalizer, n),
                      congruence_rms(beta_residual, orthogonalizer, n)) <
-                options.density_tolerance) {
+                options.density_tolerance &&
+            (!enforce_orthonormal_commutator ||
+             orthonormal_commutator(physical_fock, state.alpha, state.beta) <=
+                 options.density_tolerance)) {
           Matrix da(diag_alpha.size()), db(diag_beta.size());
           for (std::size_t i = 0; i < da.size(); ++i) {
             da[i] = diag_alpha[i] - state.alpha[i];
@@ -699,7 +714,10 @@ ScfResult run_uhf_host_plan(const core::System& system, const ScfOptions& option
                              std::move(next_beta),
                              energy,
                              state_rms,
-                             physical_residual_rms};
+                             physical_residual_rms,
+                             enforce_orthonormal_commutator
+                                 ? concatenate(state.alpha, state.beta)
+                                 : Matrix{}};
       },
       [&](const UhfState& state, UhfEvaluation evaluation,
           const ::generativeqc::solver::SelfConsistentProgress& progress) {
@@ -736,15 +754,27 @@ ScfResult run_uhf_host_plan(const core::System& system, const ScfOptions& option
         // to the bounded final selector. Refine under the same SCF budget
         // until its existing physical commutator ceiling can pass; the full
         // canonical/fixed-point proof remains owned by finalization.
+        // Opt-in focal UHF solves (e.g. focal DF-UHF on diffuse QZ bases)
+        // can have AO-basis max|FDS-SDF| and whitened RMS below
+        // density_tolerance while max|X^T(FDS-SDF)X| is still O(1e-8), leaking
+        // non-variational error into MP2-F12. When explicitly requested via
+        // enforce_orthonormal_uhf_commutator, also require the orthonormal
+        // max-abs orbital gradient <= density_tolerance.
         const double raw_max = reference::residual_max_abs(evaluation.physical_residual);
         const bool raw_ok = raw_max <= std::min(1e-8, options.density_tolerance);
         if (!raw_ok && (!stabilize || raw_max > 1e-8)) return false;
-        if (raw_ok) return true;
+        if (raw_ok && !enforce_orthonormal_commutator) return true;
         const auto [a_res, b_res] = split_spin_matrices(evaluation.physical_residual, n * n);
         if (!raw_ok && std::max(congruence_rms(a_res, orthogonalizer, n),
                                 congruence_rms(b_res, orthogonalizer, n)) >
                            options.density_tolerance) {
           return false;
+        }
+        if (enforce_orthonormal_commutator) {
+          const auto [alpha, beta] = split_spin_matrices(evaluation.density, n * n);
+          if (orthonormal_commutator(evaluation.physical_fock, alpha, beta) >
+              options.density_tolerance)
+            return false;
         }
         return true;
       });

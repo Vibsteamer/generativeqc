@@ -1955,7 +1955,7 @@ class Calculator:
             "df_metric"
             if auxiliary
             else "df_three_center"
-            if self._full_df_basis_consumer("df_three_center")
+            if self._full_df_basis_consumer("df_three_center", atoms=atoms)
             else "eri"
         )
         require_basis(
@@ -1970,7 +1970,7 @@ class Calculator:
             else self._representation_name,
             consumer=self._auxiliary_basis_consumer(selected_operator, derivative_order)
             if auxiliary
-            else self._full_df_basis_consumer(selected_operator, derivative_order),
+            else self._full_df_basis_consumer(selected_operator, derivative_order, atoms=atoms),
         )
         return selected_basis
 
@@ -1991,7 +1991,7 @@ class Calculator:
             "df_metric"
             if auxiliary
             else "df_three_center"
-            if self._full_df_basis_consumer("df_three_center")
+            if self._full_df_basis_consumer("df_three_center", atoms=atoms)
             else "eri"
         )
         return (
@@ -2007,7 +2007,7 @@ class Calculator:
                     selected_operator, derivative_order
                 )
                 if auxiliary
-                else self._full_df_basis_consumer(selected_operator, derivative_order),
+                else self._full_df_basis_consumer(selected_operator, derivative_order, atoms=atoms),
             )
             if isinstance(selected_basis, BasisSet)
             else tuple(selected_basis)
@@ -2021,9 +2021,21 @@ class Calculator:
         return self._device_name
 
     def _full_df_basis_consumer(
-        self, operator: str, derivative_order: int = 0
+        self,
+        operator: str,
+        derivative_order: int = 0,
+        *,
+        atoms: Sequence[Atom] | None = None,
     ) -> str | None:
-        """Admit only the closed-shell Coulomb full-DF operator closure, not ERIs."""
+        """Select value and gradient operators provided by the CUDA fitted Fock source."""
+        if (
+            atoms is not None
+            and derivative_order in (0, 1)
+            and operator
+            in ("overlap", "kinetic", "nuclear_attraction", "df_three_center")
+        ):
+            if self._fitted_all_electron_hf(self._basis, atoms):
+                return "full_df"
         if (
             self._device_name == "cuda"
             and self._density_fitting_mode == _native.DENSITY_FITTING_FULL_CUDA
@@ -2383,7 +2395,7 @@ class Calculator:
         derivative_orders = (0, 1) if compute_forces else (0,)
         auxiliary_backend = self._density_fitting_backend()
         orbital_operators = ["overlap", "kinetic", "nuclear_attraction"]
-        if not self._full_df_basis_consumer("df_three_center"):
+        if not self._full_df_basis_consumer("df_three_center", atoms=atoms):
             orbital_operators.append("eri")
         if self._auxiliary_basis is not None:
             orbital_operators.append("df_three_center")
@@ -2422,7 +2434,7 @@ class Calculator:
                             else self._representation_name,
                             consumer=self._auxiliary_basis_consumer(operator, order)
                             if role == "auxiliary"
-                            else self._full_df_basis_consumer(operator, order),
+                            else self._full_df_basis_consumer(operator, order, atoms=atoms),
                         )
                     )
         reasons = [reason for check in checks for reason in check["reasons"]]
@@ -2450,6 +2462,35 @@ class Calculator:
         report = self.basis_capability_report(atoms, compute_forces=compute_forces)
         if not report["eligible"]:
             raise NotImplementedError("; ".join(report["reasons"]))
+
+    def _fitted_all_electron_hf(
+        self, basis: typing.Any, atoms: Sequence[Atom]
+    ) -> bool:
+        """All-electron real-spherical CUDA FP64 DF-RHF/UHF orbital-g domain."""
+        if (
+            self._method not in (_native.METHOD_RHF, _native.METHOD_UHF)
+            or self._device_name != "cuda"
+            or self._density_fitting_mode != _native.DENSITY_FITTING_CUDA
+            or getattr(self, "_precision_mode", None) != _native.PRECISION_FP64
+            or not isinstance(basis, BasisSet)
+            or basis.representation != "spherical"
+            or not isinstance(self._auxiliary_basis, BasisSet)
+            or self._auxiliary_basis.representation != "spherical"
+        ):
+            return False
+        for atom in atoms:
+            orb_el = basis.by_element.get(atom.atomic_number)
+            aux_el = self._auxiliary_basis.by_element.get(atom.atomic_number)
+            if (
+                orb_el is None
+                or aux_el is None
+                or orb_el.ecp_core_electrons
+                or orb_el.ecp_data
+                or aux_el.ecp_core_electrons
+                or aux_el.ecp_data
+            ):
+                return False
+        return True
 
     def _create_native_system(
         self,

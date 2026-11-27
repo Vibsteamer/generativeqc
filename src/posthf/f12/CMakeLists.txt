@@ -88,7 +88,7 @@ gqc_f12_install(${shell_target} focal_shell_i_${backend})
 if(GENERATIVEQC_ENABLE_CUDA)
   add_library(focal_hf_cabs_response SHARED
       f12_molecular_metric.cu
-      ../cabs_projector_cuda.cu ../cabs_singles_cuda.cu
+      ../cabs_projector_cuda.cu ../cabs_singles_cuda.cu ../uhf_orbital_adjoint_cuda.cu
       ../../solver/cuda/symmetric_eigen_handles.cpp
       ../../solver/cuda/symmetric_eigen_provider.cpp
       ../../solver/cuda/cholesky_provider.cpp)
