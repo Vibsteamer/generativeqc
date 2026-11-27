@@ -19,6 +19,42 @@ std::unique_ptr<PreparedCalculation> prepare_df_rccsdt_calculation(
     const Capabilities&, core::ContextState&, const core::System&,
     const generativeqc_method_descriptor&, const core::System* auxiliary_basis = nullptr);
 
+struct FocalRccTriplesOptions {
+  bool forces{};
+  bool occupied_partition{};
+  std::size_t frozen_occupied{};
+  std::vector<double> occupied_weights;
+  core::DfPreconvergence preconvergence{core::DfPreconvergence::Legacy};
+  bool triples_fp32_w{};
+  bool triples_compensated_w{};
+  bool require_common_fit_all_electron{};
+};
+
+struct FocalRccTriplesValues {
+  double energy{};
+  std::vector<double> occupied;
+  std::vector<double> correlation_gradient, bar_f, bar_c;
+  bool ccsd_fp32_executed{}, lambda_fp32_executed{};
+  bool triples_fp32_w_executed{}, triples_fp32_w_resource_fallback{};
+  bool triples_fp32_w_forward_executed{}, triples_fp32_w_reverse_executed{};
+  bool triples_reverse_w_executed{}, triples_compensated_w_executed{};
+  std::size_t triples_fp32_forward_gemms{}, triples_fp32_reverse_gemms{}, triples_workspace_bytes{};
+  std::size_t triples_fp32_gemms{}, triples_fp64_gemms{};
+  double ccsd_seconds{}, triples_seconds{}, lambda_seconds{}, source_response_seconds{};
+};
+
+FocalRccTriplesValues focal_rcc_triples_values(
+    PreparedCalculation&, const std::shared_ptr<const hf::PhysicalReference>&,
+    const molecule::ScalarHamiltonianIdentity& orbital,
+    const molecule::ScalarHamiltonianIdentity& jk, std::size_t retained_reference_bytes,
+    bool occupied_partition);
+
+FocalRccTriplesValues focal_rcc_triples_values(
+    PreparedCalculation&, const std::shared_ptr<const hf::PhysicalReference>&,
+    const molecule::ScalarHamiltonianIdentity& orbital,
+    const molecule::ScalarHamiltonianIdentity& jk, std::size_t retained_reference_bytes,
+    const FocalRccTriplesOptions& options);
+
 struct FocalRccF12bOptions {
   bool forces{};
   std::size_t frozen_occupied{};

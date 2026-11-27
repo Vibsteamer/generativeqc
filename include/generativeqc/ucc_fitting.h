@@ -27,6 +27,28 @@ GENERATIVEQC_API generativeqc_status generativeqc_focal_df_reference_owned_v1(
     generativeqc_focal_reference** owner);
 GENERATIVEQC_API void generativeqc_focal_reference_destroy_v1(generativeqc_focal_reference* owner);
 
+/** Use a fresh full-DF UCCSD(T) plan with the retained determinant.
+ * Output is the (T) energy followed by optional analytic Cartesian forces.
+ * The two force Lagrangians use the same converged conventional amplitudes. */
+GENERATIVEQC_API generativeqc_status generativeqc_focal_ucc_triples_v1(
+    generativeqc_calculation* calculation, const generativeqc_focal_reference* owner, int forces,
+    double* output, size_t count);
+
+/** Return the spatial DF-RCCSD(T) increment on the retained canonical RHF root.
+ * Requires CUDA, an all-electron full-DF plan and one common JK/correlation fit.
+ * This entry computes only the scalar conventional (T) energy. */
+GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_energy_v1(
+    generativeqc_calculation* calculation, const generativeqc_focal_reference* owner,
+    double* output);
+
+/** Return the same value-only (T) energy followed by one contribution for
+ * each spatial occupied orbital, in the retained RHF canonical order.
+ * Count must be exactly one plus the number of occupied spatial orbitals.
+ * Requires CUDA, an all-electron full-DF plan and one common JK/correlation fit. */
+GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_occupied_v1(
+    generativeqc_calculation* calculation, const generativeqc_focal_reference* owner,
+    double* output, size_t count);
+
 /** Returns 1 when the build supports native CUDA fixed-cusp preparation and RHS stage
  * counters, and 0 for a host-only build. This probe does not access a CUDA device. */
 GENERATIVEQC_API int generativeqc_focal_rcc_f12b_cuda_stage_counters_v1(void);

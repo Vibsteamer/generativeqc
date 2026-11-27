@@ -118,6 +118,36 @@ class DfRccsdtPrepared final : public PreparedCalculation {
     return execute_group(compute_forces, companions);
   }
 
+  FocalRccTriplesValues triples_on_reference(
+      const std::shared_ptr<const hf::PhysicalReference>& retained,
+      const molecule::ScalarHamiltonianIdentity& orbital,
+      const molecule::ScalarHamiltonianIdentity& jk, std::size_t retained_bytes,
+      const FocalRccTriplesOptions& options) {
+    if (!full_df_reference_ || descriptor_.method != GENERATIVEQC_METHOD_DF_RCCSD_T ||
+        !orbital.matches(system_))
+      throw std::invalid_argument(
+          "focal spatial triples requires a matching full-DF CUDA RHF determinant");
+    if (options.require_common_fit_all_electron) {
+      const bool has_ecp =
+          !system_.ecp_terms.empty() ||
+          std::any_of(system_.atoms.begin(), system_.atoms.end(),
+                      [](const auto& a) { return a.ecp_core > 0; });
+      if (has_ecp)
+        throw std::invalid_argument(
+            "focal spatial triples v1 requires an all-electron system; use v2 for scalar ECP");
+      if (!jk.matches(auxiliary_))
+        throw std::invalid_argument(
+            "focal spatial triples v1 requires a common JK and correlation fit; use v2 for split "
+            "fits");
+    }
+    if (!retained)
+      throw MethodError(GENERATIVEQC_STATUS_NOT_IMPLEMENTED,
+                        "focal spatial triples requires a retained RHF snapshot");
+    FocalRccTriplesValues triples;
+    execute_group(options.forces, 0, retained, retained_bytes, &triples, options);
+    return triples;
+  }
+
   FocalRccF12bValues f12b_on_reference(
       const std::shared_ptr<const hf::PhysicalReference>& retained,
       const molecule::ScalarHamiltonianIdentity& orbital,
@@ -182,18 +212,35 @@ class DfRccsdtPrepared final : public PreparedCalculation {
 #endif
   }
 
-  Result execute_group(bool compute_forces, unsigned companions) {
+  Result execute_group(bool compute_forces, unsigned companions,
+                       const std::shared_ptr<const hf::PhysicalReference>& retained = {},
+                       std::size_t retained_bytes = 0, FocalRccTriplesValues* triples = nullptr,
+                       const FocalRccTriplesOptions& options = {}) {
     std::lock_guard<std::mutex> lock(mutex_);
     last_correlation_.reset();
     last_performance_.reset();
 #if GENERATIVEQC_HAS_CUDA
+    const auto active_preconv =
+        triples ? options.preconvergence : preconvergence_;
+    DFCorrelationDemand demand{
+        .mp2 = descriptor_.method == GENERATIVEQC_METHOD_MP2,
+        .companions = companions,
+        .df_reference = full_df_reference_,
+        .triples_occupied_partition = triples ? options.occupied_partition : false,
+        .retained_reference = retained,
+        .retained_reference_bytes = retained_bytes,
+        .frozen_occupied = triples ? options.frozen_occupied : 0,
+        .triples_occupied_weights = triples ? options.occupied_weights : std::vector<double>{},
+        .focal_triples_sources = triples != nullptr && compute_forces,
+        .triples_fp32_w = triples && (options.triples_fp32_w || options.triples_compensated_w),
+        .triples_compensated_w = triples && options.triples_compensated_w,
+    };
     auto native =
         companions || descriptor_.method == GENERATIVEQC_METHOD_MP2 || full_df_reference_ ||
-                convergence_.relaxed() || preconvergence_ != core::DfPreconvergence::Legacy
-            ? run_df_correlation_group_native(
-                  execution_, system_, auxiliary_, descriptor_, compute_forces,
-                  {descriptor_.method == GENERATIVEQC_METHOD_MP2, companions, full_df_reference_},
-                  convergence_, preconvergence_)
+                convergence_.relaxed() || active_preconv != core::DfPreconvergence::Legacy
+            ? run_df_correlation_group_native(execution_, system_, auxiliary_, descriptor_,
+                                              compute_forces, std::move(demand), convergence_,
+                                              active_preconv)
             : run_df_ccsdt_native(execution_, system_, auxiliary_, descriptor_, compute_forces);
     native.primal.triples_seconds = native.triples_seconds;
     // Publish detached response work only after the entire endpoint succeeds.
@@ -220,8 +267,36 @@ class DfRccsdtPrepared final : public PreparedCalculation {
     }
     last_correlation_ = native.correlation;
     last_performance_ = native.primal;
+    if (triples) {
+      triples->energy = native.correlation.ccsd_t_triples_energy;
+      triples->occupied = std::move(native.triples.occupied_energies);
+      triples->correlation_gradient = std::move(native.correlation_gradient);
+      triples->bar_f = std::move(native.bar_f);
+      triples->bar_c = std::move(native.bar_c);
+      triples->ccsd_fp32_executed = native.primal.ccsd_fp32_executed != 0;
+      triples->lambda_fp32_executed = native.primal.lambda_fp32_executed != 0;
+      triples->triples_fp32_w_executed = native.triples.triples_fp32_w_executed();
+      triples->triples_fp32_w_forward_executed = native.triples.triples_fp32_w_forward_executed();
+      triples->triples_fp32_w_reverse_executed = native.triples.triples_fp32_w_reverse_executed();
+      triples->triples_reverse_w_executed = native.triples.reverse_w_executed;
+      triples->triples_compensated_w_executed = native.triples.compensated_fp32_w_executed;
+      triples->triples_fp32_forward_gemms = native.triples.fp32_forward_gemms;
+      triples->triples_fp32_reverse_gemms = native.triples.fp32_reverse_gemms;
+      triples->triples_workspace_bytes = native.triples.workspace_bytes;
+      triples->triples_fp32_w_resource_fallback = native.triples.resource_fallback;
+      triples->triples_fp32_gemms = native.triples.fp32_gemms;
+      triples->triples_fp64_gemms = native.triples.fp64_gemms;
+      triples->ccsd_seconds = native.primal.solver_seconds;
+      triples->triples_seconds = native.triples_seconds;
+      triples->lambda_seconds = native.lambda_seconds;
+      triples->source_response_seconds = native.source_response_seconds;
+    }
     return std::move(native.method_result);
 #else
+    (void)retained;
+    (void)retained_bytes;
+    (void)triples;
+    (void)options;
     throw MethodError(GENERATIVEQC_STATUS_NOT_IMPLEMENTED,
                       "public DF-RCCSD(T) requires a CUDA-enabled build");
 #endif
@@ -242,6 +317,27 @@ class DfRccsdtPrepared final : public PreparedCalculation {
 };
 
 }  // namespace
+
+FocalRccTriplesValues focal_rcc_triples_values(
+    PreparedCalculation& plan, const std::shared_ptr<const hf::PhysicalReference>& retained,
+    const molecule::ScalarHamiltonianIdentity& orbital,
+    const molecule::ScalarHamiltonianIdentity& jk, std::size_t retained_reference_bytes,
+    bool occupied_partition) {
+  FocalRccTriplesOptions options;
+  options.occupied_partition = occupied_partition;
+  options.require_common_fit_all_electron = true;
+  return focal_rcc_triples_values(plan, retained, orbital, jk, retained_reference_bytes, options);
+}
+
+FocalRccTriplesValues focal_rcc_triples_values(
+    PreparedCalculation& plan, const std::shared_ptr<const hf::PhysicalReference>& retained,
+    const molecule::ScalarHamiltonianIdentity& orbital,
+    const molecule::ScalarHamiltonianIdentity& jk, std::size_t retained_reference_bytes,
+    const FocalRccTriplesOptions& options) {
+  auto* cc = dynamic_cast<DfRccsdtPrepared*>(&plan);
+  if (!cc) throw std::invalid_argument("focal spatial triples requires a native DF-RCCSD(T) plan");
+  return cc->triples_on_reference(retained, orbital, jk, retained_reference_bytes, options);
+}
 
 FocalRccF12bValues focal_rcc_f12b_values(
     PreparedCalculation& plan, const std::shared_ptr<const hf::PhysicalReference>& retained,

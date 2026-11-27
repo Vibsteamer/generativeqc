@@ -109,6 +109,19 @@ class FocalUCCSDResult:
     stationary: FocalUCCStationary
 
 
+@dataclass(frozen=True)
+class FocalTriplesEvaluation:
+    """One triples increment with its own force, complementary-space rank, and solver provenance."""
+
+    energy: float
+    forces: np.ndarray | None
+    cabs_rank: int | None = None
+    executed_backend: str | None = None
+    converged: bool | None = None
+    triples_model_id: str | None = None
+    telemetry: dict[str, object] = field(default_factory=dict)
+
+
 _UHF_CC_BACKEND_ENV = "GENERATIVEQC_F12_UHF_CC_BACKEND"
 
 
@@ -278,6 +291,10 @@ class MolecularFocalProvider:
     canonical_library: ctypes.CDLL | None = None
     run: Callable | None = None
     high_order: Callable[[FocalRequest], FocalEvaluation] | None = None
+    # One model owner call for all triples variants on a common basis and root.
+    # The owner may reuse matching CC and DF state and must return role-keyed
+    # increments with exactly the requested derivative scope.
+    triples_models: Callable[..., dict[str, FocalTriplesEvaluation]] | None = None
     relative_cutoff: float = 1e-9
     budget_mib: int = 1536
     preconvergence: str = "auto"
@@ -302,7 +319,55 @@ class MolecularFocalProvider:
     def __post_init__(self) -> None:
         slater_normalization_code(self.slater_normalization)
         object.__setattr__(self, "_pair_source_cache", {})
+        if (
+            (self.triples_models is None and self.high_order is None)
+            or self.triples_models is MolecularFocalProvider.default_triples_models
+            or getattr(self.triples_models, "__func__", None)
+            is MolecularFocalProvider.default_triples_models
+        ):
+            object.__setattr__(self, "triples_models", self.default_triples_models)
 
+
+    def default_triples_models(
+        self,
+        requests: tuple[FocalRequest, ...],
+        *,
+        reference: FocalReference,
+        low_order: FocalLowOrderEnergy | FocalLowOrderForces | None,
+        forces: bool,
+        expected_cabs_rank: int | None,
+    ) -> dict[str, FocalTriplesEvaluation]:
+        """Evaluate the selected increments on the supplied molecular determinant."""
+        by_role = {r.role: r for r in requests}
+        results: dict[str, FocalTriplesEvaluation] = {}
+        if "triples" in by_role:
+            conv_req = by_role["triples"]
+            telemetry = {}
+            if forces:
+                conv_e, conv_f = self.triples_energy_and_forces(
+                    conv_req, reference=reference, telemetry=telemetry
+                )
+                results["triples"] = FocalTriplesEvaluation(
+                    conv_e,
+                    conv_f,
+                    None,
+                    executed_backend=reference.executed_backend,
+                    converged=True,
+                    triples_model_id=f"conventional_{conv_req.root_id}",
+                    telemetry=telemetry,
+                )
+            else:
+                conv_e = self.triples_energy(conv_req, reference=reference, telemetry=telemetry)
+                results["triples"] = FocalTriplesEvaluation(
+                    conv_e,
+                    None,
+                    None,
+                    executed_backend=reference.executed_backend,
+                    converged=True,
+                    triples_model_id=f"conventional_{conv_req.root_id}",
+                    telemetry=telemetry,
+                )
+        return results
 
     def _seed_options(self, request: FocalRequest) -> dict[str, FocalReferenceSeed]:
         if self.reference_seed is None:
@@ -332,6 +397,7 @@ class MolecularFocalProvider:
         preconvergence: str = "auto",
         use_native_uhf_f12b: bool = True,
         high_order: Callable[[FocalRequest], FocalEvaluation] | None = None,
+        triples_models: Callable[..., dict[str, FocalTriplesEvaluation]] | None = None,
         record_graph: Callable[[dict], None] | None = None,
         lambda_options: UCCSDLambdaOptions | None = None,
         rhf_df_ladder: RHFDFLadderOptions | None = None,
@@ -383,6 +449,7 @@ class MolecularFocalProvider:
             preconvergence=preconvergence,
             use_native_uhf_f12b=use_native_uhf_f12b,
             high_order=high_order,
+            triples_models=triples_models,
             lambda_options=lambda_options,
             rhf_df_ladder=rhf_df_ladder,
             uhf_df_ladder=uhf_df_ladder,
@@ -860,6 +927,53 @@ class MolecularFocalProvider:
             ordinary + fixed - low_order.mp2_f12_correlation_forces,
         )
 
+    def triples_energy(
+        self, request: FocalRequest, *, reference: FocalReference, telemetry: TriplesTelemetry | None = None
+    ) -> float:
+        """Conventional triples on the supplied canonical determinant in Eh."""
+        from ._f12_focal_ucc_triples import molecular_triples_on_reference
+
+        extra: dict[str, object] = {}
+        if telemetry is not None:
+            extra["telemetry"] = telemetry
+        if self.preconvergence != "auto":
+            extra["preconvergence"] = self.preconvergence
+        return molecular_triples_on_reference(
+            request,
+            reference,
+            budget_mib=self.budget_mib,
+            forces=False,
+            provider=self,
+            **extra,
+        )[0]
+
+    def triples_energy_and_forces(
+        self,
+        request: FocalRequest,
+        *,
+        reference: FocalReference,
+        telemetry: TriplesTelemetry | None = None,
+    ) -> tuple[float, np.ndarray]:
+        """Conventional triples and its analytic Cartesian forces on a shared root.
+
+        """
+        from ._f12_focal_ucc_triples import molecular_triples_on_reference
+
+        extra: dict[str, object] = {}
+        if telemetry is not None:
+            extra["telemetry"] = telemetry
+        if self.preconvergence != "auto":
+            extra["preconvergence"] = self.preconvergence
+        energy, forces = molecular_triples_on_reference(
+            request,
+            reference,
+            budget_mib=self.budget_mib,
+            forces=True,
+            provider=self,
+            **extra,
+        )
+        assert forces is not None
+        return energy, forces
 
     def ucc_ordinary_source_forces(
         self, request: FocalRequest, solution: FocalUCCStationary

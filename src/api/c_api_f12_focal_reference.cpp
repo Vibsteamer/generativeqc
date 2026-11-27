@@ -18,6 +18,7 @@
 #include "generated_rccsd_cpu.hpp"
 #include "generativeqc/ucc_fitting.h"
 #include "methods/df_rccsdt_method.hpp"
+#include "methods/uccsd_method.hpp"
 #include "molecule/basis.hpp"
 #include "posthf/capacity.hpp"
 #include "runtime/bounded_workspace.hpp"
@@ -535,6 +536,122 @@ extern "C" generativeqc_status generativeqc_focal_df_reference_owned_v1(
 
 extern "C" void generativeqc_focal_reference_destroy_v1(generativeqc_focal_reference* owner) {
   delete owner;
+}
+
+extern "C" generativeqc_status generativeqc_focal_ucc_triples_v1(
+    generativeqc_calculation* calculation, const generativeqc_focal_reference* owner, int forces,
+    double* output, std::size_t count) {
+  if (!calculation || !calculation->context || !owner || !output || (forces != 0 && forces != 1))
+    return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
+  auto* context = calculation->context;
+  std::lock_guard lock(context->mutex);
+  try {
+    using namespace generativeqc;
+    runtime::df_progress::Scope trace(
+        "focal_ucc_triples", context->state.executed_backend == core::kCudaBackend ? "cuda" : "host");
+    if (owner->backend != context->state.executed_backend ||
+        owner->device != context->state.device_id ||
+        count != 1 + (forces ? 3 * calculation->plan->atom_count() : 0))
+      throw std::invalid_argument("inconsistent focal triples output or backend");
+    const auto result = generativeqc::methods::detail::focal_ucc_triples(
+        *calculation->plan, owner->uhf, owner->jk, false, forces);
+    if (!std::isfinite(result.energy) || result.forces.size() + 1 != count ||
+        !std::all_of(result.forces.begin(), result.forces.end(),
+                     [](double x) { return std::isfinite(x); }))
+      throw std::runtime_error("invalid focal triples result");
+    output[0] = result.energy;
+    std::copy(result.forces.begin(), result.forces.end(), output + 1);
+    trace.finish();
+    return GENERATIVEQC_STATUS_SUCCESS;
+  } catch (const std::length_error& error) {
+    record_oom_detail_noalloc(context->last_detail, error.what());
+    return GENERATIVEQC_STATUS_OUT_OF_MEMORY;
+  } catch (const std::bad_alloc& error) {
+    record_oom_detail_noalloc(context->last_detail, error.what());
+    return GENERATIVEQC_STATUS_OUT_OF_MEMORY;
+  } catch (...) {
+    return generativeqc::api::map_exception(&context->last_detail);
+  }
+}
+
+namespace {
+generativeqc_status focal_rcc_triples_values(
+    generativeqc_calculation* calculation, const generativeqc_focal_reference* owner,
+    double* output, std::size_t count, bool occupied_partition) {
+  if (!calculation || !calculation->context || !owner || !output)
+    return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
+  auto* context = calculation->context;
+  std::lock_guard lock(context->mutex);
+  try {
+    using namespace generativeqc;
+    runtime::df_progress::Scope trace(
+        occupied_partition ? "focal_rcc_triples_occupied" : "focal_rcc_triples_energy", "cuda");
+    if (!owner->uhf || !owner->uhf->source_identity ||
+        owner->backend != core::kCudaBackend || owner->backend != context->state.executed_backend ||
+        owner->device != context->state.device_id)
+      throw std::invalid_argument("focal spatial triples requires a retained CUDA RHF owner");
+    // The spatial source accounts for the RHF frame itself. Its existing
+    // spin-expanded focal view and identity records also remain live.
+    const auto& expanded = *owner->uhf;
+    const auto occupied_count = occupied_partition ? expanded.nocc[0] : 0;
+    if (count != runtime::size_add(1, occupied_count))
+      throw std::invalid_argument("focal spatial triples output has the wrong occupied dimension");
+    auto retained = runtime::size_add(owner->jk.storage_bytes(),
+                                     expanded.source_identity->storage_bytes());
+    auto charge = [&](const std::vector<double>& values) {
+      retained = runtime::size_add(retained, runtime::size_mul(values.capacity(), sizeof(double)));
+    };
+    charge(expanded.overlap);
+    charge(expanded.hcore);
+    for (std::size_t spin = 0; spin < 2; ++spin) {
+      charge(expanded.coefficients[spin]);
+      charge(expanded.density[spin]);
+      charge(expanded.fock[spin]);
+      charge(expanded.orbital_energies[spin]);
+    }
+    const auto result = methods::detail::focal_rcc_triples_values(
+        *calculation->plan, owner->rhf, *expanded.source_identity, owner->jk, retained,
+        occupied_partition);
+    if (!std::isfinite(result.energy) || result.occupied.size() != occupied_count)
+      throw std::runtime_error("invalid focal spatial triples result");
+    if (occupied_partition) {
+      long double total = 0, magnitude = 0;
+      for (const auto value : result.occupied) {
+        if (!std::isfinite(value))
+          throw std::runtime_error("nonfinite focal spatial occupied triples contribution");
+        total += value;
+        magnitude += std::abs(static_cast<long double>(value));
+      }
+      if (!std::isfinite(total) || !std::isfinite(magnitude) ||
+          std::abs(total - result.energy) > 3e-12L * (1 + magnitude))
+        throw std::runtime_error("focal spatial occupied triples do not close to their scalar");
+      std::copy(result.occupied.begin(), result.occupied.end(), output + 1);
+    }
+    *output = result.energy;
+    trace.finish();
+    return GENERATIVEQC_STATUS_SUCCESS;
+  } catch (const std::length_error& error) {
+    record_oom_detail_noalloc(context->last_detail, error.what());
+    return GENERATIVEQC_STATUS_OUT_OF_MEMORY;
+  } catch (const std::bad_alloc& error) {
+    record_oom_detail_noalloc(context->last_detail, error.what());
+    return GENERATIVEQC_STATUS_OUT_OF_MEMORY;
+  } catch (...) {
+    return generativeqc::api::map_exception(&context->last_detail);
+  }
+}
+}  // namespace
+
+extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_energy_v1(
+    generativeqc_calculation* calculation, const generativeqc_focal_reference* owner,
+    double* output) {
+  return focal_rcc_triples_values(calculation, owner, output, 1, false);
+}
+
+extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_occupied_v1(
+    generativeqc_calculation* calculation, const generativeqc_focal_reference* owner,
+    double* output, std::size_t count) {
+  return focal_rcc_triples_values(calculation, owner, output, count, true);
 }
 
 extern "C" GENERATIVEQC_API int generativeqc_focal_rcc_f12b_cuda_stage_counters_v1(void) {
