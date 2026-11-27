@@ -987,6 +987,234 @@ extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_ucc_triples_v
   }
 }
 
+extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_ucc_f12b_v1(
+    generativeqc_context* context, const generativeqc_system* orbital,
+    const generativeqc_system* correlation_fit, const generativeqc_focal_reference* owner,
+    std::size_t budget_bytes, int forces, std::size_t frozen_alpha, std::size_t frozen_beta,
+    std::uint32_t preconvergence, const generativeqc_focal_ucc_f12_coupling_v1* coupling,
+    double* ccsd_f12b_energy_out, generativeqc_focal_ucc_f12_cotangents_v1* cotangents_out,
+    double* corr_gradient_out, std::size_t corr_gradient_count, double* bar_f_alpha_out,
+    std::size_t bar_f_alpha_count, double* bar_f_beta_out, std::size_t bar_f_beta_count,
+    double* bar_c_alpha_out, std::size_t bar_c_alpha_count, double* bar_c_beta_out,
+    std::size_t bar_c_beta_count, double* telemetry_out, std::size_t telemetry_count) {
+  if (!context || !orbital || !correlation_fit || !owner || !coupling || !ccsd_f12b_energy_out ||
+      (forces != 0 && forces != 1) || preconvergence > 3)
+    return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
+  std::lock_guard lock(context->mutex);
+  try {
+    using namespace generativeqc;
+    const auto backend = context->state.executed_backend;
+    if (backend != context->state.requested_backend ||
+        (backend != core::kCudaBackend && backend != core::kCpuReferenceBackend))
+      throw std::invalid_argument("focal UCC-F12b v1 requires an explicit CPU or CUDA context");
+    const bool cuda = backend == core::kCudaBackend;
+    runtime::df_progress::Scope trace(
+        forces ? "focal_ucc_f12b_force_sources_v1" : "focal_ucc_f12b_energy_v1",
+        cuda ? "cuda" : "host");
+    if (!owner->uhf || !owner->uhf->source_identity ||
+        owner->backend != static_cast<generativeqc_backend>(backend) ||
+        owner->device != context->state.device_id)
+      throw std::invalid_argument(
+          "focal UCC-F12b v1 requires a matching retained DF reference owner");
+    if (orbital->ks_auxiliary || orbital->correlation_auxiliary || orbital->scf_auxiliary ||
+        correlation_fit->ks_auxiliary || correlation_fit->scf_auxiliary)
+      throw std::invalid_argument(
+          "focal UCC-F12b v1 requires normalized orbital and correlation-fit system handles");
+    const auto& sys = orbital->data;
+    const auto& aux = correlation_fit->data;
+    if (sys.basis_representation != core::kSphericalBasis ||
+        aux.basis_representation != core::kSphericalBasis)
+      throw std::invalid_argument(
+          "focal UCC-F12b v1 requires real-spherical orbital and correlation-fit bases");
+    if (!aux.ecp_terms.empty())
+      throw std::invalid_argument(
+          "focal UCC-F12b v1 correlation fit describes Coulomb fitting functions only");
+    if (!owner->uhf->source_identity->matches(sys))
+      throw std::invalid_argument(
+          "focal UCC-F12b v1 orbital system differs from the retained DF determinant");
+    if (sys.atoms.size() != aux.atoms.size())
+      throw std::invalid_argument(
+          "focal UCC-F12b v1 orbital and correlation-fit geometries differ");
+    for (std::size_t i = 0; i < sys.atoms.size(); ++i)
+      if (sys.atoms[i].atomic_number != aux.atoms[i].atomic_number ||
+          sys.atoms[i].position != aux.atoms[i].position || aux.atoms[i].ecp_core)
+        throw std::invalid_argument(
+            "focal UCC-F12b v1 orbital and correlation-fit nuclei differ");
+
+    const auto& ref = *owner->uhf;
+    const std::size_t oa_full = ref.nocc[0];
+    const std::size_t ob_full = ref.nocc[1];
+    if (frozen_alpha > oa_full || frozen_beta > ob_full)
+      throw std::invalid_argument("focal UCC-F12b v1 frozen count exceeds occupied count");
+    const std::size_t oa = oa_full - frozen_alpha;
+    const std::size_t ob = ob_full - frozen_beta;
+    const std::size_t n = ref.nbf;
+    const std::size_t va = n - oa_full;
+    const std::size_t vb = n - ob_full;
+    const std::size_t nn = runtime::size_mul(n, n);
+    const std::size_t coords = runtime::size_mul(3, sys.atoms.size());
+
+    auto mul4 = [](std::size_t a, std::size_t b, std::size_t c, std::size_t d) {
+      return runtime::size_mul(runtime::size_mul(a, b), runtime::size_mul(c, d));
+    };
+    const std::size_t sz_w_vo_aaaa = mul4(oa, oa, va, oa);
+    const std::size_t sz_w_vo_bbbb = mul4(ob, ob, vb, ob);
+    const std::size_t sz_w_vo_abab = mul4(oa, ob, va, ob);
+    const std::size_t sz_w_vo_abba = mul4(oa, ob, vb, oa);
+    const std::size_t sz_w_vv_aaaa = mul4(oa, oa, va, va);
+    const std::size_t sz_w_vv_abab = mul4(oa, ob, va, vb);
+    const std::size_t sz_w_vv_bbbb = mul4(ob, ob, vb, vb);
+
+    if (!std::isfinite(coupling->fixed_geminal_energy))
+      throw std::invalid_argument("focal UCC-F12b v1 fixed_geminal_energy is nonfinite");
+
+    cc::FixedF12Coupling f12;
+    f12.fixed_geminal_energy = coupling->fixed_geminal_energy;
+    auto load_in = [](const double* ptr, std::size_t count, std::size_t expected,
+                      std::vector<double>& dst, const char* name) {
+      if (count != expected || (expected && !ptr))
+        throw std::invalid_argument(std::string("focal UCC-F12b v1 coupling shape mismatch for ") +
+                                    name);
+      if (expected) {
+        dst.assign(ptr, ptr + expected);
+        if (!std::all_of(dst.begin(), dst.end(), [](double x) { return std::isfinite(x); }))
+          throw std::invalid_argument(std::string("focal UCC-F12b v1 nonfinite coupling in ") +
+                                      name);
+      }
+    };
+    load_in(coupling->w_vo_aaaa, coupling->w_vo_aaaa_count, sz_w_vo_aaaa, f12.w_vo_aaaa,
+            "w_vo_aaaa");
+    load_in(coupling->w_vo_bbbb, coupling->w_vo_bbbb_count, sz_w_vo_bbbb, f12.w_vo_bbbb,
+            "w_vo_bbbb");
+    load_in(coupling->w_vo_abab, coupling->w_vo_abab_count, sz_w_vo_abab, f12.w_vo_abab,
+            "w_vo_abab");
+    load_in(coupling->w_vo_abba, coupling->w_vo_abba_count, sz_w_vo_abba, f12.w_vo_abba,
+            "w_vo_abba");
+    load_in(coupling->w_vv_aaaa, coupling->w_vv_aaaa_count, sz_w_vv_aaaa, f12.w_vv_aaaa,
+            "w_vv_aaaa");
+    load_in(coupling->w_vv_abab, coupling->w_vv_abab_count, sz_w_vv_abab, f12.w_vv_abab,
+            "w_vv_abab");
+    load_in(coupling->w_vv_bbbb, coupling->w_vv_bbbb_count, sz_w_vv_bbbb, f12.w_vv_bbbb,
+            "w_vv_bbbb");
+    load_in(coupling->c_f12_aaaa, coupling->c_f12_aaaa_count, sz_w_vv_aaaa, f12.c_f12_aaaa,
+            "c_f12_aaaa");
+    load_in(coupling->c_f12_abab, coupling->c_f12_abab_count, sz_w_vv_abab, f12.c_f12_abab,
+            "c_f12_abab");
+    load_in(coupling->c_f12_bbbb, coupling->c_f12_bbbb_count, sz_w_vv_bbbb, f12.c_f12_bbbb,
+            "c_f12_bbbb");
+
+    if (forces) {
+      if (!cotangents_out || !cotangents_out->bar_fixed_geminal_energy)
+        throw std::invalid_argument("focal UCC-F12b v1 forces require cotangents_out struct");
+      auto check_out = [](double* ptr, std::size_t count, std::size_t expected, const char* name) {
+        if (count != expected || (expected && !ptr))
+          throw std::invalid_argument(
+              std::string("focal UCC-F12b v1 cotangent buffer shape mismatch for ") + name);
+      };
+      check_out(cotangents_out->bar_w_vo_aaaa, cotangents_out->bar_w_vo_aaaa_count, sz_w_vo_aaaa,
+                "bar_w_vo_aaaa");
+      check_out(cotangents_out->bar_w_vo_bbbb, cotangents_out->bar_w_vo_bbbb_count, sz_w_vo_bbbb,
+                "bar_w_vo_bbbb");
+      check_out(cotangents_out->bar_w_vo_abab, cotangents_out->bar_w_vo_abab_count, sz_w_vo_abab,
+                "bar_w_vo_abab");
+      check_out(cotangents_out->bar_w_vo_abba, cotangents_out->bar_w_vo_abba_count, sz_w_vo_abba,
+                "bar_w_vo_abba");
+      check_out(cotangents_out->bar_w_vv_aaaa, cotangents_out->bar_w_vv_aaaa_count, sz_w_vv_aaaa,
+                "bar_w_vv_aaaa");
+      check_out(cotangents_out->bar_w_vv_abab, cotangents_out->bar_w_vv_abab_count, sz_w_vv_abab,
+                "bar_w_vv_abab");
+      check_out(cotangents_out->bar_w_vv_bbbb, cotangents_out->bar_w_vv_bbbb_count, sz_w_vv_bbbb,
+                "bar_w_vv_bbbb");
+      check_out(cotangents_out->bar_c_f12_aaaa, cotangents_out->bar_c_f12_aaaa_count, sz_w_vv_aaaa,
+                "bar_c_f12_aaaa");
+      check_out(cotangents_out->bar_c_f12_abab, cotangents_out->bar_c_f12_abab_count, sz_w_vv_abab,
+                "bar_c_f12_abab");
+      check_out(cotangents_out->bar_c_f12_bbbb, cotangents_out->bar_c_f12_bbbb_count, sz_w_vv_bbbb,
+                "bar_c_f12_bbbb");
+      if (!corr_gradient_out || corr_gradient_count != coords || !bar_f_alpha_out ||
+          bar_f_alpha_count != nn || !bar_f_beta_out || bar_f_beta_count != nn ||
+          !bar_c_alpha_out || bar_c_alpha_count != nn || !bar_c_beta_out ||
+          bar_c_beta_count != nn)
+        throw std::invalid_argument("focal UCC-F12b v1 ordinary force source buffer shape mismatch");
+    }
+    if (telemetry_out && telemetry_count < 10)
+      throw std::invalid_argument("focal UCC-F12b v1 telemetry buffer requires >= 10 slots");
+
+    cc::DFUccV2Options options;
+    options.compute_forces = forces != 0;
+    options.compute_triples = false;
+    options.occupied_partition = false;
+    options.energy_source_only = false;
+    options.frozen_alpha = frozen_alpha;
+    options.frozen_beta = frozen_beta;
+    options.preconvergence = static_cast<core::DfPreconvergence>(preconvergence);
+    options.triples_fp32_w = false;
+    options.f12 = &f12;
+    if (budget_bytes) options.max_bytes = budget_bytes;
+
+    const auto result =
+        cc::run_df_ucc_v2(sys, aux, ref, cuda, context->state.device_id, options);
+    if (!std::isfinite(result.ccsd_correlation_energy))
+      throw std::runtime_error("nonfinite focal UCC-F12b v1 energy");
+    *ccsd_f12b_energy_out = result.ccsd_correlation_energy;
+
+    if (forces) {
+      if (result.correlation_gradient.size() != coords || result.bar_f_alpha.size() != nn ||
+          result.bar_f_beta.size() != nn || result.bar_c_alpha.size() != nn ||
+          result.bar_c_beta.size() != nn)
+        throw std::runtime_error("focal UCC-F12b v1 ordinary force source size mismatch");
+      std::copy(result.correlation_gradient.begin(), result.correlation_gradient.end(),
+                corr_gradient_out);
+      std::copy(result.bar_f_alpha.begin(), result.bar_f_alpha.end(), bar_f_alpha_out);
+      std::copy(result.bar_f_beta.begin(), result.bar_f_beta.end(), bar_f_beta_out);
+      std::copy(result.bar_c_alpha.begin(), result.bar_c_alpha.end(), bar_c_alpha_out);
+      std::copy(result.bar_c_beta.begin(), result.bar_c_beta.end(), bar_c_beta_out);
+
+      const auto& fc = result.f12_cotangents;
+      *cotangents_out->bar_fixed_geminal_energy = fc.bar_fixed_geminal_energy;
+      auto copy_out = [](const std::vector<double>& src, double* dst, std::size_t expected,
+                         const char* name) {
+        if (src.size() != expected)
+          throw std::runtime_error(std::string("focal UCC-F12b v1 cotangent size mismatch for ") +
+                                   name);
+        if (expected) std::copy(src.begin(), src.end(), dst);
+      };
+      copy_out(fc.bar_w_vo_aaaa, cotangents_out->bar_w_vo_aaaa, sz_w_vo_aaaa, "bar_w_vo_aaaa");
+      copy_out(fc.bar_w_vo_bbbb, cotangents_out->bar_w_vo_bbbb, sz_w_vo_bbbb, "bar_w_vo_bbbb");
+      copy_out(fc.bar_w_vo_abab, cotangents_out->bar_w_vo_abab, sz_w_vo_abab, "bar_w_vo_abab");
+      copy_out(fc.bar_w_vo_abba, cotangents_out->bar_w_vo_abba, sz_w_vo_abba, "bar_w_vo_abba");
+      copy_out(fc.bar_w_vv_aaaa, cotangents_out->bar_w_vv_aaaa, sz_w_vv_aaaa, "bar_w_vv_aaaa");
+      copy_out(fc.bar_w_vv_abab, cotangents_out->bar_w_vv_abab, sz_w_vv_abab, "bar_w_vv_abab");
+      copy_out(fc.bar_w_vv_bbbb, cotangents_out->bar_w_vv_bbbb, sz_w_vv_bbbb, "bar_w_vv_bbbb");
+      copy_out(fc.bar_c_f12_aaaa, cotangents_out->bar_c_f12_aaaa, sz_w_vv_aaaa, "bar_c_f12_aaaa");
+      copy_out(fc.bar_c_f12_abab, cotangents_out->bar_c_f12_abab, sz_w_vv_abab, "bar_c_f12_abab");
+      copy_out(fc.bar_c_f12_bbbb, cotangents_out->bar_c_f12_bbbb, sz_w_vv_bbbb, "bar_c_f12_bbbb");
+    }
+    if (telemetry_out) {
+      telemetry_out[0] = result.ccsd_fp32_executed ? 1.0 : 0.0;
+      telemetry_out[1] = result.lambda_fp32_executed ? 1.0 : 0.0;
+      telemetry_out[2] = static_cast<double>(result.triples_fp32_gemms);
+      telemetry_out[3] = static_cast<double>(result.triples_fp64_gemms);
+      telemetry_out[4] = result.ccsd_seconds;
+      telemetry_out[5] = result.triples_seconds;
+      telemetry_out[6] = result.lambda_seconds;
+      telemetry_out[7] = result.source_response_seconds;
+      telemetry_out[8] = static_cast<double>(result.ccsd_iterations);
+      telemetry_out[9] = static_cast<double>(result.lambda_iterations);
+    }
+    trace.finish();
+    return GENERATIVEQC_STATUS_SUCCESS;
+  } catch (const std::length_error& error) {
+    record_oom_detail_noalloc(context->last_detail, error.what());
+    return GENERATIVEQC_STATUS_OUT_OF_MEMORY;
+  } catch (const std::bad_alloc& error) {
+    record_oom_detail_noalloc(context->last_detail, error.what());
+    return GENERATIVEQC_STATUS_OUT_OF_MEMORY;
+  } catch (...) {
+    return generativeqc::api::map_exception(&context->last_detail);
+  }
+}
+
 extern "C" GENERATIVEQC_API void generativeqc_cc_reset_context_lambda_telemetry_v1(
     generativeqc_context* context) {
   if (!context) return;

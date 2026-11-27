@@ -275,5 +275,5 @@ Exchange as test inputs. The data are BSD-3-Clause; the license is retained in
 | Basis Set Exchange basis | Elements | Used in |
 | --- | --- | --- |
 | STO-3G | H, He, B, C, O | Many native and Python tests; the same records as the bundled catalog |
-| 3-21G | H, C, N, O; Br with an added d shell | `tests/python/test_focal_uhf_v2_gate1.py` |
+| 3-21G | H, C, N, O; Br with an added d shell | `tests/python/test_focal_uhf_v2_gate1.py`, `tests/python/test_focal_uhf_f12b_gate1.py` |
 | cc-pVDZ-F12 and aug-cc-pVTZ-RI | H, O | `tests/reference_data/f12/libint_contracted.json`, `tests/reference_data/f12/libint_contracted_full_shells.json` |

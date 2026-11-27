@@ -484,6 +484,50 @@ def test_m8_capture_ram_trace_contextvar_interleaved_and_multithreaded() -> None
     assert results["B"] == ["phase_B_1", "phase_B_2"]
 
 
+def test_d5_unified_uhf_cc_backend_selector(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify GENERATIVEQC_F12_UHF_CC_BACKEND=native|legacy replaces the duplicate legacy env vars."""
+    card = _compact_h2o_split_basis(split_mp2=False)
+    req = next(
+        r
+        for r, _ in plan_singlepoint(
+            [("O", (0.0, 0.0, 0.0)), ("H", (0.0, 0.0, 1.8))],
+            FocalSeries(card),
+            FocalSeries(card),
+            None,
+            root_id="uhf",
+            multiplicity=2,
+            correlation_space_id="all-active",
+            backend="cpu_reference",
+        ).steps
+        if r.role == "mp2_f12_correlation"
+    )
+    fake_owner = SimpleNamespace(
+        library=SimpleNamespace(generativeqc_focal_ucc_f12b_v1=object())
+    )
+    ref = _dummy_reference(req, n=7, occupied=(5, 4), native_owner=fake_owner)
+    prov = MolecularFocalProvider(shell_library=Path("unused.so"))
+
+    monkeypatch.delenv("GENERATIVEQC_F12_UHF_CC_BACKEND", raising=False)
+    assert prov._use_native_uhf_f12b(req, ref) is True
+
+    # Old duplicate aliases MUST NOT override selection anymore
+    monkeypatch.setenv("GENERATIVEQC_F12_LEGACY_UHF_CC", "1")
+    monkeypatch.setenv("GENERATIVEQC_UHF_F12B_V1", "0")
+    assert prov._use_native_uhf_f12b(req, ref) is True
+
+    # Unified selector controls native vs legacy cleanly
+    monkeypatch.setenv("GENERATIVEQC_F12_UHF_CC_BACKEND", "legacy")
+    assert prov._use_native_uhf_f12b(req, ref) is False
+
+    prov_legacy = replace(prov, use_native_uhf_f12b=False)
+    monkeypatch.setenv("GENERATIVEQC_F12_UHF_CC_BACKEND", "native")
+    assert prov_legacy._use_native_uhf_f12b(req, ref) is True
+
+    monkeypatch.setenv("GENERATIVEQC_F12_UHF_CC_BACKEND", "invalid_mode")
+    with pytest.raises(ValueError, match="GENERATIVEQC_F12_UHF_CC_BACKEND"):
+        prov._use_native_uhf_f12b(req, ref)
+
+
 def test_d4_host_libraries_reject_invalid_explicit_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

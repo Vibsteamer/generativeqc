@@ -90,6 +90,82 @@ GENERATIVEQC_API generativeqc_status generativeqc_focal_ucc_triples_v2(
     double* bar_c_alpha_out, size_t bar_c_alpha_count, double* bar_c_beta_out,
     size_t bar_c_beta_count, double* telemetry_out, size_t telemetry_count);
 
+/** Spin-blocked fixed-cusp F12b coupling tensors in the active canonical MO frame.
+ * Expected element counts for active occupied (oa, ob) and virtual (va, vb):
+ *   w_vo_aaaa : oa * oa * va * oa     w_vo_bbbb : ob * ob * vb * ob
+ *   w_vo_abab : oa * ob * va * ob     w_vo_abba : oa * ob * vb * oa
+ *   w_vv_aaaa : oa * oa * va * va     w_vv_abab : oa * ob * va * vb
+ *   w_vv_bbbb : ob * ob * vb * vb
+ *   c_f12_aaaa: oa * oa * va * va     c_f12_abab: oa * ob * va * vb
+ *   c_f12_bbbb: ob * ob * vb * vb */
+typedef struct generativeqc_focal_ucc_f12_coupling_v1 {
+  double fixed_geminal_energy;
+  const double* w_vo_aaaa;
+  size_t w_vo_aaaa_count;
+  const double* w_vo_bbbb;
+  size_t w_vo_bbbb_count;
+  const double* w_vo_abab;
+  size_t w_vo_abab_count;
+  const double* w_vo_abba;
+  size_t w_vo_abba_count;
+  const double* w_vv_aaaa;
+  size_t w_vv_aaaa_count;
+  const double* w_vv_abab;
+  size_t w_vv_abab_count;
+  const double* w_vv_bbbb;
+  size_t w_vv_bbbb_count;
+  const double* c_f12_aaaa;
+  size_t c_f12_aaaa_count;
+  const double* c_f12_abab;
+  size_t c_f12_abab_count;
+  const double* c_f12_bbbb;
+  size_t c_f12_bbbb_count;
+} generativeqc_focal_ucc_f12_coupling_v1;
+
+/** Stationary cotangents of generativeqc_focal_ucc_f12_coupling_v1 written when forces != 0. */
+typedef struct generativeqc_focal_ucc_f12_cotangents_v1 {
+  double* bar_fixed_geminal_energy;
+  double* bar_w_vo_aaaa;
+  size_t bar_w_vo_aaaa_count;
+  double* bar_w_vo_bbbb;
+  size_t bar_w_vo_bbbb_count;
+  double* bar_w_vo_abab;
+  size_t bar_w_vo_abab_count;
+  double* bar_w_vo_abba;
+  size_t bar_w_vo_abba_count;
+  double* bar_w_vv_aaaa;
+  size_t bar_w_vv_aaaa_count;
+  double* bar_w_vv_abab;
+  size_t bar_w_vv_abab_count;
+  double* bar_w_vv_bbbb;
+  size_t bar_w_vv_bbbb_count;
+  double* bar_c_f12_aaaa;
+  size_t bar_c_f12_aaaa_count;
+  double* bar_c_f12_abab;
+  size_t bar_c_f12_abab_count;
+  double* bar_c_f12_bbbb;
+  size_t bar_c_f12_bbbb_count;
+} generativeqc_focal_ucc_f12_cotangents_v1;
+
+/** Native spin-blocked DF-UCCSD-F12b v1 focal entry on a retained canonical UHF or RHF root.
+ * Runs on CPU (OpenBLAS) or CUDA without materializing 4-index ovvv/vvvv tensors.
+ * Injects the caller's fixed-cusp F12b coupling bundle into the 5-block DF-UCCSD primal
+ * and DF-ULambda solvers, returning the total UCCSD-F12b correlation energy and (when
+ * forces != 0) both FixedF12Cotangents and ordinary DF/MO force sources (corr_gradient,
+ * bar_f_alpha/beta, bar_c_alpha/beta) for focal CPHF relaxation.
+ * Optional telemetry_out (count >= 10) receives [ccsd_fp32, lambda_fp32, 0, 0,
+ * ccsd_s, 0, lambda_s, source_response_s, ccsd_iterations, lambda_iterations]. */
+GENERATIVEQC_API generativeqc_status generativeqc_focal_ucc_f12b_v1(
+    generativeqc_context* context, const generativeqc_system* orbital,
+    const generativeqc_system* correlation_fit, const generativeqc_focal_reference* owner,
+    size_t budget_bytes, int forces, size_t frozen_alpha, size_t frozen_beta,
+    uint32_t preconvergence, const generativeqc_focal_ucc_f12_coupling_v1* coupling,
+    double* ccsd_f12b_energy_out, generativeqc_focal_ucc_f12_cotangents_v1* cotangents_out,
+    double* corr_gradient_out, size_t corr_gradient_count, double* bar_f_alpha_out,
+    size_t bar_f_alpha_count, double* bar_f_beta_out, size_t bar_f_beta_count,
+    double* bar_c_alpha_out, size_t bar_c_alpha_count, double* bar_c_beta_out,
+    size_t bar_c_beta_count, double* telemetry_out, size_t telemetry_count);
+
 /** Reset the calling thread's last RCCSD Lambda diagnostic slot. */
 GENERATIVEQC_API void generativeqc_cc_reset_last_lambda_telemetry_v1(void);
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from types import MethodType
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal
@@ -106,6 +107,22 @@ class FocalUCCSDResult:
     ordinary_cc_forces: np.ndarray
     fixed_cc_forces: np.ndarray
     stationary: FocalUCCStationary
+
+
+_UHF_CC_BACKEND_ENV = "GENERATIVEQC_F12_UHF_CC_BACKEND"
+
+
+def _uhf_cc_backend_override() -> Literal["native", "legacy"] | None:
+    """Parse the unified UHF CCSD-F12b backend selector (native | legacy)."""
+    raw = os.environ.get(_UHF_CC_BACKEND_ENV)
+    if raw is None or not raw.strip():
+        return None
+    val = raw.strip().lower()
+    if val in ("native", "legacy"):
+        return val  # type: ignore[return-value]
+    raise ValueError(
+        f"Invalid {_UHF_CC_BACKEND_ENV}={raw!r}; expected 'native' or 'legacy'"
+    )
 
 
 _AO_NAME_TO_OP = {
@@ -267,6 +284,7 @@ class MolecularFocalProvider:
     slater_normalization: Literal[
         "negative_exponential", "negative_exponential_over_beta"
     ] = DEFAULT_SLATER_FIT_NORMALIZATION
+    use_native_uhf_f12b: bool = True
     _cuda_cc_target: tuple[str, Path, Callable[[dict], None] | None] | None = field(
         default=None, repr=False, compare=False
     )
@@ -312,6 +330,7 @@ class MolecularFocalProvider:
         budget_mib: int = 1536,
         relative_cutoff: float = 1e-9,
         preconvergence: str = "auto",
+        use_native_uhf_f12b: bool = True,
         high_order: Callable[[FocalRequest], FocalEvaluation] | None = None,
         record_graph: Callable[[dict], None] | None = None,
         lambda_options: UCCSDLambdaOptions | None = None,
@@ -362,6 +381,7 @@ class MolecularFocalProvider:
             budget_mib=budget,
             slater_normalization=slater_normalization,
             preconvergence=preconvergence,
+            use_native_uhf_f12b=use_native_uhf_f12b,
             high_order=high_order,
             lambda_options=lambda_options,
             rhf_df_ladder=rhf_df_ladder,
@@ -672,6 +692,33 @@ class MolecularFocalProvider:
             is not None
         )
 
+    def _use_native_uhf_f12b(
+        self,
+        pair_request: FocalRequest,
+        reference: FocalReference,
+        *,
+        use_native: bool | None = None,
+    ) -> bool:
+        if use_native is False:
+            return False
+        if use_native is None:
+            override = _uhf_cc_backend_override()
+            if override == "legacy":
+                return False
+            if override is None and not self.use_native_uhf_f12b:
+                return False
+        return (
+            pair_request.root_id == "uhf"
+            and pair_request.backend in ("cpu_reference", "cuda")
+            and pair_request.basis.mp2_fit is not None
+            and reference._native_owner is not None
+            and getattr(
+                reference._native_owner.library,
+                "generativeqc_focal_ucc_f12b_v1",
+                None,
+            )
+            is not None
+        )
 
     def f12_doubles_energy(
         self,
@@ -698,6 +745,27 @@ class MolecularFocalProvider:
             )
             self._pair_source_cache["last_ccsdf12b_telemetry"] = res.telemetry
             return res.correlation_energy - low_order.mp2_f12_correlation_energy
+        if self._use_native_uhf_f12b(
+            pair_request, low_order.reference, use_native=use_native
+        ):
+            from ._f12_focal_ucc_f12b import spin_blocked_uhf_f12b_v1
+
+            fixed = molecular_ucc_sources(
+                self,
+                pair_request,
+                include_ordinary=False,
+                reference=low_order.reference,
+                expected_cabs_rank=low_order.cabs_rank,
+            )
+            solved = spin_blocked_uhf_f12b_v1(
+                self,
+                pair_request,
+                fixed,
+                forces=False,
+                preconvergence=self.preconvergence,
+            )
+            return solved.ccsd_f12b_energy - low_order.mp2_f12_correlation_energy
+
         from ._f12_ucc_solver import SolverOptions, solve_focal_uccsd_f12b_energy
 
         sources = molecular_ucc_sources(
@@ -751,6 +819,30 @@ class MolecularFocalProvider:
                 res.ordinary_forces
                 + res.fixed_forces
                 - low_order.mp2_f12_correlation_forces,
+            )
+        if self._use_native_uhf_f12b(
+            pair_request, low.reference, use_native=use_native
+        ):
+            from ._f12_focal_ucc_f12b import spin_blocked_uhf_f12b_v1
+
+            fixed = molecular_ucc_sources(
+                self,
+                pair_request,
+                include_ordinary=False,
+                reference=low.reference,
+                expected_cabs_rank=low.cabs_rank,
+            )
+            solved = spin_blocked_uhf_f12b_v1(
+                self,
+                pair_request,
+                fixed,
+                forces=True,
+                preconvergence=self.preconvergence,
+            )
+            assert solved.forces is not None
+            return (
+                solved.ccsd_f12b_energy - low.mp2_f12_correlation_energy,
+                solved.forces - low_order.mp2_f12_correlation_forces,
             )
         solution = self._ucc_stationary(
             pair_request,
@@ -1029,6 +1121,35 @@ class MolecularFocalProvider:
             raise ValueError(
                 f"Request slater_normalization {req_norm!r} disagrees with "
                 f"provider.slater_normalization {self.slater_normalization!r}"
+            )
+        override = _uhf_cc_backend_override()
+        use_native_uhf = (
+            override == "native" if override is not None else self.use_native_uhf_f12b
+        )
+        if (
+            request.role == "ccsd_f12b_minus_mp2_f12"
+            and request.root_id == "uhf"
+            and use_native_uhf
+        ):
+            calculation = replace(request, role="mp2_f12_correlation")
+            low = self.low_order_energy_and_forces(
+                calculation, include_hf_cabs=False
+            )
+            energy, forces = self.f12_doubles_energy_and_forces(
+                calculation, low_order=low
+            )
+            return FocalEvaluation(
+                FocalTerm(
+                    request.surface_id,
+                    request.basis.series_id,
+                    request.basis.basis_id,
+                    request.basis.cardinal,
+                    request.role,
+                    energy,
+                    forces,
+                ),
+                executed_backend=request.backend,
+                converged=True,
             )
         solution = None
         calculation = request
