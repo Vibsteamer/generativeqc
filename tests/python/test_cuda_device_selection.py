@@ -70,6 +70,54 @@ def test_missing_driver_does_not_guess_a_target(
         _cuda_device.device_architecture()
 
 
+def _named_driver(name: bytes, status: int = 0) -> SimpleNamespace:
+    def get_device(output: Any, ordinal: int) -> int:
+        assert ordinal == 1
+        ctypes.cast(output, ctypes.POINTER(ctypes.c_int))[0] = 7
+        return 0
+
+    def compute_capability(major: Any, minor: Any, handle: ctypes.c_int) -> int:
+        for output, value in zip((major, minor), (8, 9), strict=True):
+            ctypes.cast(output, ctypes.POINTER(ctypes.c_int))[0] = value
+        return 0
+
+    def get_name(output: Any, size: int, handle: ctypes.c_int) -> int:
+        assert handle.value == 7
+        ctypes.memmove(output, name, min(len(name) + 1, size))
+        return status
+
+    return SimpleNamespace(
+        cuInit=Mock(return_value=0),
+        cuDeviceGet=Mock(side_effect=get_device),
+        cuDeviceComputeCapability=Mock(side_effect=compute_capability),
+        cuDeviceGetName=Mock(side_effect=get_name),
+    )
+
+
+def test_device_identity_reports_the_product_and_architecture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Products sharing a compute capability remain distinguishable."""
+    for product in (b"NVIDIA L20", b"NVIDIA L40S"):
+        monkeypatch.setattr(
+            ctypes, "CDLL", lambda name, product=product: _named_driver(product)
+        )
+        assert _cuda_device.device_identity(1) == _cuda_device.CudaDeviceIdentity(
+            product.decode(), "sm_89"
+        )
+
+
+@pytest.mark.parametrize("name,status", [(b"NVIDIA L20", 100), (b"", 0)])
+def test_device_identity_failure_does_not_guess_a_product(
+    monkeypatch: pytest.MonkeyPatch, name: bytes, status: int
+) -> None:
+    monkeypatch.setattr(ctypes, "CDLL", lambda _: _named_driver(name, status))
+    with pytest.raises(
+        RuntimeError, match="cuDeviceGetName" if status else "empty device name"
+    ):
+        _cuda_device.device_identity(1)
+
+
 @pytest.mark.parametrize("device", [-1, True, 2**31, 0.5])
 def test_invalid_device_is_rejected_before_driver_access(
     monkeypatch: pytest.MonkeyPatch, device: Any

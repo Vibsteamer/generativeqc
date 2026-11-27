@@ -52,11 +52,24 @@ GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_occupied_v1(
 /** Extended spatial DF-RCCSD(T) / (T+) focal entry on the retained canonical RHF root.
  * Supports split JK/correlation fits, scalar ECP, optional frozen_occupied orbitals,
  * optional per-active-occupied weights for exact (T+) analytic force sources,
- * preconvergence (0=Legacy/FP64, 1=FP64, 2=Mixed, 3=Automatic).
- * Pass 0 for triples_fp32_w. When forces != 0, writes the pure triples-increment
- * (corr_gradient, bar_f, bar_c) for focal CPHF.
+ * preconvergence (0=Legacy/FP64, 1=FP64, 2=Mixed, 3=Automatic), and optional FP32 W
+ * mixed precision (when triples_fp32_w == 1, forward DF-panel/W GEMMs and, on the fast
+ * forces path, reverse W-pullback bar_panel/bar_t2 GEMMs execute in pedantic IEEE FP32
+ * SGEMM while denominators, energy reduction, V/ovoo/Fock contractions, and outer
+ * orbital/T2 accumulations remain FP64). Mode 0 is strict FP64. Mode 2 explicitly requests
+ * three FP32 limbs per operand, nine FP32 GEMMs per inner tile, and FP64 panel storage and
+ * recombination for the compensated spatial forward and reverse W contractions. Mode 2
+ * refuses unsupported or insufficient resources instead of switching to another W schedule.
+ * When forces != 0, writes pure triples-increment (corr_gradient, bar_f, bar_c) for focal CPHF.
  * Optional telemetry_out (count >= 8) receives [ccsd_fp32, lambda_fp32, t_fp32_gemms,
- * t_fp64_gemms, ccsd_s, triples_s, lambda_s, source_response_s]. */
+ * t_fp64_gemms, ccsd_s, triples_s, lambda_s, source_response_s], when count >= 10
+ * appends [triples_fp32_w_executed, triples_fp32_w_resource_fallback], and when
+ * count >= 12 appends [triples_fp32_w_forward_executed, triples_fp32_w_reverse_executed].
+ * With count >= 13 slot 12 reports whether any reverse W pullback executed, including FP64.
+ * A provider/resource fallback can retain FP32 W and execute the DF panels in FP64.
+ * Slots 8, 10 and 11 report the work performed independently of the fallback flag.
+ * Slots 13–16, when present, report observed compensated execution, physical forward and
+ * reverse FP32 GEMM counts, and the workspace size in bytes, respectively. */
 GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_v2(
     generativeqc_calculation* calculation, const generativeqc_focal_reference* owner, int forces,
     int occupied_partition, size_t frozen_occupied, const double* occupied_weights,

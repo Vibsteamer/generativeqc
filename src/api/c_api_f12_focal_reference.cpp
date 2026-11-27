@@ -663,7 +663,7 @@ extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_v
     std::size_t bar_c_count, double* telemetry_out, std::size_t telemetry_count) {
   if (!calculation || !calculation->context || !owner || !energy_out ||
       (forces != 0 && forces != 1) || (occupied_partition != 0 && occupied_partition != 1) ||
-      triples_fp32_w != 0 || preconvergence > 3)
+      (triples_fp32_w < 0 || triples_fp32_w > 2) || preconvergence > 3)
     return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
   auto* context = calculation->context;
   std::lock_guard lock(context->mutex);
@@ -718,6 +718,8 @@ extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_v
     if (weights_count)
       options.occupied_weights.assign(occupied_weights, occupied_weights + weights_count);
     options.preconvergence = static_cast<core::DfPreconvergence>(preconvergence);
+    options.triples_fp32_w = triples_fp32_w == 1;
+    options.triples_compensated_w = triples_fp32_w == 2;
 
     cc::detail::reset_last_lambda_diagnostic();
     const auto result = methods::detail::focal_rcc_triples_values(
@@ -748,6 +750,24 @@ extern "C" GENERATIVEQC_API generativeqc_status generativeqc_focal_rcc_triples_v
       telemetry_out[5] = result.triples_seconds;
       telemetry_out[6] = result.lambda_seconds;
       telemetry_out[7] = result.source_response_seconds;
+      if (telemetry_count >= 9)
+        telemetry_out[8] = result.triples_fp32_w_executed ? 1.0 : 0.0;
+      if (telemetry_count >= 10)
+        telemetry_out[9] = result.triples_fp32_w_resource_fallback ? 1.0 : 0.0;
+      if (telemetry_count >= 11)
+        telemetry_out[10] = result.triples_fp32_w_forward_executed ? 1.0 : 0.0;
+      if (telemetry_count >= 12)
+        telemetry_out[11] = result.triples_fp32_w_reverse_executed ? 1.0 : 0.0;
+      if (telemetry_count >= 13)
+        telemetry_out[12] = result.triples_reverse_w_executed ? 1.0 : 0.0;
+      if (telemetry_count >= 14)
+        telemetry_out[13] = result.triples_compensated_w_executed ? 1.0 : 0.0;
+      if (telemetry_count >= 15)
+        telemetry_out[14] = static_cast<double>(result.triples_fp32_forward_gemms);
+      if (telemetry_count >= 16)
+        telemetry_out[15] = static_cast<double>(result.triples_fp32_reverse_gemms);
+      if (telemetry_count >= 17)
+        telemetry_out[16] = static_cast<double>(result.triples_workspace_bytes);
     }
     if (forces) cc::detail::capture_last_lambda_telemetry(context->lambda_telemetry);
     trace.finish();

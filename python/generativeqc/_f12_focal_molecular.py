@@ -46,6 +46,7 @@ from ._f12_focal_reference import (
 )
 from ._f12_focal_singles import FocalCabsSingles, reference_cabs_singles
 from ._f12_focal_ump2 import FocalCoulombSource, ordinary_df_ump2_unrelaxed, reference_df_ump2
+from ._f12_triples_w_policy import TriplesWForceAdmission, admit_triples_w_forces
 from ._f12_ram_hygiene import (
     disclose_host_assisted_stage,
     record_ram_phase,
@@ -288,13 +289,28 @@ class _Panel:
 
 @dataclass(frozen=True, kw_only=True)
 class MolecularFocalProvider:
-    """Evaluate molecular focal contributions with a native shell service.
+    """Evaluate geometric HF+CABS and all-active RHF/UHF MP2-F12/3C(FIX) focal terms.
 
-    Evaluate HF+CABS energies and analytic Cartesian forces on the requested root.
-    The low-order pair energy uses a single canonical RHF or UHF determinant.
-    The same pair pathways supply analytic MP2-F12 Cartesian forces.
-    The stationary fixed-source CCSD-F12b path includes bounded virtual actions.
-    Supply reference_seed to transport a converged determinant between geometries.
+    The default constructor uses the installed host-reference F12 shell. A
+    separate one-electron library also supplies the real-spherical projections. CUDA
+    uses an FP64 TensorIR runner, the device metric/response library, and the
+    canonical-response ABI of the main native library. Each call solves one
+    physical determinant on the backend in the request. Pass this callable as
+    the provider of singlepoint(), or evaluate individual plan steps. Select a
+    high-order evaluator explicitly for conventional post-MP2 and triples steps.
+    On all-active RHF singlet and UHF roots the provider also evaluates the same-reference difference
+    between CCSD-F12b and MP2-F12 correlation energies and forces.
+    lambda_options controls the stationary multiplier solve of each CC role.
+    Its workspace is bounded by budget_mib. For conventional (T) and (T+),
+    triples_w_schedule="fp32_split3" explicitly selects nine FP32 partial GEMMs
+    with FP64 panel storage/recombination. It is independent of single-pass
+    triples_fp32_w and requires a supported host or spatial CUDA owner.
+    Analytic triples forces run single-pass triples_fp32_w only on an NVIDIA
+    L20, or as an explicit per-call diagnostic on other devices.
+    rhf_df_ladder selects the bounded DF virtual ladder on a restricted reference.
+    uhf_df_ladder selects independent virtual operators on an unrestricted reference.
+    Supply reference_seed to transport a converged determinant between geometries
+    in internally evaluated molecular roles. A callable can select each basis seed.
     """
 
     shell_library: Path = field(
@@ -315,6 +331,8 @@ class MolecularFocalProvider:
     relative_cutoff: float = 1e-9
     budget_mib: int = 1536
     preconvergence: str = "auto"
+    triples_fp32_w: bool = False
+    triples_w_schedule: str | None = field(default=None, kw_only=True)
     slater_normalization: Literal[
         "negative_exponential", "negative_exponential_over_beta"
     ] = DEFAULT_SLATER_FIT_NORMALIZATION
@@ -325,6 +343,10 @@ class MolecularFocalProvider:
     _pair_source_cache: dict = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
+    # Identifies the CUDA device of native triples work; None queries ordinal 0.
+    _cuda_device: Callable[[], CudaDeviceIdentity] | None = field(
+        default=None, repr=False, compare=False
+    )
     lambda_options: UCCSDLambdaOptions | None = None
     rhf_df_ladder: RHFDFLadderOptions | None = None
     uhf_df_ladder: UHFDFLadderOptions | None = None
@@ -334,6 +356,9 @@ class MolecularFocalProvider:
     ) = None
 
     def __post_init__(self) -> None:
+        from ._f12_focal_ucc_triples import _w_precision_code
+
+        _w_precision_code(self.triples_fp32_w, self.triples_w_schedule)
         slater_normalization_code(self.slater_normalization)
         object.__setattr__(self, "_pair_source_cache", {})
         if (
@@ -344,6 +369,17 @@ class MolecularFocalProvider:
         ):
             object.__setattr__(self, "triples_models", self.default_triples_models)
 
+    def _admit_triples_w_forces(
+        self, request: FocalRequest, diagnostic_fp32_single_w_forces: bool
+    ) -> TriplesWForceAdmission:
+        return admit_triples_w_forces(
+            request.backend,
+            triples_fp32_w=self.triples_fp32_w,
+            triples_w_schedule=self.triples_w_schedule,
+            preconvergence=self.preconvergence,
+            cuda_device=self._cuda_device,
+            diagnostic_fp32_single_w_forces=diagnostic_fp32_single_w_forces,
+        )
 
     def supports_tplus(self, request: FocalRequest) -> bool:
         """Check the implemented occupied model and backend, independently of qualification."""
@@ -489,6 +525,8 @@ class MolecularFocalProvider:
         budget_mib: int = 1536,
         relative_cutoff: float = 1e-9,
         preconvergence: str = "auto",
+        triples_fp32_w: bool = False,
+        triples_w_schedule: str | None = None,
         use_native_uhf_f12b: bool = True,
         high_order: Callable[[FocalRequest], FocalEvaluation] | None = None,
         triples_models: Callable[..., dict[str, FocalTriplesEvaluation]] | None = None,
@@ -542,6 +580,8 @@ class MolecularFocalProvider:
             budget_mib=budget,
             slater_normalization=slater_normalization,
             preconvergence=preconvergence,
+            triples_fp32_w=triples_fp32_w,
+            triples_w_schedule=triples_w_schedule,
             use_native_uhf_f12b=use_native_uhf_f12b,
             high_order=high_order,
             triples_models=triples_models,
@@ -810,6 +850,10 @@ class MolecularFocalProvider:
         extra: dict[str, object] = {}
         if self.preconvergence != "auto":
             extra["preconvergence"] = self.preconvergence
+        if self.triples_fp32_w:
+            extra["triples_fp32_w"] = self.triples_fp32_w
+        if self.triples_w_schedule is not None:
+            extra["triples_w_schedule"] = self.triples_w_schedule
         conventional, occupied = molecular_occupied_triples_on_reference(
             request,
             low_order.reference,
@@ -855,6 +899,10 @@ class MolecularFocalProvider:
         extra: dict[str, object] = {}
         if self.preconvergence != "auto":
             extra["preconvergence"] = self.preconvergence
+        if self.triples_fp32_w:
+            extra["triples_fp32_w"] = self.triples_fp32_w
+        if self.triples_w_schedule is not None:
+            extra["triples_w_schedule"] = self.triples_w_schedule
         conventional, occupied = molecular_occupied_triples_on_reference(
             request,
             low_order.reference,
@@ -879,13 +927,17 @@ class MolecularFocalProvider:
         low_order: FocalLowOrderEnergy,
         expected_cabs_rank: int | None = None,
         inactive: tuple[bool, ...] | None = None,
+        diagnostic_fp32_single_w_forces: bool = False,
     ) -> tuple[float, FocalTriplesEvaluation, TriplesTelemetry]:
         """Evaluate conventional (T) energy plus full analytic (T+) energy & 3N forces.
 
         Uses one spatial CUDA DF-RCCSD + weighted DF-(T) pullback + Delta-Lambda solve
         for sum_i w_i * d(e_i^(T))/dR, combined with tplus_scaling_forces for
         sum_i e_i^(T) * dw_i/dR. Supports split-fit, scalar ECP, frozen-core and
-        mixed preconvergence.
+        mixed preconvergence. Single-pass FP32 W runs only on an NVIDIA L20 unless
+        diagnostic_fp32_single_w_forces=True, which tags the result as ineligible
+        for production focal assembly. The telemetry records the executed W
+        schedule, the preconvergence mode and the device.
         """
         from generativeqc_compiler.cc.tplus import evaluate_tplus
 
@@ -897,6 +949,7 @@ class MolecularFocalProvider:
             raise ValueError("Restricted (T+) forces require the RHF scaled triples role")
         if request.backend != "cuda" or self.run is None:
             raise NotImplementedError("Restricted (T+) forces require the CUDA executor")
+        admission = self._admit_triples_w_forces(request, diagnostic_fp32_single_w_forces)
         pair_request = replace(request, role="mp2_f12_correlation")
         _check_request(self, pair_request)
         if expected_cabs_rank is not None and expected_cabs_rank != low_order.cabs_rank:
@@ -932,12 +985,15 @@ class MolecularFocalProvider:
             occupied_partition=True,
             occupied_weights=occ_weights,
             preconvergence=self.preconvergence,
+            triples_fp32_w=self.triples_fp32_w,
+            triples_w_schedule=self.triples_w_schedule,
             provider=self,
         )
         record_ram_phase("after_triples")
         release_host_memory()
         record_ram_phase("after_trim")
         telemetry = dict(spatial_res.telemetry)
+        admission.record(telemetry)
         assert spatial_res.occupied is not None and spatial_res.forces is not None
         assert request.basis.mp2_fit is not None
         occupied_obj = FocalOccupiedTriples(
@@ -982,13 +1038,17 @@ class MolecularFocalProvider:
         low_order: FocalLowOrderEnergy,
         expected_cabs_rank: int | None = None,
         inactive: tuple[bool, ...] | None = None,
+        diagnostic_fp32_single_w_forces: bool = False,
     ) -> tuple[float, FocalTriplesEvaluation, TriplesTelemetry]:
         """Evaluate conventional (T) energy plus full analytic (T+) energy & 3N forces on UHF.
 
         Uses one spin-blocked DF-UCCSD + 4-channel weighted DF-(T) pullback + Delta-Lambda
         solve for sum_i w_i * d(e_i^(T))/dR across alpha and beta channels, combined with
         tplus_scaling_forces for sum_i e_i^(T) * dw_i/dR. Supports split-fit, scalar ECP,
-        frozen-core and mixed preconvergence.
+        frozen-core and mixed preconvergence. Single-pass FP32 W runs only on an NVIDIA
+        L20 unless diagnostic_fp32_single_w_forces=True, which tags the result as
+        ineligible for production focal assembly. The telemetry records the executed
+        W schedule, the preconvergence mode and the device.
         """
         from generativeqc_compiler.cc.tplus import evaluate_tplus
 
@@ -1000,6 +1060,7 @@ class MolecularFocalProvider:
             raise ValueError("Unrestricted (T+) forces require the UHF scaled triples role")
         if request.backend == "cuda" and self.run is None:
             raise NotImplementedError("CUDA unrestricted (T+) forces require the CUDA executor")
+        admission = self._admit_triples_w_forces(request, diagnostic_fp32_single_w_forces)
         pair_request = replace(request, role="mp2_f12_correlation")
         _check_request(self, pair_request)
         if expected_cabs_rank is not None and expected_cabs_rank != low_order.cabs_rank:
@@ -1046,12 +1107,15 @@ class MolecularFocalProvider:
             occupied_partition=True,
             occupied_weights=occ_weights,
             preconvergence=self.preconvergence,
+            triples_fp32_w=self.triples_fp32_w,
+            triples_w_schedule=self.triples_w_schedule,
             provider=self,
         )
         record_ram_phase("after_triples")
         release_host_memory()
         record_ram_phase("after_trim")
         telemetry = dict(uhf_res.telemetry)
+        admission.record(telemetry)
         assert (
             uhf_res.occupied_alpha is not None
             and uhf_res.occupied_beta is not None
@@ -1471,6 +1535,10 @@ class MolecularFocalProvider:
             extra["telemetry"] = telemetry
         if self.preconvergence != "auto":
             extra["preconvergence"] = self.preconvergence
+        if self.triples_fp32_w:
+            extra["triples_fp32_w"] = self.triples_fp32_w
+        if self.triples_w_schedule is not None:
+            extra["triples_w_schedule"] = self.triples_w_schedule
         return molecular_triples_on_reference(
             request,
             reference,
@@ -1486,17 +1554,32 @@ class MolecularFocalProvider:
         *,
         reference: FocalReference,
         telemetry: TriplesTelemetry | None = None,
+        diagnostic_fp32_single_w_forces: bool = False,
     ) -> tuple[float, np.ndarray]:
         """Conventional triples and its analytic Cartesian forces on a shared root.
 
+        Single-pass FP32 W runs only on an NVIDIA L20 unless
+        diagnostic_fp32_single_w_forces=True, which tags the result as ineligible
+        for production focal assembly. Either single-pass use requires a telemetry
+        mapping. A supplied mapping records the executed W schedule, the
+        preconvergence mode and the device.
         """
         from ._f12_focal_ucc_triples import molecular_triples_on_reference
 
+        admission = self._admit_triples_w_forces(request, diagnostic_fp32_single_w_forces)
+        if admission.single_pass and telemetry is None:
+            raise ValueError(
+                "A single-pass FP32 W force evaluation must record its provenance in telemetry"
+            )
         extra: dict[str, object] = {}
         if telemetry is not None:
             extra["telemetry"] = telemetry
         if self.preconvergence != "auto":
             extra["preconvergence"] = self.preconvergence
+        if self.triples_fp32_w:
+            extra["triples_fp32_w"] = self.triples_fp32_w
+        if self.triples_w_schedule is not None:
+            extra["triples_w_schedule"] = self.triples_w_schedule
         energy, forces = molecular_triples_on_reference(
             request,
             reference,
@@ -1506,6 +1589,8 @@ class MolecularFocalProvider:
             **extra,
         )
         assert forces is not None
+        if telemetry is not None:
+            admission.record(telemetry)
         return energy, forces
 
     def ucc_ordinary_source_forces(
