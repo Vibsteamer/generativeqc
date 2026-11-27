@@ -1,0 +1,20 @@
+{
+  "path": "src/posthf/uhf_orbital_adjoint_cuda.cu",
+  "reason": "Owns bounded storage, solver and BLAS handles, transfer and synchronization, and C ABI errors for the dense DF-UHF orbital adjoint.",
+  "regions": [
+    {
+      "reason": "Assembles the dense spin rotation Hessian from the shared native element equation, gates driver amplification, refines the LU solve with compensated residuals from the DF factors, bounds forward error with outward-rounded residual and factorization enclosures, and combines fixed and orbital gradient terms into Cartesian forces.",
+      "role": "scientific",
+      "start": "__global__ void assemble",
+      "stop": "void solve(int device"
+    },
+    {
+      "reason": "Applies and refines the transposed UHF orbital Hessian solve and contracts the orbital adjoint with directional right-hand sides.",
+      "role": "scientific",
+      "start": "assemble<<<blocks(square)",
+      "stop": "std::vector<double> result(add(rank"
+    }
+  ],
+  "role": "runtime",
+  "subsystem": "molecular_f12"
+}
