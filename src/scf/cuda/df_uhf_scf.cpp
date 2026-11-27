@@ -35,7 +35,7 @@ generativeqc_status run_cuda_density_fitting_uhf_device_scf(
   return run_cuda_density_fitting_uhf_device_scf(
       plan, hcore, orthogonalizer, initial_alpha_density, initial_beta_density, alpha_occupied,
       beta_occupied, nuclear_repulsion, max_iterations, energy_tolerance, density_tolerance,
-      final_alpha_density, final_beta_density, results, detail, {}, 0);
+      final_alpha_density, final_beta_density, results, detail, {}, 0, false);
 }
 
 generativeqc_status run_cuda_density_fitting_uhf_device_scf(
@@ -46,7 +46,8 @@ generativeqc_status run_cuda_density_fitting_uhf_device_scf(
     const std::vector<double>& nuclear_repulsion, unsigned max_iterations, double energy_tolerance,
     double density_tolerance, std::vector<double>& final_alpha_density,
     std::vector<double>& final_beta_density, std::vector<CudaDensityFittingDeviceScfItem>& results,
-    std::string& detail, const std::vector<double>& overlap, unsigned diis_history) {
+    std::string& detail, const std::vector<double>& overlap, unsigned diis_history,
+    bool enforce_orthonormal_uhf_commutator) {
   runtime::df_progress::Scope progress("compact_uhf_scf");
   detail.clear();
   if (plan) {
@@ -55,8 +56,11 @@ generativeqc_status run_cuda_density_fitting_uhf_device_scf(
   }
   if (plan == nullptr || max_iterations == 0 || !(energy_tolerance > 0.0) ||
       !(density_tolerance > 0.0) || !std::isfinite(energy_tolerance) ||
-      !std::isfinite(density_tolerance)) {
-    detail = "CUDA DF device UHF SCF arguments are invalid";
+      !std::isfinite(density_tolerance) ||
+      (enforce_orthonormal_uhf_commutator && diis_history < 2)) {
+    detail = enforce_orthonormal_uhf_commutator && diis_history < 2
+                 ? "CUDA DF device UHF orthonormal commutator stopping requires diis_history >= 2"
+                 : "CUDA DF device UHF SCF arguments are invalid";
     return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
   }
   runtime::df_progress::number("solve_epoch", plan->final_state_solve_epoch);
@@ -307,9 +311,11 @@ generativeqc_status run_cuda_density_fitting_uhf_device_scf(
   std::vector<std::uint8_t> host_converged(batch_size);
   std::vector<std::uint32_t> host_iterations(batch_size);
   std::vector<int> host_alpha_info(batch_size), host_beta_info(batch_size);
-  const bool options_changed = state->max_iterations != max_iterations ||
-                               state->energy_tolerance != energy_tolerance ||
-                               state->density_tolerance != density_tolerance;
+  const bool options_changed =
+      state->max_iterations != max_iterations ||
+      state->energy_tolerance != energy_tolerance ||
+      state->density_tolerance != density_tolerance ||
+      state->enforce_orthonormal_uhf_commutator != enforce_orthonormal_uhf_commutator;
   if (options_changed) {
     state->graph.reset();
     state->graph.device_id = plan->device_id;
@@ -319,6 +325,7 @@ generativeqc_status run_cuda_density_fitting_uhf_device_scf(
   state->max_iterations = max_iterations;
   state->energy_tolerance = energy_tolerance;
   state->density_tolerance = density_tolerance;
+  state->enforce_orthonormal_uhf_commutator = enforce_orthonormal_uhf_commutator;
   DeviceIterationGraph& iteration_graph = state->graph;
   const auto launch_iteration = [&](bool factors_ready, bool tail) -> generativeqc_status {
     generativeqc_status iteration_status = build_scf_occupied_jk(
@@ -337,6 +344,28 @@ generativeqc_status run_cuda_density_fitting_uhf_device_scf(
 
     iteration_status = apply_scf_diis(*plan, *state, detail);
     if (iteration_status != GENERATIVEQC_STATUS_SUCCESS) return iteration_status;
+    // On opt-in focal UHF solves (e.g., focal DF-UHF on diffuse QZ bases),
+    // AO-basis max|FDS-SDF| can dip below density_tolerance while the
+    // orthonormal MO gradient X^T(FDS-SDF)X is still O(1e-8), leaking noise
+    // into non-variational MP2-F12 energies. Whiten the idle post-DIIS copy
+    // in place without altering DIIS history or adding device workspace.
+    if (enforce_orthonormal_uhf_commutator) {
+      const std::size_t matrix = plan->matrix_elements;
+      const std::size_t stride = 2 * matrix;
+      for (unsigned spin = 0; spin < 2; ++spin) {
+        double* residual = state->d_diis_residual + spin * matrix;
+        iteration_status = scf_gemm_strided(
+            *plan, false, batch_size, plan->nbf, residual, stride, d_orthogonalizer, matrix,
+            state->d_diis_temporary, matrix, 1.0, 0.0,
+            "CUDA DF UHF orthonormal residual right product", detail);
+        if (iteration_status != GENERATIVEQC_STATUS_SUCCESS) return iteration_status;
+        iteration_status = scf_gemm_strided(
+            *plan, true, batch_size, plan->nbf, d_orthogonalizer, matrix, state->d_diis_temporary,
+            matrix, residual, stride, 1.0, 0.0,
+            "CUDA DF UHF orthonormal residual left product", detail);
+        if (iteration_status != GENERATIVEQC_STATUS_SUCCESS) return iteration_status;
+      }
+    }
     iteration_status = scf_generalized_transform(*plan, false, batch_size, plan->nbf, d_alpha_fock,
                                                  d_orthogonalizer, d_temporary, detail);
     if (iteration_status == GENERATIVEQC_STATUS_SUCCESS) {

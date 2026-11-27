@@ -38,7 +38,8 @@ generativeqc_status run_cuda_density_fitting_uhf_device_scf(
     CudaDensityFittingJkPlan*, const Matrix&, const Matrix&, const Matrix&, const Matrix&,
     const std::vector<std::int32_t>&, const std::vector<std::int32_t>&, const Matrix&,
     unsigned, double, double, Matrix&, Matrix&,
-    std::vector<CudaDensityFittingDeviceScfItem>&, std::string& detail, const Matrix&, unsigned) {
+    std::vector<CudaDensityFittingDeviceScfItem>&, std::string& detail, const Matrix&, unsigned,
+    bool = false) {
   detail = "injected device SCF allocation failure";
   return fail_compact ? GENERATIVEQC_STATUS_OUT_OF_MEMORY : GENERATIVEQC_STATUS_NOT_IMPLEMENTED;
 }

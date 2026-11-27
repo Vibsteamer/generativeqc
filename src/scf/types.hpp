@@ -176,6 +176,10 @@ struct ScfOptions {
   bool stabilize_focal_rhf_convergence{};
   /** Focal RHF recovery evaluates the existing congruence RMS as M - M^T. */
   bool use_antisymmetric_rhf_commutator{};
+  /** Opt-in focal UHF stopping guard requiring max|X^T(FDS-SDF)X| <=
+   * density_tolerance before accepting convergence. Default false preserves
+   * baseline UHF stopping across all non-focal consumers. */
+  bool enforce_orthonormal_uhf_commutator{false};
   /** False for an explicit energy-only endpoint. Backends must then omit
    * derivative evaluation and return an empty force vector. */
   bool compute_forces{true};

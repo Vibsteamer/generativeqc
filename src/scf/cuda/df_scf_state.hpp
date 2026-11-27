@@ -82,6 +82,7 @@ struct PersistentScfState {
   double density_tolerance{};
   bool qualified_standard_owner{};
   bool orbital_gradient_convergence{};
+  bool enforce_orthonormal_uhf_commutator{};
 
   // Ready entries are revoked before every attempted solve. A matched entry
   // survives privately until a successful final endpoint republishes it.

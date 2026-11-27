@@ -705,6 +705,8 @@ macro(generativeqc_add_native_tests)
   endif()
   generativeqc_native_test(generativeqc_mixed_precision_tests tests/native/test_mixed_precision.cpp)
   generativeqc_native_test(generativeqc_precision_policy_tests tests/native/test_precision_policy.cpp)
+  generativeqc_native_test(generativeqc_focal_uhf_orthonormal_commutator_tests
+                       tests/native/test_focal_uhf_orthonormal_commutator.cpp)
   generativeqc_native_test(generativeqc_focal_hf_stability_tests
                        tests/native/test_focal_hf_stability.cpp)
   generativeqc_native_test(generativeqc_small_core_halide_and_ucc_budget_tests
