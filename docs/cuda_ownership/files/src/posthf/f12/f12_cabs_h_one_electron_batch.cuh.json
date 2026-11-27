@@ -1,0 +1,14 @@
+{
+  "path": "src/posthf/f12/f12_cabs_h_one_electron_batch.cuh",
+  "reason": "Batched shell integrals assemble CABS one-electron matrix elements and weights in the molecular frame with host and device contraction paths.",
+  "regions": [
+    {
+      "reason": "Scoped device buffer ownership.",
+      "role": "runtime",
+      "start": "struct Allocation {",
+      "stop": "int evaluate_batch("
+    }
+  ],
+  "role": "scientific",
+  "subsystem": "molecular_f12"
+}

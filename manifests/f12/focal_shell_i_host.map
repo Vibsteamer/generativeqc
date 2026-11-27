@@ -1,5 +1,9 @@
 {
   global:
+    gqc_f12_cabs_i_one_electron_batch_host_reference;
+    gqc_f12_cabs_i_one_electron_full_batch_host_reference;
+    gqc_f12_cabs_i_one_electron_host_reference;
+    gqc_f12_cabs_i_one_electron_weights_host_reference;
     gqc_f12_cartesian_shells_coulomb_ex_host_reference;
     gqc_f12_cartesian_shells_coulomb_host_reference;
     gqc_f12_cartesian_shells_geminal_ex_host_reference;

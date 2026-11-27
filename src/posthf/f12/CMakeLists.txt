@@ -8,7 +8,8 @@ endif()
 
 set(shell_target focal_shell_${GENERATIVEQC_F12_SHELL_DOMAIN})
 set(shell_sources
-    f12_molecular_integral_sink.cu)
+    f12_molecular_integral_sink.cu
+    f12_cabs_h_one_electron.cu)
 if(GENERATIVEQC_ENABLE_CUDA)
   set(backend cuda)
 else()
@@ -71,6 +72,7 @@ foreach(target IN LISTS shell_targets)
     set_property(TARGET ${target} PROPERTY JOB_POOL_COMPILE "${_generativeqc_cuda_compile_pool}")
   endif()
 endforeach()
+target_compile_definitions(${shell_target} PRIVATE GQC_F12_CABS_I_ONE_ELECTRON)
 if(NOT GENERATIVEQC_ENABLE_CUDA)
   set_target_properties(${shell_target} PROPERTIES OUTPUT_NAME "${shell_target}_host")
 endif()

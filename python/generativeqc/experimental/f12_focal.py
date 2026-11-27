@@ -17,6 +17,8 @@ import numpy as np
 from .. import (
     _f12_focal_cv,
     _f12_focal_integral_kernel,
+    _f12_focal_molecular,
+    _f12_focal_one_electron,
     _f12_focal_reference,
     _f12_frozen_core,
     _native,
@@ -66,6 +68,7 @@ SlaterNormalization = Literal[
 DEFAULT_SLATER_FIT_NORMALIZATION = (
     _f12_focal_integral_kernel.DEFAULT_SLATER_FIT_NORMALIZATION
 )
+MolecularFocalProvider = _f12_focal_molecular.MolecularFocalProvider
 conventional_mp2_request = _f12_focal_cv.conventional_mp2_request
 DEFAULT_PRODUCTION_CORRELATION_SPACE = _f12_frozen_core.DEFAULT_PRODUCTION_CORRELATION_SPACE
 FROZEN_CORE_DEFINITION_VERSION = _f12_frozen_core.FROZEN_CORE_DEFINITION_VERSION
@@ -73,6 +76,8 @@ frozen_core_orbitals_for_atom = _f12_frozen_core.frozen_core_orbitals_for_atom
 frozen_core_spd_orbitals_for_atom = _f12_frozen_core.frozen_core_spd_orbitals_for_atom
 cv_active_frozen_orbitals_for_atom = _f12_frozen_core.cv_active_frozen_orbitals_for_atom
 resolve_frozen_occupied = _f12_frozen_core.resolve_frozen_occupied
+FocalOneElectron = _f12_focal_one_electron.FocalOneElectron
+one_electron_sources = _f12_focal_one_electron.one_electron_sources
 FocalReference = _f12_focal_reference.FocalReference
 FocalReferenceSeed = _f12_focal_reference.FocalReferenceSeed
 df_reference = _f12_focal_reference.df_reference

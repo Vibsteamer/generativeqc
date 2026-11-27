@@ -1,5 +1,9 @@
 {
   global:
+    gqc_f12_cabs_i_one_electron;
+    gqc_f12_cabs_i_one_electron_batch;
+    gqc_f12_cabs_i_one_electron_full_batch;
+    gqc_f12_cabs_i_one_electron_weights;
     gqc_f12_cartesian_shells_coulomb;
     gqc_f12_cartesian_shells_coulomb_ex;
     gqc_f12_cartesian_shells_geminal;
