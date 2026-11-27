@@ -11,6 +11,8 @@ set(shell_sources
     f12_molecular_integral_sink.cu
     f12_cabs_h_one_electron.cu
     f12_ao_mo_project_cuda.cu
+    f12_spin_fock_1e_cuda.cu
+    f12_cphf_relax_cuda.cu
     f12_ext_fock_cuda.cu)
 if(GENERATIVEQC_ENABLE_CUDA)
   set(backend cuda)

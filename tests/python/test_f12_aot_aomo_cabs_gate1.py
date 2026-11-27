@@ -650,6 +650,216 @@ def test_cabs_fock_and_frame_kernel_unit_parity(
             assert err <= 1e-12 + 1e-13 * mag, f"{case_id} fk {key} err={err} mag={mag}"
 
 
+@pytest.mark.parametrize(
+    "case_id,oa,ob,obs,aux,nao,same_spin",
+    [
+        ("rhf-obs", 3, 3, 7, 9, 7, True),
+        ("uhf-obs", 4, 2, 7, 9, 7, False),
+        ("uhf-ob0", 3, 0, 6, 8, 6, False),
+        ("uhf-nao-gt-obs", 3, 1, 6, 8, 10, False),
+    ],
+)
+def test_cabs_cphf_action_and_nuclear_weights_unit_parity(
+    host_sink: Path,
+    case_id: str,
+    oa: int,
+    ob: int,
+    obs: int,
+    aux: int,
+    nao: int,
+    same_spin: bool,
+):
+    """Exact unit parity for AOT whiten_3c, cphf_action, and nuclear_weights."""
+    from generativeqc._f12_ao_mo_native import (
+        bind_cabs_singles_ops,
+        run_cabs_cphf_action,
+        run_cabs_nuclear_weights,
+        run_cabs_whiten_3c,
+    )
+    from generativeqc._f12_focal_singles_response import _rhf_df_orbital_action
+    from generativeqc.f12_orbital_response import unrestricted_nuclear_source_weights
+    from generativeqc_compiler.mp2.f12_unrestricted_reference import (
+        unrestricted_df_orbital_action,
+    )
+
+    import zlib
+
+    ops = bind_cabs_singles_ops(host_sink, host_reference=True)
+    assert ops is not None
+    rng = np.random.default_rng(8101 + (zlib.crc32(case_id.encode()) % 100000))
+
+    w_raw = rng.standard_normal((aux, aux))
+    metric = w_raw @ w_raw.T + 2.0 * np.eye(aux)
+    whitener = np.linalg.solve(np.linalg.cholesky(metric), np.eye(aux))
+    raw_a = rng.standard_normal((aux, obs, obs))
+    raw_a = 0.5 * (raw_a + raw_a.swapaxes(1, 2))
+    df_a = run_cabs_whiten_3c(ops, whitener, raw_a)
+    assert np.max(np.abs(df_a - np.einsum("ab,bpq->apq", whitener, raw_a))) <= 1e-12
+
+    if same_spin:
+        df_b = df_a
+    else:
+        raw_b = rng.standard_normal((aux, obs, obs))
+        raw_b = 0.5 * (raw_b + raw_b.swapaxes(1, 2))
+        df_b = run_cabs_whiten_3c(ops, whitener, raw_b)
+
+    va, vb = obs - oa, obs - ob
+    gap_a = rng.uniform(0.5, 3.0, size=(va, oa)) if oa > 0 else None
+    gap_b = (
+        gap_a.copy()
+        if same_spin
+        else (rng.uniform(0.5, 3.0, size=(vb, ob)) if ob > 0 else None)
+    )
+    trial_a = rng.standard_normal((va, oa)) if oa > 0 else None
+    trial_b = (
+        trial_a.copy()
+        if same_spin
+        else (rng.standard_normal((vb, ob)) if ob > 0 else None)
+    )
+
+    cpu = _cpu_run()
+    # 1. CPHF action parity (both RHF fast-path and general UHF)
+    if same_spin:
+        ref_rhf = cpu(
+            _rhf_df_orbital_action(oa, obs, aux),
+            {
+                "vv": df_a[:, oa:, oa:],
+                "oo": df_a[:, :oa, :oa],
+                "vo": df_a[:, oa:, :oa],
+                "trial": trial_a,
+                "gap": gap_a,
+            },
+        ).outputs["rhf"]
+        aot_a, aot_b = run_cabs_cphf_action(
+            ops,
+            oa,
+            ob,
+            obs,
+            aux,
+            is_rhf=True,
+            df_a=df_a,
+            df_b=None,
+            gap_a=gap_a,
+            gap_b=None,
+            trial_a=trial_a,
+            trial_b=None,
+        )
+        assert aot_a is not None and aot_b is None
+        assert np.max(np.abs(aot_a - ref_rhf)) <= 1e-12
+    else:
+        u_in = {}
+        if oa > 0:
+            u_in.update(
+                {
+                    "vv_alpha": df_a[:, oa:, oa:],
+                    "oo_alpha": df_a[:, :oa, :oa],
+                    "vo_alpha": df_a[:, oa:, :oa],
+                    "trial_alpha": trial_a,
+                    "gap_alpha": gap_a,
+                }
+            )
+        if ob > 0:
+            u_in.update(
+                {
+                    "vv_beta": df_b[:, ob:, ob:],
+                    "oo_beta": df_b[:, :ob, :ob],
+                    "vo_beta": df_b[:, ob:, :ob],
+                    "trial_beta": trial_b,
+                    "gap_beta": gap_b,
+                }
+            )
+        ref_u = cpu(unrestricted_df_orbital_action(oa, ob, obs, aux), u_in).outputs
+        aot_a, aot_b = run_cabs_cphf_action(
+            ops,
+            oa,
+            ob,
+            obs,
+            aux,
+            is_rhf=False,
+            df_a=df_a if oa > 0 else None,
+            df_b=df_b if ob > 0 else None,
+            gap_a=gap_a,
+            gap_b=gap_b,
+            trial_a=trial_a,
+            trial_b=trial_b,
+        )
+        if oa > 0:
+            assert aot_a is not None
+            assert np.max(np.abs(aot_a - ref_u["alpha"])) <= 1e-12
+        if ob > 0:
+            assert aot_b is not None
+            assert np.max(np.abs(aot_b - ref_u["beta"])) <= 1e-12
+        else:
+            assert aot_b is None
+
+    # 2. Nuclear weights parity
+    c_a = rng.standard_normal((nao, obs))
+    c_b = c_a.copy() if same_spin else rng.standard_normal((nao, obs))
+    eps_a = rng.standard_normal((oa,)) if oa > 0 else np.empty((0,))
+    eps_b = eps_a.copy() if same_spin else (rng.standard_normal((ob,)) if ob > 0 else np.empty((0,)))
+    fseed_a = rng.standard_normal((obs, obs))
+    fseed_b = fseed_a.copy() if same_spin else rng.standard_normal((obs, obs))
+    sseed_a = rng.standard_normal((obs, obs))
+    sseed_b = sseed_a.copy() if same_spin else rng.standard_normal((obs, obs))
+    z_a = rng.standard_normal((va, oa)) if oa > 0 else np.empty((0, 0))
+    z_b = z_a.copy() if same_spin else (rng.standard_normal((vb, ob)) if ob > 0 else np.empty((0, 0)))
+    z_parts = []
+    if oa > 0:
+        z_parts.append(z_a.ravel())
+    if ob > 0:
+        z_parts.append(z_b.ravel())
+    z_vec = np.concatenate(z_parts)
+
+    central = {
+        "whitener": whitener,
+        "coefficients_alpha": c_a,
+        "coefficients_beta": c_b,
+        "df_alpha": df_a,
+        "df_beta": df_b,
+        "fock_seed_alpha": fseed_a,
+        "fock_seed_beta": fseed_b,
+        "overlap_seed_alpha": sseed_a,
+        "overlap_seed_beta": sseed_b,
+    }
+    if oa > 0:
+        central["occupied_energies_alpha"] = eps_a
+    if ob > 0:
+        central["occupied_energies_beta"] = eps_b
+
+    ref_nuc = unrestricted_nuclear_source_weights((oa, ob, obs, aux), central, z_vec, cpu)
+
+    p_a = fseed_a.copy()
+    sm_a = sseed_a.copy()
+    if oa > 0:
+        p_a[oa:, :oa] -= z_a
+        sm_a[oa:, :oa] += z_a * eps_a[None, :]
+    p_b = fseed_b.copy()
+    sm_b = sseed_b.copy()
+    if ob > 0:
+        p_b[ob:, :ob] -= z_b
+        sm_b[ob:, :ob] += z_b * eps_b[None, :]
+
+    aot_nuc = run_cabs_nuclear_weights(
+        ops,
+        oa,
+        ob,
+        obs,
+        aux,
+        nao,
+        same_spin=same_spin,
+        whitener=whitener,
+        c_a=c_a,
+        c_b=c_b,
+        df_a=df_a,
+        df_b=df_b,
+        p_a=p_a,
+        p_b=p_b,
+        sm_a=sm_a,
+        sm_b=sm_b,
+    )
+    for key in ("overlap_ao", "hcore_ao", "ao_coulomb", "metric/coulomb"):
+        err = float(np.max(np.abs(aot_nuc[key] - ref_nuc[key])))
+        assert err <= 1e-11, f"{case_id} nuclear weight {key} err={err}"
 
 
 

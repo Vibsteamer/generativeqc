@@ -1,0 +1,14 @@
+{
+  "path": "src/posthf/f12/f12_spin_fock_1e_cuda.cu",
+  "reason": "Fock construction and its adjoint in explicit spin spaces, with density and one-electron term weights for Cartesian derivatives.",
+  "regions": [
+    {
+      "reason": "Device buffer and cuBLAS handle management.",
+      "role": "runtime",
+      "start": "struct DevBuf {",
+      "stop": "__global__ void k_slice_occ_raw"
+    }
+  ],
+  "role": "scientific",
+  "subsystem": "molecular_f12"
+}

@@ -1,0 +1,14 @@
+{
+  "path": "src/posthf/f12/f12_cphf_relax_cuda.cu",
+  "reason": "Whitened DF tensors, spin-resolved orbital Hessian actions and the backpropagation of canonical orbitals and nuclear response weights.",
+  "regions": [
+    {
+      "reason": "Scoped device resources and cuBLAS layouts.",
+      "role": "runtime",
+      "start": "struct DeviceBuf {",
+      "stop": "__global__ void k_transpose_3d_012_to_102"
+    }
+  ],
+  "role": "scientific",
+  "subsystem": "molecular_f12"
+}
