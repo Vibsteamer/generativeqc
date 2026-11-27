@@ -327,6 +327,9 @@
     "generativeqc.experimental.array_api.where": "generativeqc/experimental/array_api.py:where",
     "generativeqc.experimental.array_api.zeros": "generativeqc/experimental/array_api.py:zeros",
     "generativeqc.experimental.array_api.zeros_like": "generativeqc/experimental/array_api.py:zeros_like",
+    "generativeqc.experimental.f12_focal": "generativeqc/experimental/f12_focal.py:<module>",
+    "generativeqc.experimental.uccsd_f12.SolverOptions": "generativeqc/_ucc/solver.py:SolverOptions",
+    "generativeqc.experimental.uccsd_f12.UCCSDLambdaOptions": "generativeqc/_ucc/uccsd_lambda.py:UCCSDLambdaOptions",
     "generativeqc.extensions.API_VERSION": "generativeqc/extensions/__init__.py:API_VERSION",
     "generativeqc.extensions.method": "generativeqc/extensions/method.py:<module>",
     "generativeqc.extensions.method.API_VERSION": "generativeqc/extensions/method.py:API_VERSION",
@@ -394,6 +397,7 @@
     "generativeqc.extensions.xc.named": "generativeqc/extensions/xc.py:named",
     "generativeqc.finalize_hf_verification": "generativeqc/progressive_controller.py:finalize_hf_verification",
     "generativeqc.import_bse": "generativeqc/basis_import.py:import_bse",
+    "generativeqc.import_nwchem": "generativeqc/basis_import.py:import_nwchem",
     "generativeqc.load_basis": "generativeqc/basis.py:load_basis",
     "generativeqc.load_r2scan3c_basis": "generativeqc/r2scan3c.py:load_r2scan3c_basis",
     "generativeqc.make_deterministic_hf_plan": "generativeqc/progressive_controller.py:make_deterministic_hf_plan",
@@ -782,6 +786,42 @@
         "behavior": "docstring"
       }
     },
+    "generativeqc/_ucc/solver.py:SolverOptions": {
+      "kind": "class",
+      "profile": "record",
+      "facets": {
+        "behavior": "docstring",
+        "ownership": "docs/reference/python_contracts.md#python-options-ownership",
+        "values": "docs/reference/python_contracts.md#python-stationary-cc-options-values"
+      }
+    },
+    "generativeqc/_ucc/solver.py:SolverOptions.__post_init__": {
+      "kind": "function",
+      "profile": "validation",
+      "facets": {
+        "behavior": "docstring",
+        "errors": "docs/reference/python_contracts.md#python-stationary-cc-options-errors",
+        "values": "docs/reference/python_contracts.md#python-stationary-cc-options-values"
+      }
+    },
+    "generativeqc/_ucc/uccsd_lambda.py:UCCSDLambdaOptions": {
+      "kind": "class",
+      "profile": "record",
+      "facets": {
+        "behavior": "docstring",
+        "ownership": "docs/reference/python_contracts.md#python-options-ownership",
+        "values": "docs/reference/python_contracts.md#python-stationary-cc-options-values"
+      }
+    },
+    "generativeqc/_ucc/uccsd_lambda.py:UCCSDLambdaOptions.__post_init__": {
+      "kind": "function",
+      "profile": "validation",
+      "facets": {
+        "behavior": "docstring",
+        "errors": "docs/reference/python_contracts.md#python-stationary-cc-options-errors",
+        "values": "docs/reference/python_contracts.md#python-stationary-cc-options-values"
+      }
+    },
     "generativeqc/accuracy.py:AccuracyAssessment": {
       "kind": "class",
       "profile": "record",
@@ -1115,6 +1155,16 @@
       }
     },
     "generativeqc/basis_import.py:import_bse": {
+      "kind": "function",
+      "profile": "transformation",
+      "facets": {
+        "behavior": "docstring",
+        "errors": "docs/reference/python_contracts.md#python-basis-errors",
+        "ownership": "docs/reference/python_contracts.md#python-basis-ownership",
+        "values": "docs/reference/python_contracts.md#python-basis-values"
+      }
+    },
+    "generativeqc/basis_import.py:import_nwchem": {
       "kind": "function",
       "profile": "transformation",
       "facets": {
@@ -4556,6 +4606,13 @@
         "errors": "docs/reference/python_contracts.md#python-array-errors",
         "ownership": "docs/reference/python_contracts.md#python-array-ownership",
         "values": "docs/reference/python_contracts.md#python-array-values"
+      }
+    },
+    "generativeqc/experimental/f12_focal.py:<module>": {
+      "kind": "module",
+      "profile": "module",
+      "facets": {
+        "behavior": "docstring"
       }
     },
     "generativeqc/extensions/__init__.py:API_VERSION": {

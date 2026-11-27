@@ -25,17 +25,35 @@ basis loading never requires a native library or an accelerator.
 
 ## Import and use
 
-Convert a locally supplied **MolSSI Basis Set Exchange complete JSON 0.1** file:
+Convert a locally supplied **MolSSI Basis Set Exchange JSON 0.1** file (complete,
+or the minimal form written by BSE format converters) or an **NWChem** basis/ECP
+file:
 
 ```bash
 python tools/import_basis.py input.bse.json local-basis.json \
   --source 'local BSE export' --source-version '<exact release or git revision>' \
   --license BSD-3-Clause --representation spherical
+python tools/import_basis.py input.nwchem local-basis.json --format nwchem \
+  --source '<publisher and URL>' --source-version '<version or retrieval date>' \
+  --license '<terms>' --representation spherical
 ```
 
 The source, version and redistribution license are explicit declarations. The
-importer hashes the source bytes and retains the basis-data version as well.
-It never queries BSE or installs an external quantum-chemistry backend.
+importer hashes the source bytes. Complete JSON also retains its basis-data
+version and name; minimal JSON and NWChem input record `basis-data=unversioned`
+and take the name from `--name` or the file stem. NWChem parsing uses the
+`basis_set_exchange` reader (`pip install 'generativeqc[bse]'`). The importer
+never queries BSE or installs an external quantum-chemistry backend. A file
+with only s and p shells cannot show its AO representation, so pass
+`--representation`. The Python entry points are `import_bse` and
+`import_nwchem`.
+
+The tool prints the basis identity and then one `Z=<n> content_sha256=<hash>`
+line per element. `generativeqc.basis.element_content_sha256` hashes the
+binary64 shell and scalar-ECP values together with the AO representation, and
+ignores decimal spelling, shell source groups and provenance. Compare it with a
+recorded value to confirm that a separately obtained file holds the expected
+record.
 
 ```python
 from pathlib import Path

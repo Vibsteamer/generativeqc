@@ -25,7 +25,7 @@ from .accuracy import (
 )
 from .basis import BasisProvenance, BasisSet, BasisShell, ElementBasis, load_basis
 from .basis_capabilities import basis_capability
-from .basis_import import import_bse
+from .basis_import import import_bse, import_nwchem
 from .batch import (
     BatchItemResult,
     BatchResult,
@@ -289,6 +289,7 @@ __all__ = [
     "exchange_operator_key",
     "finalize_hf_verification",
     "import_bse",
+    "import_nwchem",
     "load_basis",
     "load_r2scan3c_basis",
     "make_deterministic_hf_plan",

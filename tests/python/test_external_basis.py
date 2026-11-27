@@ -1,6 +1,8 @@
 """Offline basis identity, independent integral/HF and unsupported-domain gates."""
 
 import json
+import subprocess
+import sys
 import typing
 from dataclasses import replace
 from decimal import localcontext
@@ -18,9 +20,17 @@ from generativeqc import (
     basis_capability,
     electron_state,
     import_bse,
+    import_nwchem,
     load_basis,
 )
-from generativeqc.basis import NORMALIZATION, decimal_text, read_local_json
+from generativeqc.basis import (
+    MAX_FILE_BYTES,
+    NORMALIZATION,
+    decimal_text,
+    element_content_sha256,
+    read_local_bytes,
+    read_local_json,
+)
 from generativeqc.elements import SYMBOLS
 from generativeqc.profiles import canonical_hash, file_hash
 from generativeqc_compiler.common.evidence import block_error
@@ -170,6 +180,54 @@ def test_checksums_duplicate_keys_records_and_normalization_are_not_ignored(
         replace(basis.by_element[1], ecp_core_electrons=1)
 
 
+def test_local_inputs_are_refused_above_64_mib(tmp_path: typing.Any) -> None:
+    exact, over = tmp_path / "exact.bin", tmp_path / "over.nw"
+    for path, size in ((exact, MAX_FILE_BYTES), (over, MAX_FILE_BYTES + 1)):
+        with path.open("wb") as stream:
+            stream.truncate(size)
+    assert len(read_local_bytes(exact)) == MAX_FILE_BYTES
+    kwargs = {"source": "test", "source_version": "1", "license": "CC0-1.0"}
+    for read in (
+        read_local_bytes,
+        read_local_json,
+        lambda p: import_nwchem(p, **kwargs),
+    ):
+        with pytest.raises(ValueError, match="exceeds the 64 MiB input limit"):
+            read(over)
+
+
+@pytest.mark.skipif(
+    not (Path("/dev/zero").exists() and Path("/proc/self/statm").exists()),
+    reason="needs /dev/zero and /proc/self/statm",
+)
+def test_local_input_limit_counts_bytes_read_not_reported_size() -> None:
+    # /dev/zero reports size 0 and never ends. The address-space cap makes an
+    # unbounded read fail with MemoryError instead of exhausting the host.
+    script = (
+        "import os, resource\n"
+        "from generativeqc.basis import read_local_bytes\n"
+        "pages = int(open('/proc/self/statm').read().split()[0])\n"
+        "cap = pages * os.sysconf('SC_PAGE_SIZE') + (512 << 20)\n"
+        "hard = resource.getrlimit(resource.RLIMIT_AS)[1]\n"
+        "if hard != resource.RLIM_INFINITY:\n"
+        "    cap = min(cap, hard)\n"
+        "resource.setrlimit(resource.RLIMIT_AS, (cap, hard))\n"
+        "try:\n"
+        "    read_local_bytes('/dev/zero')\n"
+        "except ValueError as error:\n"
+        "    print(error)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "/dev/zero exceeds the 64 MiB input limit"
+
+
 def test_ambiguous_combined_and_malformed_ecp_imports(
     tmp_path: typing.Any,
 ) -> None:
@@ -186,6 +244,147 @@ def test_ambiguous_combined_and_malformed_ecp_imports(
     path.write_text(json.dumps(data))
     with pytest.raises(ValueError, match="radial"):
         import_bse(path, source="test", source_version="1", license="BSD-3-Clause")
+
+
+def test_minimal_json_and_nwchem_imports_keep_the_complete_record_content(
+    tmp_path: typing.Any,
+) -> None:
+    writers = pytest.importorskip(
+        "basis_set_exchange.writers", reason="NWChem import needs basis-set-exchange"
+    )
+    complete = imported("def2-tzvp-au")
+    data = json.loads((ROOT / "def2-tzvp-au.json").read_text())
+    minimal = {
+        "molssi_bse_schema": {"schema_type": "minimal", "schema_version": "0.1"},
+        "elements": data["elements"],
+    }
+    path = tmp_path / "au-minimal.json"
+    path.write_text(json.dumps(minimal))
+    basis = import_bse(
+        path, source="test", source_version="pinned 4adaf13", license="BSD-3-Clause"
+    )
+    assert basis.name == "au-minimal" and basis.elements == complete.elements
+    assert basis.representation == "spherical"
+    assert basis.provenance.version == "pinned 4adaf13; basis-data=unversioned"
+    path = tmp_path / "au.nwchem"
+    path.write_text(writers.write_formatted_basis_str(data, "nwchem"))
+    nwchem = import_nwchem(
+        path, source="test", source_version="pinned 4adaf13", license="BSD-3-Clause"
+    )
+    assert nwchem.name == "au" and nwchem.provenance.checksum == file_hash(path)
+    assert nwchem.representation == "spherical"
+    au, other = complete.by_element[79], nwchem.by_element[79]
+    assert other.ecp_core_electrons == au.ecp_core_electrons == 60
+    assert element_content_sha256(other, "spherical") == element_content_sha256(
+        au, "spherical"
+    )
+    for bad in ({**minimal, "version": ""}, {**minimal, "function_types": "gto"}):
+        path = tmp_path / "bad-minimal.json"
+        path.write_text(json.dumps(bad))
+        with pytest.raises((ValueError, TypeError)):
+            import_bse(path, source="test", source_version="1", license="BSD-3-Clause")
+    with pytest.raises(ValueError, match="source version"):
+        import_nwchem(path, source="test", source_version=" ", license="BSD-3-Clause")
+
+
+def test_nwchem_general_contractions_and_fortran_exponents(
+    tmp_path: typing.Any,
+) -> None:
+    pytest.importorskip("basis_set_exchange", reason="needs basis-set-exchange")
+    path = tmp_path / "h.nw"
+    path.write_text(
+        'BASIS "ao basis" SPHERICAL PRINT\nH    S\n'
+        "      1.0D+00   0.5D0  0.25\n      0.2       0.0    1.0\nEND\n"
+    )
+    kwargs = {"source": "test", "source_version": "1", "license": "CC0-1.0"}
+    inferred = import_nwchem(path, **kwargs)
+    spherical = import_nwchem(path, representation="spherical", name="h", **kwargs)
+    shell = BasisShell(0, ("1", "0.2"), (("0.5", "0"), ("0.25", "1")))
+    assert inferred.by_element[1].shells == spherical.by_element[1].shells == (shell,)
+    # An s-only file cannot show its representation; it is part of the content.
+    assert inferred.representation == "cartesian"
+    assert element_content_sha256(
+        inferred.by_element[1], "cartesian"
+    ) != element_content_sha256(spherical.by_element[1], "spherical")
+
+
+def test_element_content_hash_tracks_values_not_spelling_or_grouping() -> None:
+    oxygen = imported().by_element[8]
+    base = element_content_sha256(oxygen, "cartesian")
+    respelled = replace(
+        oxygen,
+        shells=tuple(
+            replace(
+                s,
+                exponents=tuple(f"{float(x):.17e}" for x in s.exponents),
+                source_group=7,
+            )
+            for s in oxygen.shells
+        ),
+    )
+    assert element_content_sha256(respelled, "cartesian") == base
+    assert element_content_sha256(oxygen, "spherical") != base
+    first = oxygen.shells[0]
+    bumped = replace(
+        first,
+        exponents=(
+            repr(float(first.exponents[0]) * (1 + 2**-52)),
+            *first.exponents[1:],
+        ),
+    )
+    swapped = (oxygen.shells[1], oxygen.shells[0], *oxygen.shells[2:])
+    for shells in ((bumped, *oxygen.shells[1:]), swapped):
+        assert (
+            element_content_sha256(replace(oxygen, shells=shells), "cartesian") != base
+        )
+
+    gold = imported("def2-tzvp-au").by_element[79]
+    terms = json.loads(gold.ecp_data)
+    reordered = replace(gold, ecp_data=json.dumps(terms[::-1]))
+    assert element_content_sha256(reordered, "spherical") == element_content_sha256(
+        gold, "spherical"
+    )
+    terms[0]["coefficients"][0][0] = repr(float(terms[0]["coefficients"][0][0]) + 1)
+    changed = replace(gold, ecp_data=json.dumps(terms))
+    assert element_content_sha256(changed, "spherical") != element_content_sha256(
+        gold, "spherical"
+    )
+
+
+def test_import_tool_reports_identity_and_element_content(
+    tmp_path: typing.Any,
+) -> None:
+    pytest.importorskip("basis_set_exchange", reason="needs basis-set-exchange")
+    source = tmp_path / "h2.nwchem"
+    source.write_text('BASIS "ao basis" SPHERICAL PRINT\nH S\n  0.5 1.0\nEND\n')
+    output = tmp_path / "h2.json"
+    root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(root / "tools/import_basis.py"),
+            str(source),
+            str(output),
+            "--source",
+            "test",
+            "--source-version",
+            "1",
+            "--license",
+            "CC0-1.0",
+            "--representation",
+            "spherical",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    basis = load_basis(output)
+    hydrogen = element_content_sha256(basis.by_element[1], "spherical")
+    assert result.stdout.splitlines() == [
+        basis.identity,
+        f"Z=1 content_sha256={hydrogen}",
+    ]
+    assert basis.name == "h2" and basis.representation == "spherical"
 
 
 @pytest.mark.parametrize("version", [True, 1.0, "1", None])

@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import typing
 from dataclasses import asdict, dataclass
@@ -21,6 +22,7 @@ from .profiles import canonical_hash
 
 SCHEMA = "generativeqc.basis"
 VERSION = 1
+ELEMENT_CONTENT_SCHEMA = "generativeqc.basis-element-content/v1"
 NORMALIZATION = "normalized-primitives; native-normalized-contractions"
 ORDERING = "CCA-cartesian; libcint-real-spherical"
 MAX_FILE_BYTES = 64 << 20
@@ -66,14 +68,25 @@ def _pairs(pairs: typing.Any) -> typing.Any:
     return result
 
 
+def read_local_bytes(path: typing.Any) -> bytes:
+    """Read a local input file of at most 64 MiB, refusing it before any parsing.
+
+    The limit applies to the bytes read through one open descriptor, never to
+    an earlier size query, so a file that grows or is replaced meanwhile, or a
+    device without a size, cannot make the read exceed it.
+    """
+    with open(path, "rb") as stream:
+        if os.fstat(stream.fileno()).st_size > MAX_FILE_BYTES:
+            raise ValueError(f"{path} exceeds the 64 MiB input limit")
+        raw = stream.read(MAX_FILE_BYTES + 1)
+    if len(raw) > MAX_FILE_BYTES:
+        raise ValueError(f"{path} exceeds the 64 MiB input limit")
+    return raw
+
+
 def read_local_json(path: typing.Any) -> typing.Any:
     """Bound a local interchange file and reject duplicate keys/nonfinite JSON."""
-    path = Path(path)
-    if path.stat().st_size > MAX_FILE_BYTES:
-        raise ValueError("basis file exceeds the 64 MiB input limit")
-    raw = path.read_bytes()
-    if len(raw) > MAX_FILE_BYTES:
-        raise ValueError("basis file exceeds the 64 MiB input limit")
+    raw = read_local_bytes(path)
     data = json.loads(
         raw,
         object_pairs_hook=_pairs,
@@ -349,6 +362,52 @@ class BasisSet:
                         )
                     )
         return tuple(result)
+
+
+def element_content_sha256(element: ElementBasis, representation: str) -> str:
+    """Identify one element record by the binary64 values a calculation uses.
+
+    Shell order, angular momenta, exponents, contraction rows, the AO
+    representation and the scalar ECP terms determine the hash. Decimal
+    spelling, shell source groups and provenance do not. ECP terms form an
+    unordered set.
+    """
+    if representation not in ("cartesian", "spherical"):
+        raise ValueError("basis representation must be Cartesian or real spherical")
+    shells = [
+        [
+            shell.angular_momentum,
+            [float(x).hex() for x in shell.exponents],
+            [[float(c).hex() for c in row] for row in shell.coefficients],
+        ]
+        for shell in element.shells
+    ]
+    ecp = None
+    if element.ecp_core_electrons:
+        potentials = [
+            {
+                "angular_momentum": [int(l) for l in term["angular_momentum"]],
+                "r_exponents": [int(r) for r in term["r_exponents"]],
+                "gaussian_exponents": [
+                    float(x).hex() for x in term["gaussian_exponents"]
+                ],
+                "coefficients": [
+                    [float(c).hex() for c in row] for row in term["coefficients"]
+                ],
+            }
+            for term in json.loads(element.ecp_data)
+        ]
+        potentials.sort(key=lambda term: json.dumps(term, sort_keys=True))
+        ecp = {"core_electrons": element.ecp_core_electrons, "potentials": potentials}
+    return canonical_hash(
+        {
+            "schema": ELEMENT_CONTENT_SCHEMA,
+            "atomic_number": element.atomic_number,
+            "representation": representation,
+            "shells": shells,
+            "ecp": ecp,
+        }
+    )
 
 
 def load_basis(path: typing.Any) -> typing.Any:
