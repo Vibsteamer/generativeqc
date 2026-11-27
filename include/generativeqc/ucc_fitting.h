@@ -27,6 +27,22 @@ GENERATIVEQC_API generativeqc_status generativeqc_focal_df_reference_owned_v1(
     generativeqc_focal_reference** owner);
 GENERATIVEQC_API void generativeqc_focal_reference_destroy_v1(generativeqc_focal_reference* owner);
 
+/** Clone a focal determinant with its occupied columns permuted in public AO order.
+ * Each integer maps a new occupied column to its old index. Virtual columns,
+ * the AO density and the physical Hamiltonian retain their original identity.
+ */
+GENERATIVEQC_API generativeqc_status generativeqc_focal_reference_permute_occupied_v1(
+    const generativeqc_focal_reference* owner, const size_t* alpha, size_t alpha_count,
+    const size_t* beta, size_t beta_count, size_t budget, generativeqc_focal_reference** result);
+
+/** Return the lowest occupied spherical HF orbitals of one neutral atom as
+ * [public AO, orbitals] and their energies plus the next occupied energy.
+ */
+GENERATIVEQC_API generativeqc_status generativeqc_focal_atomic_core_v1(
+    generativeqc_context* context, const generativeqc_system* atomic, size_t orbitals,
+    size_t budget, double* coefficients, size_t coefficient_count, double* energies,
+    size_t energy_count);
+
 /** Use a fresh full-DF UCCSD(T) plan with the retained determinant.
  * Output is the (T) energy followed by optional analytic Cartesian forces.
  * The two force Lagrangians use the same converged conventional amplitudes. */

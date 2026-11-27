@@ -14,6 +14,13 @@ struct HuckelDensityResult {
  * Return the electron counts in s and p channels, not molecular occupations. */
 std::pair<unsigned, unsigned> huckel_atomic_configuration(int atomic_number);
 
+/** Isolated spherical atomic HF orbitals in the full one-atom public AO frame.
+ * Return the lowest occupied atomic columns and the energy just above them so
+ * callers can verify their chemical shell boundary.
+ */
+void spherical_atomic_core(const core::System& atom, std::size_t orbitals, std::size_t budget,
+                           double* coefficients, double* energies);
+
 /** Native Modified Hückel (updated Wolfsberg-Helmholtz rule).
  * CPU atomic RHF and the occupied-atomic-subspace eigenproblem are explicit
  * production preparation, including for CUDA targets. No PySCF is called.

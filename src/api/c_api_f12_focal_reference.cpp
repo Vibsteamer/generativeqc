@@ -27,6 +27,7 @@
 #include "runtime/execution_context.hpp"
 #include "scf/fock_prepared.hpp"
 #include "scf/initial_guess/density.hpp"
+#include "scf/initial_guess/huckel.hpp"
 #include "scf/mean_field.hpp"
 #include "scf/solver/uhf_second_order.hpp"
 
@@ -548,6 +549,91 @@ extern "C" generativeqc_status generativeqc_focal_df_reference_owned_v1(
 
 extern "C" void generativeqc_focal_reference_destroy_v1(generativeqc_focal_reference* owner) {
   delete owner;
+}
+
+extern "C" generativeqc_status generativeqc_focal_reference_permute_occupied_v1(
+    const generativeqc_focal_reference* owner, const std::size_t* alpha, std::size_t alpha_count,
+    const std::size_t* beta, std::size_t beta_count, std::size_t budget,
+    generativeqc_focal_reference** result) {
+  using namespace generativeqc;
+  if (!result) return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
+  *result = nullptr;
+  if (!owner || !owner->uhf || !budget || (alpha_count && !alpha) || (beta_count && !beta) ||
+      alpha_count != owner->uhf->nocc[0] || beta_count != owner->uhf->nocc[1])
+    return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
+  try {
+    const std::array orders{std::span(alpha, alpha_count), std::span(beta, beta_count)};
+    const auto n = owner->uhf->nbf;
+    for (auto order : orders) {
+      std::vector<bool> seen(order.size());
+      for (auto index : order) {
+        if (index >= order.size() || seen[index]) return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
+        seen[index] = true;
+      }
+    }
+    if (owner->rhf && !std::equal(orders[0].begin(), orders[0].end(), orders[1].begin(),
+                                  orders[1].end()))
+      return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
+    const auto squares = runtime::size_mul(n, n);
+    const auto numeric_bytes = runtime::size_mul(sizeof(double),
+        runtime::size_add(runtime::size_mul(owner->rhf ? 14 : 8, squares), 3 * n));
+    const auto identity_bytes = runtime::size_add(
+        owner->jk.storage_bytes(),
+        owner->uhf->source_identity ? owner->uhf->source_identity->storage_bytes() : 0);
+    if (runtime::size_add(numeric_bytes, identity_bytes) > budget)
+      return GENERATIVEQC_STATUS_OUT_OF_MEMORY;
+    auto reorder = [n](const auto& src_c, const auto& src_e, auto& dst_c, auto& dst_e,
+                        std::span<const std::size_t> order) {
+      for (std::size_t i = 0; i < order.size(); ++i) {
+        dst_e[i] = src_e[order[i]];
+        for (std::size_t row = 0; row < n; ++row)
+          dst_c[row * n + i] = src_c[row * n + order[i]];
+      }
+    };
+    auto unrestricted = std::make_shared<hf::UnrestrictedPhysicalReference>(*owner->uhf);
+    for (std::size_t spin = 0; spin < 2; ++spin)
+      reorder(owner->uhf->coefficients[spin], owner->uhf->orbital_energies[spin],
+              unrestricted->coefficients[spin], unrestricted->orbital_energies[spin], orders[spin]);
+    std::shared_ptr<hf::PhysicalReference> restricted;
+    if (owner->rhf) {
+      restricted = std::make_shared<hf::PhysicalReference>(*owner->rhf);
+      reorder(owner->rhf->coefficients, owner->rhf->orbital_energies, restricted->coefficients,
+              restricted->orbital_energies, orders[0]);
+    }
+    *result = new generativeqc_focal_reference{
+        std::move(unrestricted), owner->jk, owner->backend, owner->device,
+        owner->refine_ecp_quadrature, std::move(restricted)};
+    return GENERATIVEQC_STATUS_SUCCESS;
+  } catch (const std::length_error&) {
+    return GENERATIVEQC_STATUS_OUT_OF_MEMORY;
+  } catch (...) {
+    return api::map_exception();
+  }
+}
+
+extern "C" generativeqc_status generativeqc_focal_atomic_core_v1(
+    generativeqc_context* context, const generativeqc_system* atomic, std::size_t orbitals,
+    std::size_t budget, double* coefficients, std::size_t coefficient_count, double* energies,
+    std::size_t energy_count) {
+  using namespace generativeqc;
+  if (!context || !atomic || !orbitals || !coefficients || !energies || !budget)
+    return GENERATIVEQC_STATUS_INVALID_ARGUMENT;
+  std::lock_guard lock(context->mutex);
+  try {
+    const auto n = molecule::ao_count(atomic->data);
+    if (coefficient_count != runtime::size_mul(n, orbitals) ||
+        energy_count != runtime::size_add(orbitals, 1))
+      throw std::invalid_argument("atomic core output shape differs from the one-atom OBS");
+    if (runtime::size_mul(runtime::size_add(coefficient_count, energy_count), sizeof(double)) > budget)
+      return GENERATIVEQC_STATUS_OUT_OF_MEMORY;
+    scf::initial_guess::spherical_atomic_core(atomic->data, orbitals, budget, coefficients, energies);
+    return GENERATIVEQC_STATUS_SUCCESS;
+  } catch (const std::length_error& error) {
+    record_oom_detail_noalloc(context->last_detail, error.what());
+    return GENERATIVEQC_STATUS_OUT_OF_MEMORY;
+  } catch (...) {
+    return api::map_exception(&context->last_detail);
+  }
 }
 
 extern "C" generativeqc_status generativeqc_focal_ucc_triples_v1(
