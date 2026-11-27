@@ -38,6 +38,11 @@ ALLOWED = {
 # Keep its exact-Fock/DIIS/scalar-eigen ownership specific to this file; MINAO
 # projection and all reference modules retain their narrower dependency rules.
 SOURCE_EXACT_ALLOWED = {
+    # These standard-library-only numerical leaves carry no driver or provider
+    # state. The reference implementation borrows the accumulator only for
+    # stabilized RHF energy. The host driver borrows the pre-DIIS Fock check.
+    "scf/reference/mean_field.cpp": ("tensor/cpu_compensated_sum.hpp",),
+    "scf/solver/mean_field_driver.cpp": ("scf/fock_symmetry.hpp",),
     # Private generated-dispatch declarations expose no recurrence or owner state.
     "scf/cuda_rhf.cpp": (
         "scf/shared_rys_weighted_z.hpp",
