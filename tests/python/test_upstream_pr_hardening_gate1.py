@@ -24,6 +24,101 @@ def test_b1_pyproject_declares_basis_set_exchange_optional_extra() -> None:
 
 
 # ============================================================================
+# M2: Non-_ex integral normalization contract matches compiled kDefault=1 (1/beta)
+# ============================================================================
+
+
+def test_m2_non_ex_fallback_matches_compiled_1_over_beta_default(tmp_path: Path) -> None:
+    """Non-_ex fallback bind and execute match compiled kDefaultSlaterFitNormalizationCode=1."""
+    import ctypes as ct
+    from unittest.mock import patch
+
+    from generativeqc._f12_focal_integral_kernel import (
+        DEFAULT_SLATER_FIT_NORMALIZATION,
+        LEGACY_SLATER_FIT_NORMALIZATION,
+        LEGACY_SLATER_NORM_CODE,
+        contract_geometry,
+        slater_normalization_code,
+    )
+    from generativeqc._f12_focal_integral_sink import _bind_fallback_weighted
+
+    assert DEFAULT_SLATER_FIT_NORMALIZATION == "negative_exponential_over_beta"
+    assert LEGACY_SLATER_FIT_NORMALIZATION == "negative_exponential_over_beta"
+    assert LEGACY_SLATER_NORM_CODE == 1
+
+    fake_lib = tmp_path / "lib_non_ex.so"
+    fake_lib.write_bytes(b"")
+
+    def fake_non_ex_kernel(
+        ncenter, op, beta, nshell, nprim, nblocks, nweights,
+        angular, prim_offsets, exponents, radial, centers,
+        blocks, offsets, weights, output, budget, size_ptr,
+    ) -> int:
+        output[:] = 0.0
+        output[:, 0] = 2.5
+        ct.cast(size_ptr, ct.POINTER(ct.c_uint64))[0] = 64
+        return 0
+
+    def fake_bind(library, kernel, host_reference, *, extended: bool = False):
+        if extended:
+            raise AttributeError("non-_ex library")
+        return fake_non_ex_kernel
+
+    code_over_beta = slater_normalization_code("negative_exponential_over_beta")
+    code_unscaled = slater_normalization_code("negative_exponential")
+    assert code_over_beta == 1 and code_unscaled == 0
+
+    with patch("generativeqc._f12_focal_integral_sink.bind", side_effect=fake_bind):
+        fn, is_ext = _bind_fallback_weighted(fake_lib, "geminal", True, code_over_beta)
+        assert fn is fake_non_ex_kernel and is_ext is False
+        with pytest.raises(RuntimeError, match="SlaterFitNormalization"):
+            _bind_fallback_weighted(fake_lib, "geminal", True, code_unscaled)
+        # Coulomb is independent of Slater normalization.
+        fn_c, is_ext_c = _bind_fallback_weighted(fake_lib, "coulomb", True, code_unscaled)
+        assert fn_c is fake_non_ex_kernel and is_ext_c is False
+
+    fixture = {
+        "metric_blocks": np.array([[0, 0]], dtype=np.int32),
+        "metric_offsets": np.array([0, 1], dtype=np.int32),
+        "weights_metric_f12": np.array([1.0], dtype=np.float64),
+        "weights_metric": np.array([1.0], dtype=np.float64),
+        "angular": np.array([0], dtype=np.int32),
+        "atom": np.array([0], dtype=np.int32),
+        "prim_offsets": np.array([0, 1], dtype=np.int32),
+        "exponents": np.array([1.0], dtype=np.float64),
+        "radial": np.array([1.0], dtype=np.float64),
+        "centers": np.array([[0.0, 0.0, 0.0]], dtype=np.float64),
+    }
+    manifest = {
+        "elements": ["H"],
+        "geometry_bohr": [[0.0, 0.0, 0.0]],
+        "options": {"f12_beta": 1.0},
+    }
+    _, row_ok = contract_geometry(
+        fixture, manifest, {"geminal": fake_non_ex_kernel},
+        "metric", "f12", 1 << 20, True,
+        slater_normalization="negative_exponential_over_beta",
+        extended_abi=False,
+    )
+    assert row_ok["weighted_value_Eh"] == pytest.approx(2.5)
+    with pytest.raises(RuntimeError, match="SlaterFitNormalization"):
+        contract_geometry(
+            fixture, manifest, {"geminal": fake_non_ex_kernel},
+            "metric", "f12", 1 << 20, True,
+            slater_normalization="negative_exponential",
+            extended_abi=False,
+        )
+    # Coulomb accepts non-default Slater normalization on non-_ex too.
+    _, row_c = contract_geometry(
+        fixture, manifest, {"coulomb": fake_non_ex_kernel},
+        "metric", "coulomb", 1 << 20, True,
+        slater_normalization="negative_exponential",
+        extended_abi=False,
+    )
+    assert row_c["weighted_value_Eh"] == pytest.approx(2.5)
+
+
+# ============================================================================
 # M7: Frozen-core shell-splitting energy-gap guard (NaBr FC4 vs FC9)
 # ============================================================================
 

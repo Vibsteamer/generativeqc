@@ -1,0 +1,14 @@
+{
+  "path": "src/posthf/f12/f12_molecular_integral_sink.cu",
+  "reason": "Molecular shell contraction, Cartesian-to-spherical assembly, derivative weights and translational scatter for Coulomb and fitted geminal channels. The primitive derivative polynomials are emitted by the integral compiler.",
+  "regions": [
+    {
+      "reason": "Shell, primitive, map, index and layout admission for the batched interfaces.",
+      "role": "runtime",
+      "start": "bool supported(ShellBatch data",
+      "stop": "struct Layout {"
+    }
+  ],
+  "role": "scientific",
+  "subsystem": "molecular_f12"
+}

@@ -1,0 +1,17 @@
+{
+  global:
+    gqc_f12_cartesian_shells_coulomb;
+    gqc_f12_cartesian_shells_coulomb_ex;
+    gqc_f12_cartesian_shells_geminal;
+    gqc_f12_cartesian_shells_geminal_ex;
+    gqc_f12_raw_spherical_projection;
+    gqc_f12_spherical_forward_coulomb;
+    gqc_f12_spherical_forward_geminal;
+    gqc_f12_spherical_weighted_coulomb;
+    gqc_f12_spherical_weighted_geminal;
+    gqc_f12_weighted_shells_coulomb;
+    gqc_f12_weighted_shells_coulomb_ex;
+    gqc_f12_weighted_shells_geminal;
+    gqc_f12_weighted_shells_geminal_ex;
+  local: *;
+};
