@@ -2795,6 +2795,9 @@ typedef struct generativeqc_ecp_term {
  * core_electrons has atom_count entries; terms has term_count entries. Terms use
  * c*r^(power-2)*exp(-exponent*r^2), channel -1 local or 0..3 projector difference, and valid
  * atom indices; effective ionic charges must stay positive.
+ * Orbital shells are s..f. Real-spherical g shells are admitted only for the fitted small-core
+ * Br/I compositions, charges and multiplicities in docs/user/ecp.md ("Orbital g for fitted
+ * small-core halides"); other g shells and all h shells return INVALID_ARGUMENT.
  * @outputs Returns a new owning system on success, with copied/validated ECP data.
  * @lifetime Copies atoms, basis, core counts and terms; no caller array is retained. Prepared
  * consumers copy the system.

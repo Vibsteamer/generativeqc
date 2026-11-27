@@ -714,6 +714,8 @@ macro(generativeqc_add_native_tests)
                        LIBRARIES Threads::Threads)
   generativeqc_native_test(generativeqc_small_core_halide_and_ucc_budget_tests
                        tests/native/test_small_core_halide_and_ucc_budget.cpp)
+  generativeqc_native_test(generativeqc_ecp_fitted_g_admission_tests
+                       tests/native/test_ecp_fitted_g_admission.cpp)
 
   if(GENERATIVEQC_ENABLE_CUDA)
     generativeqc_native_test(generativeqc_cuda_runtime_tests tests/native/test_cuda_runtime.cu

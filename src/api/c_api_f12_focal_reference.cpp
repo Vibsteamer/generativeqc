@@ -18,11 +18,13 @@
 #include "generated_rccsd_cpu.hpp"
 #include "generativeqc/ucc_fitting.h"
 #include "methods/df_rccsdt_method.hpp"
+#include "methods/hf_ecp_df.hpp"
 #include "methods/uccsd_method.hpp"
 #include "molecule/basis.hpp"
 #include "posthf/capacity.hpp"
 #include "runtime/bounded_workspace.hpp"
 #include "runtime/df_progress_trace.hpp"
+#include "runtime/execution_context.hpp"
 #include "scf/fock_prepared.hpp"
 #include "scf/initial_guess/density.hpp"
 #include "scf/mean_field.hpp"
@@ -33,6 +35,7 @@ struct generativeqc_focal_reference {
   generativeqc::molecule::ScalarHamiltonianIdentity jk;
   generativeqc_backend backend;
   int device;
+  bool refine_ecp_quadrature;
   std::shared_ptr<const generativeqc::hf::PhysicalReference> rhf;
 };
 
@@ -92,8 +95,6 @@ generativeqc_status focal_df_reference(generativeqc_context* context,
           "focal reference requires real-spherical orbital and JKFit representations");
     if (!aux.ecp_terms.empty())
       throw std::invalid_argument("the focal JKFit describes Coulomb fitting functions only");
-    if (!sys.ecp_terms.empty())
-      throw std::invalid_argument("focal reference requires an all-electron Hamiltonian");
     if (sys.atoms.size() != aux.atoms.size() || sys.charge != aux.charge ||
         sys.multiplicity != aux.multiplicity)
       throw std::invalid_argument(
@@ -160,7 +161,15 @@ generativeqc_status focal_df_reference(generativeqc_context* context,
         options.density_fitting_relative_threshold);
     // Only the orbital system defines occupations and the scalar Hamiltonian.
     // Keep the JKFit as supplied, with its own Gaussian shells on the same nuclei.
-    const auto& physical = sys;
+    std::optional<core::System> prepared_ecp;
+    if (cuda && !sys.ecp_terms.empty()) {
+      prepared_ecp = sys;
+      options.density_fitting_mode = GENERATIVEQC_DENSITY_FITTING_CUDA;
+      methods::detail::prepare_ecp_df_hf(*prepared_ecp, options,
+          spins == 1 ? GENERATIVEQC_METHOD_RHF : GENERATIVEQC_METHOD_UHF,
+          runtime::ExecutionContext(context->state), &aux);
+    }
+    const auto& physical = prepared_ecp ? *prepared_ecp : sys;
     std::vector<double> seed;
     if (initial_density) {
       seed.assign(initial_density, initial_density + initial_count);
@@ -493,7 +502,7 @@ generativeqc_status focal_df_reference(generativeqc_context* context,
       *owner = new generativeqc_focal_reference{
           std::move(ref), molecule::ScalarHamiltonianIdentity(aux),
           static_cast<generativeqc_backend>(backend), context->state.device_id,
-          spatial ? state.reference : nullptr};
+          physical.refine_ecp_quadrature, spatial ? state.reference : nullptr};
     }
     return GENERATIVEQC_STATUS_SUCCESS;
   } catch (const std::length_error& error) {
@@ -557,7 +566,7 @@ extern "C" generativeqc_status generativeqc_focal_ucc_triples_v1(
         count != 1 + (forces ? 3 * calculation->plan->atom_count() : 0))
       throw std::invalid_argument("inconsistent focal triples output or backend");
     const auto result = generativeqc::methods::detail::focal_ucc_triples(
-        *calculation->plan, owner->uhf, owner->jk, false, forces);
+        *calculation->plan, owner->uhf, owner->jk, owner->refine_ecp_quadrature, forces);
     if (!std::isfinite(result.energy) || result.forces.size() + 1 != count ||
         !std::all_of(result.forces.begin(), result.forces.end(),
                      [](double x) { return std::isfinite(x); }))

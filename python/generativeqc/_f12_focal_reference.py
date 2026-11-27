@@ -260,13 +260,15 @@ def df_reference(
 
     Use root_id="rhf" or "uhf" and optionally transport an occupied seed.
     Seed projection and the cross-geometry overlap check use host setup. Both J and K
-    use the same Coulomb metric with relative cutoff 1e-10.
+    use the same Coulomb metric with relative cutoff 1e-10. A scalar ECP on
+    the OBS uses native CUDA FP64 fitted HF on admitted hydrides, C/H monohalides,
+    and Br/I-water systems.
     The JKFit supplies only Coulomb fitting functions. With forces=True
     the same solve also evaluates the reference's analytic nuclear forces.
     The CUDA path uses the native CUDA DF operator and derivative providers
     with host SCF control. Its fitted g-shell value and first-derivative routes
     cover general all-electron real-spherical RHF and UHF systems with explicit
-    JKFit auxiliaries. The
+    JKFit auxiliaries as well as the admitted scalar ECP halide domain. The
     budget limits detached output and native reference capacity separately and
     sets the CUDA DF provider workspace allowance.
     CPU DF integral scratch is additional. Results use public AO order.
@@ -306,7 +308,14 @@ def df_reference(
         orb.by_element[a.atomic_number].ecp_core_electrons for a in request.atoms
     )
     if has_ecp and request.backend == "cuda":
-        raise NotImplementedError("focal CUDA DF-HF requires an all-electron OBS")
+        from .ecp import fitted_hf_ecp_domain
+
+        if not fitted_hf_ecp_domain(
+            request.root_id, orb, request.atoms, request.charge, request.multiplicity
+        ):
+            raise NotImplementedError(
+                "focal scalar ECP requires the native CUDA fitted HF ECP domain"
+            )
 
     from .calculator import Calculator
 

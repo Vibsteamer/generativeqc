@@ -2036,6 +2036,26 @@ class Calculator:
         ):
             if self._fitted_all_electron_hf(self._basis, atoms):
                 return "full_df"
+            from .ecp import (
+                g_shell_carbon_halide,
+                g_shell_halogen_hydride,
+                g_shell_halogen_water,
+                g_shell_small_core_halide,
+            )
+
+            molecular_halide = (
+                g_shell_carbon_halide(self._basis, atoms)
+                or g_shell_halogen_water(self._basis, atoms)
+                or g_shell_small_core_halide(self._basis, atoms)
+            )
+            multiplicity = 2 if self._method == _native.METHOD_UHF else 1
+            if (
+                molecular_halide or g_shell_halogen_hydride(self._basis, atoms)
+            ) and any(
+                self._fitted_ecp_hf(self._basis, atoms, charge, multiplicity)
+                for charge in ((0, 1) if molecular_halide else (0,))
+            ):
+                return "full_df"
         if (
             self._device_name == "cuda"
             and self._density_fitting_mode == _native.DENSITY_FITTING_FULL_CUDA
@@ -2492,6 +2512,20 @@ class Calculator:
                 return False
         return True
 
+    def _fitted_ecp_hf(self, basis, atoms, charge, multiplicity):
+        from .ecp import fitted_hf_ecp_domain
+
+        return (
+            self._method in (_native.METHOD_RHF, _native.METHOD_UHF)
+            and self._device_name == "cuda"
+            and self._density_fitting_mode == _native.DENSITY_FITTING_CUDA
+            and self._precision_mode == _native.PRECISION_FP64
+            and self._auxiliary_basis is not None
+            and fitted_hf_ecp_domain(
+                self._method_name, basis, atoms, charge, multiplicity
+            )
+        )
+
     def _create_native_system(
         self,
         context: ctypes.c_void_p,
@@ -2638,6 +2672,7 @@ class Calculator:
                     and self._density_fitting_mode != _native.DENSITY_FITTING_NONE
                     and not self._composite_rks_second_order
                     and self._method not in _CORRELATED_METHODS
+                    and not self._fitted_ecp_hf(selected_basis, atoms, charge, multiplicity)
                 ):
                     raise NotImplementedError(
                         "ECP density-fitting execution is not yet validated"
@@ -2710,6 +2745,7 @@ class Calculator:
                 self._density_fitting_mode != _native.DENSITY_FITTING_NONE
                 and not self._composite_rks_second_order
                 and self._method not in _CORRELATED_METHODS
+                and not self._fitted_ecp_hf(selected_basis, atoms, charge, multiplicity)
             ):
                 raise NotImplementedError(
                     "ECP density-fitting execution is not yet validated"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes as ct
+import json
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -10,6 +11,8 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+
+from generativeqc import Atom, Primitive, Shell
 from generativeqc._f12_focal_molecular import (
     MolecularFocalProvider,
 )
@@ -27,6 +30,7 @@ from generativeqc._f12_ram_hygiene import (
 )
 from generativeqc._f12_ucc_solver import UCCSDLambdaOptions
 from generativeqc.basis import BasisProvenance, BasisSet, BasisShell, ElementBasis
+from generativeqc.ecp import fitted_hf_ecp_domain
 from generativeqc.experimental.f12_focal import (
     FocalBasis,
     FocalLowOrderEnergy,
@@ -36,6 +40,7 @@ from generativeqc.experimental.f12_focal import (
     plan_singlepoint,
 )
 from generativeqc.profiles import canonical_hash
+from generativeqc.resources_hf import hf_resource_request
 
 
 def _shell(ell: int, exps: tuple[float, ...], coeffs: tuple[float, ...]) -> BasisShell:
@@ -497,6 +502,121 @@ def test_m11_hybrid_phase_disclosure_and_strict_gpu_only_guard(
             requested_backend="cuda",
             detail="Ozaki-4 host full-rank CABS overlap bar",
         )
+
+
+# ---------------------------------------------------------------------------
+# m3, m4, m8, D5, D1, D4
+# ---------------------------------------------------------------------------
+
+
+def test_m3_brh4_doublet_orbital_g_rejected_matching_cpp_halide_topology() -> None:
+    """Verify BrH4 neutral doublet orbital-g is rejected in Python just like C++ small_core_halide.hpp."""
+    dummy_ecp = json.dumps(
+        [
+            {
+                "ecp_type": "scalar_ecp",
+                "angular_momentum": [0],
+                "r_exponents": [0],
+                "gaussian_exponents": ["1.0"],
+                "coefficients": [["1.0"]],
+            }
+        ]
+    )
+    h_eb = ElementBasis(1, (_shell(0, (1.0,), (1.0,)),))
+    br_f = ElementBasis(
+        35,
+        (_shell(0, (1.0,), (1.0,)), _shell(3, (0.5,), (1.0,))),
+        ecp_core_electrons=10,
+        ecp_data=dummy_ecp,
+    )
+    br_g = ElementBasis(
+        35,
+        (_shell(0, (1.0,), (1.0,)), _shell(4, (0.5,), (1.0,))),
+        ecp_core_electrons=10,
+        ecp_data=dummy_ecp,
+    )
+    basis_f = _make_basis("br-f", (h_eb, br_f))
+    basis_g = _make_basis("br-g", (h_eb, br_g))
+
+    brh4 = [
+        Atom("Br", (0.0, 0.0, 0.0)),
+        Atom("H", (1.5, 0.0, 0.0)),
+        Atom("H", (-1.5, 0.0, 0.0)),
+        Atom("H", (0.0, 1.5, 0.0)),
+        Atom("H", (0.0, -1.5, 0.0)),
+    ]
+    brh2 = brh4[:3]
+    hbr = brh4[:2]
+    br_atom = brh4[:1]
+
+    # BrH4 neutral doublet: s..f admitted, orbital-g REJECTED (matches C++ limit == 3)!
+    assert fitted_hf_ecp_domain("uhf", basis_f, brh4, 0, 2) is True
+    assert fitted_hf_ecp_domain("uhf", basis_g, brh4, 0, 2) is False
+    # BrH2 doublet, bare Br doublet, and HBr singlet with orbital-g remain admitted (limit == 4)!
+    assert fitted_hf_ecp_domain("uhf", basis_g, brh2, 0, 2) is True
+    assert fitted_hf_ecp_domain("uhf", basis_g, br_atom, 0, 2) is True
+    assert fitted_hf_ecp_domain("rhf", basis_g, hbr, 0, 1) is True
+
+
+def test_m4_hf_resource_request_does_not_exhaust_single_use_shell_iterator() -> None:
+    """Verify hf_resource_request snapshots basis once so single-use iterators retain full shell counts."""
+    atoms = (Atom("H", (0.0, 0.0, 0.0)), Atom("H", (0.0, 0.0, 1.4)))
+    shells = (
+        Shell(0, 0, (Primitive(3.42525091, 0.15432897), Primitive(0.62391373, 0.53532814))),
+        Shell(1, 0, (Primitive(3.42525091, 0.15432897), Primitive(0.62391373, 0.53532814))),
+    )
+    req_tuple = hf_resource_request(
+        method="rhf",
+        backend="cpu",
+        precision="fp64",
+        basis=shells,
+        auxiliary_basis=None,
+        basis_representation="cartesian",
+        systems=(atoms,),
+        charges=(0,),
+        multiplicities=(1,),
+        density_fitting="none",
+        diis_history=8,
+        max_iterations=50,
+        energy_tolerance=1e-9,
+        density_tolerance=1e-8,
+        screening_tolerance=1e-12,
+        density_fitting_relative_threshold=1e-8,
+        density_fitting_memory_budget_bytes=0,
+        device_id=0,
+    )
+    req_iter = hf_resource_request(
+        method="rhf",
+        backend="cpu",
+        precision="fp64",
+        basis=(s for s in shells),
+        auxiliary_basis=None,
+        basis_representation="cartesian",
+        systems=(atoms,),
+        charges=(0,),
+        multiplicities=(1,),
+        density_fitting="none",
+        diis_history=8,
+        max_iterations=50,
+        energy_tolerance=1e-9,
+        density_tolerance=1e-8,
+        screening_tolerance=1e-12,
+        density_fitting_relative_threshold=1e-8,
+        density_fitting_memory_budget_bytes=0,
+        device_id=0,
+    )
+    assert req_iter.identity == req_tuple.identity
+    payload = json.loads(req_iter.identity.topology)
+    assert payload["items"][0]["orbital"]["nbf"] == 2
+
+    shared_iterator = iter(shells)
+    fitted_from_iter = hf_resource_request(
+        (atoms,), basis=shared_iterator, auxiliary_basis=shared_iterator, density_fitting="cpu",
+    )
+    fitted_from_tuple = hf_resource_request(
+        (atoms,), basis=shells, auxiliary_basis=shells, density_fitting="cpu",
+    )
+    assert fitted_from_iter.identity == fitted_from_tuple.identity
 
 
 @pytest.mark.parametrize("capture", [capture_ram_trace, capture_hybrid_phases])
