@@ -1,0 +1,14 @@
+{
+  "path": "src/cc/df_ucc_v2_lambda_pass_a_cuda.cuh",
+  "reason": "Propagates the five spin-block residual and optional fixed-F12 cotangents into amplitude and intermediate adjoints with explicit kernels and GEMMs.",
+  "regions": [
+    {
+      "start": "// Intermediate adjoint tensors passed from Pass A to Pass B.",
+      "stop": "// --- Pass A helper kernels",
+      "role": "runtime",
+      "reason": "Sizes, allocates and clears the intermediate adjoint buffers shared by both reverse passes."
+    }
+  ],
+  "role": "scientific",
+  "subsystem": "focal_cc"
+}

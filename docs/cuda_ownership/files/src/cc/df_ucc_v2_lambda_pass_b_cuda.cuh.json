@@ -1,0 +1,7 @@
+{
+  "path": "src/cc/df_ucc_v2_lambda_pass_b_cuda.cuh",
+  "reason": "Pulls the intermediate adjoints back to amplitudes, Fock blocks, DF factors and four-index source parameters with same- and mixed-spin contractions.",
+  "regions": [],
+  "role": "scientific",
+  "subsystem": "focal_cc"
+}

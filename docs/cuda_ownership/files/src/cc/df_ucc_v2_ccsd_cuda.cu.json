@@ -1,0 +1,14 @@
+{
+  "path": "src/cc/df_ucc_v2_ccsd_cuda.cu",
+  "reason": "Implements the five spin-block CCSD residuals, fixed-F12 terms, correlation energy, Jacobi denominators and tiled DF virtual ladder. Mixed-precision warmup is followed by FP64 convergence.",
+  "regions": [
+    {
+      "start": "CudaCcsdSolveResult solve_df_uccsd_cuda_impl(",
+      "stop": null,
+      "role": "runtime",
+      "reason": "Schedules precision stages, admits scratch and DIIS history, calls residual and energy evaluation and publishes iterative convergence."
+    }
+  ],
+  "role": "scientific",
+  "subsystem": "focal_cc"
+}

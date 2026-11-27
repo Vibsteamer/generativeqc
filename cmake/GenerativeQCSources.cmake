@@ -143,6 +143,11 @@ function(generativeqc_add_posthf_cc_sources target)
       src/cc/lambda_response_cuda.cu
       src/cc/triples_response_cuda.cu
       src/cc/triples_fock_response_cuda.cu
+      src/cc/df_ucc_v2_source_cuda.cu
+      src/cc/df_ucc_v2_ccsd_cuda.cu
+      src/cc/df_ucc_v2_triples_cuda.cu
+      src/cc/df_ucc_v2_lambda_cuda.cu
+      src/cc/df_ucc_v2_cuda.cu
       src/posthf/df_bridge.cu
       src/posthf/cabs_singles_cuda.cu
       src/posthf/cabs_projector_cuda.cu

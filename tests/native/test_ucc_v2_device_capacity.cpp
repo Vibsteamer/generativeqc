@@ -1,4 +1,7 @@
+#include "cc/df_ucc_v2_device_capacity.hpp"
+#include "cc/df_ucc_v2_triples_capacity.hpp"
 #include "cc/df_ucc_v2_triples_host_capacity.hpp"
+#include "ucc_v2_source_capacity_cases.hpp"
 
 #include <algorithm>
 #include <array>
@@ -22,6 +25,97 @@ void expect_rejection(F action, const char* message) {
     return;
   }
   throw std::runtime_error(message);
+}
+
+void check_iteration(std::size_t q, std::size_t oa, std::size_t ob, std::size_t va,
+                     std::size_t vb, std::size_t non_ppl, std::size_t resident, std::size_t tile) {
+  SpinBlockedDims d{};
+  d.q = q; d.oa = oa; d.ob = ob; d.va = va; d.vb = vb;
+  const auto a = oa * va, b = ob * vb;
+  const auto amplitudes = a + b + a * a + a * b + b * b;
+  for (const auto width : {sizeof(float), sizeof(double)}) {
+    const auto scratch = ucc_residual_capacity(d, width);
+    require(scratch.non_ppl_peak_bytes == non_ppl * width, "residual peak bytes");
+    require(scratch.ppl_resident_bytes == resident * width, "packed ladder resident bytes");
+    require(scratch.min_ppl_tile_bytes == tile * width, "one-Q ladder tile bytes");
+
+    const auto base = 100 + 3 * amplitudes * width;
+    const auto minimum = base + std::max(non_ppl, resident + tile) * width;
+    require(!ucc_iteration_budget(d, width, amplitudes, base, minimum - 1), "one-byte shortage");
+    for (auto extra : {0U, 1U, 1024U, 65536U}) {
+      const auto plan = ucc_iteration_budget(d, width, amplitudes, base, minimum + extra);
+      require(plan && plan->ppl_tile_bytes >= tile * width, "feasible ladder lost");
+      require(base + plan->diis_bytes + non_ppl * width <= minimum + extra, "residual over cap");
+      require(base + plan->diis_bytes + resident * width + plan->ppl_tile_bytes <= minimum + extra,
+              "packed ladder and DIIS over cap");
+    }
+  }
+}
+
+void test_iterations() {
+  // Independent peak inventories for uneven spins, an empty alpha occupied space,
+  // and a Q-dominated system. The last keeps all six DF panels at once.
+  check_iteration(5, 2, 3, 4, 9, 5721, 4459, 810);
+  check_iteration(25, 0, 3, 16, 2, 7852, 7032, 40);
+  check_iteration(300, 1, 1, 2, 2, 5764, 4540, 16);
+  const SpinBlockedDims empty{};
+  require(!ucc_iteration_budget(empty, 8, 0, 0, 7), "empty FP64 energy sum requires eight bytes");
+  require(ucc_iteration_budget(empty, 8, 0, 0, 8).has_value(), "empty energy sum fits");
+  SpinBlockedDims huge{};
+  huge.oa = std::numeric_limits<std::size_t>::max();
+  expect_rejection<std::overflow_error>([&] { ucc_residual_capacity(huge, 8); }, "shape overflow");
+}
+
+void test_allocator_and_history() {
+  expect_rejection<UccDeviceLimitError>([] { UccDeviceCapacityScope excessive(9, 10); },
+                                        "source cap rejection");
+  UccDeviceCapacityScope scope(100, 30);
+  UccDeviceCharge history(40);
+  {
+    UccDeviceCharge work(30);
+    require(!ucc_device_available(100), "all bytes occupied");
+    expect_rejection<UccDeviceLimitError>([] { UccDeviceCharge excess(1); }, "over-cap allocation");
+    history = std::move(work);
+    require(ucc_device_available(100) == 40, "replacement releases only the old owner");
+  }
+  require(ucc_device_available(100) == 40, "moved-from owner double-credited");
+  history.reset();
+  require(ucc_device_available(100) == 70, "lease release");
+  require(!try_ucc_warmup([&] { UccDeviceCharge excessive(71); }), "warmup cap fallback");
+  require(try_ucc_warmup([&] { UccDeviceCharge exact(70); }), "warmup exact bound");
+  require(!try_ucc_warmup([] { throw std::bad_alloc(); }), "warmup OOM fallback");
+  expect_rejection<std::logic_error>([] {
+    try_ucc_warmup([] { throw std::logic_error("calculation error"); });
+  }, "optional warmup must propagate calculation errors");
+  require(ucc_diis_space(6, 8, 39) == 0, "four vectors cannot extrapolate");
+  require(ucc_diis_space(6, 8, 40) == 2, "two pairs and one combination fit exactly");
+  require(ucc_diis_space(6, 8, std::numeric_limits<std::size_t>::max()) == 6, "slot narrowing");
+}
+
+void test_adjoint_tile() {
+  require(ucc_lambda_ppl_q_tile(0, 99, 8, 0) == 0, "empty Lambda ladder");
+  expect_rejection<UccDeviceLimitError>([] { ucc_lambda_ppl_q_tile(7, 15, 8, 479); },
+                                        "adjoint transposes were omitted");
+  require(ucc_lambda_ppl_q_tile(7, 15, 8, 480) == 1, "minimum Lambda tile");
+  require(ucc_lambda_ppl_q_tile(7, 15, 8, 1200) == 4, "bounded Lambda Q batch");
+}
+
+void test_triples_pages() {
+  // Each cross-page row holds four vectors plus two square Gram matrices.
+  expect_rejection<std::length_error>([] { ucc_triples_page_rows(5, 11, 367); },
+                                     "triples 1-row pages exceed budget");
+  require(ucc_triples_page_rows(5, 11, 368) == 1, "minimum triples page");
+  require(ucc_triples_page_rows(5, 11, 767) == 1, "second Gram row over budget");
+  require(ucc_triples_page_rows(5, 11, 768) == 2, "second Gram row fits");
+  require(ucc_triples_page_rows(5, 11, 1079) == 2, "single page too large");
+  require(ucc_triples_page_rows(5, 11, 1080) == 5, "single-page layout fits");
+
+  const auto cached = [](std::size_t available) {
+    return ucc_triples_cache_slabs<float>({{27, 8, 3}}, true, available);
+  };
+  expect_rejection<std::length_error>([&] { cached(971); }, "recompute working set too large");
+  require(!cached(972) && !cached(2591), "bounded triples recompute");
+  require(cached(2592), "resident triples slabs fit");
 }
 
 void test_compensated_host_admission() {
@@ -121,6 +215,11 @@ void test_finite_partition() {
 
 int main() {
   try {
+    test_ucc_v2_source_capacity();
+    test_iterations();
+    test_allocator_and_history();
+    test_adjoint_tile();
+    test_triples_pages();
     test_finite_partition();
     test_compensated_host_admission();
   } catch (const std::exception& e) {

@@ -112,8 +112,12 @@ DFUccV2Result run_df_ucc_v2(const core::System& orbital, const core::System& aux
                             const hf::UnrestrictedPhysicalReference& reference, bool cuda,
                             int device, const DFUccV2Options& options) {
   if (cuda) {
+#if GENERATIVEQC_HAS_CUDA
+    return run_df_ucc_v2_cuda(orbital, auxiliary, reference, device, options);
+#else
     (void)device;
     throw std::runtime_error("DF-UCC v2 CUDA backend is not enabled in this build");
+#endif
   }
   return run_df_ucc_v2_cpu(orbital, auxiliary, reference, options);
 }

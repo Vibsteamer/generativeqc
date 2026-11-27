@@ -1,0 +1,14 @@
+{
+  "path": "src/cc/df_ucc_v2_lambda_vjp_cuda.cuh",
+  "reason": "Reconstructs spin-blocked forward intermediates for the Lambda adjoint and applies the tiled DF virtual-ladder pullback to both factors and tau.",
+  "regions": [
+    {
+      "start": "// --- Cached forward intermediates on device",
+      "stop": "inline void build_tau_buffers_device",
+      "role": "runtime",
+      "reason": "Groups forward intermediate storage for replay by the adjoint passes."
+    }
+  ],
+  "role": "scientific",
+  "subsystem": "focal_cc"
+}

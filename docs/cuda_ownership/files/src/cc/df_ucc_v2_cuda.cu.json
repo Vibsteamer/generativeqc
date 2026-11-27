@@ -1,0 +1,7 @@
+{
+  "path": "src/cc/df_ucc_v2_cuda.cu",
+  "reason": "Coordinates spin-blocked DF source, CCSD, triples, Lambda and source response. Owns temporary lifetimes, capacity admission, finite-result checks, timings and publication of energies, partitions and cotangents.",
+  "regions": [],
+  "role": "runtime",
+  "subsystem": "focal_cc"
+}
