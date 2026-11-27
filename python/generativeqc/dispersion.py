@@ -10,7 +10,6 @@ from __future__ import annotations
 import ctypes
 import typing
 from dataclasses import dataclass
-from typing import Self
 
 import numpy as np
 from generativeqc_compiler.common.provenance import canonical_hash
@@ -27,6 +26,7 @@ from generativeqc_compiler.method import (
 from generativeqc_compiler.method.d4_derivative import PRODUCTION_D4_EEQ_DERIVATIVE
 
 from . import _native
+from ._typing import Self  # noqa: TC001 - used by runtime annotation introspection
 
 if typing.TYPE_CHECKING:
     from collections.abc import Sequence

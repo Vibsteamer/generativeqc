@@ -9,7 +9,6 @@ from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Self
 
 import numpy as np
 
@@ -38,6 +37,7 @@ from ._result_translation import (
 from ._result_translation import (
     read_correlation_result as _read_correlation_result,
 )
+from ._typing import Self  # noqa: TC001 - used by runtime annotation introspection
 from ._warm_state import WarmStartState
 from .ks_diagnostics import (
     KsDiagnostic,
