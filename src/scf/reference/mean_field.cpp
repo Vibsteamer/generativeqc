@@ -6,6 +6,7 @@
 #include <stdexcept>
 
 #include "generated_scf_array_native.hpp"
+#include "tensor/cpu_compensated_sum.hpp"
 
 namespace generativeqc::scf::reference {
 
@@ -69,6 +70,17 @@ double electronic_energy(const Matrix& density, const Matrix& hcore, const Matri
   return energy;
 }
 
+double compensated_electronic_energy(const Matrix& density, const Matrix& hcore,
+                                    const Matrix& fock) {
+  if (density.size() != hcore.size() || density.size() != fock.size())
+    throw std::invalid_argument("restricted electronic energy matrix extents differ");
+  tensor::CpuCompensatedSum energy;
+  for (std::size_t i = 0; i < density.size(); ++i) {
+    energy.add(0.5 * density[i] * (hcore[i] + fock[i]));
+  }
+  return energy.value();
+}
+
 Matrix commutator_residual(const Matrix& fock, const Matrix& density, const Matrix& overlap,
                            std::size_t n) {
   const Matrix fps = multiply(multiply(fock, density, n), overlap, n);
@@ -76,6 +88,29 @@ Matrix commutator_residual(const Matrix& fock, const Matrix& density, const Matr
   Matrix residual(n * n);
   for (std::size_t i = 0; i < residual.size(); ++i) residual[i] = fps[i] - spf[i];
   return residual;
+}
+
+Matrix orthonormal_commutator_residual(const Matrix& fock, const Matrix& density,
+                                       const Matrix& orthogonalizer,
+                                       const Matrix& overlap_orthogonalizer, std::size_t n) {
+  Matrix m = multiply(multiply(transpose(orthogonalizer, n), fock, n),
+                      multiply(density, overlap_orthogonalizer, n), n);
+  for (std::size_t i = 0; i < n; ++i) {
+    m[i * n + i] -= m[i * n + i];
+    for (std::size_t j = i + 1; j < n; ++j) {
+      const double value = m[i * n + j] - m[j * n + i];
+      m[i * n + j] = value;
+      m[j * n + i] = -value;
+    }
+  }
+  return m;
+}
+
+double orthonormal_commutator_max_abs(const Matrix& fock, const Matrix& density,
+                                      const Matrix& orthogonalizer,
+                                      const Matrix& overlap_orthogonalizer, std::size_t n) {
+  return residual_max_abs(
+      orthonormal_commutator_residual(fock, density, orthogonalizer, overlap_orthogonalizer, n));
 }
 
 double density_rms(const Matrix& a, const Matrix& b) {

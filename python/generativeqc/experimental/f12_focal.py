@@ -17,6 +17,7 @@ import numpy as np
 from .. import (
     _f12_focal_cv,
     _f12_focal_integral_kernel,
+    _f12_focal_reference,
     _f12_frozen_core,
     _native,
 )
@@ -72,6 +73,9 @@ frozen_core_orbitals_for_atom = _f12_frozen_core.frozen_core_orbitals_for_atom
 frozen_core_spd_orbitals_for_atom = _f12_frozen_core.frozen_core_spd_orbitals_for_atom
 cv_active_frozen_orbitals_for_atom = _f12_frozen_core.cv_active_frozen_orbitals_for_atom
 resolve_frozen_occupied = _f12_frozen_core.resolve_frozen_occupied
+FocalReference = _f12_focal_reference.FocalReference
+FocalReferenceSeed = _f12_focal_reference.FocalReferenceSeed
+df_reference = _f12_focal_reference.df_reference
 
 
 @dataclass(frozen=True)

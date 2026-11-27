@@ -10,6 +10,12 @@
 #include "molecule/basis.hpp"
 #include "runtime/context.hpp"
 
+namespace {
+// Out-of-memory paths write their detail without allocating, within the
+// capacity the detail already has; keep room for a full refusal message.
+constexpr std::size_t kReservedDetailBytes = 512;
+}  // namespace
+
 extern "C" {
 
 generativeqc_status generativeqc_context_create(const generativeqc_context_descriptor* descriptor,
@@ -23,6 +29,7 @@ generativeqc_status generativeqc_context_create(const generativeqc_context_descr
   }
   try {
     auto candidate = std::make_unique<generativeqc_context>();
+    candidate->last_detail.reserve(kReservedDetailBytes);
     candidate->state.device_id = descriptor->device_id;
     candidate->state.requested_backend = generativeqc::api::native_backend(descriptor->backend);
     const generativeqc_status status =

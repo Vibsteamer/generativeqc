@@ -20,6 +20,7 @@ function(generativeqc_add_api_sources target)
     src/api/c_api_projection.cpp
     src/api/c_api_fleet_projection.cpp
     src/api/c_api_hf_physical_audit.cpp
+    src/api/c_api_f12_focal_reference.cpp
     src/api/c_api_response.cpp
     src/api/c_api_saddle.cpp
     src/api/c_api_df_gradient.cpp
