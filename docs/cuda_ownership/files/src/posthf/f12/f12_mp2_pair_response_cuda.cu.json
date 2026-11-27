@@ -1,0 +1,14 @@
+{
+  "path": "src/posthf/f12/f12_mp2_pair_response_cuda.cu",
+  "reason": "Ordinary and explicitly correlated same-spin, opposite-spin and closed-shell pair energies and analytic adjoints. Scientific equations include denominator weights, robust fit residuals and exchange symmetry.",
+  "regions": [
+    {
+      "reason": "Checked device scratch ownership, CUDA/BLAS error reporting and launch primitives.",
+      "role": "runtime",
+      "start": "struct DeviceBudgetExceeded {};",
+      "stop": "__global__ void k_transpose_2d"
+    }
+  ],
+  "role": "scientific",
+  "subsystem": "molecular_f12"
+}

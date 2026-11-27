@@ -246,6 +246,26 @@ numbers are used unchanged; at run time the exponents are multiplied by the
 square of the Slater exponent and, for the second normalization, the
 coefficients are divided by it.
 
+## GSCDB test geometries
+
+Some tests use molecular geometries from GSCDB137, the database of J. Liang and
+M. Head-Gordon, *J. Chem. Theory Comput.* **21**, 12601–12621 (2025),
+doi:10.1021/acs.jctc.5c01380, as published in
+https://github.com/JiashuLiang/GSCDB at commit
+`0624edaad9a694735a13cd5493e2bb63a27e0fd7`. Copyright (c) 2025, Jiashu Liang
+and Martin Head-Gordon. The data are licensed under the Creative Commons
+Attribution 4.0 International License, retained in
+`LICENSES/gscdb-CC-BY-4.0.txt`, and are provided as-is, without warranties.
+GSCDB compiles these records from earlier datasets; see the article for the
+original references.
+
+| GSCDB record (`xyz_files/`) | Used in | Changes |
+| --- | --- | --- |
+| `W4-17_h2o` | `tests/python/test_f12_aot_mp2f12_gate1.py` | Converted from Å to Bohr (divided by 0.529177210903) |
+| `W4-17_oh` | `tests/python/test_f12_aot_mp2f12_gate1.py` | Bond length only, converted from Å to Bohr (divided by 0.529177210903) |
+| `P34_P06_HBr` | `tests/python/test_f12_aot_mp2f12_gate1.py` | Converted from Å to Bohr (divided by 0.529177210903) |
+| `IHB100x10_05.012_OH-Oa__water--hydroxide_080` | `tests/python/test_f12_aot_mp2f12_gate1.py` | Converted from Å to Bohr (divided by 0.529177210903) |
+
 ## Test-embedded Basis Set Exchange excerpts
 
 Some tests embed small excerpts of Gaussian basis sets from MolSSI Basis Set

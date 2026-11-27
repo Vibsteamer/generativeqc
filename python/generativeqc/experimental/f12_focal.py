@@ -22,6 +22,7 @@ from .. import (
     _f12_focal_projector,
     _f12_focal_reference,
     _f12_focal_singles,
+    _f12_focal_ump2,
     _f12_frozen_core,
     _native,
 )
@@ -87,6 +88,9 @@ focal_cabs_projector = _f12_focal_projector.focal_cabs_projector
 CompensatedProductWorkLimit = _f12_focal_projector.CompensatedProductWorkLimit
 FocalCabsSingles = _f12_focal_singles.FocalCabsSingles
 reference_cabs_singles = _f12_focal_singles.reference_cabs_singles
+FocalCoulombSource = _f12_focal_ump2.FocalCoulombSource
+FocalUMP2Weights = _f12_focal_ump2.FocalUMP2Weights
+reference_df_ump2 = _f12_focal_ump2.reference_df_ump2
 
 
 @dataclass(frozen=True)

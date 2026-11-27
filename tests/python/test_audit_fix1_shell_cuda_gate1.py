@@ -42,6 +42,10 @@ from generativeqc._f12_ao_mo_native import (
     run_coulomb_fit_fwd,
     run_coulomb_fit_rev,
 )
+from generativeqc._f12_mp2_pair_native import (
+    bind_ordinary_df_mp2,
+    run_ordinary_df_mp2_native,
+)
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -54,6 +58,7 @@ def host_sink(tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureR
     root = Path(__file__).resolve().parents[2]
     units = (
         "src/posthf/f12/f12_ao_mo_project_cuda.cu",
+        "src/posthf/f12/f12_mp2_pair_response_cuda.cu",
     )
     output = tmp_path_factory.mktemp("audit_host") / "libaudit_host_fixture.so"
     compiler = request.getfixturevalue("required_native_cxx")
@@ -175,6 +180,35 @@ def test_m8_ao_mo_and_cabs_fail_closed_on_overflow_to_inf(host_sink: Path):
             gap_b=None,
             trial_a=np.array([[2.0]], dtype=np.float64),
             trial_b=None,
+        )
+
+
+def test_m8_mp2_pair_and_ordinary_mp2_fail_closed_overflow_and_nan(host_sink: Path):
+    """Ordinary DF-MP2 rejects output overflow with status -5."""
+    ord_fn = bind_ordinary_df_mp2(host_reference=True, shell_library=host_sink)
+    assert ord_fn is not None
+
+    # Overflow in ordinary DF-MP2 -> status -5
+    c = np.eye(2, dtype=np.float64)
+    eps = np.array([-1.0, 1.0], dtype=np.float64)
+    ao = np.array([[[1e160, 1e160], [1e160, 1e160]]], dtype=np.float64)
+    w = np.array([[1e160]], dtype=np.float64)
+    with pytest.raises(RuntimeError, match="status -5"):
+        run_ordinary_df_mp2_native(
+            ord_fn,
+            same_spin=True,
+            compute_response=False,
+            oa=1,
+            fa=0,
+            ob=1,
+            fb=0,
+            budget_bytes=64 << 20,
+            coeff_a=c,
+            coeff_b=c,
+            eps_a=eps,
+            eps_b=eps,
+            ao_coul=ao,
+            whitener=w,
         )
 
 

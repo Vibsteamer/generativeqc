@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import ctypes as ct
+import gc
 import os
 import shutil
+import threading
 import types
+import weakref
 from pathlib import Path
 from unittest.mock import patch
 
@@ -34,6 +37,11 @@ from generativeqc._f12_focal_integral_kernel import (
 )
 from generativeqc._f12_focal_integral_sink import _bind_fallback_weighted
 from generativeqc._f12_focal_projector import _ozaki_mm, _ozaki_mm_left_dd
+from generativeqc._f12_spin_ao import (
+    _orbital_sources,
+    clear_projected_source_cache,
+    projected_source_cache_info,
+)
 from generativeqc._f12_spin_fock_1e_native import (
     SpinFock1eNativeOps,
     _prep_output_buffer,
@@ -56,6 +64,7 @@ def host_sink(tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureR
         "src/posthf/f12/f12_ext_fock_cuda.cu",
         "src/posthf/f12/f12_spin_fock_1e_cuda.cu",
         "src/posthf/f12/f12_cphf_relax_cuda.cu",
+        "src/posthf/f12/f12_mp2_pair_response_cuda.cu",
     )
     output = tmp_path_factory.mktemp("audit_host") / "libaudit_host_fixture.so"
     compiler = request.getfixturevalue("required_native_cxx")
@@ -269,6 +278,238 @@ def test_b2_ext_fock_native_ctypes_entry_validation(host_sink: Path) -> None:
         )
 
 
+# ============================================================================
+# B3 + m8: Large writable AO panel stale cache & concurrent LRU locking
+# ============================================================================
+
+
+def test_b3_large_writable_ao_panel_mutation_never_returns_stale_cache(
+    host_sink: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audit B3: 36 MiB FP64 (128, 192, 192) writable AO mutation on slice 1 must never hit stale cache."""
+    monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_AOT_AOMO", raising=False)
+    monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_HAD_REUSE", raising=False)
+    clear_projected_source_cache(reset_stats=True)
+
+    aux, nc, obs, ext = 128, 192, 2, 3
+    panel = np.zeros((aux, nc, nc), dtype=np.float64)
+    assert panel.nbytes == 36 * 1024 * 1024  # 36 MiB > 32 MiB threshold
+    panel[0, 0, 0] = 1.0
+    panel[1, 0, 0] = 2.0
+
+    rng = np.random.default_rng(303)
+    c_mat = np.zeros((nc, ext), dtype=np.float64)
+    c_mat[:4, :] = rng.normal(size=(4, ext))
+    c_mat[0, :] = np.array([1.0, 0.5, -0.25])
+
+    ov = np.eye(nc, dtype=np.float64)
+    metric = np.eye(aux, dtype=np.float64)
+    ao = {
+        "overlap_ao": ov,
+        "hcore_ao": np.zeros((nc, nc), dtype=np.float64),
+        "coefficients_alpha": c_mat,
+        "coefficients_beta": c_mat,
+        "metric_whitener": metric,
+        "metric/coulomb": metric,
+        "metric/geminal": metric,
+        "metric/squared_geminal": metric,
+        "metric/geminal_coulomb": metric,
+        "metric/double_commutator": metric,
+        "ao_coulomb": panel,
+        "ao_f12": panel,
+        "ao_f12_squared": panel,
+        "ao_f12_over_coulomb": panel,
+        "ao_double_commutator": panel,
+    }
+    space = (1, 1, obs, ext, aux)
+    run = _cpu_runner()
+
+    d1, _ = _orbital_sources(
+        space, ao, run, None, projected=None, role="pairs",
+        shell_library=host_sink, host_reference=True,
+    )
+    assert projected_source_cache_info()["size"] == 0  # Writable >32 MiB never cached
+
+    # Mutate ONLY unsampled slice 1 (old sample indices were {0, 32, 64, 96, 127}).
+    delta = 7.5
+    panel[1, 0, 0] += delta
+    d2, _ = _orbital_sources(
+        space, ao, run, None, projected=None, role="pairs",
+        shell_library=host_sink, host_reference=True,
+    )
+    expected_delta = delta * np.outer(c_mat[0], c_mat[0])
+    np.testing.assert_allclose(
+        d2["source/raw_coulomb_alpha"][1] - d1["source/raw_coulomb_alpha"][1],
+        expected_delta,
+        atol=1e-12,
+        rtol=0.0,
+    )
+
+    # A read-only VIEW backed by a writable base MUST ALSO NOT be cached.
+    ro_view = panel.view()
+    ro_view.setflags(write=False)
+    ao_view = {**ao, "ao_coulomb": ro_view, "ao_f12": ro_view, "ao_f12_squared": ro_view,
+               "ao_f12_over_coulomb": ro_view, "ao_double_commutator": ro_view}
+    d3, _ = _orbital_sources(
+        space, ao_view, run, None, projected=None, role="pairs",
+        shell_library=host_sink, host_reference=True,
+    )
+    assert projected_source_cache_info()["size"] == 0
+    panel[1, 0, 0] += 3.0
+    d4, _ = _orbital_sources(
+        space, ao_view, run, None, projected=None, role="pairs",
+        shell_library=host_sink, host_reference=True,
+    )
+    np.testing.assert_allclose(
+        d4["source/raw_coulomb_alpha"][1] - d3["source/raw_coulomb_alpha"][1],
+        3.0 * np.outer(c_mat[0], c_mat[0]),
+        atol=1e-12,
+        rtol=0.0,
+    )
+
+    # A truly immutable (writeable=False, base is None) >32 MiB panel DOES cache safely.
+    panel.setflags(write=False)
+    clear_projected_source_cache(reset_stats=True)
+    d5, _ = _orbital_sources(
+        space, ao, run, None, projected=None, role="pairs",
+        shell_library=host_sink, host_reference=True,
+    )
+    d6, _ = _orbital_sources(
+        space, ao, run, None, projected=None, role="pairs",
+        shell_library=host_sink, host_reference=True,
+    )
+    stats = projected_source_cache_info()
+    assert stats["size"] == 1 and stats["hits"] == 1
+    np.testing.assert_array_equal(
+        d5["source/raw_coulomb_alpha"], d6["source/raw_coulomb_alpha"]
+    )
+    clear_projected_source_cache(reset_stats=True)
+
+
+def _project_streamed_sources(loader, nc, aux, host_sink):
+    frame = np.eye(nc, 3)
+    metric = np.eye(aux)
+    ao = {
+        "overlap_ao": np.eye(nc), "hcore_ao": np.eye(nc),
+        "coefficients_alpha": frame, "coefficients_beta": frame,
+        "metric_whitener": metric, "__ao_loader__": loader,
+        **{"metric/" + name: metric for name in (
+            "coulomb", "geminal", "squared_geminal", "geminal_coulomb", "double_commutator"
+        )},
+    }
+
+    def evaluate():
+        values, _ = _orbital_sources(
+            (1, 1, 2, 3, aux), ao, _cpu_runner(), None, projected=None,
+            role="pairs", shell_library=host_sink, host_reference=True,
+        )
+        return values["source/raw_coulomb_alpha"]
+
+    return evaluate
+
+
+@pytest.mark.parametrize("use_panel_owner", [False, True])
+def test_b3_mutable_streamed_panel_reloads_with_identical_metadata(
+    host_sink, monkeypatch, use_panel_owner
+):
+    from generativeqc._f12_focal_molecular import _Panel
+
+    monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_HAD_REUSE", raising=False)
+    clear_projected_source_cache(reset_stats=True)
+    raw = np.zeros((2, 3, 3))
+    data = {name: raw for name in (
+        "ao_coulomb", "ao_f12", "ao_f12_squared", "ao_f12_over_coulomb", "ao_double_commutator"
+    )}
+
+    class CustomPanel:
+        layout = {"manifest": "unchanged"}
+        fit_id = "fit"
+        slater_normalization = "negative_exponential"
+        host_reference = True
+        coulomb_only = False
+
+        def load_ao(self, name):
+            return data[name]
+
+    owner = (
+        _Panel({"manifest": "unchanged"}, data, np.eye(2), "fit")
+        if use_panel_owner else CustomPanel()
+    )
+    evaluate = _project_streamed_sources(owner.load_ao, 3, 2, host_sink)
+    np.testing.assert_array_equal(evaluate(), raw)
+    raw[1, 0, 0] = 2.5
+    np.testing.assert_array_equal(evaluate(), raw)
+
+
+def test_m8_projected_lru_concurrent_access_and_clear_no_keyerror(
+    host_sink: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audit m8: concurrent _orbital_sources + clear_projected_source_cache never raises KeyError."""
+    monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_AOT_AOMO", raising=False)
+    monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_HAD_REUSE", raising=False)
+    clear_projected_source_cache(reset_stats=True)
+
+    rng = np.random.default_rng(808)
+    nc, obs, ext, aux = 5, 3, 4, 4
+    c_mat, _ = np.linalg.qr(rng.normal(size=(nc, nc)))
+    c_mat = np.ascontiguousarray(c_mat[:, :ext])
+    ov = np.eye(nc, dtype=np.float64)
+    metric = np.eye(aux, dtype=np.float64)
+
+    def make_ao(scale: float):
+        p = rng.normal(size=(aux, nc, nc)) * scale
+        p = 0.5 * (p + p.swapaxes(1, 2))
+        return {
+            "overlap_ao": ov,
+            "hcore_ao": np.eye(nc, dtype=np.float64) * scale,
+            "coefficients_alpha": c_mat,
+            "coefficients_beta": c_mat,
+            "metric_whitener": metric,
+            "metric/coulomb": metric,
+            "metric/geminal": metric,
+            "metric/squared_geminal": metric,
+            "metric/geminal_coulomb": metric,
+            "metric/double_commutator": metric,
+            "ao_coulomb": p,
+            "ao_f12": p,
+            "ao_f12_squared": p,
+            "ao_f12_over_coulomb": p,
+            "ao_double_commutator": p,
+        }
+
+    ao_variants = [make_ao(1.0 + 0.1 * k) for k in range(3)]
+    space = (1, 1, obs, ext, aux)
+    run = _cpu_runner()
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(6)
+
+    def worker(tid: int):
+        try:
+            barrier.wait()
+            for it in range(30):
+                if tid == 0 and it % 3 == 0:
+                    clear_projected_source_cache()
+                else:
+                    _orbital_sources(
+                        space, ao_variants[(tid + it) % 3], run, None,
+                        projected=None, role="pairs",
+                        shell_library=host_sink, host_reference=True,
+                    )
+                    projected_source_cache_info()
+        except BaseException as exc:  # pragma: no cover - test expects empty errors
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    clear_projected_source_cache(reset_stats=True)
+
+
 @pytest.mark.parametrize("use_native", [True, False])
 def test_m1_physical_spin_operators_cached_loader_repeated_vjp_safe(
     host_sink: Path,
@@ -479,6 +720,27 @@ def test_m2_reference_cabs_singles_rejects_mismatched_obs_three_center(
         shell_library=host_sink if use_aot else None,
     )
     np.testing.assert_allclose(res_match.hf_cabs_energy, res_none.hf_cabs_energy, atol=1e-13)
+
+    if use_loader and not use_aot:
+        # Only the forward and Fock reverse see the original source. An unrelated
+        # load for orbital relaxation would use the changed OBS block.
+        from generativeqc import _f12_focal_singles_response
+
+        panels = iter((tc, tc))
+        observed = {}
+
+        def capture_response(req, ref, one, frame, raw, whitener, weights, *args, **kwargs):
+            observed.update(raw)
+            return weights
+
+        monkeypatch.setattr(_f12_focal_singles_response, "relaxed_weights", capture_response)
+        reference_cabs_singles(
+            request, reference, one, complement=complement, three_center=None,
+            three_center_loader=lambda: next(panels, np.zeros_like(tc)),
+            metric=metric, whitener=whitener, pullback=True, relax=True,
+        )
+        for spin in ("alpha", "beta"):
+            np.testing.assert_allclose(observed["raw_coulomb_" + spin], matching_obs)
 
 
 # ============================================================================
@@ -749,6 +1011,91 @@ def test_m9_spin_fock_1e_disables_inplace_on_unsafe_older_library(
     assert got_bars["raw_coulomb_alpha"] is not raw_in
     np.testing.assert_allclose(got_bars["fit_alpha"], ref_bars["fit_alpha"], atol=1e-13)
     np.testing.assert_allclose(got_bars["raw_coulomb_alpha"], ref_bars["raw_coulomb_alpha"], atol=1e-13)
+
+
+# ============================================================================
+# M12: Streaming reverse releases bar_ao_mat AND target_bar_ao before next load
+# ============================================================================
+
+
+def test_m12_streaming_reverse_zero_retained_bar_ao_before_next_load(
+    host_sink: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audit M12: previous operator's bar_ao panel has zero retained references before next ao_loader call."""
+    import generativeqc._f12_spin_ao as spin_ao_mod
+
+    class _TrackableArray(np.ndarray):
+        pass
+
+    orig_zeros = np.zeros
+
+    def tracked_zeros(shape, dtype=float, *args, **kwargs):
+        arr = orig_zeros(shape, dtype, *args, **kwargs)
+        if isinstance(shape, tuple) and len(shape) == 3:
+            return arr.view(_TrackableArray)
+        return arr
+
+    monkeypatch.setattr(spin_ao_mod.np, "zeros", tracked_zeros)
+    clear_projected_source_cache(reset_stats=True)
+
+    rng = np.random.default_rng(12120)
+    nc, obs, ext, aux = 5, 3, 4, 4
+    c_mat, _ = np.linalg.qr(rng.normal(size=(nc, nc)))
+    c_mat = np.ascontiguousarray(c_mat[:, :ext])
+    ov = np.eye(nc, dtype=np.float64)
+    metric = np.eye(aux, dtype=np.float64)
+    panels = {}
+    for name in ("ao_coulomb", "ao_f12", "ao_f12_squared", "ao_f12_over_coulomb", "ao_double_commutator"):
+        p = rng.normal(size=(aux, nc, nc)) * 0.1
+        panels[name] = np.ascontiguousarray(0.5 * (p + p.swapaxes(1, 2)))
+
+    prev_bar_refs: list[tuple[str, weakref.ReferenceType]] = []
+    liveness_checks: list[tuple[str, bool]] = []
+
+    def ao_loader(name: str) -> np.ndarray:
+        # Before loading the next operator's panel, ALL previously sunk bar_ao panels must be dead!
+        for prev_name, ref in prev_bar_refs:
+            liveness_checks.append((f"before_load_{name}_prev_{prev_name}_dead", ref() is None))
+        return panels[name].copy()
+
+    def ao_bar_sink(name: str, bar_ao: np.ndarray) -> None:
+        assert isinstance(bar_ao, _TrackableArray)
+        prev_bar_refs.append((name, weakref.ref(bar_ao)))
+
+    ao = {
+        "overlap_ao": ov,
+        "hcore_ao": np.eye(nc, dtype=np.float64),
+        "coefficients_alpha": c_mat,
+        "coefficients_beta": c_mat,
+        "metric_whitener": metric,
+        "metric/coulomb": metric,
+        "metric/geminal": metric,
+        "metric/squared_geminal": metric,
+        "metric/geminal_coulomb": metric,
+        "metric/double_commutator": metric,
+        "__ao_loader__": ao_loader,
+    }
+    space = (1, 1, obs, ext, aux)
+    run = _cpu_runner()
+
+    proj, _ = _orbital_sources(
+        space, ao, run, None, projected=None, role="shared",
+        shell_library=host_sink, host_reference=True,
+    )
+    prev_bar_refs.clear()
+    liveness_checks.clear()
+
+    weights = {k: np.ones_like(v) * 0.1 for k, v in proj.items() if k != "space"}
+    _orbital_sources(
+        space, ao, run, weights, projected=proj, role="shared",
+        ao_bar_sink=ao_bar_sink, shell_library=host_sink, host_reference=True,
+    )
+    gc.collect()
+    assert len(prev_bar_refs) == 5
+    assert len(liveness_checks) > 0
+    assert all(dead for _, dead in liveness_checks), f"Retained bar_ao alias detected: {liveness_checks}"
+    assert all(ref() is None for _, ref in prev_bar_refs)
 
 
 # ============================================================================

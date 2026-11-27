@@ -32,6 +32,7 @@ from ._f12_focal_reference import (
     partition_focal_reference,
 )
 from ._f12_focal_singles import FocalCabsSingles, reference_cabs_singles
+from ._f12_focal_ump2 import FocalCoulombSource, ordinary_df_ump2_unrelaxed, reference_df_ump2
 from ._f12_ram_hygiene import disclose_host_assisted_stage, record_ram_phase, release_host_memory, should_stream_panel
 from .elements import checked_integer
 
@@ -96,6 +97,65 @@ class _Panel:
             coulomb_only=self.coulomb_only,
             budget_mib=self.budget_mib,
             slater_normalization=self.slater_normalization,
+        )
+
+    @staticmethod
+    def stream_key(loader: Callable) -> tuple | None:
+        """Identify all shell evaluator inputs; opaque loaders must be replayed."""
+        from ._f12_spin_ao import _digest_array_full
+
+        if not isinstance(loader, MethodType) or loader.__func__ is not _Panel.load_ao:
+            return None
+        owner = loader.__self__
+        if type(owner) is not _Panel or not owner.streaming or owner.library is None:
+            return None
+        return (
+            id(owner), owner.fit_id, owner.slater_normalization, owner.host_reference,
+            owner.coulomb_only, owner.budget_mib, str(owner.library.resolve()),
+            tuple(
+                (name, _digest_array_full(np.asarray(value)))
+                for name, value in sorted(owner.layout.items())
+            ),
+        )
+
+    def _cached_obs(self, key: tuple | None) -> np.ndarray | None:
+        entry = self._obs_coulomb_cache
+        if entry is not None and entry[0] == key:
+            return entry[1].view()
+        self._obs_coulomb_cache = None
+        return None
+
+    def obs_coulomb(self, n: int) -> np.ndarray:
+        if not self.streaming:
+            return self.data["ao_coulomb"][:, :n, :n]
+        key = self.stream_key(self.load_ao)
+        cached = self._cached_obs(key)
+        if cached is not None and cached.shape[1] == n:
+            return cached
+        self._obs_coulomb_cache = None
+        del cached
+        full = self.load_ao("ao_coulomb")
+        large = full.nbytes >= (256 << 20)
+        block = full[:, :n, :n]
+        # Bytes-backed storage prevents exposed OBS arrays from changing the cache.
+        obs = np.frombuffer(block.tobytes(order="C"), dtype=block.dtype).reshape(block.shape)
+        del block, full
+        if large:
+            release_host_memory()
+        if key is not None:
+            self._obs_coulomb_cache = (key, obs)
+            return obs.view()
+        return obs
+
+    def obs(self, request: FocalRequest, n: int) -> FocalCoulombSource:
+        return FocalCoulombSource(
+            request.surface_id,
+            request.basis.orbital.identity,
+            self.fit_id,
+            request.backend,
+            self.obs_coulomb(n),
+            self.data["metric"],
+            self.whitener,
         )
 
 
@@ -212,6 +272,7 @@ class MolecularFocalProvider:
         role: str,
         *,
         orbital_only: bool = False,
+        allow_streaming: bool = False,
     ) -> _Panel:
         if role == "f12_fit" and request.slater_normalization != self.slater_normalization:
             raise ValueError("F12 panel request and provider Slater normalization must match")
@@ -229,8 +290,26 @@ class MolecularFocalProvider:
             projection_library=self.one_electron_library,
         )
         coulomb_only = role != "f12_fit"
+        n_ext, n_aux = map(int, layout["ao_sizes"])
         ao_cart_total = int(layout["ao_offsets"][-1])
-        if coulomb_only and ao_cart_total > 128_000_000:
+        streaming = should_stream_panel(
+            allow_streaming=allow_streaming,
+            ordinary=ordinary,
+            coulomb_only=coulomb_only,
+            n_ext=n_ext,
+            n_aux=n_aux,
+            ao_cart_total=ao_cart_total,
+        )
+        if streaming:
+            raw = forward_metrics_only(
+                layout,
+                self.shell_library,
+                host_reference=host,
+                coulomb_only=coulomb_only,
+                budget_mib=self.budget_mib,
+                slater_normalization=self.slater_normalization,
+            )
+        elif coulomb_only and ao_cart_total > 128_000_000:
             raw = forward_metrics_only(
                 layout,
                 self.shell_library,
@@ -283,6 +362,8 @@ class MolecularFocalProvider:
             raw,
             whitener,
             getattr(request.basis, role).identity,
+            streaming=streaming,
+            library=self.shell_library if streaming else None,
             host_reference=host,
             budget_mib=self.budget_mib,
             coulomb_only=coulomb_only,
@@ -423,20 +504,41 @@ class MolecularFocalProvider:
                 requested_backend=request.backend,
                 detail="Ozaki-4 compensated host SciPy/NumPy full-rank CABS overlap cotangent",
             )
-        singles = reference_cabs_singles(
-            request,
-            ref,
-            one,
-            complement=projector.frame,
-            three_center=jk.data["ao_coulomb"],
-            metric=jk.data["metric"],
-            whitener=jk.whitener,
-            relax=True,
-            run=self.run,
-            library=self.response_library,
-            relative_cutoff=self.relative_cutoff,
-            budget_mib=self.budget_mib,
-        )
+        if jk.streaming:
+            obs_jk = jk.obs_coulomb(one.obs_ao_count)
+            singles = reference_cabs_singles(
+                request,
+                ref,
+                one,
+                complement=projector.frame,
+                three_center=None,
+                three_center_loader=lambda: jk.load_ao("ao_coulomb"),
+                obs_three_center=obs_jk,
+                metric=jk.data["metric"],
+                whitener=jk.whitener,
+                relax=True,
+                run=self.run,
+                library=self.response_library,
+                relative_cutoff=self.relative_cutoff,
+                budget_mib=self.budget_mib,
+            )
+            del obs_jk
+            jk._obs_coulomb_cache = None
+        else:
+            singles = reference_cabs_singles(
+                request,
+                ref,
+                one,
+                complement=projector.frame,
+                three_center=jk.data["ao_coulomb"],
+                metric=jk.data["metric"],
+                whitener=jk.whitener,
+                relax=True,
+                run=self.run,
+                library=self.response_library,
+                relative_cutoff=self.relative_cutoff,
+                budget_mib=self.budget_mib,
+            )
         w = singles.weights
         assert ref.forces is not None and w is not None
         assert one.d_overlap is not None and one.d_hcore is not None
