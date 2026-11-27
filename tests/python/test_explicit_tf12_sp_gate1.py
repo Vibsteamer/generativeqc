@@ -42,6 +42,7 @@ from generativeqc.experimental.f12_focal import (
     FocalSeries,
     MolecularFocalProvider,
     plan_singlepoint,
+    singlepoint_energy,
 )
 from _bse_basis_support import br_ecp10mdf
 
@@ -741,6 +742,18 @@ def test_df_vs_exact4_consistency_and_beta_scaling_on_bh_and_h2o() -> None:
     req_ws = next(r for r, _ in plan_ws.steps if r.role == "mp2_f12_correlation")
     ref_ws = _solve_rhf_ref(prov, req_ws)
     res_ws = spatial_rhf_explicit_tf12_energy(prov, req_ws, ref_ws, z2_mode="ffg", geminal_scale=1.0)
+
+    public = singlepoint_energy(
+        h2o_atoms, FocalSeries(basis_w), FocalSeries(basis_w), provider=prov,
+        root_id="rhf", correlation_space_id="frozen-core", backend="cpu_reference",
+        f12_doubles=basis_w, triples={"f12": basis_w},
+    )
+    component = public.components[-1]
+    assert component.triples_model_id == "kohn_extended_sp_rhf_ffg_v1"
+    assert component.executed_backend == "cpu_reference" and component.converged is True
+    assert public.cabs_ranks[basis_w.basis_id] == res_w.cabs_rank
+    assert abs(component.energy - res_w.energy) < 1e-11
+    assert abs(component.telemetry["ccsd_f12b_energy"] - res_w.ccsd_f12b_energy) < 1e-11
 
     trans_diff = abs(res_w.energy - res_ws.energy)
     print(

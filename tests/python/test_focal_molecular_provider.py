@@ -531,3 +531,264 @@ def test_ordinary_energy_uses_one_canonical_spectrum_with_or_without_partitions(
             assert sum(map(np.sum, result.occupied_mp2_f12.mp2)) == pytest.approx(
                 sum(result.ordinary_mp2_spin_energies), abs=5e-13, rel=0,
             )
+
+
+def test_rhf_focal_center_and_forward_displacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A two-electron RHF recipe has an empty triples space on each geometry."""
+    from generativeqc.experimental.f12_focal import singlepoint, singlepoint_energy
+
+    shell = os.environ.get("GENERATIVEQC_F12_HOST_SINK")
+    if not shell:
+        pytest.skip("set GENERATIVEQC_F12_HOST_SINK for molecular host integrals")
+    x = XYZ[:2].copy()
+    q = request(x, (0, 1, 1), "rhf")
+    p = MolecularFocalProvider(shell_library=Path(shell), budget_mib=800)
+    ser = FocalSeries(q.basis)
+    args = {
+        "hf_cabs": ser,
+        "correlation": ser,
+        "f12_doubles": ser,
+        "triples": ser,
+        "post_mp2": None,
+        "root_id": "rhf",
+        "correlation_space_id": "all-active",
+        "provider": p,
+        "backend": "cpu_reference",
+        "protocol_id": "h2",
+    }
+    center = singlepoint(list(zip(("H", "H"), x, strict=True)), **args)
+    assert len(center.references) == 1
+    triple = center.components[-1].term
+    assert triple.role == "triples" and triple.energy == 0 and not np.any(triple.forces)
+
+    def forbid_gradient(*args: object, **kwargs: object) -> None:
+        pytest.fail("a forward-only geometry called the integral gradient engine")
+
+    monkeypatch.setattr(MolecularFocalProvider, "_gradient", forbid_gradient)
+    for step in (2.0e-4, 4.0e-4):
+        energies = []
+        for h in (-step, step):
+            y = x.copy()
+            y[0, 0] += h
+            result = singlepoint_energy(
+                list(zip(("H", "H"), y, strict=True)), center=center, **args
+            )
+            assert result.references[q.basis.basis_id].reference.forces is None
+            assert result.cabs_ranks == center.cabs_ranks
+            assert result.components[-1].energy == 0.0
+            energies.append(result.energy)
+        assert (
+            abs((energies[0] - energies[1]) / (2 * step) - center.forces[0, 0]) < 3e-6
+        )
+
+
+def test_hydrogen_atom_four_role_center_and_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One occupied alpha and empty beta have no pair or triples correlation."""
+    from generativeqc.experimental.f12_focal import singlepoint, singlepoint_energy
+
+    if not (shell := os.environ.get("GENERATIVEQC_F12_HOST_SINK")):
+        pytest.skip("set GENERATIVEQC_F12_HOST_SINK for molecular host integrals")
+    atoms = [("H", (0.0, 0.0, 0.0))]
+    b = request(np.zeros((1, 3)), (0, 1, 1)).basis
+    s = FocalSeries(b)
+    args = {
+        "hf_cabs": s,
+        "correlation": s,
+        "f12_doubles": s,
+        "triples": s,
+        "root_id": "uhf",
+        "multiplicity": 2,
+        "correlation_space_id": "all-active",
+        "provider": MolecularFocalProvider(shell_library=Path(shell), budget_mib=768),
+        "backend": "cpu_reference",
+    }
+    center = singlepoint(atoms, post_mp2=None, **args)
+    assert center.references[b.basis_id].reference.occupied == (1, 0)
+    assert center.energy < 0
+    np.testing.assert_allclose(center.forces, np.zeros((1, 3)), atol=2e-12, rtol=0)
+    assert len(center.components) == 4
+    assert all(abs(row.term.energy) < 2e-12 for row in center.components[1:])
+
+    def no_response(*args: object, **kwargs: object) -> None:
+        pytest.fail("a displaced energy evaluated a nuclear derivative")
+
+    for method in ("_gradient", "_ucc_stationary", "low_order_energy_and_forces"):
+        monkeypatch.setattr(MolecularFocalProvider, method, no_response)
+    for step in (4e-4, 2e-4):
+        displacement = [("H", (0.0, 0.0, step))]
+        forward = singlepoint_energy(displacement, center=center, **args)
+        assert forward.energy == pytest.approx(center.energy, abs=2e-12, rel=0)
+        assert forward.cabs_ranks == center.cabs_ranks
+        assert forward.references[b.basis_id].reference.forces is None
+        assert all(abs(row.energy) < 2e-12 for row in forward.components[1:])
+
+    monkeypatch.setattr(MolecularFocalProvider, "low_order_energy", no_response)
+    with pytest.raises(ValueError, match="same molecular bases"):
+        singlepoint_energy(atoms, center=replace(center, references={}), **args)
+
+
+def test_rhf_forward_displacement_with_nonzero_triples(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from generativeqc import _f12_focal_ucc_triples
+    from generativeqc.experimental.f12_focal import singlepoint, singlepoint_energy
+
+    shell = os.environ.get("GENERATIVEQC_F12_HOST_SINK")
+    if not shell:
+        pytest.skip("set GENERATIVEQC_F12_HOST_SINK for molecular host integrals")
+    atoms = [("Li", (0.0, 0.0, 0.0)), ("H", (0.1, 0.2, 3.0))]
+    b = FocalBasis(
+        2, "test", "sto-3g", jk_fit="def2-svp", mp2_fit="def2-svp",
+        f12_fit="def2-svp", cabs="def2-svp", beta=1.0,
+    )
+    series = FocalSeries(b)
+    args = dict(
+        hf_cabs=series,
+        correlation=series,
+        f12_doubles=b,
+        triples=b,
+        root_id="rhf",
+        correlation_space_id="all-active",
+        provider=MolecularFocalProvider(shell_library=Path(shell), budget_mib=1024),
+        backend="cpu_reference",
+        protocol_id="lih-retained-triples",
+    )
+    center = singlepoint(atoms, post_mp2=None, **args)
+    triples = next(c.term for c in center.components if c.term.role == "triples")
+    # Independent DF-RCCSD(T) with the same STO-3G and def2-SVP fitting bases.
+    assert triples.energy == pytest.approx(-7.4691686931e-6, abs=8e-12, rel=0)
+
+    def forbidden_response(*args: object, **kwargs: object) -> None:
+        pytest.fail("a displaced energy evaluated the stationary force response")
+
+    for name in ("_gradient", "_ucc_stationary", "low_order_energy_and_forces"):
+        monkeypatch.setattr(MolecularFocalProvider, name, forbidden_response)
+    native_triples = _f12_focal_ucc_triples.molecular_triples_on_reference
+
+    def forward_triples(request, reference, *, forces, **options):
+        assert not forces and reference.forces is None
+        return native_triples(request, reference, forces=forces, **options)
+
+    monkeypatch.setattr(
+        _f12_focal_ucc_triples, "molecular_triples_on_reference", forward_triples
+    )
+    for step in (4e-4, 2e-4):
+        pair = []
+        for delta in (-step, step):
+            displaced = [atoms[0], ("H", (0.1, 0.2, 3.0 + delta))]
+            result = singlepoint_energy(displaced, center=center, **args)
+            assert result.cabs_ranks == center.cabs_ranks
+            assert min(result.references[b.basis_id].reference.occupied_overlaps) > 0.999
+            pair.append({part.request.role: part.energy for part in result.components})
+        assert all(abs(point["ccsd_f12b_minus_mp2_f12"]) > 1e-6 for point in pair)
+        for component in center.components:
+            role = component.term.role
+            fd = (pair[0][role] - pair[1][role]) / (2 * step)
+            assert fd == pytest.approx(
+                component.term.forces[1, 2], abs=3e-8 if role == "triples" else 3e-6, rel=0
+            )
+
+
+def test_cc_only_basis_skips_hf_singles_and_reference_gradient() -> None:
+    from unittest.mock import patch
+
+    from generativeqc import _f12_cabs_fock as fock
+    from generativeqc import _f12_focal_molecular as owner
+    from generativeqc import _f12_focal_reference as reference_owner
+    from generativeqc.experimental.f12_focal import singlepoint, singlepoint_energy
+
+    shell = os.environ.get("GENERATIVEQC_F12_HOST_SINK")
+    if not shell:
+        pytest.skip("requires the molecular host shell library")
+    xyz = XYZ[:2]
+    low = request(xyz, (0, 1, 1), "rhf").basis
+    high = request(xyz, (0, 2, 2), "rhf").basis
+    provider = MolecularFocalProvider(shell_library=Path(shell), budget_mib=800)
+    args = {
+        "hf_cabs": FocalSeries(low),
+        "correlation": FocalSeries(low),
+        "f12_doubles": FocalSeries(high),
+        "triples": FocalSeries(high),
+        "post_mp2": None,
+        "provider": provider,
+        "root_id": "rhf",
+        "correlation_space_id": "all-active",
+        "backend": "cpu_reference",
+        "protocol_id": "h2-mixed-fits",
+    }
+    atoms = list(zip(("H", "H"), xyz, strict=True))
+    moved = xyz.copy()
+    moved[0, 0] += 2e-4
+    displaced = list(zip(("H", "H"), moved, strict=True))
+    center_method = MolecularFocalProvider.low_order_energy_and_forces
+    energy_method = MolecularFocalProvider.low_order_energy
+    with (
+        patch.object(
+            MolecularFocalProvider,
+            "low_order_energy_and_forces",
+            lambda self, q, **_: center_method(self, q),
+        ),
+        patch.object(
+            MolecularFocalProvider,
+            "low_order_energy",
+            lambda self, q, *, expected_cabs_rank, **_: energy_method(
+                self, q, expected_cabs_rank=expected_cabs_rank
+            ),
+        ),
+    ):
+        full = singlepoint(atoms, **args)
+        full_signed = singlepoint_energy(displaced, center=full, **args)
+    with (
+        patch.object(reference_owner, "df_reference", wraps=reference_owner.df_reference) as scf,
+        patch.object(
+            MolecularFocalProvider,
+            "_singles_components",
+            autospec=True,
+            side_effect=MolecularFocalProvider._singles_components,
+        ) as singles,
+    ):
+        center = singlepoint(atoms, **args)
+    assert [
+        (c.args[0].basis.basis_id, c.kwargs["forces"]) for c in scf.call_args_list
+    ] == [(low.basis_id, True), (high.basis_id, False)]
+    assert (
+        singles.call_count == 1
+        and singles.call_args.args[1].basis.basis_id == low.basis_id
+    )
+    assert center.energy == pytest.approx(full.energy, abs=1e-12, rel=0)
+    np.testing.assert_allclose(center.forces, full.forces, atol=1e-11, rtol=0)
+    for actual, original in zip(center.components, full.components, strict=True):
+        assert actual.term.energy == pytest.approx(
+            original.term.energy, abs=1e-12, rel=0
+        )
+        np.testing.assert_allclose(
+            actual.term.forces, original.term.forces, atol=1e-11, rtol=0
+        )
+    assert center.cabs_ranks == full.cabs_ranks
+    for key, seed in center.references.items():
+        ref = seed.reference
+        previous = full.references[key].reference
+        occupied_overlap = (
+            previous.coefficients[0, :, 0] @ ref.overlap @ ref.coefficients[0, :, 0]
+        )
+        assert abs(occupied_overlap) == pytest.approx(1.0, abs=1e-10, rel=0)
+    with (
+        patch.object(owner, "df_reference", wraps=owner.df_reference) as scf,
+        patch.object(fock, "physical_fock", wraps=fock.physical_fock) as singles_fock,
+    ):
+        signed = singlepoint_energy(displaced, center=center, **args)
+    assert scf.call_count == 2 and all(
+        not c.kwargs["forces"] for c in scf.call_args_list
+    )
+    assert singles_fock.call_count == 1
+    assert signed.cabs_ranks == center.cabs_ranks
+    assert all(
+        min(s.reference.occupied_overlaps) > 0.999 for s in signed.references.values()
+    )
+    assert [p.energy for p in signed.components] == pytest.approx(
+        [p.energy for p in full_signed.components], abs=1e-12, rel=0
+    )

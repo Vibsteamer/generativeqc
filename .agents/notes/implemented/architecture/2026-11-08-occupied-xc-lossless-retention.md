@@ -2,7 +2,6 @@
 
 Status: implemented
 Date: 2026-11-08
-Agent: /root/audit_3041
 Model: GPT-6 Astra Pro
 
 ## Problem

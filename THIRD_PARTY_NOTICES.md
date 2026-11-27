@@ -34,6 +34,8 @@ The vendored files are MIT-licensed, Copyright (c) 2017-2023 Yury Gribov; see
 
 The generated trampoline objects are compiled into `libgenerativeqc.so` and lazily
 resolve CUDA runtime, cuBLAS, and cuSOLVER provider SONAMEs at execution time.
+The native install includes the retained MIT text under
+`share/generativeqc/licenses/` (or the configured CMake data directory).
 The NVIDIA provider shared libraries themselves are not redistributed in the
 GenerativeQC wheel.
 
@@ -48,6 +50,11 @@ implementation sources (DFT-D4 reference files, EEQ support sources,
 simple-DFTD3 gCP sources, and the GPU4PySCF Rys table) remain hash-pinned
 remote file sets and are materialized explicitly for maintainer regeneration.
 Their SPDX identities remain recorded in the registry and retained license files.
+
+The compiled semilocal kernels are generated from Libxc 7.0.0 expressions.
+The Libxc MPL-2.0 text is retained verbatim in `upstream/libxc/7.0.0/COPYING`.
+Wheels retain that source path in the license metadata, and native installs
+include the text as `share/generativeqc/licenses/libxc-MPL-2.0.txt`.
 
 ## Native GFN2 runtime provenance
 
@@ -101,12 +108,15 @@ additional permission is retained verbatim in
 `LICENSES/xtbloom-CUDA_MKL_LINKING_EXCEPTION.txt`; it is not a blanket
 relicensing of GenerativeQC or third-party data. Source hashes and scope are recorded
 in `src/dft/dispersion/xtbloom_manifest.json`.
+Native installs include the project `LICENSE`, the scoped xTBloom additional
+permission, and the retained mctc-lib license under `share/generativeqc/licenses/`.
 
 The generated GFN2-D4 reference data in `src/dft/dispersion/d4_data.hpp`
 is derived from DFT-D4 commit `6e1f59c3f39d919a2dbef0601d2576727c8b30e8`,
 under LGPL-3.0-or-later. See `d4_manifest.json` and `d4.NOTICE` in the same
 directory, plus `LICENSES/dftd4-COPYING.txt` and
-`LICENSES/dftd4-COPYING.LESSER.txt`. The retained mctc-lib constant/provenance
+`LICENSES/dftd4-COPYING.LESSER.txt`; native SDK/CLI builds install both texts
+under `share/generativeqc/licenses/`. The retained mctc-lib constant/provenance
 record has its Apache-2.0 notice in `LICENSES/mctc-lib-LICENSE.txt`.
 
 This DFT-D4 qualification migration itself imports no xTB Hamiltonian or SCC
@@ -146,7 +156,8 @@ commit `41d5a07b98ce15e97bec7a1815869725f6c7b0c2`, licensed
 LGPL-3.0-or-later. Exact source hashes are recorded in the same manifest and
 the upstream GPL/LGPL license texts are retained in
 `LICENSES/simple-dftd3-COPYING.txt` and
-`LICENSES/simple-dftd3-COPYING.LESSER.txt`. No simple-dftd3 binary or runtime
+`LICENSES/simple-dftd3-COPYING.LESSER.txt`, both installed with the native
+library under `share/generativeqc/licenses/`. No simple-dftd3 binary or runtime
 dependency is added. The embedded MB16-43/06 qualification geometry is from
 mstore commit `a9070de01ad67e0539edc87c29ab048a60381a74` under Apache-2.0;
 see `LICENSES/mstore-Apache-2.0.txt`.

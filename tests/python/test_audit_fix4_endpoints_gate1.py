@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from conftest import f12_host_shell
 
 from generativeqc import Atom, Primitive, Shell
 from generativeqc._f12_focal_cv import (
@@ -21,12 +22,14 @@ from generativeqc._f12_focal_cv import (
     default_valence_correlation_space_id,
 )
 from generativeqc._f12_focal_molecular import (
+    FocalTriplesEvaluation,
     MolecularFocalProvider,
 )
 from generativeqc._f12_focal_rcc_f12b import spatial_rhf_ccsdf12b_v1
 from generativeqc._f12_focal_reference import (
     FocalReference,
     FocalReferenceSeed,
+    _NativeFocalReference,
 )
 from generativeqc._f12_focal_tplus_sources import FocalOccupiedTriples, OccupiedMP2F12
 from generativeqc._f12_ram_hygiene import (
@@ -45,7 +48,10 @@ from generativeqc.experimental.f12_focal import (
     FocalLowOrderForces,
     FocalRequest,
     FocalSeries,
+    FocalTriplesAlternatives,
     plan_singlepoint,
+    singlepoint,
+    singlepoint_energy,
 )
 from generativeqc.profiles import canonical_hash
 from generativeqc.resources_hf import hf_resource_request
@@ -156,6 +162,236 @@ def _dummy_reference(
         request.basis.jk_fit.identity,
         _native_owner=native_owner,  # type: ignore[arg-type]
     )
+
+
+# ---------------------------------------------------------------------------
+# B5: Built-in Public Provider (T+) & Explicit (T)-F12 Contract + M15(iii)
+# ---------------------------------------------------------------------------
+
+
+def test_b5_builtin_cuda_provider_wires_tplus_and_rejects_tf12_forces_and_mock_cuda(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Verify MolecularFocalProvider.cuda wires real (T+), rejects (T)-F12 3N forces, and refuses fake CUDA mocks."""
+    import ctypes
+    from generativeqc import _f12_focal_runner, _native
+
+    fake_lib = tmp_path / "fake_resp.so"
+    fake_lib.write_bytes(b"")
+    dummy_runner = lambda prog, inp: None  # noqa: E731
+    monkeypatch.setattr(ctypes, "CDLL", lambda *_a, **_kw: SimpleNamespace(_handle=1))
+    monkeypatch.setattr(_native, "load_library", lambda **_kw: SimpleNamespace(_handle=2))
+    monkeypatch.setattr(_f12_focal_runner, "focal_cuda_runner", lambda *_a, **_kw: dummy_runner)
+
+    cuda_prov = MolecularFocalProvider.cuda(
+        shell_library=fake_lib,
+        response_library=fake_lib,
+        architecture="sm_80",
+        cache_directory=tmp_path,
+        budget_mib=1024,
+    )
+    assert cuda_prov.triples_models is not None
+    assert cuda_prov.qualified_tplus is None
+    assert cuda_prov.triples_models.__self__ is cuda_prov
+
+    # Replacing budget_mib rebinds built-in triples_models/qualified_tplus to the new instance!
+    replaced_prov = replace(cuda_prov, budget_mib=2048)
+    assert replaced_prov.triples_models.__self__ is replaced_prov
+    assert replaced_prov.qualified_tplus is None
+    assert replaced_prov._pair_source_cache is not cuda_prov._pair_source_cache
+
+    card = FocalBasis(
+        2,
+        "ha-DZ-F12",
+        "sto-3g",
+        jk_fit="sto-3g",
+        mp2_fit="sto-3g",
+        f12_fit="sto-3g",
+        cabs="sto-3g",
+        beta=0.9,
+    )
+    series = FocalSeries(card)
+    water = [("O", (0.0, 0.0, 0.0)), ("H", (0.0, 0.0, 1.8)), ("H", (1.75, 0.0, -0.4))]
+    dispatched: list[tuple[str, bool]] = []
+
+    def fake_low_energy(
+        self: MolecularFocalProvider,
+        request: FocalRequest,
+        *,
+        expected_cabs_rank: int | None = None,
+        include_hf_cabs: bool = True,
+        include_occupied_partitions: bool = False,
+        reference: FocalReference | None = None,
+    ) -> FocalLowOrderEnergy:
+        ref = reference if reference is not None else _dummy_reference(request)
+        occ = (
+            OccupiedMP2F12(
+                (np.full(5, -0.015), np.full(5, -0.015)),
+                (np.full(5, -0.005), np.full(5, -0.005)),
+            )
+            if include_occupied_partitions
+            else None
+        )
+        return FocalLowOrderEnergy(ref, 2, (0.0, 0.0), (-0.05, -0.05, -0.05), -0.05, occ)
+
+    def fake_low_forces(
+        self: MolecularFocalProvider,
+        request: FocalRequest,
+        *,
+        include_hf_cabs: bool = True,
+    ) -> FocalLowOrderForces:
+        return FocalLowOrderForces(
+            fake_low_energy(self, request, include_hf_cabs=include_hf_cabs),
+            np.zeros((3, 3)),
+            np.full((3, 3), 0.1),
+        )
+
+    def fake_rhf_tplus_ef(
+        self: MolecularFocalProvider,
+        request: FocalRequest,
+        *,
+        low_order: FocalLowOrderEnergy,
+        expected_cabs_rank: int | None = None,
+        inactive: tuple[bool, ...] | None = None,
+    ):
+        dispatched.append(("rhf_tplus_ef", low_order.occupied_mp2_f12 is not None))
+        return (
+            -0.03,
+            FocalTriplesEvaluation(
+                -0.04,
+                np.full((3, 3), -0.04),
+                low_order.cabs_rank,
+                executed_backend=request.backend,
+                converged=True,
+                triples_model_id="tplus_rhf_occupied_v2",
+            ),
+            {},
+        )
+
+    def fake_rhf_tplus_e(
+        self: MolecularFocalProvider,
+        request: FocalRequest,
+        *,
+        low_order: FocalLowOrderEnergy,
+        expected_cabs_rank: int | None = None,
+    ):
+        dispatched.append(("rhf_tplus_e", low_order.occupied_mp2_f12 is not None))
+        return (
+            -0.03,
+            FocalTriplesEvaluation(
+                -0.04,
+                None,
+                low_order.cabs_rank,
+                executed_backend=request.backend,
+                converged=True,
+                triples_model_id="tplus_rhf_occupied_v2",
+            ),
+        )
+
+    monkeypatch.setattr(MolecularFocalProvider, "low_order_energy", fake_low_energy)
+    monkeypatch.setattr(MolecularFocalProvider, "low_order_energy_and_forces", fake_low_forces)
+    monkeypatch.setattr(MolecularFocalProvider, "f12_doubles_energy", lambda *a, **kw: -0.02)
+    monkeypatch.setattr(
+        MolecularFocalProvider,
+        "f12_doubles_energy_and_forces",
+        lambda *a, **kw: (-0.02, np.full((3, 3), 0.02)),
+    )
+    monkeypatch.setattr(
+        MolecularFocalProvider,
+        "restricted_tplus_energy_and_forces_on_reference",
+        fake_rhf_tplus_ef,
+    )
+    monkeypatch.setattr(
+        MolecularFocalProvider,
+        "restricted_tplus_energy_on_reference",
+        fake_rhf_tplus_e,
+    )
+
+    # Only an explicit model selection opts in without recipe-specific qualification.
+    res = singlepoint(
+        water,
+        series,
+        series,
+        None,
+        provider=cuda_prov,
+        root_id="rhf",
+        correlation_space_id="all-active",
+        f12_doubles=card,
+        triples={"tplus": card},
+        backend="cuda",
+    )
+    assert res.components[-1].term.role == "triples_plus"
+    assert res.components[-1].executed_backend == "cuda"
+    assert res.components[-1].converged is True
+    assert res.components[-1].triples_model_id == "tplus_rhf_occupied_v2"
+    assert dispatched == [("rhf_tplus_ef", True)]
+
+    def conventional_energy(_self, _req, *, reference, telemetry):
+        telemetry["forward_w_precision"] = "fp64"
+        return -0.03
+
+    monkeypatch.setattr(MolecularFocalProvider, "triples_energy", conventional_energy)
+    unqualified = singlepoint_energy(
+        water, series, series, provider=cuda_prov, root_id="rhf",
+        correlation_space_id="all-active", f12_doubles=card, triples=card, backend="cuda",
+    )
+    assert unqualified.components[-1].triples_model_id == "conventional_rhf"
+    assert unqualified.components[-1].telemetry["forward_w_precision"] == "fp64"
+
+    # 2. Explicit {"tplus": card} energy-only executes built-in (T+) energy evaluator!
+    dispatched.clear()
+    res_e = singlepoint_energy(
+        water,
+        series,
+        series,
+        provider=cuda_prov,
+        root_id="rhf",
+        correlation_space_id="all-active",
+        f12_doubles=card,
+        triples={"tplus": card},
+        backend="cuda",
+    )
+    assert res_e.energy == pytest.approx(-75.26)
+    assert res_e.components[-1].triples_model_id == "tplus_rhf_occupied_v2"
+    assert res_e.components[-1].executed_backend == "cuda"
+    assert res_e.components[-1].converged is True
+    assert dispatched == [("rhf_tplus_e", True)]
+
+    # 3. Explicit Kohn (T)-F12 3N forces MUST be rejected with explicit NO-GO capability error!
+    with pytest.raises(NotImplementedError, match="NO-GO for 3N forces"):
+        singlepoint(
+            water,
+            series,
+            series,
+            None,
+            provider=cuda_prov,
+            root_id="rhf",
+            correlation_space_id="all-active",
+            f12_doubles=card,
+            triples={"f12": card},
+            backend="cuda",
+        )
+
+    # 4. Injected mock callback on CUDA that omits executed_backend MUST NOT be forged as CUDA!
+    bad_mock_prov = replace(
+        cuda_prov,
+        triples_models=lambda reqs, **_kw: {
+            r.role: FocalTriplesEvaluation(-0.04, np.zeros((3, 3)), 2) for r in reqs
+        },
+    )
+    with pytest.raises(RuntimeError, match="refusing to fabricate CUDA provenance"):
+        singlepoint(
+            water,
+            series,
+            series,
+            None,
+            provider=bad_mock_prov,
+            root_id="rhf",
+            correlation_space_id="all-active",
+            f12_doubles=card,
+            triples={"tplus": card},
+            backend="cuda",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +639,26 @@ def test_m5_m16_m20_spatial_rhf_ccsdf12b_contracts(
         spatial_rhf_ccsdf12b_v1(prov_tiny, req_active, ref_big, forces=True, expected_cabs_rank=2)
 
 
+# ---------------------------------------------------------------------------
+# M10: Zero residual TensorIR compiles in rotation_gradient, low_order_energy,
+#      tplus_from_occupied, and streamed_f12_increment
+# ---------------------------------------------------------------------------
+
+def test_spatial_force_rotation_with_installed_aot(monkeypatch):
+    from generativeqc._f12_focal_ucc_triples import _frame_rotation_action
+
+    provider = MolecularFocalProvider(shell_library=f12_host_shell(), budget_mib=2)
+    monkeypatch.setenv("GENERATIVEQC_F12_REQUIRE_AOT_CPHF", "1")
+    def no_jit(*args):
+        pytest.fail("AOT canonical-frame contraction dispatched a TensorIR graph")
+
+    coeff = np.array([[1.0, -0.6], [0.3, 0.4], [0.12, -0.75]])
+    bar = np.array([[2.0, 0.1], [1.9, 0.5], [-3.0, 0.2]])
+    action = _frame_rotation_action(provider, no_jit, cuda=False)
+    np.testing.assert_allclose(action(coeff, bar), coeff.T @ bar, rtol=0, atol=2e-15)
+    np.testing.assert_allclose(action(coeff, -bar), -(coeff.T @ bar), rtol=0, atol=2e-15)
+
+
 def test_m10_tplus_from_occupied_zero_cuda_runner_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify tplus_from_occupied runs directly in exact FP64 NumPy (0 calls to provider.run on CUDA)."""
     from generativeqc_compiler.tensor import execute
@@ -468,6 +724,71 @@ def test_m10_tplus_from_occupied_zero_cuda_runner_calls(monkeypatch: pytest.Monk
     monkeypatch.setenv("GENERATIVEQC_F12_STRICT_GPU_ONLY", "1")
     with pytest.raises(NotImplementedError, match="tplus_occupied_scaling"):
         prov.tplus_from_occupied(req, low, triples)
+
+
+def test_m10_zero_tensorir_in_low_order_tplus_and_streamed_increment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify 0 TensorIR calls in split-fit low_order_energy(occupied) and streamed_f12_increment with AOT sink."""
+    import generativeqc_compiler.tensor as tensor_mod
+
+    shell = f12_host_shell()
+    basis = _compact_h2o_split_basis(split_mp2=True)
+    atoms = [("O", (0.0, 0.0, 0.0)), ("H", (0.0, 1.43, 1.10)), ("H", (0.15, -1.43, 1.10))]
+    req = next(
+        r
+        for r, _ in plan_singlepoint(
+            atoms,
+            FocalSeries(basis),
+            FocalSeries(basis),
+            None,
+            root_id="rhf",
+            correlation_space_id="frozen-core",
+            backend="cpu_reference",
+        ).steps
+        if r.role == "mp2_f12_correlation"
+    )
+
+    # Reference TensorIR oracle (with AOT MP2-F12 disabled)
+    monkeypatch.setenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", "1")
+    monkeypatch.setenv("GENERATIVEQC_F12_STREAM_PANELS", "0")
+    prov_oracle = MolecularFocalProvider(shell_library=shell, budget_mib=512)
+    low_oracle = prov_oracle.low_order_energy(
+        req, include_hf_cabs=False, include_occupied_partitions=True
+    )
+
+    # AOT path: count EVERY TensorIR execute() call
+    monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_AOT_MP2F12", raising=False)
+    monkeypatch.setenv("GENERATIVEQC_F12_STREAM_PANELS", "1")
+    real_execute = tensor_mod.execute
+    tir_calls: list[tuple[str, ...]] = []
+
+    def spy_execute(program, inputs, *args, **kwargs):
+        tir_calls.append(tuple(sorted(program.outputs.keys())))
+        return real_execute(program, inputs, *args, **kwargs)
+
+    monkeypatch.setattr(tensor_mod, "execute", spy_execute)
+
+    prov_aot = MolecularFocalProvider(shell_library=shell, budget_mib=512)
+    low_aot = prov_aot.low_order_energy(
+        req, include_hf_cabs=False, include_occupied_partitions=True
+    )
+    assert tir_calls == [], f"low_order_energy(occupied) invoked TensorIR: {tir_calls}"
+    assert low_aot.occupied_mp2_f12 is not None and low_oracle.occupied_mp2_f12 is not None
+    assert abs(low_aot.mp2_f12_correlation_energy - low_oracle.mp2_f12_correlation_energy) < 1e-12
+    for a, b in zip(low_aot.occupied_mp2_f12.mp2, low_oracle.occupied_mp2_f12.mp2, strict=True):
+        np.testing.assert_allclose(a, b, atol=1e-12, rtol=0)
+
+    # Now run streamed_f12_increment via tplus_scaling_forces -> 0 TensorIR calls!
+    o_act = len(low_aot.occupied_mp2_f12.mp2[0])
+    w_mp2 = np.linspace(1.1, 1.4, o_act)
+    w_f12 = np.linspace(0.8, 1.1, o_act)
+    tir_calls.clear()
+    f_stream = prov_aot.tplus_scaling_forces(
+        req, low_aot.reference, (w_mp2, w_mp2), (w_f12, w_f12), expected_cabs_rank=low_aot.cabs_rank
+    )
+    assert tir_calls == [], f"streamed_f12_increment invoked TensorIR: {tir_calls}"
+    assert np.isfinite(f_stream).all()
 
 
 # ---------------------------------------------------------------------------
@@ -720,6 +1041,156 @@ def test_m14_displaced_seed_uses_overlap_normalized_spin_density(monkeypatch) ->
         )
 
 
+def test_m21_delta_cv_identical_freeze_counts_returns_none_not_fake_zero() -> None:
+    """Verify H2 (cv_frozen == fc_frozen == (0, 0)) returns delta=0 and None for uncomputed absolutes."""
+    shell = f12_host_shell()
+    basis = _compact_h2o_split_basis(split_mp2=False)
+    h2 = [("H", (0.0, 0.0, 0.0)), ("H", (0.0, 0.0, 1.4))]
+    req_f12 = next(
+        r
+        for r, _ in plan_singlepoint(
+            h2,
+            FocalSeries(basis),
+            FocalSeries(basis),
+            None,
+            root_id="rhf",
+            correlation_space_id="cv-active",
+            backend="cpu_reference",
+        ).steps
+        if r.role == "mp2_f12_correlation"
+    )
+    req_mp2 = conventional_mp2_request(
+        h2, basis, root_id="rhf", correlation_space_id="cv-active", backend="cpu_reference"
+    )
+    prov = MolecularFocalProvider(shell_library=shell, budget_mib=512)
+
+    for evaluate in (prov.delta_cv_energy, prov.delta_cv_energy_and_forces):
+        measured = evaluate(req_f12).cabs_rank
+        assert measured == 2
+        with pytest.raises(ValueError, match="rank"):
+            evaluate(req_f12, expected_cabs_rank=1)
+
+    for res, has_forces in (
+        (prov.delta_cv_energy(req_f12), False),
+        (prov.delta_cv_energy_and_forces(req_f12), True),
+        (prov.delta_cv_mp2_energy(req_mp2), False),
+        (prov.delta_cv_mp2_energy_and_forces(req_mp2), True),
+    ):
+        assert res.cv_frozen_occupied == (0, 0)
+        assert res.fc_frozen_occupied == (0, 0)
+        assert res.delta_ordinary_mp2_Eh == 0.0
+        assert res.delta_f12_increment_Eh == 0.0
+        assert res.delta_mp2_f12_Eh == 0.0
+        assert res.cv_ordinary_mp2_Eh is None
+        assert res.fc_ordinary_mp2_Eh is None
+        assert res.cv_f12_increment_Eh is None
+        assert res.fc_f12_increment_Eh is None
+        assert res.cv_mp2_f12_Eh is None
+        assert res.fc_mp2_f12_Eh is None
+        assert res.cv_forces is None
+        assert res.fc_forces is None
+        if has_forces:
+            assert res.delta_forces is not None
+            np.testing.assert_array_equal(res.delta_forces, np.zeros((2, 3)))
+        else:
+            assert res.delta_forces is None
+
+
+# ---------------------------------------------------------------------------
+# M15: slater_normalization Fingerprint & Provider Cache Isolation Across replace
+# ---------------------------------------------------------------------------
+
+
+def test_m15_slater_normalization_fingerprint_and_replace_cache_isolation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify slater_normalization enters surface_id & center check, and replace() isolates _pair_source_cache."""
+    card = FocalBasis(
+        2,
+        "ha-DZ-F12",
+        "sto-3g",
+        jk_fit="sto-3g",
+        mp2_fit="sto-3g",
+        f12_fit="sto-3g",
+        cabs="sto-3g",
+        beta=0.9,
+    )
+    series = FocalSeries(card)
+    h2 = [("H", (0.0, 0.0, 0.0)), ("H", (0.0, 0.0, 1.4))]
+    h2_disp = [("H", (0.0, 0.0, 0.0)), ("H", (0.0, 0.0, 1.401))]
+
+    p_exp = plan_singlepoint(
+        h2,
+        series,
+        series,
+        None,
+        root_id="rhf",
+        correlation_space_id="all-active",
+        backend="cpu_reference",
+        slater_normalization="negative_exponential",
+    )
+    p_over = plan_singlepoint(
+        h2,
+        series,
+        series,
+        None,
+        root_id="rhf",
+        correlation_space_id="all-active",
+        backend="cpu_reference",
+        slater_normalization="negative_exponential_over_beta",
+    )
+    assert p_exp.steps[0][0].surface_id != p_over.steps[0][0].surface_id
+
+    # Cross-validating a center produced under negative_exponential with a negative_exponential_over_beta provider fails!
+    monkeypatch.setattr(
+        MolecularFocalProvider,
+        "low_order_energy_and_forces",
+        lambda self, req, *, include_hf_cabs=True: FocalLowOrderForces(
+            FocalLowOrderEnergy(_dummy_reference(req, n=2, occupied=(1,)), 1, (0.0, 0.0), (0.0, -0.01, 0.0), -0.005),
+            np.zeros((2, 3)),
+            np.zeros((2, 3)),
+        ),
+    )
+    prov_exp = MolecularFocalProvider(
+        shell_library=Path("lib_a.so"),
+        slater_normalization="negative_exponential",
+    )
+    prov_over = MolecularFocalProvider(
+        shell_library=Path("lib_a.so"),
+        slater_normalization="negative_exponential_over_beta",
+    )
+    center = singlepoint(
+        h2,
+        series,
+        series,
+        None,
+        provider=prov_exp,
+        root_id="rhf",
+        correlation_space_id="all-active",
+        backend="cpu_reference",
+    )
+    with pytest.raises(ValueError, match="same electronic surface and protocol"):
+        singlepoint_energy(
+            h2_disp,
+            series,
+            series,
+            provider=prov_over,
+            root_id="rhf",
+            correlation_space_id="all-active",
+            backend="cpu_reference",
+            center=center,
+        )
+
+    # Provider cache isolation across dataclasses.replace()!
+    prov_exp._pair_source_cache["entry"] = ("sentinel", True, None, None)
+    prov_replaced_lib = replace(prov_exp, shell_library=Path("lib_b.so"))
+    prov_replaced_budget = replace(prov_exp, budget_mib=256)
+    assert prov_replaced_lib._pair_source_cache == {}
+    assert prov_replaced_budget._pair_source_cache == {}
+    assert prov_replaced_lib._pair_source_cache is not prov_exp._pair_source_cache
+    assert prov_replaced_budget._pair_source_cache is not prov_exp._pair_source_cache
+
+
 # ---------------------------------------------------------------------------
 # m3, m4, m8, D5, D1, D4
 # ---------------------------------------------------------------------------
@@ -951,3 +1422,80 @@ def test_d4_host_libraries_reject_invalid_explicit_env(
         f12_host_libraries()
     monkeypatch.delenv("GENERATIVEQC_F12_ONE_ECP")
     assert f12_host_libraries() == (shell, shell)
+
+
+def test_m10_ordinary_ucc_source_forces_uses_aot_rotation_zero_tensorir(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify ordinary_ucc_source_forces uses AOT orbital_rot_metric (0 orbital_rotation_cotangent TensorIR)."""
+    import generativeqc_compiler.tensor as tensor_mod
+    from generativeqc._f12_focal_cc_ordinary import ordinary_ucc_source_forces
+
+    shell = f12_host_shell()
+    basis = _compact_h2o_split_basis(split_mp2=True)
+    h2 = [("H", (0.0, 0.0, 0.0)), ("H", (0.0, 0.0, 1.4))]
+    req = next(
+        r
+        for r, _ in plan_singlepoint(
+            h2,
+            FocalSeries(basis),
+            FocalSeries(basis),
+            None,
+            root_id="rhf",
+            correlation_space_id="all-active",
+            backend="cpu_reference",
+        ).steps
+        if r.role == "mp2_f12_correlation"
+    )
+    prov = MolecularFocalProvider(shell_library=shell, budget_mib=512)
+    sources = prov.ucc_equation_sources(req)
+    rng = np.random.default_rng(42)
+    weights = {k: rng.normal(0.0, 0.01, size=v.shape) for k, v in sources.ordinary.items()}
+
+    real_execute = tensor_mod.execute
+    rotation_tir_calls: list[tuple[str, ...]] = []
+
+    def spy_execute(program, inputs, *args, **kwargs):
+        outs = tuple(sorted(program.outputs.keys()))
+        if "rotation_gradient" in outs:
+            rotation_tir_calls.append(outs)
+        return real_execute(program, inputs, *args, **kwargs)
+
+    monkeypatch.setattr(tensor_mod, "execute", spy_execute)
+    grad = ordinary_ucc_source_forces(prov, req, sources, weights)
+    assert rotation_tir_calls == []
+    assert grad.shape == (2, 3) and np.isfinite(grad).all()
+
+
+def test_d1_24_verified_dead_benchmark_scripts_removed() -> None:
+    """Verify the exact 24 verified zero-reference early-Codex benchmark files are deleted."""
+    root = Path(__file__).resolve().parents[2] / "benchmarks"
+    deleted = (
+        "df_unrestricted_snapshot.cpp",
+        "f12_canonical_frame.py",
+        "f12_cc_residual.py",
+        "f12_focal_hf_cabs.py",
+        "f12_full_frame_probe.py",
+        "f12_full_rank_center.py",
+        "f12_molecular_displacements.py",
+        "f12_molecular_i_sink_test.py",
+        "f12_nuclear_overlap.py",
+        "f12_occupied_fock.py",
+        "f12_polarized_force.py",
+        "f12_polarized_ladder.py",
+        "f12_polarized_ladder_force.py",
+        "f12_projector_component.py",
+        "f12_psi4_double_commutator.cpp",
+        "f12_psi4_geminal_nuclear.cpp",
+        "f12_unrestricted_ao.py",
+        "f12_unrestricted_cartesian.py",
+        "f12_unrestricted_energy.py",
+        "f12_unrestricted_live_reference.py",
+        "f12_unrestricted_molecule.py",
+        "f12_unrestricted_molecule_force.py",
+        "f12_unrestricted_reference_response.py",
+        "focal_oh_f_orbital.py",
+    )
+    assert len(deleted) == 24
+    for name in deleted:
+        assert not (root / name).exists(), f"Dead benchmark file still present: {name}"

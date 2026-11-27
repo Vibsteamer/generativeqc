@@ -309,6 +309,212 @@ def test_h1_ecp_cuda_skips_third_grid_when_initial_pair_converges(
     np.testing.assert_array_equal(hcore, fine)
 
 
+# ============================================================================
+# H5: Locked Plan-A recipe enforcement, _x2c1e FC9 support, manifest TZ beta
+# ============================================================================
+
+
+def test_h5_validate_and_assemble_plan_a_recipe_and_reject_mismatches() -> None:
+    """Locked Plan A (FC9 + Delta-CV9 + Delta-SR(FC9) with beta={2:0.9,3:1.0,4:1.0}) passes; mismatches reject."""
+    from generativeqc._f12_focal_cv import (
+        DEFAULT_PRODUCTION_CORRELATION_SPACE as CV_DEFAULT_SPACE,
+        FocalDeltaCVResult,
+    )
+    from generativeqc._f12_focal_molecular import MolecularFocalProvider
+    from generativeqc._f12_frozen_core import (
+        DEFAULT_PRODUCTION_CORRELATION_SPACE,
+        DEFAULT_PRODUCTION_F12_BETA_BY_CARDINAL,
+        assemble_production_focal_energy_and_forces,
+        validate_production_focal_recipe,
+    )
+    from generativeqc._x2c1e import DeltaSrResult
+    from generativeqc.experimental.f12_focal import (
+        FocalEvaluation,
+        FocalRunResult,
+        FocalTerm,
+    )
+
+    assert DEFAULT_PRODUCTION_CORRELATION_SPACE == "frozen-core-spd"
+    assert CV_DEFAULT_SPACE == DEFAULT_PRODUCTION_CORRELATION_SPACE
+    assert DEFAULT_PRODUCTION_F12_BETA_BY_CARDINAL == {2: 0.9, 3: 1.0, 4: 1.0}
+
+    # Valid Plan A with consistent subsystems.
+    recipe = validate_production_focal_recipe(
+        valence_correlation_space="frozen-core-spd",
+        delta_cv_valence_space="frozen-core-spd",
+        delta_sr_correlation_space="frozen-core-spd",
+        f12_beta_by_cardinal={2: 0.9, 3: 1.0, 4: 1.0},
+        subsystem_f12_betas=({2: 0.9, 3: 1.0}, {3: 1.0, 4: 1.0}),
+    )
+    assert recipe.valence_correlation_space == "frozen-core-spd"
+    assert recipe.f12_beta_by_cardinal == {2: 0.9, 3: 1.0, 4: 1.0}
+
+    # Assemble with typed Delta-CV and Delta-SR result objects.
+    f_val = np.array([[0.1, -0.2, 0.3], [-0.1, 0.2, -0.3]], dtype=np.float64)
+    f_cv = np.array([[0.01, 0.0, -0.02], [-0.01, 0.0, 0.02]], dtype=np.float64)
+    f_sr = np.array([[-0.005, 0.002, 0.0], [0.005, -0.002, 0.0]], dtype=np.float64)
+    valence = FocalRunResult(
+        -100.0,
+        f_val,
+        (("hf_cabs", "basis", 2, 1.0),),
+        (
+            FocalEvaluation(
+                FocalTerm("surface", "series", "basis", 2, "hf_cabs", -100.0, f_val),
+                "cuda",
+                True,
+            ),
+        ),
+        valence_correlation_space="frozen-core-spd",
+        frozen_core_definition_version=2,
+    )
+    fake_cv = FocalDeltaCVResult(
+        reference=None,  # type: ignore[arg-type]
+        cabs_rank=10,
+        cv_frozen=(0, 0),
+        fc_frozen=(9, 9),
+        cv_ordinary_mp2_Eh=-1.0,
+        fc_ordinary_mp2_Eh=-0.8,
+        cv_f12_increment_Eh=0.0,
+        fc_f12_increment_Eh=0.0,
+        cv_mp2_f12_Eh=-1.0,
+        fc_mp2_f12_Eh=-0.8,
+        delta_ordinary_mp2_Eh=-0.2,
+        delta_f12_increment_Eh=0.0,
+        delta_mp2_f12_Eh=-0.2,
+        delta_forces=f_cv,
+        fc_mode="frozen-core-spd",
+        frozen_core_definition_version=2,
+    )
+    fake_sr = DeltaSrResult(
+        mode="dlu1e",
+        correlation_space="frozen-core-spd",
+        nbf=20,
+        nocc=(13, 13),
+        e_hf_nr=-10.0,
+        e_hf_sr=-10.01,
+        delta_sr_hf=-0.01,
+        e_mp2_corr_nr=-0.5,
+        e_mp2_corr_sr=-0.502,
+        e_mp2_nr=-10.5,
+        e_mp2_sr=-10.512,
+        delta_sr_mp2=-0.012,
+        forces_hf_nr=None,
+        forces_hf_sr=None,
+        delta_forces_hf=None,
+        forces_mp2_nr=None,
+        forces_mp2_sr=None,
+        delta_forces_mp2=f_sr,
+        timings_s={},
+        frozen_core_definition_version=2,
+    )
+    assembled = MolecularFocalProvider.assemble_production_energy_and_forces(
+        valence=valence,
+        valence_correlation_space="frozen-core-spd",
+        f12_beta_by_cardinal={2: 0.9, 3: 1.0, 4: 1.0},
+        delta_cv=fake_cv,
+        delta_sr=fake_sr,
+    )
+    assert assembled.total_energy_Eh == pytest.approx(-100.212, abs=1e-14)
+    assert assembled.total_forces_Eh_per_bohr is not None
+    np.testing.assert_allclose(assembled.total_forces_Eh_per_bohr, f_val + f_cv + f_sr, atol=1e-15)
+
+    # Reject FC9 + Delta-CV4 (omits (n-1)d core-valence correlation!).
+    with pytest.raises(ValueError, match="Mismatched valence.*Delta-CV"):
+        validate_production_focal_recipe(
+            valence_correlation_space="frozen-core-spd",
+            delta_cv_valence_space="frozen-core",
+            f12_beta_by_cardinal={2: 0.9, 3: 1.0},
+        )
+
+    # Reject FC4 + Delta-CV9 even when require_production_defaults=False.
+    with pytest.raises(ValueError, match="Mismatched valence.*Delta-CV"):
+        validate_production_focal_recipe(
+            valence_correlation_space="frozen-core",
+            delta_cv_valence_space="frozen-core-spd",
+            f12_beta_by_cardinal={2: 0.9, 3: 1.0},
+            require_production_defaults=False,
+        )
+
+    # Reject FC9 + Delta-CV9 + Delta-SR(FC4).
+    with pytest.raises(ValueError, match="Mismatched valence.*Delta-SR"):
+        validate_production_focal_recipe(
+            valence_correlation_space="frozen-core-spd",
+            delta_cv_valence_space="frozen-core-spd",
+            delta_sr_correlation_space="frozen-core",
+            f12_beta_by_cardinal={2: 0.9, 3: 1.0},
+        )
+
+    # Reject non-Plan-A FC4 under production defaults.
+    with pytest.raises(ValueError, match="Plan A requires valence correlation space"):
+        validate_production_focal_recipe(
+            valence_correlation_space="frozen-core",
+            delta_cv_valence_space="frozen-core",
+            delta_sr_correlation_space="frozen-core",
+            f12_beta_by_cardinal={2: 0.9, 3: 1.0},
+        )
+
+    # Reject TZ beta=0.9 under production defaults.
+    with pytest.raises(ValueError, match="requires F12 beta=1.0 at cardinal 3"):
+        validate_production_focal_recipe(
+            valence_correlation_space="frozen-core-spd",
+            f12_beta_by_cardinal={2: 0.9, 3: 0.9},
+        )
+
+    # Reject mixed TZ beta=0.9 vs 1.0 across subsystems even when diagnostic mode is enabled.
+    with pytest.raises(ValueError, match="Inconsistent F12 beta at cardinal 3"):
+        validate_production_focal_recipe(
+            valence_correlation_space="frozen-core-spd",
+            f12_beta_by_cardinal={2: 0.9, 3: 1.0},
+            subsystem_f12_betas=({2: 0.9, 3: 0.9},),
+            require_production_defaults=False,
+        )
+
+    # Reject assembling forces when a component supplies energy without forces.
+    fake_cv_no_f = FocalDeltaCVResult(
+        reference=None,  # type: ignore[arg-type]
+        cabs_rank=10,
+        cv_frozen=(0, 0),
+        fc_frozen=(9, 9),
+        cv_ordinary_mp2_Eh=-1.0,
+        fc_ordinary_mp2_Eh=-0.8,
+        cv_f12_increment_Eh=0.0,
+        fc_f12_increment_Eh=0.0,
+        cv_mp2_f12_Eh=-1.0,
+        fc_mp2_f12_Eh=-0.8,
+        delta_ordinary_mp2_Eh=-0.2,
+        delta_f12_increment_Eh=0.0,
+        delta_mp2_f12_Eh=-0.2,
+        delta_forces=None,
+        fc_mode="frozen-core-spd",
+        frozen_core_definition_version=2,
+    )
+    with pytest.raises(ValueError, match="Delta-CV forces"):
+        assemble_production_focal_energy_and_forces(
+            valence=valence,
+            valence_correlation_space="frozen-core-spd",
+            f12_beta_by_cardinal={2: 0.9, 3: 1.0},
+            delta_cv=fake_cv_no_f,
+        )
+
+
+def test_h5_methyl_halide_manifest_tz_beta_and_provenance() -> None:
+    """The hash-only Br/I methyl-halide manifest records Plan-A beta {2: 0.9, 3: 1.0} and provenance."""
+    import json
+
+    from generativeqc._f12_frozen_core import DEFAULT_PRODUCTION_F12_BETA_BY_CARDINAL
+
+    manifest_path = ROOT / "python/generativeqc/data/f12_methyl_halide_external.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    betas = manifest["beta_bohr_inverse_by_cardinal"]
+    assert betas == {"2": 0.9, "3": 1.0}
+    for cardinal in (2, 3):
+        expected = DEFAULT_PRODUCTION_F12_BETA_BY_CARDINAL[cardinal]
+        assert betas[str(cardinal)] == pytest.approx(expected)
+    assert manifest["beta_policy"]
+    for entry in manifest["files"].values():
+        assert entry["citation"] and entry["source"] in manifest["sources"]
+
+
 def test_h5_x2c1e_delta_sr_fc9_parity_and_fd_forces_on_hbr() -> None:
     """evaluate_delta_sr supports frozen-core-spd (FC9) on ECP HBr matching PySCF and central FD."""
     pytest.importorskip("basis_set_exchange")
@@ -596,6 +802,7 @@ def test_m7_real_df_hf_shell_gaps_pass_for_h2o_oh_hbr() -> None:
         )
         assert frame.counts(cspace) == (expected_fc, expected_fc)
         assert frame.channels(cspace)[0].minimum_gap_eh > 1.0
+
 
 
 # ============================================================================

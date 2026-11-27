@@ -688,6 +688,18 @@ install(FILES LICENSES/psi4-COPYING.LESSER.txt
               LICENSES/dftd4-COPYING.LESSER.txt
               LICENSES/dftd4-COPYING.txt
         DESTINATION "${CMAKE_INSTALL_DATADIR}/generativeqc/licenses")
+# License texts retained for the project, xTBloom, EEQ, CUDA trampolines,
+# and D3/gCP data used by native builds.
+install(FILES LICENSE
+              LICENSES/xtbloom-CUDA_MKL_LINKING_EXCEPTION.txt
+              LICENSES/mctc-lib-LICENSE.txt
+              LICENSES/implib-MIT.txt
+              LICENSES/simple-dftd3-COPYING.txt
+              LICENSES/simple-dftd3-COPYING.LESSER.txt
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/generativeqc/licenses")
+install(FILES upstream/libxc/7.0.0/COPYING
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/generativeqc/licenses"
+        RENAME libxc-MPL-2.0.txt)
 if(GENERATIVEQC_BUILD_CLI)
   install(TARGETS generativeqc_cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
   if(GENERATIVEQC_ENABLE_CUDA)

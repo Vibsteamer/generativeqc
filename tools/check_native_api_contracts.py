@@ -31,6 +31,10 @@ HEADERS = (
     "include/generativeqc/electronic_properties.h",
     "include/generativeqc/saddle.h",
 )
+# Additive public C headers scanned for macro safety, literal GENERATIVEQC_API
+# declaration grammar, and cross-header symbol/anchor uniqueness until promoted
+# with full source-owned @native-contract facets in manifests/native_api_contracts.json.
+ADDITIVE_C_HEADERS = ("include/generativeqc/ucc_fitting.h",)
 MANIFEST = "manifests/native_api_contracts.json"
 REFERENCE = "docs/reference/native_symbols.md"
 FACETS = {"behavior", "inputs", "outputs", "lifetime", "errors", "execution", "units"}
@@ -217,7 +221,7 @@ def scan_c(source: str) -> list[Declaration]:
         # variables, attributes, and macro-generated declarations fail closed.
         text = signature(declaration)
         match = re.fullmatch(
-            r"GENERATIVEQC_API (?:uint32_t|generativeqc_status|void|const char \*) "
+            r"GENERATIVEQC_API (?:int|uint32_t|generativeqc_status|void|const char \*) "
             r"(generativeqc_\w+) \( ([^{};]*) \)",
             text,
         )
@@ -446,6 +450,42 @@ def discover(root: Path) -> list[Declaration]:
     return declarations
 
 
+def discover_additive_c(
+    root: Path, *, require_present: bool = False
+) -> list[Declaration]:
+    declarations = []
+    for path in ADDITIVE_C_HEADERS:
+        header_path = root / path
+        if not header_path.exists():
+            if require_present:
+                raise ContractError(f"missing additive public C header: {path}")
+            continue
+        found = scan_c(header_path.read_text(encoding="utf-8"))
+        for declaration in found:
+            declaration.header = path
+        declarations.extend(found)
+    return declarations
+
+
+def validate_additive_c(
+    root: Path,
+    manifested: list[Declaration],
+    *,
+    require_present: bool = False,
+) -> list[Declaration]:
+    additive = discover_additive_c(root, require_present=require_present)
+    combined = [*manifested, *additive]
+    if len({d.name for d in combined}) != len(combined):
+        raise ContractError(
+            "duplicate native declaration identity across manifested and additive headers"
+        )
+    if len({d.anchor for d in combined}) != len(combined):
+        raise ContractError(
+            "duplicate native reference anchor across manifested and additive headers"
+        )
+    return additive
+
+
 def contract_facets(declaration: Declaration) -> dict[str, str]:
     markers = re.findall(r"^@native-contract (.+)$", declaration.comment, re.MULTILINE)
     if markers != [declaration.name]:
@@ -572,6 +612,11 @@ def main() -> int:
     args = parser.parse_args()
     try:
         declarations = validate(args.root)
+        additive = validate_additive_c(
+            args.root,
+            declarations,
+            require_present=args.root.resolve() == ROOT.resolve(),
+        )
         expected = render(declarations)
         reference = args.root / REFERENCE
         if args.write_reference:
@@ -587,10 +632,12 @@ def main() -> int:
         kind: sum(d.kind == kind for d in declarations)
         for kind in ("c-function", "c-callback", "cpp-type", "cpp-operation")
     }
-    print(
-        "Native API contracts covered: "
-        + ", ".join(f"{n} {k}" for k, n in counts.items())
+    summary = "Native API contracts covered: " + ", ".join(
+        f"{n} {k}" for k, n in counts.items()
     )
+    if additive:
+        summary += f"; additive C ABI scanned: {len(additive)} c-function"
+    print(summary)
     return 0
 
 

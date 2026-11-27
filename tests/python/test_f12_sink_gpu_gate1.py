@@ -65,6 +65,7 @@ from generativeqc.experimental.f12_focal import (
     DEFAULT_SLATER_FIT_NORMALIZATION,
     FocalBasis,
     FocalSeries,
+    MolecularFocalProvider,
     plan_singlepoint,
 )
 
@@ -517,10 +518,235 @@ def test_spherical_slab_admission_is_monotone_in_the_budget(host_sink: Path) -> 
     np.testing.assert_allclose(unslabbed_gradient.sum(axis=0), 0.0, atol=1e-12)
 
 
+@pytest.mark.parametrize("beta", [0.9, 1.0, 1.4])
+def test_slater_normalization_integral_scaling_and_validation(
+    host_sink: Path, beta: float
+) -> None:
+    """Verify exact 1/beta (linear) and 1/beta^2 (quadratic) scaling and beta=1 identity."""
+    basis = _compact_water_basis(beta=beta)
+    req = _pair_request(_water_atoms(), basis)
+    layout = focal_shell_layout(req, host_sink, host_reference=True, budget_mib=512)
+
+    t_default, _ = forward_integrals(layout, host_sink, host_reference=True)
+    t_def, _ = forward_integrals(
+        layout, host_sink, host_reference=True, slater_normalization="negative_exponential"
+    )
+    t_leg = _legacy_cartesian_forward(layout, host_sink, beta=beta)
+    t_ob, _ = forward_integrals(
+        layout, host_sink, host_reference=True, slater_normalization="negative_exponential_over_beta"
+    )
+
+    # Production default (Python + C++ non-_ex export) is negative_exponential_over_beta (< 1e-14).
+    from generativeqc._f12_focal_integral_kernel import DEFAULT_SLATER_FIT_NORMALIZATION
+
+    assert DEFAULT_SLATER_FIT_NORMALIZATION == "negative_exponential_over_beta"
+    assert MolecularFocalProvider(shell_library=host_sink).slater_normalization == "negative_exponential_over_beta"
+    for k in t_ob:
+        np.testing.assert_allclose(t_default[k], t_ob[k], atol=1e-14, rtol=1e-14, err_msg=k)
+        np.testing.assert_allclose(t_ob[k], t_leg[k], atol=1e-14, rtol=1e-14, err_msg=k)
+
+    # Exact theoretical scaling between negative_exponential and negative_exponential_over_beta.
+    scales = {
+        "metric": 1.0,
+        "ao_coulomb": 1.0,
+        "metric_f12": 1.0 / beta,
+        "ao_f12": 1.0 / beta,
+        "metric_f12_over_coulomb": 1.0 / beta,
+        "ao_f12_over_coulomb": 1.0 / beta,
+        "metric_f12_squared": 1.0 / (beta * beta),
+        "ao_f12_squared": 1.0 / (beta * beta),
+        "metric_double_commutator": 1.0 / (beta * beta),
+        "ao_double_commutator": 1.0 / (beta * beta),
+    }
+    for k, scale in scales.items():
+        np.testing.assert_allclose(t_ob[k], scale * t_def[k], atol=1e-13, rtol=1e-13, err_msg=k)
+
+    # Nuclear derivatives obey the exact same scaling factors.
+    rng = np.random.default_rng(100 + int(beta * 10))
+    weights = {k: rng.normal(scale=0.05, size=v.shape) for k, v in t_def.items()}
+    r_def = contract_live_weights(
+        layout, weights, host_sink, host_reference=True, slater_normalization="negative_exponential"
+    )
+    r_ob = contract_live_weights(
+        layout,
+        weights,
+        host_sink,
+        host_reference=True,
+        slater_normalization="negative_exponential_over_beta",
+    )
+    for k, scale in scales.items():
+        np.testing.assert_allclose(
+            r_ob["rows"][k]["gradient_Eh_per_bohr"],
+            scale * np.asarray(r_def["rows"][k]["gradient_Eh_per_bohr"]),
+            atol=1e-12,
+            rtol=1e-12,
+            err_msg=k,
+        )
+
+    with pytest.raises(ValueError, match="unknown Slater fit normalization"):
+        slater_normalization_code("invalid_mode")
 
 
+@pytest.mark.parametrize("norm", ["negative_exponential", "negative_exponential_over_beta"])
+def test_slater_normalization_analytic_forces_vs_fd(host_sink: Path, norm: str) -> None:
+    """Both SlaterFitNormalization modes pass analytic vs central FD force checks at beta=1.4."""
+    basis = _compact_water_basis(beta=1.4)
+    atoms = _water_atoms(scale=1.02)
+    req = _pair_request(
+        atoms, basis, correlation_space_id="all-active", slater_normalization=norm
+    )
+    prov = MolecularFocalProvider(
+        shell_library=host_sink, budget_mib=1024, slater_normalization=norm
+    )
+    ef = prov.low_order_energy_and_forces(req, include_hf_cabs=True)
+    forces = ef.mp2_f12_correlation_forces
+    assert np.max(np.abs(np.sum(forces, axis=0))) < 1e-12
+
+    # Two-step central FD along two independent Cartesian coordinates (O-z and H1-y).
+    h = 2e-4
+    for atom_idx, axis in ((0, 2), (1, 1)):
+        def shifted_e(delta: float) -> float:
+            moved = []
+            for idx, a in enumerate(atoms):
+                pos = list(a.position)
+                if idx == atom_idx:
+                    pos[axis] += delta
+                moved.append(Atom.from_value((a.atomic_number, tuple(pos))))
+            r = _pair_request(
+                tuple(moved),
+                basis,
+                correlation_space_id="all-active",
+                slater_normalization=norm,
+            )
+            return prov.low_order_energy(
+                r, expected_cabs_rank=ef.energies.cabs_rank, include_hf_cabs=False
+            ).mp2_f12_correlation_energy
+
+        fd = -(shifted_e(h) - shifted_e(-h)) / (2.0 * h)
+        assert abs(forces[atom_idx, axis] - fd) < 2e-8
 
 
+@pytest.mark.parametrize("root_id,atoms_spec,charge,mult,corr_space", [
+    ("rhf", _water_atoms(scale=1.02), 0, 1, "frozen-core"),
+    ("rhf", _water_atoms(scale=1.02), 0, 1, "all-active"),
+    (
+        "uhf",
+        (Atom.from_value(("O", (0.0, 0.0, 0.0))), Atom.from_value(("H", (0.0, 0.0, 1.85)))),
+        0,
+        2,
+        "frozen-core",
+    ),
+])
+def test_fused_fixed_ucc_source_forces_parity_and_streaming(
+    host_sink: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    root_id: str,
+    atoms_spec: tuple[Atom, ...],
+    charge: int,
+    mult: int,
+    corr_space: str,
+) -> None:
+    """Fused fixed_ucc_source_forces (streamed & non-streamed) matches unfused standalone pullbacks < 1e-12."""
+    from functools import partial
+
+    from generativeqc._f12_cc_c_nuclear import unrestricted_cc_c_ao_weights
+    from generativeqc._f12_cc_fock_pullback import extended_fock_response
+    from generativeqc._f12_cc_scalar_nuclear import unrestricted_cc_scalar_ao_weights
+    from generativeqc._f12_cc_w_nuclear import unrestricted_cc_w_ao_weights
+    from generativeqc._f12_focal_cc_fixed import fixed_ucc_source_forces
+    from generativeqc._f12_focal_cc_sources import FocalUCCEquationSources
+    from generativeqc._f12_focal_frame import canonical_pair_frame
+    from generativeqc._f12_focal_increment import relaxed_f12_source_weights
+    from generativeqc._f12_focal_one_electron import one_electron_sources
+    from generativeqc_compiler.cc.uccsd_equations import build_f12_program
+    from generativeqc_compiler.cc.uccsd_layout import UCCSDLayout
+    from generativeqc_compiler.tensor import execute
+
+    basis = _compact_water_basis(beta=1.0)
+    req = _pair_request(
+        atoms_spec,
+        basis,
+        charge=charge,
+        multiplicity=mult,
+        root_id=root_id,
+        correlation_space_id=corr_space,
+    )
+    prov = MolecularFocalProvider(shell_library=host_sink, budget_mib=1024)
+    fixed = prov.ucc_fixed_sources(req)
+    eq_sources = FocalUCCEquationSources(fixed, basis.mp2_fit.identity, {})
+
+    ref = fixed.reference
+    oa, ob = (ref.occupied[i] for i in ref._pair_spin_indices(req))
+    fa, fb = fixed.frozen_occupied
+    n = ref.coefficients.shape[-1]
+    cc = build_f12_program(UCCSDLayout(oa - fa, ob - fb, n - oa, n - ob))
+    required = sorted(
+        node.attrs["name"]
+        for node in cc.live_nodes
+        if node.op == "input" and node.attrs["name"] in fixed.feeds
+    )
+    rng = np.random.default_rng(2026)
+    fixed_weights = {
+        k: (
+            np.asarray(1.0, dtype=np.float64)
+            if k == "fixed_geminal_energy"
+            else rng.normal(0.0, 0.05, size=fixed.feeds[k].shape)
+        )
+        for k in required
+    }
+
+    # Unfused reference using the three standalone pullbacks directly
+    run = partial(execute, max_bytes=prov.budget_mib << 20)
+    one = one_electron_sources(req, library=host_sink, derivatives=True, budget_mib=prov.budget_mib)
+    corr = prov._panel(req, "f12_fit", allow_streaming=False)
+    jk = prov._panel(req, "jk_fit", allow_streaming=False)
+    jk_sources = jk.joint(req, explicit=False)
+    space, ao, panel, proj = canonical_pair_frame(
+        req,
+        ref,
+        one,
+        jk_sources,
+        corr.joint(req, explicit=True),
+        expected_cabs_rank=fixed.cabs_rank,
+        relative_cutoff=prov.relative_cutoff,
+        library=None,
+    )
+    fock = extended_fock_response(space, ao, panel, run, cuda=False, library=None)
+    scalar = unrestricted_cc_scalar_ao_weights(
+        space, ao, fixed_weights["fixed_geminal_energy"], run, frozen_occupied=(fa, fb), jkfit=panel, fock_response=fock
+    )
+    bars = scalar.weights
+    w_sel = {k: v for k, v in fixed_weights.items() if k.startswith("w_")}
+    if w_sel:
+        for k, v in unrestricted_cc_w_ao_weights(space, ao, w_sel, run, frozen_occupied=(fa, fb)).items():
+            bars[k] += v
+    c_sel = {k: v for k, v in fixed_weights.items() if k.startswith("c_f12_")}
+    if c_sel:
+        for k, v in unrestricted_cc_c_ao_weights(
+            space, ao, c_sel, run, frozen_occupied=(fa, fb), jkfit=panel, fock_response=fock
+        ).items():
+            bars[k] += v
+    wo, wj, wf = relaxed_f12_source_weights(
+        req, ref, one, jk_sources, panel, proj, bars, run, budget=prov.budget_mib, relative_cutoff=prov.relative_cutoff, library=None, canonical_library=None
+    )
+    ref_grad = (
+        prov._gradient(req, corr, wf, coulomb_only=False)
+        + prov._gradient(req, jk, wj, coulomb_only=True)
+        + one.nuclear_gradient(wo["overlap"], wo["hcore"], run=None)
+    )
+    ref_forces = -ref_grad
+
+    # 1. Fused non-streaming
+    monkeypatch.setenv("GENERATIVEQC_F12_STREAM_PANELS", "0")
+    prov._pair_source_cache.clear()
+    fused_nonstream = fixed_ucc_source_forces(prov, req, eq_sources, fixed_weights)
+    np.testing.assert_allclose(fused_nonstream, ref_forces, atol=1e-12, rtol=1e-12)
+
+    # 2. Fused forced streaming (ao_bar_sink path used for CNa3O3 / C4H6Br2O)
+    monkeypatch.setenv("GENERATIVEQC_F12_STREAM_PANELS", "1")
+    prov._pair_source_cache.clear()
+    fused_stream = fixed_ucc_source_forces(prov, req, eq_sources, fixed_weights)
+    np.testing.assert_allclose(fused_stream, ref_forces, atol=1e-12, rtol=1e-12)
 
 
 @pytest.mark.parametrize("oa,ob,frozen", [(3, 3, (1, 1)), (3, 2, (1, 0))])
@@ -626,3 +852,136 @@ def test_native_pair_pullbacks_match_tensorir_exact(
         np.testing.assert_allclose(fbar_nat[k], fbar_ref[k], atol=1e-12, rtol=1e-12, err_msg=k)
     for k in fobs_ref:
         np.testing.assert_allclose(fobs_nat[k], fobs_ref[k], atol=1e-12, rtol=1e-12, err_msg=k)
+
+
+def test_slater_normalization_vs_psi4_h2o_and_hcl(host_sink: Path) -> None:
+    """Verify default negative_exponential and 1/beta over_beta against Psi4 1.11 at beta=0.9, 1.0, 1.4."""
+    psi4 = pytest.importorskip("psi4")
+    psi4.core.be_quiet()
+    psi4.set_memory("2 GB")
+
+    def basis_from_psi4(name: str, symbols: list[str], role: str) -> BasisSet:
+        elems = []
+        seen = set()
+        for sym in symbols:
+            if sym in seen:
+                continue
+            seen.add(sym)
+            z = atomic_number(sym)
+            mult = 1 if z % 2 == 0 else 2
+            mol = psi4.geometry(f"0 {mult}\n{sym} 0.0 0.0 0.0\nunits bohr\nsymmetry c1\n")
+            b = psi4.core.BasisSet.build(mol, role, name, quiet=True)
+            shells = []
+            for s in range(b.nshell()):
+                sh = b.shell(s)
+                exps = tuple(f"{sh.exp(p):.16e}" for p in range(sh.nprimitive))
+                coeffs = tuple(f"{sh.original_coef(p):.16e}" for p in range(sh.nprimitive))
+                shells.append(BasisShell(sh.am, exps, (coeffs,)))
+            elems.append(ElementBasis(z, tuple(shells)))
+        prov = BasisProvenance(f"psi4:{name}", "1.11", "BSD", "0" * 64)
+        return BasisSet(name, tuple(elems), prov, "spherical")
+
+    cases = [
+        (
+            "H2O",
+            [
+                ("O", (0.0, 0.0, 0.0)),
+                ("H", (0.0, 1.43042809, -1.10715266)),
+                ("H", (0.0, -1.43042809, -1.10715266)),
+            ],
+            "cc-pCVDZ-F12",
+            "cc-pCVDZ-F12-optri",
+            "def2-universal-jkfit",
+            "aug-cc-pVTZ-ri",
+            2.0e-4,
+        ),
+        (
+            "HCl",
+            [("Cl", (0.0, 0.0, 0.0)), ("H", (0.0, 0.0, 2.4086))],
+            "cc-pVDZ-F12",
+            "cc-pVDZ-F12-optri",
+            "aug-cc-pVTZ-jkfit",
+            "aug-cc-pVTZ-ri",
+            1.0e-3,
+        ),
+    ]
+
+    for mol_name, atom_list, orb_n, cabs_n, jk_n, ri_n, df_tol in cases:
+        syms = [s for s, _ in atom_list]
+        orb = basis_from_psi4(orb_n, syms, "ORBITAL")
+        cabs = basis_from_psi4(cabs_n, syms, "CABS")
+        jk = basis_from_psi4(jk_n, syms, "DF_BASIS_SCF")
+        ri = basis_from_psi4(ri_n, syms, "DF_BASIS_MP2")
+        atoms = tuple(Atom.from_value(x) for x in atom_list)
+        geom_str = (
+            "0 1\n"
+            + "\n".join(f"{s} {x} {y} {z}" for s, (x, y, z) in atom_list)
+            + "\nunits bohr\nsymmetry c1\n"
+        )
+        for beta in (0.9, 1.0, 1.4):
+            fb = FocalBasis(2, f"psi4-{mol_name}", orb, jk_fit=jk, mp2_fit=ri, f12_fit=ri, cabs=cabs, beta=beta)
+            p_def = MolecularFocalProvider(
+                shell_library=host_sink, budget_mib=2048, slater_normalization="negative_exponential"
+            )
+            p_ob = MolecularFocalProvider(
+                shell_library=host_sink,
+                budget_mib=2048,
+                slater_normalization="negative_exponential_over_beta",
+            )
+            f12_def = {}
+            f12_ob = {}
+            f12_psi4 = {}
+            for corr_space in ("all-active", "frozen-core"):
+                req_def = _pair_request(
+                    atoms,
+                    fb,
+                    correlation_space_id=corr_space,
+                    slater_normalization="negative_exponential",
+                )
+                req_ob = _pair_request(
+                    atoms,
+                    fb,
+                    correlation_space_id=corr_space,
+                    slater_normalization="negative_exponential_over_beta",
+                )
+                e_def = p_def.low_order_energy(req_def, include_hf_cabs=False)
+                e_ob = p_ob.low_order_energy(req_ob, include_hf_cabs=False)
+                f12_def[corr_space] = e_def.f12_increment
+                f12_ob[corr_space] = e_ob.f12_increment
+
+                psi4.core.clean()
+                psi4.core.clean_options()
+                psi4.geometry(geom_str)
+                psi4.set_options(
+                    {
+                        "basis": orb_n,
+                        "cabs_basis": cabs_n,
+                        "df_basis_scf": jk_n,
+                        "df_basis_mp2": ri_n,
+                        "f12_beta": beta,
+                        "freeze_core": (corr_space == "frozen-core"),
+                        "scf_type": "df",
+                        "mp2_type": "df",
+                    }
+                )
+                psi4.energy("mp2-f12")
+                vs = psi4.core.variables()
+                f12_psi4[corr_space] = vs["MP2-F12 CORRELATION ENERGY"] - vs["MP2 CORRELATION ENERGY"]
+                # Default negative_exponential tracks Psi4 1.11 (up to RI DF error).
+                assert abs(f12_def[corr_space] - f12_psi4[corr_space]) < df_tol
+                # At beta = 1.0 both normalizations are mathematically identical.
+                if beta == 1.0:
+                    assert abs(f12_ob[corr_space] - f12_def[corr_space]) < 1e-14
+                # Over-beta F12 increment must always be strictly negative (variational).
+                assert f12_ob[corr_space] < -0.04
+
+            dcv_def = f12_def["all-active"] - f12_def["frozen-core"]
+            dcv_ob = f12_ob["all-active"] - f12_ob["frozen-core"]
+            dcv_psi4 = f12_psi4["all-active"] - f12_psi4["frozen-core"]
+            if beta == 1.4:
+                # Confirm unscaled default reproduces Psi4's positive sign inversion at beta=1.4,
+                # while negative_exponential_over_beta eliminates it completely!
+                assert dcv_psi4 > 0.0 and dcv_def > 0.0
+                assert dcv_ob < -0.010
+            else:
+                assert dcv_ob < -0.005

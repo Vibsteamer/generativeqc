@@ -321,7 +321,8 @@ serialization expose data without running a solve or acquiring device storage.
 ## Fixed-cusp CC amplitude and Lambda options
 
 `generativeqc.experimental.uccsd_f12.SolverOptions` controls the compiled
-amplitude solve. `energy_tolerance` bounds the energy comparisons in Hartree
+amplitude solve used by `MolecularFocalProvider.ucc_stationary` and
+`uccsd_f12b`. `energy_tolerance` bounds the energy comparisons in Hartree
 and may be at most `1e-8`. `residual_tolerance` bounds the maximum absolute
 physical amplitude residual and may be at most `1e-9`. Both tolerances
 must be positive and finite. `max_iterations` and the logical numeric

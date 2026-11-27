@@ -1,0 +1,15 @@
+{
+  "current_default": "The experimental focal CUDA provider selects native spin-blocked UCCSD-F12b for eligible UHF requests. Conventional triples remain the default. Explicit Köhn (T)-F12 is an opt-in RHF singlet energy.",
+  "evidence": [
+    "docs/user/ccsdt_cbs.md",
+    "tests/native/test_ucc_v2_device_capacity.cpp",
+    "tests/python/test_focal_uhf_f12b_gate1.py",
+    "tests/python/test_explicit_tf12_sp_gate1.py",
+    "tests/python/test_df_triples_traversal.py"
+  ],
+  "generated_capability": "DF sources use generated integral evaluation and compensated MO transformations. Restricted explicit (T)-F12 reuses the generated conventional triples panel, moment and energy routines.",
+  "missing_capability": "Spin-blocked residuals, Lambda pullbacks, unrestricted triples and fixed-cusp terms still have manually maintained CUDA equations. Explicit (T)-F12 has no UHF or analytic molecular-force endpoint.",
+  "owner": "focal_cc",
+  "retirement_condition": "Migrate each manual equation when a compiler-owned implementation passes independent energy or gradient and full-endpoint capacity gates for the same spin, precision and basis domains.",
+  "status": "experimental"
+}

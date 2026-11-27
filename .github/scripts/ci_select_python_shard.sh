@@ -477,6 +477,13 @@ case "${GENERATIVEQC_CI_SHARD}" in
       [tests/python/test_cuda_aot_compile_evidence.py]=1
       [tests/python/test_cuda_aot_endpoint_evidence.py]=2
       [tests/python/test_cuda_aot_global_promotion.py]=0
+      # Native admission and response qualifications retain the existing core
+      # owners by joining the supplemental files outside the modulo rotation.
+      [tests/python/test_ecp_fitted_g_admission.py]=0
+      [tests/python/test_f12_orbital_response_true_residual.py]=1
+      [tests/python/test_triples_compensated_w_cuda.py]=1
+      [tests/python/test_uhf_orbital_adjoint_admission.py]=0
+      [tests/python/test_x2c1e_speed_of_light_abi.py]=1
       # Derivative AD adds nine files. In PR run 42410861878 their insertion
       # moved 1272 existing modules, including scalar-ECP HVPs from core-a
       # into core-c's molecular Hessian queue, which exhausted the 30m cap.
@@ -502,6 +509,19 @@ case "${GENERATIVEQC_CI_SHARD}" in
       [tests/python/test_second_component_schedule.py]=0
       [tests/python/test_spherical_global_hybrid_basis.py]=1
       [tests/python/test_stationary_one_center_integrals.py]=2
+    )
+    # Upstream-PR follow-up qualifications (device budgets, FP32 force policy,
+    # exact CABS bound, PySCF basis parity, frozen-core shell gap) add seven files
+    # with about 45 s of routine work. Give them no-slot owners so existing core
+    # files keep their owners; the CPU DF-HF halide oracle takes core-b.
+    supplemental_core_owner+=(
+      [tests/python/test_cc_pair_pullback_provider_budget.py]=2
+      [tests/python/test_compensated_product_exact_bound.py]=0
+      [tests/python/test_delta_cv_provider_budget_propagation.py]=0
+      [tests/python/test_frozen_core_shell_gap_halide_oracle.py]=1
+      [tests/python/test_frozen_core_shell_gap_refusal_advice.py]=2
+      [tests/python/test_methyl_halide_pyscf_records.py]=2
+      [tests/python/test_triples_single_pass_fp32_force_policy.py]=0
     )
     # Keep the remaining function-scoped UKS HVP early.
     # The intact RKS Hessian suite now starts on the existing force lane.

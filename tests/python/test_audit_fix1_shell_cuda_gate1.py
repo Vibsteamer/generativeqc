@@ -65,23 +65,28 @@ def _dptr(arr: np.ndarray | None):
 
 
 @pytest.fixture(scope="module")
-def host_sink(tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureRequest) -> Path:
+def host_sink(tmp_path_factory: pytest.TempPathFactory) -> Path:
     configured = configured_test_library("GENERATIVEQC_F12_HOST_SINK")
     if configured is not None:
         return configured
-    root = Path(__file__).resolve().parents[2]
-    units = (
-        "src/posthf/f12/f12_ao_mo_project_cuda.cu",
-        "src/posthf/f12/f12_mp2_pair_response_cuda.cu",
-        "src/posthf/f12/f12_dfmp2_cv_cuda.cu",
+    out_dir = tmp_path_factory.mktemp("audit_fix1a_host_sink")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(REPO / "src/posthf/f12/build_f12_molecular_integral_sink.py"),
+            "--backend",
+            "host",
+            "--output-dir",
+            str(out_dir),
+        ],
+        check=True,
+        cwd=REPO,
+        stdout=subprocess.PIPE,
+        text=True,
     )
-    output = tmp_path_factory.mktemp("audit_host") / "libaudit_host_fixture.so"
-    compiler = request.getfixturevalue("required_native_cxx")
-    return compiler.build_shared(
-        [root / unit for unit in units],
-        output,
-        compile_args=("-x", "c++", "-std=c++20", "-O3", "-DGQC_SINK_HOST_REFERENCE"),
-    )
+    lib = Path(json.loads(result.stdout)["library"])
+    assert lib.is_file()
+    return lib
 
 
 def _make_synthetic_f12_problem(

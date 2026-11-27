@@ -3,25 +3,59 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
+from ._f12_triples_w_policy import reject_unqualified_single_pass_w_forces
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
     from ._api_types import Atom
+    from ._f12_focal_cv import FocalDeltaCVResult
+    from ._x2c1e import DeltaSrResult
     from .basis import BasisSet, ElementBasis
-    from .experimental.f12_focal import FocalRequest
+    from .experimental.f12_focal import FocalEnergyResult, FocalRequest, FocalRunResult
 
 
 DEFAULT_PRODUCTION_CORRELATION_SPACE = "frozen-core-spd"
+DEFAULT_PRODUCTION_F12_BETA_BY_CARDINAL: dict[int, float] = {2: 0.9, 3: 1.0, 4: 1.0}
 DEFAULT_FROZEN_CORE_MIN_SHELL_GAP_EH = 0.05
 FROZEN_CORE_DEFINITION_VERSION = 2
 _MIN_CORE_OVERLAP = 0.9
+
+
+def reject_diagnostic_components(components: Iterable[object]) -> None:
+    """Refuse diagnostic results and unqualified single-pass FP32 triples W forces.
+
+    Each component exposes a `telemetry` mapping, as focal result components and
+    triples evaluations do. The component identifies analytic force scope
+    independently of W telemetry, which may omit a direction or report no W work.
+    """
+    from .experimental.f12_focal import FocalEvaluation
+
+    for component in components:
+        telemetry = getattr(component, "telemetry", None)
+        if not isinstance(telemetry, Mapping):
+            raise TypeError(
+                "production focal components must expose a telemetry mapping"
+            )
+        if telemetry.get("production_eligible") is False:
+            raise ValueError(
+                f"diagnostic focal result {telemetry.get('diagnostic_mode')!r} cannot enter "
+                "production focal validation or assembly"
+            )
+        if (
+            isinstance(component, FocalEvaluation)
+            or getattr(component, "forces", None) is not None
+        ):
+            reject_unqualified_single_pass_w_forces(
+                telemetry, executed_backend=getattr(component, "executed_backend", None)
+            )
 
 
 def _nearest_admissible_frozen_counts(
@@ -608,3 +642,402 @@ def active_occupied_counts(
 ) -> tuple[int, int]:
     """Return active (alpha, beta) occupied orbital counts after freezing."""
     return (occupied[0] - frozen[0], occupied[1] - frozen[1])
+
+
+def default_production_f12_beta(cardinal: int) -> float:
+    """Return the locked size-consistent Plan-A F12 geminal exponent beta (bohr^-1) for a cardinal."""
+    if isinstance(cardinal, bool) or not isinstance(cardinal, int):
+        raise ValueError(f"F12 cardinal must be an integer, got {cardinal!r}")
+    if cardinal not in DEFAULT_PRODUCTION_F12_BETA_BY_CARDINAL:
+        raise ValueError(
+            f"Unsupported F12 cardinal {cardinal!r}; expected one of "
+            f"{sorted(DEFAULT_PRODUCTION_F12_BETA_BY_CARDINAL)}"
+        )
+    return DEFAULT_PRODUCTION_F12_BETA_BY_CARDINAL[cardinal]
+
+
+def _is_valid_valence_space_id(correlation_space_id: str) -> bool:
+    if correlation_space_id in (
+        "all-active",
+        "frozen-core",
+        DEFAULT_PRODUCTION_CORRELATION_SPACE,
+    ):
+        return True
+    if correlation_space_id.startswith("frozen:"):
+        parts = correlation_space_id.removeprefix("frozen:").split(",")
+        if len(parts) not in (1, 2):
+            return False
+        try:
+            return all(int(p) >= 0 for p in parts)
+        except ValueError:
+            return False
+    return False
+
+
+@dataclass(frozen=True)
+class ProductionFocalRecipe:
+    """Validated Plan-A focal recipe contract (matched core space and size-consistent F12 beta)."""
+
+    valence_correlation_space: str
+    delta_cv_valence_space: str | None
+    delta_sr_correlation_space: str | None
+    f12_beta_by_cardinal: dict[int, float]
+    frozen_core_definition_version: int = FROZEN_CORE_DEFINITION_VERSION
+
+
+@dataclass(frozen=True)
+class ProductionFocalAssembly:
+    """Validated additive focal total energy (Eh) and optional nuclear forces (Eh/bohr)."""
+
+    recipe: ProductionFocalRecipe
+    valence_energy_Eh: float
+    delta_cv_energy_Eh: float
+    delta_sr_energy_Eh: float
+    total_energy_Eh: float
+    valence_forces_Eh_per_bohr: np.ndarray | None = None
+    delta_cv_forces_Eh_per_bohr: np.ndarray | None = None
+    delta_sr_forces_Eh_per_bohr: np.ndarray | None = None
+    total_forces_Eh_per_bohr: np.ndarray | None = None
+
+
+def validate_production_focal_recipe(
+    *,
+    valence_correlation_space: str = DEFAULT_PRODUCTION_CORRELATION_SPACE,
+    delta_cv_valence_space: str | None = None,
+    delta_sr_correlation_space: str | None = None,
+    f12_beta_by_cardinal: Mapping[int, float] | None = None,
+    subsystem_f12_betas: Sequence[Mapping[int, float]] = (),
+    require_production_defaults: bool = True,
+    components: Sequence[object] = (),
+) -> ProductionFocalRecipe:
+    """Validate locked Plan-A focal correlation-space pairing and size-consistent F12 betas.
+
+    Enforces:
+    1. Valence, Delta-CV valence, and Delta-SR correlation spaces match identically
+       (e.g., FC9 + Delta-CV9 + Delta-SR(FC9); mixing FC4 and FC9 raises ValueError).
+    2. When require_production_defaults=True, valence correlation space must equal
+       DEFAULT_PRODUCTION_CORRELATION_SPACE ('frozen-core-spd') and every declared
+       F12 cardinal beta must match DEFAULT_PRODUCTION_F12_BETA_BY_CARDINAL
+       ({2: 0.9, 3: 1.0, 4: 1.0}).
+    3. Across all subsystems, every shared F12 cardinal must use an identical finite
+       positive beta (rejecting mixed TZ beta=0.9 vs 1.0 across subsystems).
+    4. No supplied result component is a diagnostic result or carries single-pass
+       FP32 triples W forces executed elsewhere than on an NVIDIA L20.
+    """
+    reject_diagnostic_components(components)
+    if not isinstance(valence_correlation_space, str) or not _is_valid_valence_space_id(
+        valence_correlation_space
+    ):
+        raise ValueError(
+            f"Unsupported valence correlation space {valence_correlation_space!r}; "
+            f"expected {DEFAULT_PRODUCTION_CORRELATION_SPACE!r}, 'frozen-core', "
+            "'all-active', or 'frozen:<n>'"
+        )
+    if require_production_defaults and (
+        valence_correlation_space != DEFAULT_PRODUCTION_CORRELATION_SPACE
+    ):
+        raise ValueError(
+            f"Production focal Plan A requires valence correlation space "
+            f"{DEFAULT_PRODUCTION_CORRELATION_SPACE!r} (FC9), got {valence_correlation_space!r}; "
+            "pass require_production_defaults=False only for explicit diagnostic comparisons"
+        )
+    if delta_cv_valence_space is not None:
+        if delta_cv_valence_space != valence_correlation_space:
+            raise ValueError(
+                f"Mismatched valence ({valence_correlation_space!r}) and Delta-CV valence "
+                f"({delta_cv_valence_space!r}) correlation spaces would double-count or omit "
+                "core-valence correlation"
+            )
+    if delta_sr_correlation_space is not None:
+        if delta_sr_correlation_space != valence_correlation_space:
+            raise ValueError(
+                f"Mismatched valence ({valence_correlation_space!r}) and Delta-SR "
+                f"({delta_sr_correlation_space!r}) correlation spaces"
+            )
+
+    beta_maps: list[Mapping[int, float]] = []
+    if f12_beta_by_cardinal is not None:
+        beta_maps.append(f12_beta_by_cardinal)
+    beta_maps.extend(subsystem_f12_betas)
+    if not beta_maps:
+        resolved_betas = dict(DEFAULT_PRODUCTION_F12_BETA_BY_CARDINAL)
+    else:
+        resolved_betas = {}
+        for beta_map in beta_maps:
+            if not beta_map:
+                raise ValueError("F12 beta schedule mapping cannot be empty")
+            for cardinal, raw_beta in beta_map.items():
+                if isinstance(cardinal, bool) or not isinstance(cardinal, int) or cardinal < 2:
+                    raise ValueError(f"Invalid F12 cardinal {cardinal!r}; expected integer >= 2")
+                if isinstance(raw_beta, bool) or not isinstance(raw_beta, (int, float)):
+                    raise ValueError(
+                        f"Invalid F12 beta {raw_beta!r} for cardinal {cardinal}; expected finite float"
+                    )
+                beta = float(raw_beta)
+                if not math.isfinite(beta) or beta <= 0.0:
+                    raise ValueError(
+                        f"F12 beta must be finite and positive for cardinal {cardinal}, got {raw_beta!r}"
+                    )
+                if cardinal in resolved_betas and not math.isclose(
+                    resolved_betas[cardinal], beta, rel_tol=0.0, abs_tol=1e-12
+                ):
+                    raise ValueError(
+                        f"Inconsistent F12 beta at cardinal {cardinal} across subsystems: "
+                        f"{resolved_betas[cardinal]!r} vs {beta!r} breaks size consistency"
+                    )
+                if require_production_defaults:
+                    expected_beta = default_production_f12_beta(cardinal)
+                    if not math.isclose(beta, expected_beta, rel_tol=0.0, abs_tol=1e-12):
+                        raise ValueError(
+                            f"Production focal Plan A requires F12 beta={expected_beta!r} at "
+                            f"cardinal {cardinal} (DEFAULT_PRODUCTION_F12_BETA_BY_CARDINAL="
+                            f"{DEFAULT_PRODUCTION_F12_BETA_BY_CARDINAL}), got {beta!r}"
+                        )
+                resolved_betas[cardinal] = beta
+
+    return ProductionFocalRecipe(
+        valence_correlation_space=valence_correlation_space,
+        delta_cv_valence_space=delta_cv_valence_space,
+        delta_sr_correlation_space=delta_sr_correlation_space,
+        f12_beta_by_cardinal=dict(sorted(resolved_betas.items())),
+    )
+
+
+def _recomposed_valence(
+    valence: FocalRunResult | FocalEnergyResult,
+) -> tuple[float, np.ndarray | None, tuple[object, ...]]:
+    """Return the valence energy, forces and components recomposed from the result itself.
+
+    The stored totals must equal the weighted component sum exactly, as focal
+    composition computes it, so totals cannot be paired with unrelated components.
+    """
+    from .experimental.f12_focal import (
+        FocalEnergyComponent,
+        FocalEnergyResult,
+        FocalEvaluation,
+        FocalRunResult,
+        FocalTerm,
+    )
+
+    if not isinstance(valence, (FocalRunResult, FocalEnergyResult)):
+        raise TypeError(
+            "production focal assembly takes the composed valence FocalRunResult "
+            "(energy and forces) or FocalEnergyResult (energy only)"
+        )
+    components = tuple(valence.components)
+    if not components:
+        raise ValueError(
+            "production focal assembly requires the valence result components"
+        )
+    reject_diagnostic_components(components)
+    if isinstance(valence, FocalEnergyResult):
+        if not all(isinstance(c, FocalEnergyComponent) for c in components):
+            raise TypeError(
+                "valence FocalEnergyResult components must be FocalEnergyComponent"
+            )
+        if not all(c.converged is True for c in components):
+            raise ValueError("valence components must be converged")
+        energy = math.fsum(c.energy * c.weight for c in components)
+        if energy != float(valence.energy):
+            raise ValueError(
+                "valence energy does not equal the weighted sum of its components"
+            )
+        return energy, None, components
+    if not all(
+        isinstance(c, FocalEvaluation) and isinstance(c.term, FocalTerm)
+        for c in components
+    ):
+        raise TypeError(
+            "valence FocalRunResult components must be FocalEvaluation with a FocalTerm"
+        )
+    if not all(c.converged is True for c in components):
+        raise ValueError("valence components must be converged")
+    weights = tuple(valence.weights)
+    if len(weights) != len(components):
+        raise ValueError("valence weights and components differ in length")
+    first = components[0].term
+    shape = np.shape(first.forces)
+    energies = []
+    force_terms = []
+    for (role, basis_id, cardinal, coefficient), component in zip(
+        weights, components, strict=True
+    ):
+        term = component.term
+        if (term.role, term.basis_id, term.cardinal) != (role, basis_id, cardinal):
+            raise ValueError("valence weights and components describe different terms")
+        if term.surface_id != first.surface_id:
+            raise ValueError("valence components must share one surface identity")
+        value = float(term.energy)
+        arr = np.asarray(term.forces, dtype=np.float64)
+        if (
+            len(shape) != 2
+            or shape[1] != 3
+            or arr.shape != shape
+            or not math.isfinite(value)
+            or not np.isfinite(arr).all()
+        ):
+            raise ValueError(
+                "valence component energies and forces must be finite with one (natoms, 3) shape"
+            )
+        energies.append(value * coefficient)
+        force_terms.append(arr * coefficient)
+    energy = math.fsum(energies)
+    forces = np.sum(force_terms, axis=0)
+    stored = np.asarray(valence.forces, dtype=np.float64)
+    if energy != float(valence.energy) or not np.array_equal(stored, forces):
+        raise ValueError(
+            "valence energy and forces do not equal the weighted sum of its components"
+        )
+    return energy, forces, components
+
+
+def assemble_production_focal_energy_and_forces(
+    *,
+    valence: FocalRunResult | FocalEnergyResult,
+    valence_correlation_space: str | None = None,
+    f12_beta_by_cardinal: Mapping[int, float] | None = None,
+    delta_cv: FocalDeltaCVResult | None = None,
+    delta_sr: DeltaSrResult | None = None,
+    delta_cv_energy: float | None = None,
+    delta_cv_forces: np.ndarray | None = None,
+    delta_cv_valence_space: str | None = None,
+    delta_cv_frozen_core_definition_version: int | None = None,
+    delta_sr_energy: float | None = None,
+    delta_sr_forces: np.ndarray | None = None,
+    delta_sr_correlation_space: str | None = None,
+    delta_sr_frozen_core_definition_version: int | None = None,
+    delta_sr_level: Literal["mp2", "hf"] = "mp2",
+    subsystem_f12_betas: Sequence[Mapping[int, float]] = (),
+    require_production_defaults: bool = True,
+) -> ProductionFocalAssembly:
+    """Validate the Plan-A recipe and assemble additive valence + Delta-CV + Delta-SR E and F.
+
+    `valence` is the composed focal result: a `FocalRunResult` (or
+    `FocalMolecularResult`) assembles energy and forces, a `FocalEnergyResult`
+    assembles the energy only. The valence energy and forces are recomposed
+    from its components and weights and must equal its stored totals. A result
+    without components, a diagnostic component or single-pass FP32 triples W
+    force telemetry without the device record of an NVIDIA L20 is refused.
+    """
+    val_e, val_f_arr, components = _recomposed_valence(valence)
+    version = FROZEN_CORE_DEFINITION_VERSION
+    if valence.frozen_core_definition_version != version or valence.valence_correlation_space is None:
+        raise ValueError(f"valence result requires frozen-core definition version {version} and a correlation space")
+    valence_space = valence.valence_correlation_space
+    if valence_correlation_space is not None and valence_correlation_space != valence_space:
+        raise ValueError("Explicit valence correlation space disagrees with the typed valence result")
+    if delta_sr_level not in ("mp2", "hf"):
+        raise ValueError(f"delta_sr_level must be 'mp2' or 'hf', got {delta_sr_level!r}")
+
+    if delta_cv is not None:
+        if any(x is not None for x in (delta_cv_energy, delta_cv_forces, delta_cv_frozen_core_definition_version)):
+            raise ValueError("Supply either delta_cv result object or explicit delta_cv_energy/forces")
+        if delta_cv.frozen_core_definition_version != version:
+            raise ValueError(f"Delta-CV requires frozen-core definition version {version}")
+        if delta_cv_valence_space is not None and delta_cv_valence_space != delta_cv.fc_mode:
+            raise ValueError(
+                f"Explicit delta_cv_valence_space {delta_cv_valence_space!r} disagrees with "
+                f"delta_cv.fc_mode {delta_cv.fc_mode!r}"
+            )
+        cv_e = float(delta_cv.delta_mp2_f12_Eh)
+        cv_f = delta_cv.delta_forces
+        cv_space: str | None = delta_cv.fc_mode
+    else:
+        cv_e = 0.0 if delta_cv_energy is None else float(delta_cv_energy)
+        cv_f = delta_cv_forces
+        cv_space = delta_cv_valence_space
+        if (delta_cv_energy is not None or delta_cv_forces is not None) and cv_space is None:
+            raise ValueError(
+                "Explicit delta_cv_energy/forces requires delta_cv_valence_space to verify core matching"
+            )
+        if (delta_cv_energy is not None or delta_cv_forces is not None) and delta_cv_frozen_core_definition_version != version:
+            raise ValueError(f"Explicit Delta-CV requires frozen-core definition version {version}")
+
+    if delta_sr is not None:
+        if any(x is not None for x in (delta_sr_energy, delta_sr_forces, delta_sr_frozen_core_definition_version)):
+            raise ValueError("Supply either delta_sr result object or explicit delta_sr_energy/forces")
+        if delta_sr.frozen_core_definition_version != version:
+            raise ValueError(f"Delta-SR requires frozen-core definition version {version}")
+        if (
+            delta_sr_correlation_space is not None
+            and delta_sr_correlation_space != delta_sr.correlation_space
+        ):
+            raise ValueError(
+                f"Explicit delta_sr_correlation_space {delta_sr_correlation_space!r} disagrees "
+                f"with delta_sr.correlation_space {delta_sr.correlation_space!r}"
+            )
+        sr_e = float(delta_sr.delta_sr_mp2 if delta_sr_level == "mp2" else delta_sr.delta_sr_hf)
+        sr_f = (
+            delta_sr.delta_forces_mp2
+            if delta_sr_level == "mp2"
+            else delta_sr.delta_forces_hf
+        )
+        sr_space: str | None = delta_sr.correlation_space
+    else:
+        sr_e = 0.0 if delta_sr_energy is None else float(delta_sr_energy)
+        sr_f = delta_sr_forces
+        sr_space = delta_sr_correlation_space
+        if (delta_sr_energy is not None or delta_sr_forces is not None) and sr_space is None:
+            raise ValueError(
+                "Explicit delta_sr_energy/forces requires delta_sr_correlation_space to verify core matching"
+            )
+        if (delta_sr_energy is not None or delta_sr_forces is not None) and delta_sr_frozen_core_definition_version != version:
+            raise ValueError(f"Explicit Delta-SR requires frozen-core definition version {version}")
+
+    recipe = validate_production_focal_recipe(
+        valence_correlation_space=valence_space,
+        delta_cv_valence_space=cv_space,
+        delta_sr_correlation_space=sr_space,
+        f12_beta_by_cardinal=f12_beta_by_cardinal,
+        subsystem_f12_betas=subsystem_f12_betas,
+        require_production_defaults=require_production_defaults,
+        components=components,
+    )
+
+    if not (math.isfinite(val_e) and math.isfinite(cv_e) and math.isfinite(sr_e)):
+        raise ValueError("Focal energy components must be finite")
+    total_e = math.fsum((val_e, cv_e, sr_e))
+
+    has_cv = delta_cv is not None or delta_cv_energy is not None or delta_cv_forces is not None
+    has_sr = delta_sr is not None or delta_sr_energy is not None or delta_sr_forces is not None
+    if val_f_arr is None:
+        if cv_f is not None or sr_f is not None:
+            raise ValueError(
+                "Delta-CV or Delta-SR forces require a valence FocalRunResult with forces"
+            )
+        return ProductionFocalAssembly(
+            recipe=recipe,
+            valence_energy_Eh=val_e,
+            delta_cv_energy_Eh=cv_e,
+            delta_sr_energy_Eh=sr_e,
+            total_energy_Eh=total_e,
+        )
+
+    if has_cv and cv_f is None:
+        raise ValueError("Delta-CV energy was supplied without matching Delta-CV forces")
+    if has_sr and sr_f is None:
+        raise ValueError("Delta-SR energy was supplied without matching Delta-SR forces")
+
+    cv_f_arr = (
+        np.zeros_like(val_f_arr) if cv_f is None else np.asarray(cv_f, dtype=np.float64)
+    )
+    sr_f_arr = (
+        np.zeros_like(val_f_arr) if sr_f is None else np.asarray(sr_f, dtype=np.float64)
+    )
+    for label, arr in (("delta_cv_forces", cv_f_arr), ("delta_sr_forces", sr_f_arr)):
+        if arr.shape != val_f_arr.shape or not np.isfinite(arr).all():
+            raise ValueError(
+                f"{label} must be finite with shape {val_f_arr.shape}, got {arr.shape}"
+            )
+    total_f = val_f_arr + cv_f_arr + sr_f_arr
+    return ProductionFocalAssembly(
+        recipe=recipe,
+        valence_energy_Eh=val_e,
+        delta_cv_energy_Eh=cv_e,
+        delta_sr_energy_Eh=sr_e,
+        total_energy_Eh=total_e,
+        valence_forces_Eh_per_bohr=val_f_arr.copy(),
+        delta_cv_forces_Eh_per_bohr=cv_f_arr.copy(),
+        delta_sr_forces_Eh_per_bohr=sr_f_arr.copy(),
+        total_forces_Eh_per_bohr=total_f,
+    )

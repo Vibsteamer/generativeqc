@@ -253,3 +253,441 @@ def test_frozen_core_atom_table():
     # I ECP28MDF: 28 ECP electrons = 14 pairs -> 18 - 14 = 4 frozen (4s4p), 17 correlated (4d5s5p)
     assert frozen_core_orbitals_for_atom(53, ecp_core_electrons=28) == 4
     assert active_occupied_counts((10, 10), (2, 2)) == (8, 8)
+
+
+@pytest.mark.parametrize("root,atoms_spec,mult", [
+    ("rhf", (("O", (0.0, 0.0, 0.0)), ("H", (0.0, -1.43, 1.11)), ("H", (0.0, 1.43, 1.11))), 1),
+    ("uhf", (("O", (0.0, 0.0, 0.0)), ("H", (0.0, 0.0, 1.84))), 2),
+])
+def test_frozen_core_df_mp2_matches_pyscf_energy(root, atoms_spec, mult):
+    """Verify frozen-core split-fit DF-MP2 energy matches PySCF 2.14.0 to < 1e-11 Eh."""
+    pyscf_gto = pytest.importorskip("pyscf.gto")
+    pyscf_scf = pytest.importorskip("pyscf.scf")
+    pyscf_mp = pytest.importorskip("pyscf.mp")
+    pyscf_df = pytest.importorskip("pyscf.df")
+
+    basis = _build_split_water_bases()
+    plan = plan_singlepoint(
+        atoms_spec,
+        FocalSeries(basis),
+        FocalSeries(basis),
+        None,
+        charge=0,
+        multiplicity=mult,
+        root_id=root,
+        correlation_space_id="frozen-core",
+        backend="cpu_reference",
+    )
+    req = next(r for r, _ in plan.steps if r.role == "mp2_f12_correlation")
+    ref = df_reference(req, forces=False, budget_mib=512)
+    jk = _pyscf_coulomb_source(req, basis.jk_fit, req.atoms)
+    mp2_src = _pyscf_coulomb_source(req, basis.mp2_fit, req.atoms)
+    res = reference_df_ump2(req, ref, jk, mp2_src, budget_mib=512)
+    native_mp2 = sum(res.spin_energies)
+
+    # Independent PySCF 2.14.0 split-fit DF-RHF/UHF + DF-MP2(frozen=1)
+    mol = pyscf_gto.M(
+        atom=[(s, c) for s, c in atoms_spec],
+        basis=_pyscf_basis_dict(basis.orbital, req.atoms),
+        unit="Bohr",
+        cart=False,
+        charge=0,
+        spin=mult - 1,
+        verbose=0,
+    )
+    jk_aux = _pyscf_basis_dict(basis.jk_fit, req.atoms)
+    mp2_aux = _pyscf_basis_dict(basis.mp2_fit, req.atoms)
+    mf = (pyscf_scf.RHF(mol) if root == "rhf" else pyscf_scf.UHF(mol)).density_fit(auxbasis=jk_aux)
+    mf.conv_tol = 1e-13
+    mf.conv_tol_grad = 1e-10
+    mf.max_cycle = 100
+    mf.kernel()
+    assert mf.converged
+    assert abs(ref.energy - mf.e_tot) < 1e-11
+
+    mp = (
+        pyscf_mp.MP2(mf, frozen=1) if root == "rhf" else pyscf_mp.UMP2(mf, frozen=1)
+    ).density_fit(auxbasis=mp2_aux)
+    e_corr, _ = mp.kernel()
+    assert abs(native_mp2 - e_corr) < 1e-11, f"{root} frozen-core DF-MP2 mismatch: {native_mp2} vs {e_corr}"
+
+
+def test_frozen_core_df_mp2_forces_and_weighted_tplus_forces_two_step_fd():
+    """Verify frozen-core split-fit DF-MP2 & weighted-occupied MP2 analytic forces vs two-step FD."""
+    pytest.importorskip("pyscf.gto")
+
+    basis = _build_split_water_bases()
+    center_coords = [
+        ("O", (0.0, 0.0, 0.0)),
+        ("H", (0.12, -1.43, 1.11)),
+        ("H", (-0.05, 1.38, 1.16)),
+    ]
+
+    def eval_point(coords, *, occupied_weights=None):
+        plan = plan_singlepoint(
+            coords,
+            FocalSeries(basis),
+            FocalSeries(basis),
+            None,
+            charge=0,
+            multiplicity=1,
+            root_id="rhf",
+            correlation_space_id="frozen-core",
+            backend="cpu_reference",
+        )
+        req = next(r for r, _ in plan.steps if r.role == "mp2_f12_correlation")
+        ref = df_reference(req, forces=False, budget_mib=512)
+        jk = _pyscf_coulomb_source(req, basis.jk_fit, req.atoms)
+        mp2_src = _pyscf_coulomb_source(req, basis.mp2_fit, req.atoms)
+        out = reference_df_ump2(
+            req, ref, jk, mp2_src, budget_mib=512, occupied_weights=occupied_weights
+        )
+        return req, sum(out.spin_energies), out.weights
+
+    # 1) Unweighted frozen-core DF-MP2 (4 active occupied orbitals out of 5)
+    req0, e0, w0 = eval_point(center_coords)
+    analytic_unw = _pyscf_nuclear_gradient(
+        req0.atoms, basis.orbital, basis.jk_fit, basis.mp2_fit, w0
+    )
+
+    # 2) Unequal occupied-weighted frozen-core DF-MP2 (as in (T+) chain rule!)
+    occ_w_vec = np.array([1.15, 0.92, 1.31, 0.87], dtype=np.float64)
+    occ_weights = (occ_w_vec, occ_w_vec.copy())
+    _, ew0, ww0 = eval_point(center_coords, occupied_weights=occ_weights)
+    analytic_w = _pyscf_nuclear_gradient(
+        req0.atoms, basis.orbital, basis.jk_fit, basis.mp2_fit, ww0
+    )
+
+    # Check representative non-zero coordinates across two steps h=0.0004 and h=0.0002 bohr
+    for atom_idx, axis in ((0, 2), (1, 0), (1, 1)):
+        for h in (0.0004, 0.0002):
+            def shifted(delta):
+                c = [(s, list(p)) for s, p in center_coords]
+                c[atom_idx][1][axis] += delta
+                return [(s, tuple(p)) for s, p in c]
+
+            _, ep, _ = eval_point(shifted(+h))
+            _, em, _ = eval_point(shifted(-h))
+            fd_unw = -(ep - em) / (2.0 * h)
+            err_unw = abs(analytic_unw[atom_idx, axis] - fd_unw)
+            assert err_unw < 2e-8, (
+                f"Frozen-core DF-MP2 force mismatch at atom={atom_idx} axis={axis} h={h}: "
+                f"analytic={analytic_unw[atom_idx, axis]} fd={fd_unw} err={err_unw}"
+            )
+
+            _, ewp, _ = eval_point(shifted(+h), occupied_weights=occ_weights)
+            _, ewm, _ = eval_point(shifted(-h), occupied_weights=occ_weights)
+            fd_w = -(ewp - ewm) / (2.0 * h)
+            err_w = abs(analytic_w[atom_idx, axis] - fd_w)
+            assert err_w < 2e-8, (
+                f"Frozen-core weighted (T+) MP2 force mismatch at atom={atom_idx} axis={axis} h={h}: "
+                f"analytic={analytic_w[atom_idx, axis]} fd={fd_w} err={err_w}"
+            )
+
+
+@pytest.mark.parametrize(
+    "oa,ob,distinct_jk",
+    [(2, 2, True), (2, 2, False), (3, 2, True), (3, 2, False)],
+)
+def test_f12_panel_streaming_exact_parity(oa, ob, distinct_jk):
+    """Streaming single-operator AO load + cotangent sink matches dense F12 response to <1e-13."""
+    from generativeqc._f12_unrestricted import unrestricted_mp2_f12_ao_response
+    from generativeqc_compiler.tensor import execute
+
+    rng = np.random.default_rng(100 + 10 * oa + ob + int(distinct_jk))
+    obs, ext, q, qjk = 5, 8, 12, 10
+    space = (oa, ob, obs, ext, q)
+
+    def spd(n):
+        a = rng.standard_normal((n, n)) * 0.1
+        return a @ a.T + 2.0 * np.eye(n)
+
+    def sym_panel(nq, n):
+        p = rng.standard_normal((nq, n, n)) * 0.02
+        return 0.5 * (p + p.swapaxes(1, 2))
+
+    ca, _ = np.linalg.qr(rng.standard_normal((ext, ext)))
+    cb = (
+        ca.copy()
+        if oa == ob
+        else np.linalg.qr(ca + 0.05 * rng.standard_normal((ext, ext)))[0]
+    )
+    hcore = ca @ np.diag([-3.0, -2.0, -1.0, 0.5, 1.0, 1.5, 2.0, 2.5]) @ ca.T
+    hcore = 0.5 * (hcore + hcore.T)
+    m_c = spd(q)
+    w_c = np.linalg.inv(np.linalg.cholesky(m_c))
+    ao_dense = {
+        "overlap_ao": np.eye(ext),
+        "hcore_ao": hcore,
+        "coefficients_alpha": ca,
+        "coefficients_beta": cb,
+        "metric_whitener": w_c,
+        "metric/coulomb": m_c,
+        "metric/geminal": spd(q),
+        "metric/squared_geminal": spd(q),
+        "metric/geminal_coulomb": spd(q),
+        "metric/double_commutator": spd(q),
+        "ao_coulomb": sym_panel(q, ext),
+        "ao_f12": sym_panel(q, ext),
+        "ao_f12_squared": sym_panel(q, ext),
+        "ao_f12_over_coulomb": sym_panel(q, ext),
+        "ao_double_commutator": sym_panel(q, ext),
+    }
+    jk_dense = jk_stream = None
+    if distinct_jk:
+        m_jk = spd(qjk)
+        w_jk = np.linalg.inv(np.linalg.cholesky(m_jk))
+        ao_jk = sym_panel(qjk, ext)
+        jk_dense = {"ao_coulomb": ao_jk, "metric/coulomb": m_jk, "metric_whitener": w_jk}
+        jk_stream = {
+            "__ao_loader__": lambda _name, _a=ao_jk: _a.copy(),
+            "metric/coulomb": m_jk,
+            "metric_whitener": w_jk,
+        }
+    ao_stream = {k: v for k, v in ao_dense.items() if not k.startswith("ao_")}
+    ao_stream["__ao_loader__"] = lambda name, _d=ao_dense: _d[name].copy()
+    run = lambda g, inp: execute(g, inp, max_bytes=1 << 29)
+    t0, b0 = unrestricted_mp2_f12_ao_response(
+        space, ao_dense, run, frozen_occupied=(1, 1), jkfit=jk_dense, component="f12"
+    )
+    sunk: dict[str, np.ndarray] = {}
+    t1, b1 = unrestricted_mp2_f12_ao_response(
+        space,
+        ao_stream,
+        run,
+        frozen_occupied=(1, 1),
+        jkfit=jk_stream,
+        component="f12",
+        ao_bar_sink=lambda name, mat: sunk.__setitem__(name, mat.copy()),
+    )
+    assert abs(t0.f12_increment - t1.f12_increment) < 1e-14
+    for key, ref_val in b0.items():
+        if key.startswith("ao_"):
+            assert key in sunk and key not in b1
+            assert np.max(np.abs(ref_val - sunk[key])) < 1e-13
+        else:
+            assert np.max(np.abs(ref_val - b1[key])) < 1e-13
+
+
+def test_auxiliary_tiling_matches_untiled_low_order_and_cabs_fock(monkeypatch):
+    """Verify multi-chunk + remainder auxiliary tiling matches untiled AO/Fock/CABS pullbacks to <1e-13."""
+    from generativeqc import _f12_spin_fock as sf
+    from generativeqc._f12_cabs_fock import physical_spin_operators
+    from generativeqc._f12_unrestricted import unrestricted_mp2_f12_ao_response
+    from generativeqc_compiler.tensor import execute
+
+    rng = np.random.default_rng(20261122)
+    oa, ob, obs, ext, q = 2, 2, 4, 6, 7
+    space = (oa, ob, obs, ext, q)
+
+    def sym_panel(depth: int, dim: int) -> np.ndarray:
+        a = rng.normal(size=(depth, dim, dim)) * 0.02
+        return 0.5 * (a + a.swapaxes(1, 2))
+
+    def spd(dim: int) -> np.ndarray:
+        a = rng.normal(size=(dim, dim)) * 0.1
+        return a @ a.T + 2.0 * np.eye(dim)
+
+    m_c = spd(q)
+    w_c = np.linalg.inv(np.linalg.cholesky(m_c))
+    ca = np.linalg.qr(rng.normal(size=(ext, ext)))[0]
+    cb = np.linalg.qr(ca + 0.05 * rng.normal(size=(ext, ext)))[0]
+    hcore = ca @ np.diag([-3.0, -2.0, 0.5, 1.0, 1.5, 2.0]) @ ca.T
+    hcore = 0.5 * (hcore + hcore.T)
+    ao = {
+        "overlap_ao": np.eye(ext),
+        "hcore_ao": hcore,
+        "coefficients_alpha": ca,
+        "coefficients_beta": cb,
+        "metric_whitener": w_c,
+        "metric/coulomb": m_c,
+        "metric/geminal": spd(q),
+        "metric/squared_geminal": spd(q),
+        "metric/geminal_coulomb": spd(q),
+        "metric/double_commutator": spd(q),
+        "ao_coulomb": sym_panel(q, ext),
+        "ao_f12": sym_panel(q, ext),
+        "ao_f12_squared": sym_panel(q, ext),
+        "ao_f12_over_coulomb": sym_panel(q, ext),
+        "ao_double_commutator": sym_panel(q, ext),
+    }
+    run = lambda g, inp: execute(g, inp, max_bytes=1 << 29)
+    # Untiled baseline (target slab >> total bytes -> 1 chunk)
+    t_full, b_full = unrestricted_mp2_f12_ao_response(
+        space, ao, run, frozen_occupied=(1, 1), component="f12"
+    )
+    mats_full, pb_full = physical_spin_operators(
+        hcore, ao["ao_coulomb"], w_c, (ca, cb), (oa, ob), run, False, None, include_exchange=True
+    )
+    seeds = {k: sym_panel(1, ext)[0] for k in mats_full}
+    pb_res_full = pb_full(seeds)
+
+    # Force width=2 on q=7 (three full tiles of 2 + one remainder tile of 1)
+    monkeypatch.setattr(sf, "_TARGET_AUX_SLAB_BYTES", 2 * ext * ext * 8)
+    assert sf.default_auxiliary_batch_size(q, ext) == 2
+
+    t_tiled, b_tiled = unrestricted_mp2_f12_ao_response(
+        space, ao, run, frozen_occupied=(1, 1), component="f12"
+    )
+    assert abs(t_full.f12_increment - t_tiled.f12_increment) < 1e-13
+    for key, ref_val in b_full.items():
+        assert np.max(np.abs(ref_val - b_tiled[key])) < 1e-13, key
+
+    mats_tiled, pb_tiled = physical_spin_operators(
+        hcore, ao["ao_coulomb"], w_c, (ca, cb), (oa, ob), run, False, None, include_exchange=True
+    )
+    for k in mats_full:
+        assert np.max(np.abs(mats_full[k] - mats_tiled[k])) < 1e-13, k
+    pb_res_tiled = pb_tiled(seeds)
+    for c0, c1 in zip(pb_res_full[0], pb_res_tiled[0], strict=True):
+        assert np.max(np.abs(c0 - c1)) < 1e-13
+    for a0, a1 in zip(pb_res_full[1:], pb_res_tiled[1:], strict=True):
+        assert np.max(np.abs(a0 - a1)) < 1e-13
+
+
+def test_shell_projection_chunking_matches_full_for_int32_and_int64():
+    """Verify ShellProjection block chunking matches full pack/spherical_values bit-for-bit."""
+    from generativeqc._f12_focal_integral_sink import ShellProjection
+
+    rng = np.random.default_rng(77)
+    # 3 orbital shells (s, p, d -> 1+3+5=9 sph, 1+3+6=10 cart), 4 fit shells (s, p, s, d -> 1+3+1+5=10 sph)
+    angular = np.array([0, 1, 2, 0, 1, 0, 2], dtype=np.int32)
+    ncombined = 3
+    nfit = 4
+    rows = np.full((7, 5), -1, dtype=np.int32)
+    off = 0
+    for i in range(ncombined):
+        n = 2 * int(angular[i]) + 1
+        rows[i, :n] = np.arange(off, off + n)
+        off += n
+    norb = off
+    off = 0
+    for i in range(ncombined, 7):
+        n = 2 * int(angular[i]) + 1
+        rows[i, :n] = np.arange(off, off + n)
+        off += n
+    naux = off
+    orb_pairs = np.stack(np.tril_indices(ncombined), axis=1).astype(np.int32)
+    ao_blocks = np.empty((nfit, len(orb_pairs), 3), dtype=np.int32)
+    ao_blocks[:, :, :2] = orb_pairs
+    ao_blocks[:, :, 2] = np.arange(ncombined, 7, dtype=np.int32)[:, None]
+    ao_blocks = ao_blocks.reshape(-1, 3)
+    cart_sizes = np.array([(l + 1) * (l + 2) // 2 for l in angular], dtype=np.int64)
+    counts = np.prod(cart_sizes[ao_blocks], axis=1)
+    offsets_i64 = np.r_[0, np.cumsum(counts, dtype=np.int64)]
+    transforms = {
+        0: np.eye(1),
+        1: np.eye(3),
+        2: rng.normal(size=(5, 6)),
+    }
+    layout = {
+        "angular": angular,
+        "spherical_rows": rows,
+        "ao_sizes": np.array([norb, naux], dtype=np.int32),
+        "orbital_shell_count": np.int32(ncombined),
+        "ao_blocks": ao_blocks,
+        "ao_offsets": offsets_i64,
+        "transform_0": transforms[0],
+        "transform_1": transforms[1],
+        "transform_2": transforms[2],
+    }
+    proj = ShellProjection(layout, "ao")
+    chunks = proj.block_chunks(max_cart=150)
+    assert len(chunks) > 2
+    assert chunks[0][0] == 0 and chunks[-1][1] == len(ao_blocks)
+    for (a0, a1), (b0, b1) in zip(chunks, chunks[1:]):
+        assert a1 == b0
+
+    cart_full = rng.normal(size=int(offsets_i64[-1]))
+    val_full = proj.spherical_values(cart_full)
+    val_chunked = np.empty_like(val_full)
+    for b0, b1 in chunks:
+        s0, s1 = int(offsets_i64[b0]), int(offsets_i64[b1])
+        proj.spherical_values_into(cart_full[s0:s1], val_chunked, b0, b1)
+    np.testing.assert_allclose(val_full, val_chunked, atol=1e-14, rtol=0)
+
+    w = rng.normal(size=(naux, norb, norb))
+    p_full = proj.pack(w)
+    p_chunked = np.concatenate([proj.pack_slice(w, b0, b1) for b0, b1 in chunks])
+    np.testing.assert_allclose(p_full, p_chunked, atol=1e-14, rtol=0)
+
+
+@pytest.mark.parametrize("oa,ob,obs_only,include_direct", [
+    (2, 2, True, False),
+    (2, 2, True, True),
+    (2, 1, False, False),
+    (2, 1, False, True),
+    (2, 0, True, True),
+])
+def test_tiled_nuclear_source_weights_matches_untiled_graph(
+    monkeypatch, oa, ob, obs_only, include_direct
+):
+    """Verify auxiliary-tiled unrestricted_nuclear_source_weights matches untiled graph to <1e-12."""
+    from generativeqc import _f12_spin_fock as sf
+    from generativeqc.f12_orbital_response import (
+        _run_unrestricted_nuclear_weights_tiled,
+        unrestricted_nuclear_source_weights,
+    )
+    from generativeqc_compiler.tensor import execute
+
+    rng = np.random.default_rng(1000 + 31 * oa + 7 * ob + int(obs_only) * 2 + int(include_direct))
+    n, nao, q = 4, 6, 7
+
+    def sym(x):
+        return 0.5 * (x + x.swapaxes(-1, -2))
+
+    raw = sym(rng.normal(size=(q, nao, nao)))
+    j0 = rng.normal(size=(q, q))
+    j0 = j0 @ j0.T + 2.0 * np.eye(q)
+    w = np.linalg.qr(rng.normal(size=(q, q)))[0] @ np.linalg.inv(np.linalg.cholesky(j0))
+    ca = np.zeros((nao, n))
+    ca[: (n if obs_only else nao), :] = np.linalg.qr(rng.normal(size=(n if obs_only else nao, n)))[0]
+    if oa == ob:
+        cb = ca.copy()
+    else:
+        cb = np.zeros((nao, n))
+        cb[: (n if obs_only else nao), :] = np.linalg.qr(rng.normal(size=(n if obs_only else nao, n)))[0]
+
+    central = {"whitener": w}
+    fseed_a = sym(rng.normal(size=(n, n)))
+    sseed_a = sym(rng.normal(size=(n, n)))
+    eps_a = np.sort(rng.normal(size=n))
+    for spin, occ, c in (("alpha", oa, ca), ("beta", ob, cb)):
+        r = np.einsum("mp,amn,nq->apq", c, raw, c)
+        df = np.einsum("ab,bpq->apq", w, r)
+        central["coefficients_" + spin] = c
+        central["df_" + spin] = df
+        central["fock_seed_" + spin] = fseed_a if oa == ob else sym(rng.normal(size=(n, n)))
+        central["overlap_seed_" + spin] = sseed_a if oa == ob else sym(rng.normal(size=(n, n)))
+        if occ:
+            central["occupied_energies_" + spin] = eps_a[:occ] if oa == ob else np.sort(rng.normal(size=n))[:occ]
+
+    za = rng.normal(size=oa * (n - oa))
+    zb = za.copy() if oa == ob else rng.normal(size=ob * (n - ob))
+    z = np.concatenate([za, zb])
+    direct = (
+        {
+            "overlap_ao": sym(rng.normal(size=(nao, nao))),
+            "hcore_ao": sym(rng.normal(size=(nao, nao))),
+            "ao_coulomb": sym(rng.normal(size=(q, nao, nao))),
+            "metric/coulomb": sym(rng.normal(size=(q, q))),
+        }
+        if include_direct
+        else None
+    )
+    frame_ov = (
+        {s: rng.normal(size=(nao, nao)) for s in ("alpha", "beta")}
+        if include_direct
+        else None
+    )
+    ref = unrestricted_nuclear_source_weights(
+        (oa, ob, n, q), central, z, execute, direct_weights=direct, frame_overlap=frame_ov
+    )
+    monkeypatch.setattr(sf, "_TARGET_AUX_SLAB_BYTES", 2 * nao * nao * 8)
+    assert sf.default_auxiliary_batch_size(q, nao) == 2
+    got = _run_unrestricted_nuclear_weights_tiled(
+        (oa, ob, n, q), central, z, execute, direct_weights=direct, frame_overlap=frame_ov
+    )
+    assert set(got) == set(ref)
+    for k in ref:
+        np.testing.assert_allclose(got[k], ref[k], atol=1e-12, rtol=0, err_msg=k)

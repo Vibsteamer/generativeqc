@@ -17,6 +17,7 @@ from generativeqc._f12_frozen_core import (
     select_frozen_occupied_frame,
 )
 from generativeqc.basis import BasisProvenance, BasisSet, BasisShell, ElementBasis
+from generativeqc.experimental.f12_methyl_halide import methyl_halide_basis
 
 ROOT = Path(__file__).resolve().parents[2]
 ORACLE = json.loads(
@@ -176,3 +177,84 @@ def _native_basis(halogen: str) -> tuple[BasisSet, BasisSet]:
         combined("orbital", "cc-pVDZ-F12", external.orbital),
         combined("jkfit", "def2-universal-JKFIT", external.jk_fit),
     )
+
+
+@pytest.mark.parametrize(
+    ("halogen", "charge"),
+    [
+        pytest.param("Br", 0, id="NaBr"),
+        pytest.param("Br", 1, id="NaBr+", marks=pytest.mark.ci_nightly),
+        pytest.param("I", 0, id="NaI", marks=pytest.mark.ci_nightly),
+        pytest.param("I", 1, id="NaI+", marks=pytest.mark.ci_nightly),
+    ],
+)
+def test_native_df_hf_reproduces_the_oracle_spectrum(halogen: str, charge: int) -> None:
+    from generativeqc._x2c1e import (
+        _build_sad_density,
+        _factor_df,
+        _solve_df_hf,
+        df_integrals_cpu,
+        one_electron_integrals_cpu,
+    )
+
+    orbital, jk_fit = _native_basis(halogen)
+    case = _oracle_case(halogen, charge)
+    atoms = _atoms(case)
+    multiplicity = case["multiplicity"]
+    occupied = (case["channels"][0]["occupied"], case["channels"][-1]["occupied"])
+    overlap, hcore, nuclear = one_electron_integrals_cpu(
+        atoms, orbital, charge=charge, multiplicity=multiplicity
+    )
+    metric, three_center = df_integrals_cpu(
+        atoms, orbital, jk_fit, charge=charge, multiplicity=multiplicity
+    )
+    factor = _factor_df(metric, three_center)
+    seed = _build_sad_density(atoms, orbital, overlap, hcore, factor, occupied)
+    reference = _solve_df_hf(
+        overlap,
+        hcore,
+        nuclear,
+        factor,
+        occupied,
+        unrestricted=case["root_id"] == "uhf",
+        initial_densities=seed,
+    )
+
+    assert reference.energy == pytest.approx(case["total_energy_Eh"], rel=0, abs=1e-9)
+    for spin, channel in enumerate(case["channels"]):
+        np.testing.assert_allclose(
+            reference.orbital_energies[spin][: channel["occupied"]],
+            channel["occupied_energies_Eh"],
+            rtol=0,
+            atol=2e-8,
+        )
+    nspin = 2 if reference.unrestricted else 1
+    frame = select_frozen_occupied_frame(
+        atoms, orbital, overlap, reference.coefficients[:nspin], reference.orbital_energies[:nspin],
+        occupied[:nspin], "frozen-core-spd",
+    )
+    assert frame.counts("frozen-core-spd") == (10, 10)
+    for chosen, channel in zip(frame.channels("frozen-core-spd"), case["channels"], strict=True):
+        char = channel["dominant_character"]
+        expected = (char.index("Na s"), char.index(f"{halogen} s"),
+                    *[i for i, label in enumerate(char) if label == f"{halogen} p"][:3],
+                    *[i for i, label in enumerate(char) if label == f"{halogen} d"])
+        assert chosen.indices == tuple(sorted(expected))
+
+
+@pytest.mark.ci_nightly
+def test_delta_sr_tracks_na_1s_and_the_iodine_core_on_both_references() -> None:
+    from generativeqc._x2c1e import evaluate_delta_sr
+
+    orbital, jk_fit = _native_basis("I")
+    case = _oracle_case("I", 0)
+    result = evaluate_delta_sr(
+        _atoms(case), orbital, jk_fit, jk_fit, root_id="rhf",
+        correlation_space="frozen-core-spd", forces=False,
+    )
+    assert result.frozen_core_definition_version == 2
+    for frame in (result.frozen_nr, result.frozen_sr):
+        assert frame is not None
+        assert frame.counts("frozen-core-spd") == (10, 10)
+        # The occupied sodium 2s lies below occupied frozen iodine 4d.
+        assert frame.occupied_order[0] != tuple(range(result.nocc[0]))

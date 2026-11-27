@@ -1,0 +1,17 @@
+{
+  "id": "cc.lambda-external-energy-source",
+  "classification": "scientific-choice",
+  "controls": [
+    "cc-option:lambda.energy_source_only"
+  ],
+  "owner_issues": [
+    1598
+  ],
+  "sources": [
+    "src/cc/lambda_response.hpp",
+    "src/cc/lambda_response_cuda.cu",
+    "src/api/c_api_f12_focal_reference.cpp"
+  ],
+  "rationale": "RCCSD CUDA can solve the Lambda equation for an explicitly supplied external energy source with a zero CCSD energy seed. Focal triples response requests select this equation explicitly. The option defaults off and the ordinary CCSD Lambda equation retains its energy seed.",
+  "revisit_condition": "Revisit when the response API defines a different source equation and qualifies its parameter cotangents and analytic forces against independent references."
+}

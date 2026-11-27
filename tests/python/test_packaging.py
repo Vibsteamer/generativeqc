@@ -405,3 +405,31 @@ def test_cibuildwheel_uses_base_dependencies_for_provider_smoke() -> None:
     root = Path(__file__).resolve().parents[2]
     workflow = (root / ".github/workflows/wheels.yml").read_text()
     assert "CIBW_TEST_EXTRAS" not in workflow
+
+
+def test_license_texts_and_third_party_notices_reference_each_other() -> None:
+    root = Path(__file__).resolve().parents[2]
+    notices = (root / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+    texts = {path.name for path in (root / "LICENSES").glob("*.txt")}
+    assert set(re.findall(r"LICENSES/([\w.+-]+\.txt)", notices)) == texts
+
+
+def test_gscdb_geometries_are_attributed_at_every_use() -> None:
+    root = Path(__file__).resolve().parents[2]
+    notices = (root / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+    section = notices.split("## GSCDB test geometries", 1)[1].split("\n## ", 1)[0]
+    rows = re.findall(r"^\| `([^`]+)` \| (.+?) \| [^|]+ \|$", section, re.MULTILINE)
+    assert len(rows) == 5
+    for record, uses in rows:
+        for use in re.findall(r"`([^`]+)`", uses):
+            text = (root / use).read_text(encoding="utf-8")
+            assert record in text and "CC BY 4.0" in text, (record, use)
+
+
+def test_third_party_notice_tables_name_existing_repository_files() -> None:
+    root = Path(__file__).resolve().parents[2]
+    notices = (root / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+    rows = "\n".join(line for line in notices.splitlines() if line.startswith("| "))
+    cited = set(re.findall(r"`((?:src|tests|python)/[^`]+)`", rows))
+    assert len(cited) >= 10
+    assert sorted(path for path in cited if not (root / path).is_file()) == []

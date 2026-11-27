@@ -15,6 +15,44 @@ def test_current_shared_scf_dependencies_are_valid() -> None:
 
 
 @pytest.mark.parametrize(
+    ("owner", "header"),
+    (
+        ("scf/reference/mean_field.cpp", "tensor/cpu_compensated_sum.hpp"),
+        ("scf/solver/mean_field_driver.cpp", "scf/fock_symmetry.hpp"),
+    ),
+)
+def test_host_scf_borrows_only_the_exact_numerical_leaf(
+    tmp_path: Path, owner: str, header: str
+) -> None:
+    source = tmp_path / "src"
+    consumer = source / owner
+    consumer.parent.mkdir(parents=True)
+    leaf = source / header
+    leaf.parent.mkdir(parents=True, exist_ok=True)
+    leaf.write_text("// Stateless numerical leaf\n")
+    consumer.write_text(f'#include "{header}"\n')
+    assert not audit_scf_structure(tmp_path)["errors"]
+
+    sibling = consumer.with_name("other.cpp")
+    sibling.write_text(f'#include "{header}"\n')
+    provider = leaf.with_name(f"{leaf.stem}_provider.hpp")
+    provider.write_text("// Simulated adjacent provider header\n")
+    provider_relative = provider.relative_to(source).as_posix()
+    consumer.write_text(f'#include "{provider_relative}"\n')
+    errors = audit_scf_structure(tmp_path)["errors"]
+    assert len(errors) == 2
+    assert any(
+        error.startswith(f"{owner}:1:") and error.endswith(provider_relative)
+        for error in errors
+    )
+    assert any(
+        error.startswith(f"{sibling.relative_to(source).as_posix()}:1:")
+        and error.endswith(header)
+        for error in errors
+    )
+
+
+@pytest.mark.parametrize(
     "dependency",
     ("validation_products.hpp", "cpu_target_eigen.hpp", "diis.hpp"),
 )

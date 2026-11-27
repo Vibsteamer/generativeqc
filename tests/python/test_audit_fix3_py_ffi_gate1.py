@@ -27,7 +27,7 @@ from generativeqc._f12_ao_mo_native import (
     run_ao_mo_project_rev,
     run_coulomb_fit_rev,
 )
-from generativeqc._f12_cabs_fock import physical_spin_operators
+from generativeqc._f12_cabs_fock import physical_fock, physical_spin_operators
 from generativeqc._f12_cc_fixed_sources_native import (
     AUTO_NATIVE_LIBRARY,
     bind_fixed_pair_sources,
@@ -49,6 +49,7 @@ from generativeqc._f12_focal_integral_kernel import (
 from generativeqc._f12_focal_integral_sink import _bind_fallback_weighted
 from generativeqc._f12_focal_projector import _ozaki_mm, _ozaki_mm_left_dd
 from generativeqc._f12_mp2_pair_native import (
+    _resolve_symbol as mp2_resolve_symbol,
     bind_mp2_f12_pair_energies,
 )
 from generativeqc._f12_spin_ao import (
@@ -68,29 +69,13 @@ from generativeqc.f12_orbital_response import unrestricted_source_orbital_adjoin
 
 
 @pytest.fixture(scope="module")
-def host_sink(tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureRequest) -> Path:
-    if os.environ.get("GENERATIVEQC_F12_HOST_SINK") is not None:
-        src = f12_host_shell()
-        dst = tmp_path_factory.mktemp("audit_fix3_host") / "libaudit_fix3_host_fixture.so"
-        shutil.copy2(src, dst)
-        return dst
-    root = Path(__file__).resolve().parents[2]
-    units = (
-        "src/posthf/f12/f12_ao_mo_project_cuda.cu",
-        "src/posthf/f12/f12_ext_fock_cuda.cu",
-        "src/posthf/f12/f12_spin_fock_1e_cuda.cu",
-        "src/posthf/f12/f12_cphf_relax_cuda.cu",
-        "src/posthf/f12/f12_cc_fixed_sources_cuda.cu",
-        "src/posthf/f12/f12_mp2_pair_response_cuda.cu",
-        "src/posthf/f12/f12_dfmp2_cv_cuda.cu",
-    )
-    output = tmp_path_factory.mktemp("audit_host") / "libaudit_host_fixture.so"
-    compiler = request.getfixturevalue("required_native_cxx")
-    return compiler.build_shared(
-        [root / unit for unit in units],
-        output,
-        compile_args=("-x", "c++", "-std=c++20", "-O3", "-DGQC_SINK_HOST_REFERENCE"),
-    )
+def host_sink(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    src = f12_host_shell()
+    # Copy under a neutral filename so dlopen inside this module never pollutes
+    # /proc/self/maps auto-discovery for other Gate 1 test modules in the same pytest process.
+    dst = tmp_path_factory.mktemp("audit_fix3_host") / "libaudit_fix3_host_fixture.so"
+    shutil.copy2(src, dst)
+    return dst
 
 
 @pytest.fixture(autouse=True)
@@ -458,6 +443,41 @@ def test_b3_mutable_streamed_panel_reloads_with_identical_metadata(
     np.testing.assert_array_equal(evaluate(), raw)
     raw[1, 0, 0] = 2.5
     np.testing.assert_array_equal(evaluate(), raw)
+
+
+def test_b3_builtin_streamed_shell_content_invalidates_projection(host_sink, monkeypatch):
+    from generativeqc._f12_focal_molecular import _Panel
+    from generativeqc._f12_focal_shells import focal_shell_layout
+    from generativeqc.experimental.f12_focal import FocalRequest
+    from test_f12_aot_aomo_cabs_gate1 import _compact_split_basis, _make_atoms
+
+    monkeypatch.delenv("GENERATIVEQC_F12_DISABLE_HAD_REUSE", raising=False)
+    clear_projected_source_cache(reset_stats=True)
+    req = FocalRequest(
+        surface_id="streamed-shell-cache", atoms=_make_atoms((("H", (0.0, 0.0, 0.0)),)),
+        charge=0, multiplicity=2, basis=_compact_split_basis((1,)), role="mp2_f12_correlation",
+        root_id="uhf", correlation_space_id="all-active", backend="cpu_reference",
+    )
+    layout = focal_shell_layout(req, host_sink, host_reference=True, budget_mib=64)
+    nc, aux = map(int, layout["ao_sizes"])
+    owner = _Panel(layout, {}, np.eye(aux), req.basis.f12_fit.identity,
+                   streaming=True, host_reference=True, library=host_sink, budget_mib=64)
+    evaluate = _project_streamed_sources(owner.load_ao, nc, aux, host_sink)
+    first = evaluate()
+    np.testing.assert_allclose(owner.obs_coulomb(2), first[:, :2, :2])
+    exposed = owner.joint(req, explicit=True).obs_coulomb
+    with pytest.raises(ValueError):
+        exposed.setflags(write=True)
+    np.testing.assert_array_equal(evaluate(), first)
+    assert projected_source_cache_info()["hits"] > 0
+    # These contraction coefficients enter the integrals but not the manifest.
+    layout["radial"] *= 2.0
+    assert owner.joint(req, explicit=True).obs_coulomb is None
+    changed = evaluate()
+    np.testing.assert_allclose(owner.obs_coulomb(2), changed[:, :2, :2])
+    assert np.max(np.abs(changed - first)) > 1e-3
+    np.testing.assert_allclose(changed, owner.load_ao("ao_coulomb")[:, :3, :3])
+    clear_projected_source_cache(reset_stats=True)
 
 
 def test_m8_projected_lru_concurrent_access_and_clear_no_keyerror(
